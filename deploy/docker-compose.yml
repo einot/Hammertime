@@ -1,0 +1,58 @@
+name: hammertime
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  ingest:
+    build: { context: .., dockerfile: services/ingest/Dockerfile }
+    env_file: ../.env.example
+    environment:
+      HAMMERTIME_BUS_BROKERS: redpanda:9092
+      HAMMERTIME_REDIS_URL: redis://redis:6379/0
+    ports: ["8080:8080"]
+    depends_on: [redpanda, redis]
+
+  aggregator:
+    build: { context: .., dockerfile: services/aggregator/Dockerfile }
+    env_file: ../.env.example
+    environment:
+      HAMMERTIME_BUS_BROKERS: redpanda:9092
+      HAMMERTIME_REDIS_URL: redis://redis:6379/0
+    depends_on: [redpanda, redis]
+
+  trie:
+    build: { context: .., dockerfile: services/trie/Dockerfile }
+    env_file: ../.env.example
+    environment:
+      HAMMERTIME_BUS_BROKERS: redpanda:9092
+    ports: ["8081:8081"]
+    volumes: ["trie-snapshots:/snapshots"]
+    depends_on: [redpanda]
+
+  detector:
+    build: { context: .., dockerfile: services/detector/Dockerfile }
+    env_file: ../.env.example
+    environment:
+      HAMMERTIME_BUS_BROKERS: redpanda:9092
+    ports: ["8082:8082"]
+    depends_on: [redpanda]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+volumes:
+  trie-snapshots:

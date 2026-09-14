@@ -1,0 +1,46 @@
+[project]
+name = "hammertime"
+version = "0.1.0"
+description = "Distributed IP activity & prefix detection service"
+requires-python = ">=3.12"
+dependencies = [
+    "hammertime-core",
+    "hammertime-bus",
+    "hammertime-store",
+    "hammertime-ingest",
+    "hammertime-aggregator",
+    "hammertime-trie",
+    "hammertime-detector",
+]
+
+[tool.uv.workspace]
+members = ["packages/*", "services/*", "tools/*"]
+
+[tool.uv.sources]
+hammertime-core = { workspace = true }
+hammertime-bus = { workspace = true }
+hammertime-store = { workspace = true }
+hammertime-testkit = { workspace = true }
+hammertime-ingest = { workspace = true }
+hammertime-aggregator = { workspace = true }
+hammertime-trie = { workspace = true }
+hammertime-detector = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "hammertime-testkit",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest-benchmark>=4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["packages", "services", "tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

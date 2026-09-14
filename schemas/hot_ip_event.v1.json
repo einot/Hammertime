@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hammertime.dev/schemas/hot_ip_event.v1.json",
+  "title": "HotIpEvent",
+  "type": "object",
+  "required": ["type", "ip", "timestamp", "sequence", "config_version"],
+  "additionalProperties": false,
+  "properties": {
+    "type": { "enum": ["HotIpAdded", "HotIpRemoved"] },
+    "ip": { "type": "string" },
+    "family": { "enum": ["ipv4", "ipv6"] },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "shard": { "type": "integer", "minimum": 0 },
+    "window_count": { "type": "integer", "minimum": 0 },
+    "config_version": { "type": "integer", "minimum": 1 }
+  }
+}

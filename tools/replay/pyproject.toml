@@ -1,0 +1,15 @@
+[project]
+name = "hammertime-replay"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["hammertime-core", "hammertime-bus"]
+
+[project.scripts]
+hammertime-replay = "hammertime.tools.replay.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hammertime"]

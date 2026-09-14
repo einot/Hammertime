@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hammertime.dev/schemas/detection_config.v1.json",
+  "title": "DetectionConfig",
+  "type": "object",
+  "required": [
+    "config_version", "window_seconds", "bucket_seconds",
+    "hot_threshold", "cold_threshold", "minimum_hot_ips", "minimum_hot_ratio"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "config_version": { "type": "integer", "minimum": 1 },
+    "window_seconds": { "type": "integer", "minimum": 1 },
+    "bucket_seconds": { "type": "integer", "minimum": 1 },
+    "hot_threshold": { "type": "integer", "minimum": 1 },
+    "cold_threshold": { "type": "integer", "minimum": 0 },
+    "minimum_hot_ips": { "type": "integer", "minimum": 1 },
+    "minimum_hot_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "allowed_lateness_seconds": { "type": "integer", "minimum": 0 },
+    "state_retention_seconds": { "type": "integer", "minimum": 1 }
+  }
+}

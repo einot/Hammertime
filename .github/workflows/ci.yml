@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --all-extras --dev
+      - run: uv run ruff check .
+      - run: uv run mypy packages services
+      - run: uv run pytest -q
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: docker compose -f deploy/docker-compose.yml up -d --build
+      - run: uv run pytest tests/integration tests/e2e -q
+      - if: always()
+        run: docker compose -f deploy/docker-compose.yml logs

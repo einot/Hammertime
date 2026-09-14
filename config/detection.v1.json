@@ -1,0 +1,11 @@
+{
+  "config_version": 1,
+  "window_seconds": 300,
+  "bucket_seconds": 10,
+  "hot_threshold": 1000,
+  "cold_threshold": 800,
+  "minimum_hot_ips": 16,
+  "minimum_hot_ratio": 0.10,
+  "allowed_lateness_seconds": 30,
+  "state_retention_seconds": 600
+}

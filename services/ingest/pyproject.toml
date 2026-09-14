@@ -1,0 +1,15 @@
+[project]
+name = "hammertime-ingest"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["hammertime-core", "hammertime-bus", "hammertime-store", "fastapi>=0.115", "uvicorn>=0.30", "jsonschema>=4.23"]
+
+[project.scripts]
+hammertime-ingest = "hammertime.ingest.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hammertime"]

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hammertime.dev/schemas/prefix_stats_event.v1.json",
+  "title": "PrefixStatsChanged",
+  "type": "object",
+  "required": ["prefix", "hot_count", "capacity", "sequence", "timestamp"],
+  "additionalProperties": false,
+  "properties": {
+    "prefix": { "type": "string" },
+    "hot_count": { "type": "integer", "minimum": 0 },
+    "capacity": { "type": "string", "description": "decimal string; IPv6 capacities exceed 64-bit" },
+    "hot_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "string", "format": "date-time" }
+  }
+}
