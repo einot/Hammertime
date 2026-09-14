@@ -1,11 +1,13 @@
 # Specification
 
 The authoritative architecture specification is
-`hammertime_spec_1.md` (Distributed IP Activity & Prefix Detection Service).
+[`hammertime_spec_1.md`](./hammertime_spec_1.md) — *Distributed IP Activity &
+Prefix Detection Service*, 45 sections.
 
-Drop the current revision into this directory and reference sections by number;
-every module docstring in this repository cites the section it implements, e.g.
-`Spec: §6, §30` for the HOT/COLD state machine.
+Sections are referenced by number throughout the codebase: every module docstring
+cites the section it implements, e.g. `Spec: §6, §30` for the HOT/COLD state
+machine. When the spec is revised, update this index and re-check the cited
+sections in the modules below.
 
 Section index used throughout the code:
 
