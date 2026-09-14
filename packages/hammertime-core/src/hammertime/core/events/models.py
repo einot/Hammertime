@@ -5,7 +5,6 @@ Spec: section 4, section 19, section 32
 
 from __future__ import annotations
 
-
 from dataclasses import dataclass
 from datetime import datetime
 

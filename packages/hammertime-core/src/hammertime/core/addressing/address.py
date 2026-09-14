@@ -9,9 +9,9 @@ declared bit_length. IPv4 and IPv6 use the same type and separate trie roots.
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterator
 
 from hammertime.core.errors import InvalidAddressError
 
@@ -54,4 +54,6 @@ class Address:
 
     def __str__(self) -> str:
         version = 4 if self.family is AddressFamily.IPV4 else 6
-        return str(ipaddress.ip_address(self.value) if version == 4 else ipaddress.IPv6Address(self.value))
+        return str(
+            ipaddress.ip_address(self.value) if version == 4 else ipaddress.IPv6Address(self.value)
+        )

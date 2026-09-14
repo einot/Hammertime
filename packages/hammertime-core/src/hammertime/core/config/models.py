@@ -28,6 +28,8 @@ class DetectionConfig:
     state_retention_seconds: int = 600
 
     def __post_init__(self) -> None:
+        if self.config_version < 1:
+            raise ConfigurationError("config_version must be >= 1")
         if self.cold_threshold >= self.hot_threshold:
             raise ConfigurationError("cold_threshold must be strictly below hot_threshold")
         if self.window_seconds % self.bucket_seconds:

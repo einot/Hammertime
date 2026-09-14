@@ -44,3 +44,18 @@ testpaths = ["packages", "services", "tests"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+explicit_package_bases = true
+namespace_packages = true
+mypy_path = [
+    "packages/hammertime-core/src",
+    "packages/hammertime-bus/src",
+    "packages/hammertime-store/src",
+    "packages/hammertime-testkit/src",
+    "services/ingest/src",
+    "services/aggregator/src",
+    "services/trie/src",
+    "services/detector/src",
+    "tools/agent-sim/src",
+    "tools/replay/src",
+    "tools/trie-inspect/src",
+]

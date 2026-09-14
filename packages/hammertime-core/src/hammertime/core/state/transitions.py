@@ -5,7 +5,6 @@ Spec: section 19, section 30
 
 from __future__ import annotations
 
-
 from dataclasses import dataclass
 
 from hammertime.core.state.enums import IpState
