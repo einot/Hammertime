@@ -23,6 +23,9 @@
 * `(agent_id, sequence)` is the message identity. Resending an identical message
   is a no-op (§23).
 * Agents never assert state. `"state": "HOT"` in a payload is a schema violation (§36).
+  The same applies to the per-IP attributes of §46, including `weight` and any
+  future provenance entries: they are derived server-side from observations, and
+  an agent-supplied `attributes` (or any other unknown key) is a 400 (ADR-0005).
 
 ## Responses
 

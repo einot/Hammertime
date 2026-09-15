@@ -17,6 +17,16 @@
     "minimum_hot_ips": { "type": "integer", "minimum": 1 },
     "minimum_hot_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
     "allowed_lateness_seconds": { "type": "integer", "minimum": 0 },
-    "state_retention_seconds": { "type": "integer", "minimum": 1 }
+    "state_retention_seconds": { "type": "integer", "minimum": 1 },
+    "weight_function": {
+      "enum": ["threshold_ratio"],
+      "description": "Which function produces IpAttributes.weight at transition time (spec section 46, ADR-0005). Default \"threshold_ratio\". Adding a function is an enum entry plus a spec section 46 definition; the wire format does not change, because weight is always a fixed-point integer in thousandths of hot_threshold."
+    },
+    "weight_max": {
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 1000000,
+      "description": "Upper clamp applied to weight, in the same thousandths-of-hot_threshold units (1000 = exactly at hot_threshold). Default 1000000. Bounds what an extreme window count can write into a per-IP record."
+    }
   }
 }

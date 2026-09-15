@@ -441,6 +441,10 @@ Number of currently hot `/32` descendants.
 
 Metadata explicitly attached to this prefix.
 
+> **ADR-0005:** this is *prefix*-scoped metadata (Section 16). Per-IP
+> attributes are a separate mechanism stored beside the trie, not in this node;
+> the node layout above is unchanged. See Section 46.
+
 ### `prefix_state`
 
 Derived classification such as:
@@ -564,6 +568,11 @@ hot_count(child[1])
 ```
 
 assuming both children are represented and the node has no separate `/32` semantic.
+
+> **ADR-0005:** `hot_count` is the trie's only per-node aggregate. Per-IP
+> attributes (Section 46), including `weight`, are never summed along the path
+> and never enter this invariant. The attribute map adds a derived invariant
+> instead: `len(records) == hot_count(root)` per address family.
 
 This invariant is more important than cached `prefix_state`.
 
@@ -756,6 +765,10 @@ combine(A, B) = A | B
 A policy may use priority/override semantics instead of set union.
 
 The trie SHOULD NOT assume that all metadata is mergeable by simple union.
+
+> **ADR-0005:** this section governs prefix-scoped metadata only. Per-IP
+> attributes (Section 46) are not inherited and are not combined along the path;
+> the two mechanisms share no namespace.
 
 ---
 
@@ -1198,7 +1211,8 @@ should directly locate the `/16` trie node and return:
 }
 ```
 
-An IP query:
+An IP query — which since ADR-0005 also returns the IP's attributes while it is
+HOT (Section 46.7):
 
 ```text
 GET /ip/192.168.1.42
@@ -1408,6 +1422,7 @@ A snapshot may contain:
 trie structure
 hot_count values
 hot IP states
+per-IP attribute records   (ADR-0005, Section 46.8)
 configuration version
 event sequence number
 ```
@@ -1429,9 +1444,17 @@ Example:
   "hot_threshold": 1000,
   "cold_threshold": 800,
   "minimum_hot_ips": 16,
-  "minimum_hot_ratio": 0.10
+  "minimum_hot_ratio": 0.10,
+  "weight_function": "threshold_ratio",
+  "weight_max": 1000000
 }
 ```
+
+`weight_function` and `weight_max` (ADR-0005) select and bound the per-IP
+`weight` attribute of Section 46.4. They are optional and descriptive: changing
+either alters the `weight` recorded on subsequent transitions and nothing else —
+no IP changes state, and no prefix changes classification — so they do not
+require the re-evaluation below.
 
 A configuration change MUST define its effect on existing state.
 
@@ -1543,6 +1566,9 @@ trie_nodes
 hot_ip_count
 prefix_queries
 trie_updates
+ip_attribute_records   (ADR-0005, Section 46.8)
+ip_attribute_bytes
+attributes_rejected
 ```
 
 ### Detection metrics
@@ -1980,3 +2006,229 @@ The central design principle is:
 This separation allows the system to maintain prefix-level bot-network signals incrementally without repeatedly scanning all IP addresses.
 
 For IPv4, each HOT/COLD transition updates at most 32 trie levels. Consequently, the cost of maintaining hierarchical hot-IP density is effectively constant per state transition, independent of the number of IPs represented by the prefix.
+
+---
+
+# 46. Per-IP Attributes
+
+> Added by ADR-0005. Sections 1-45 are unchanged; this section only adds a
+> descriptive layer beside the trie.
+
+## 46.1 Purpose and non-goals
+
+A HOT IP answers "is this address currently hot?" and nothing else. Operators
+also need to know *how* hot it is, and eventually *why* it is in the trie — which
+detector rule or alerting system put it there. That is descriptive information
+about an address, not a change to the trie's arithmetic.
+
+Per-IP attributes are therefore **descriptive only**. The following MUST NOT
+change, and MUST NOT be influenced by any attribute:
+
+```text
+hot_count semantics and the Section 12 invariant
+hot_ratio
+the HOT_PREFIX predicate (Section 13, Section 38)
+the HOT/COLD state machine and hysteresis (Section 6, Section 7, Section 30)
+the HotIpAdded / HotIpRemoved event types (Section 19)
+```
+
+No attribute value is ever summed, averaged, or otherwise aggregated along the
+trie path. The trie stores counts of hot descendants; it stores no other
+per-node numeric aggregate.
+
+## 46.2 The attribute document
+
+An `IpAttributes` document is an open, versioned JSON object
+(`schemas/ip_attributes.v1.json`):
+
+```json
+{
+  "attributes_version": 1,
+  "weight": 1450,
+  "x_experiment": "any JSON"
+}
+```
+
+Names fall into two tiers:
+
+### Registered names
+
+Defined in the registry below with a type, a meaning, and a producer. Validated
+strictly: an unregistered bare name is rejected, so a misspelling cannot pass as
+a new feature.
+
+### Experimental names
+
+Any key matching `^x_[a-z0-9_]{1,48}$`, carrying any JSON value. Validated for
+shape only. A consumer that does not recognise an `x_` key MUST preserve it
+verbatim — store it, return it on read-back — and MUST NOT interpret it. This is
+what lets a producer ship a new attribute end-to-end before anyone standardizes
+it.
+
+Adding a registered name is an entry in the registry below plus a property in
+`schemas/ip_attributes.v1.json`. It is not a schema migration: documents without
+the new name stay valid, `attributes_version` stays 1 unless the *meaning* of an
+existing name changes, and consumers that predate the name fall back to the
+pass-through rule.
+
+A document carrying an `attributes_version` higher than a consumer understands
+MUST be stored and echoed verbatim and MUST NOT be interpreted.
+
+Bounds, enforced by producers and by the codec:
+
+```text
+serialized size   <= 1024 bytes
+key count         <= 16
+```
+
+## 46.3 Attribute registry
+
+| Name | Type | Produced by | Meaning |
+| --- | --- | --- | --- |
+| `attributes_version` | integer >= 1 | every producer | Generation of this registry the document was written against. Required. |
+| `weight` | integer 0..1000000 | aggregator, at transition | Fixed-point hotness, in thousandths of `hot_threshold` (Section 46.4). |
+
+Reserved, defined but not yet enabled:
+
+| Name | Type | Intended meaning |
+| --- | --- | --- |
+| `sources` | array (<= 8) of `{system, rule, at, detail}` | Provenance trail: which system or detector rule contributed to this IP being HOT, and when. Specified in `$defs` of `schemas/ip_attributes.v1.json`; a document carrying it is rejected until it is promoted into `properties`. Experiments use `x_sources`. |
+
+## 46.4 Weight
+
+`weight` is a fixed-point integer in thousandths of `hot_threshold`:
+
+```text
+weight = 1000   <=>   window count exactly at hot_threshold
+weight = 2500   <=>   window count 2.5x hot_threshold
+```
+
+It is produced at transition time by the configured `weight_function`
+(Section 34). The v1 function is `threshold_ratio`:
+
+```text
+threshold_ratio(window_count, config) =
+    clamp(
+        (1000 * window_count + config.hot_threshold // 2) // config.hot_threshold,
+        0,
+        config.weight_max
+    )
+```
+
+Integer arithmetic throughout: replay MUST reproduce the same value bit for bit,
+which floating point does not guarantee across platforms. Because the function
+depends only on `window_count` and the config version the event already names,
+any consumer can recompute and verify `weight`, and a consumer that drops it
+loses nothing that cannot be derived again.
+
+A stored record keeps the value computed by the configuration in force at its
+transition. After a `weight_function` or `weight_max` change, records written
+before and after are therefore on different scales until each IP next
+transitions; consumers comparing weights across a configuration change MUST
+treat them as approximate. This is deliberate — rewriting stored weights would
+mean touching every HOT record on a configuration edit, for information that is
+descriptive only.
+
+`weight` is available to the classifier as a ranking or severity input
+(Section 14, Section 31). It MUST NOT appear in the `HOT_PREFIX` predicate.
+Prefix-level weight aggregates are out of scope for this version: maintaining one
+incrementally would introduce a second per-node aggregate that replay would have
+to reproduce exactly (ADR-0005).
+
+## 46.5 Transport, storage, and lifecycle
+
+Attributes travel on the HOT/COLD transition event as an optional `attributes`
+property (`schemas/hot_ip_event.v1.json`). An absent `attributes` is equivalent
+to `{"attributes_version": 1}`.
+
+The trie service stores them in a map keyed by full address, held beside the
+trie — **not** inside `TrieNode` (Section 9), whose layout is unchanged. The map
+is updated in the same single-writer step as the `hot_count` path (Section 28):
+
+```text
+HotIpAdded(ip, attributes)   ->  hot_count += 1 along path ;  record[ip] = attributes
+HotIpRemoved(ip)             ->  hot_count -= 1 along path ;  delete record[ip]
+```
+
+`HotIpAdded` replaces any existing record for that IP; this makes redelivery
+idempotent and replay deterministic under the per-IP ordering Section 20 already
+guarantees. Attributes on a `HotIpRemoved` MAY be logged but MUST NOT be stored:
+the record is deleted.
+
+The resulting invariant derives from the binary primitive rather than
+perturbing it:
+
+```text
+set(record.keys()) == the set of currently HOT /32 addresses
+len(record)        == hot_count(root)          per address family
+```
+
+Because attributes are reconstructed from the same event replay as the trie
+(Section 32), they require no separate durability or consistency mechanism.
+
+## 46.6 Relationship to prefix metadata
+
+Per-IP attributes and the `local_metadata` of Section 16 are distinct
+mechanisms and share no namespace:
+
+```text
+local_metadata   prefix-scoped, operator-declared, inherited down the path,
+                 never materialized (Section 17), lifetime independent of hot state
+
+IpAttributes     address-scoped, machine-produced, never inherited,
+                 lifetime exactly "currently HOT"
+```
+
+A full view of an address is both, returned separately:
+
+```text
+effective_metadata(ip) = combine(root.local_metadata, ..., /32.local_metadata)
+attributes(ip)         = record[ip]   if the IP is HOT
+```
+
+## 46.7 Read path
+
+`GET /ip/{ip}` (Section 29) gains an `attributes` object, present only while the
+IP is HOT:
+
+```json
+{
+  "ip": "192.168.1.42",
+  "state": "HOT",
+  "request_count": 1834,
+  "attributes": { "attributes_version": 1, "weight": 1834 }
+}
+```
+
+`matched_prefixes` is omitted above for brevity; it is unchanged from
+Section 29.
+
+`GET /prefix/{cidr}` is unchanged: no attribute is aggregated to prefix level.
+
+## 46.8 Persistence and observability
+
+A snapshot (Section 33) MUST include the per-IP attribute records alongside hot
+IP states, so that loading a snapshot and replaying subsequent events yields the
+same records as a full replay would.
+
+Metrics (Section 37):
+
+```text
+ip_attribute_records      currently stored records; MUST equal hot_ip_count
+ip_attribute_bytes        total serialized size of stored records
+attributes_rejected       documents rejected for size or shape
+```
+
+## 46.9 Security
+
+A validator compiling `schemas/hot_ip_event.v1.json` MUST resolve its `$ref` to
+`ip_attributes.v1.json` from the local `schemas/` directory. The `$id` values in
+this project are identifiers, not fetchable URLs; resolving one over the network
+would make schema compilation depend on an outbound request.
+
+Attributes are written only by trusted internal producers. `schemas/observation.v1.json`
+is unchanged: an agent cannot supply attributes, for the same reason Section 36
+forbids an agent from declaring `IP = HOT`. A producer MUST validate size and
+shape before storing, and no attribute value may be used in an authorization,
+routing, or rate-limiting decision — including unrecognised `x_` values, which
+are stored and echoed as opaque data.
