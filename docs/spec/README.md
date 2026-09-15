@@ -19,10 +19,10 @@ Section index used throughout the code:
 | 8-12 | Binary IP trie & invariants | `services/trie/structure` |
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Metadata inheritance | `services/trie/metadata` |
-| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` |
-| 20, 21 | Sharding & aggregation | `services/aggregator/sharding` |
+| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus`, `docs/adr/0004` |
+| 20, 21 | Sharding & aggregation | `services/aggregator/sharding`, `services/ingest/publisher.py`, `docs/adr/0004` |
 | 22 | Consistency model | `docs/adr/0001` |
-| 23 | Dedup | `services/ingest/dedup` |
+| 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
 | 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `core/time/buckets.py` |
 | 26 | Memory / retention | `services/aggregator/window/expiry.py` |
 | 27 | Trie representation | `services/trie/structure/patricia.py` |
