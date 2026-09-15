@@ -11,12 +11,12 @@ from __future__ import annotations
 import ipaddress
 from collections.abc import Iterator
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 from hammertime.core.errors import InvalidAddressError
 
 
-class AddressFamily(str, Enum):
+class AddressFamily(StrEnum):
     IPV4 = "ipv4"
     IPV6 = "ipv6"
 
