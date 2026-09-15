@@ -288,6 +288,16 @@ class TestMalformedBytes:
         with pytest.raises(CodecError):
             decode(deeply_nested)
 
+    def test_decode_rejects_an_oversized_numeric_literal_as_codec_error(self) -> None:
+        # CPython's int-string conversion limit (default 4300 digits)
+        # raises a bare ValueError from inside json.loads for a
+        # many-thousand-digit integer literal -- not JSONDecodeError, so it
+        # needs its own guard; must still surface as CodecError.
+        huge_digits = b"9" * 5000
+        document = b'{"schema_version": ' + huge_digits + b", " + b'"event_type": "HotIpAdded"}'
+        with pytest.raises(CodecError):
+            decode(document)
+
     def test_decode_rejects_malformed_ip_in_observation_as_codec_error(self) -> None:
         envelope = EventEnvelope(
             agent_id="edge-17",

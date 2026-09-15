@@ -1,3 +1,5 @@
+Add optional `attributes` to HotIpAdded/HotIpRemoved events, validated against schemas/ip_attributes.v1.json (registered names attributes_version/weight, x_-prefixed experimental keys, 1024-byte/16-key caps); absent attributes encode byte-identically to before
+Add `weight_function` and `weight_max` config keys to detection_config, reserved for the fixed-point weight a future aggregator change will write into an IP's attributes at HOT/COLD transition
 Reject observations whose sequence exceeds 9223372036854775807
 Ingest claims an observation's (agent_id, sequence) atomically before publishing it, closing a race where concurrent retries of the same request could all be accepted; a retry after a 503 publish failure is now reported as a duplicate (200) rather than retried immediately, until the claim's dedup window lapses
 BREAKING: event envelopes carry an optional `subject` that participates in event_id derivation; builds without it reject such envelopes as event_id mismatches

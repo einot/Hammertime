@@ -3,8 +3,6 @@
 Spec: section 34
 """
 
-from __future__ import annotations
-
 import dataclasses
 import json
 import time
@@ -12,7 +10,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from hammertime.core.config.models import DetectionConfig
+from hammertime.core.config.models import WEIGHT_FUNCTIONS, DetectionConfig
 from hammertime.core.errors import ConfigurationError
 
 # Mirrors schemas/detection_config.v1.json: the required keys, the full set
@@ -32,7 +30,9 @@ _REQUIRED_KEYS = frozenset(
     }
 )
 _KNOWN_KEYS = frozenset({f.name for f in dataclasses.fields(DetectionConfig)})
-_INTEGER_KEYS = _KNOWN_KEYS - {"minimum_hot_ratio"}
+# minimum_hot_ratio is a JSON number, not a JSON integer; weight_function is
+# a JSON string (an enum member), validated separately below.
+_INTEGER_KEYS = _KNOWN_KEYS - {"minimum_hot_ratio", "weight_function"}
 
 
 def _validate_document(data: Any) -> dict[str, Any]:
@@ -57,6 +57,14 @@ def _validate_document(data: Any) -> dict[str, Any]:
         # bool is a subclass of int in Python; the schema means a real integer.
         if isinstance(value, bool) or not isinstance(value, int):
             raise ConfigurationError(f"detection config field {key!r} must be an integer")
+
+    if "weight_function" in data:
+        weight_function = data["weight_function"]
+        if not isinstance(weight_function, str) or weight_function not in WEIGHT_FUNCTIONS:
+            raise ConfigurationError(
+                f"detection config field 'weight_function' must be one of "
+                f"{sorted(WEIGHT_FUNCTIONS)}, got {weight_function!r}"
+            )
 
     return data
 
