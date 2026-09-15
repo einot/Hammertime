@@ -69,6 +69,34 @@ class TestDetectionConfigValidation:
             DetectionConfig(config_version=version)
 
 
+class TestWeightFunctionAndWeightMax:
+    """spec section 46.4, ADR-0005: weight_function/weight_max drive
+    IpAttributes.weight but are validated as ordinary DetectionConfig fields
+    (schemas/detection_config.v1.json)."""
+
+    def test_defaults_match_the_schema_defaults(self) -> None:
+        config = DetectionConfig()
+        assert config.weight_function == "threshold_ratio"
+        assert config.weight_max == 1000000
+
+    def test_accepts_the_only_registered_weight_function(self) -> None:
+        DetectionConfig(weight_function="threshold_ratio")  # must not raise
+
+    @pytest.mark.parametrize("weight_function", ["", "THRESHOLD_RATIO", "made_up_function", "linear"])
+    def test_rejects_unrecognized_weight_function(self, weight_function: str) -> None:
+        with pytest.raises(ConfigurationError):
+            DetectionConfig(weight_function=weight_function)
+
+    @pytest.mark.parametrize("weight_max", [1000, 1000000])
+    def test_accepts_weight_max_at_schema_bounds(self, weight_max: int) -> None:
+        DetectionConfig(weight_max=weight_max)  # must not raise
+
+    @pytest.mark.parametrize("weight_max", [999, 1000001])
+    def test_rejects_weight_max_outside_schema_bounds(self, weight_max: int) -> None:
+        with pytest.raises(ConfigurationError):
+            DetectionConfig(weight_max=weight_max)
+
+
 def _write(path: Path, doc: dict[str, Any]) -> Path:
     config_path = path / "detection.json"
     config_path.write_text(json.dumps(doc))
@@ -80,6 +108,24 @@ class TestLoad:
         sample = Path(__file__).parents[6] / "config" / "detection.v1.json"
         config = load(sample)
         assert config == DetectionConfig()
+
+    def test_repo_sample_config_declares_weight_function_and_weight_max(self) -> None:
+        # ADR-0005 consequences: "schemas/detection_config.v1.json gains
+        # weight_function and weight_max ahead of the code that reads them
+        # ... Closing that gap is the first task of the implementing issue."
+        # The on-disk default config must therefore be updated to actually
+        # declare these keys, not merely fall back to DetectionConfig's
+        # in-code defaults.
+        sample = Path(__file__).parents[6] / "config" / "detection.v1.json"
+        raw = json.loads(sample.read_text())
+        assert raw["weight_function"] == "threshold_ratio"
+        assert raw["weight_max"] == 1000000
+
+    def test_loads_the_repo_sample_config_with_weight_fields(self) -> None:
+        sample = Path(__file__).parents[6] / "config" / "detection.v1.json"
+        config = load(sample)
+        assert config.weight_function == "threshold_ratio"
+        assert config.weight_max == 1000000
 
     def test_happy_path(self, tmp_path: Path) -> None:
         config = load(_write(tmp_path, VALID_DOC))
@@ -129,6 +175,40 @@ class TestLoad:
 
     def test_bad_threshold_ordering_surfaces_as_configuration_error(self, tmp_path: Path) -> None:
         doc = dict(VALID_DOC, hot_threshold=100, cold_threshold=200)
+        with pytest.raises(ConfigurationError):
+            load(_write(tmp_path, doc))
+
+    def test_happy_path_with_weight_fields(self, tmp_path: Path) -> None:
+        # Regression guard for the specific gotcha ADR-0005 calls out: a
+        # loader that classifies every known key as an integer field (as
+        # `_INTEGER_KEYS` does today by deriving from all dataclass fields
+        # minus `minimum_hot_ratio`) would wrongly reject the string value
+        # "threshold_ratio" for weight_function.
+        doc = dict(VALID_DOC, weight_function="threshold_ratio", weight_max=500000)
+        config = load(_write(tmp_path, doc))
+        assert config.weight_function == "threshold_ratio"
+        assert config.weight_max == 500000
+
+    def test_unrecognized_weight_function_surfaces_as_configuration_error(
+        self, tmp_path: Path
+    ) -> None:
+        doc = dict(VALID_DOC, weight_function="made_up_function")
+        with pytest.raises(ConfigurationError):
+            load(_write(tmp_path, doc))
+
+    @pytest.mark.parametrize("weight_max", [1000, 1000000])
+    def test_loader_accepts_weight_max_at_schema_bounds(
+        self, tmp_path: Path, weight_max: int
+    ) -> None:
+        doc = dict(VALID_DOC, weight_max=weight_max)
+        config = load(_write(tmp_path, doc))
+        assert config.weight_max == weight_max
+
+    @pytest.mark.parametrize("weight_max", [999, 1000001])
+    def test_loader_rejects_weight_max_outside_schema_bounds(
+        self, tmp_path: Path, weight_max: int
+    ) -> None:
+        doc = dict(VALID_DOC, weight_max=weight_max)
         with pytest.raises(ConfigurationError):
             load(_write(tmp_path, doc))
 

@@ -112,6 +112,36 @@ class TestEventIdDeterminism:
         )
         assert e1.event_id == e2.event_id
 
+    def test_attributes_do_not_affect_event_id(self) -> None:
+        # ADR-0005 ("Additive and non-breaking"): "event_id derives from
+        # (agent_id, sequence, event_type, subject), not the payload" --
+        # `attributes` is payload content like `window_count` or
+        # `config_version` above, so an otherwise-identical HotIpAdded with
+        # and without attributes must still produce the same event_id.
+        with_attributes = HotIpAdded(
+            ip=Address.parse("192.168.1.42"),
+            timestamp=T0,
+            sequence=1,
+            window_count=1000,
+            config_version=1,
+            attributes={"attributes_version": 1, "weight": 1000},
+        )
+        without_attributes = HotIpAdded(
+            ip=Address.parse("192.168.1.42"),
+            timestamp=T0,
+            sequence=1,
+            window_count=1000,
+            config_version=1,
+            attributes=None,
+        )
+        e1 = _envelope(
+            agent_id="edge-17", sequence=42, event_type="HotIpAdded", payload=with_attributes
+        )
+        e2 = _envelope(
+            agent_id="edge-17", sequence=42, event_type="HotIpAdded", payload=without_attributes
+        )
+        assert e1.event_id == e2.event_id
+
 
 class TestEventIdDistinctness:
     def test_different_sequence_yields_a_different_event_id(self) -> None:
