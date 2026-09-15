@@ -13,6 +13,10 @@
     "sequence": { "type": "integer", "minimum": 0 },
     "shard": { "type": "integer", "minimum": 0 },
     "window_count": { "type": "integer", "minimum": 0 },
-    "config_version": { "type": "integer", "minimum": 1 }
+    "config_version": { "type": "integer", "minimum": 1 },
+    "attributes": {
+      "$ref": "https://hammertime.dev/schemas/ip_attributes.v1.json",
+      "description": "Optional descriptive per-IP attributes (spec section 46, ADR-0005). Absent is equivalent to {\"attributes_version\": 1}. Purely additive: the event `type` enum, the binary HOT/COLD semantics, and every field above are unchanged, and a consumer that ignores this key still derives exactly the same trie state."
+    }
   }
 }

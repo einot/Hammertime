@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hammertime.dev/schemas/ip_attributes.v1.json",
+  "title": "IpAttributes",
+  "description": "Descriptive, extensible per-IP attribute document (spec section 46, ADR-0005). Attached to a HOT/COLD transition event and stored by the trie service alongside -- never inside -- the binary trie. Attributes are DESCRIPTIVE ONLY: nothing here may participate in hot_count, hot_ratio, the HOT_PREFIX predicate, or the HOT/COLD state machine (spec sections 12, 13, 38). The registered-name set is deliberately small; experimental keys use the x_ namespace and are preserved verbatim by consumers that do not understand them.",
+  "type": "object",
+  "required": ["attributes_version"],
+  "maxProperties": 16,
+  "properties": {
+    "attributes_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Generation of the registered-attribute set this document was written against. 1 for this schema. A consumer that sees a higher version MUST store and echo the document verbatim and MUST NOT interpret names it does not know."
+    },
+    "weight": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000,
+      "description": "Fixed-point hotness score in thousandths of hot_threshold: 1000 means the window count was exactly at hot_threshold. Produced by detection_config's weight_function (v1: threshold_ratio = clamp((1000 * window_count + hot_threshold // 2) // hot_threshold, 0, weight_max)). Integer so that replay is exact; recomputable by any consumer from the event's window_count and config_version, so dropping it loses nothing irrecoverable."
+    }
+  },
+  "patternProperties": {
+    "^x_[a-z0-9_]{1,48}$": {
+      "description": "Experimental/vendor attribute. Any JSON value, subject to the whole document's 1024-byte serialized cap (enforced by producers and the codec, not expressible here). Consumers MUST preserve these keys verbatim on read-back and MUST NOT interpret them. Promoting one to a registered name is a deliberate edit to this schema plus a spec section 46 registry entry."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "source": {
+      "description": "RESERVED, not yet referenced from `properties` -- a document carrying a `sources` key is rejected by this version. Defined here so the shape of the eventual provenance trail (which alerting system or detector rule put this IP in the trie, and when) is settled in advance: turning it on is adding \"sources\": { \"$ref\": \"#/$defs/sourceList\" } to `properties` and a registry entry in spec section 46, not a schema migration. Until then, experiments use x_sources.",
+      "type": "object",
+      "required": ["system", "at"],
+      "additionalProperties": false,
+      "properties": {
+        "system": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Stable identifier of the system or feed that contributed this entry, e.g. \"hammertime.aggregator\" or an external alerting system's name."
+        },
+        "rule": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Identifier of the specific rule/detector within `system` that fired."
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Event time at which this system contributed the entry."
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Short human-readable reason. Free text; never interpreted."
+        }
+      }
+    },
+    "sourceList": {
+      "description": "RESERVED. Most-recent-last, bounded: a trace, not a log.",
+      "type": "array",
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/source" }
+    }
+  }
+}
