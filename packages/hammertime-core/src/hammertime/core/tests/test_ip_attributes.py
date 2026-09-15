@@ -281,25 +281,35 @@ class TestKeyCountCap:
             decode(tampered)
 
 
+def _compact_size(document: dict[str, Any]) -> int:
+    # Matches codec.py's own _check_attributes_size measurement exactly
+    # (separators=(",", ":")) -- json.dumps's default (spaced) separators
+    # measure a different, larger byte count, which would leave a padding
+    # test's constructed document short of the codec's real 1024-byte
+    # compact-encoding boundary instead of adjacent to it.
+    return len(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+
+
 class TestSerializedSizeCap:
     def test_document_over_1024_bytes_serialized_is_rejected(self) -> None:
         # spec section 46.2 / ADR-0005: "serialized size <= 1024 bytes".
         attributes = {"attributes_version": 1, "x_blob": "a" * 2000}
-        assert len(json.dumps(attributes)) > 1024
+        assert _compact_size(attributes) > 1024
         envelope = _hot_ip_envelope("HotIpAdded")
         tampered = _with_attributes(encode(envelope), attributes)
         with pytest.raises(CodecError):
             decode(tampered)
 
-    def test_document_just_under_1024_bytes_serialized_is_accepted(self) -> None:
+    def test_document_exactly_at_1024_bytes_serialized_is_accepted(self) -> None:
         # Boundary companion to the oversized-document test above: pad an
-        # x_ value so the whole document serializes to just under the cap
-        # and confirm it is still accepted.
-        base_attributes = {"attributes_version": 1, "x_blob": ""}
-        overhead = len(json.dumps(base_attributes))
-        padding = "a" * (1024 - overhead - 1)
+        # x_ value so the whole document serializes to exactly the cap
+        # (compact encoding, matching the codec's own measurement) and
+        # confirm it is still accepted.
+        base_attributes: dict[str, Any] = {"attributes_version": 1, "x_blob": ""}
+        overhead = _compact_size(base_attributes)
+        padding = "a" * (1024 - overhead)
         attributes = {"attributes_version": 1, "x_blob": padding}
-        assert len(json.dumps(attributes)) <= 1024
+        assert _compact_size(attributes) == 1024
         envelope = _hot_ip_envelope("HotIpAdded", attributes=attributes)
         decoded = decode(encode(envelope))
         assert _payload(decoded).attributes == attributes
@@ -315,5 +325,131 @@ class TestMalformedAttributesShape:
     def test_weight_of_wrong_type_is_rejected(self) -> None:
         envelope = _hot_ip_envelope("HotIpAdded")
         tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "weight": "500"})
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    def test_explicit_null_attributes_is_rejected_not_treated_as_absent(self) -> None:
+        # Regression: schemas/ip_attributes.v1.json's top-level type is
+        # "object" -- an explicit `"attributes": null` on the wire is
+        # schema-invalid and must be rejected, not silently collapsed to
+        # "absent" the way a plain `data.get("attributes")` truthy-check
+        # would (None either way).
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), None)
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+
+class TestIntegerLikeFloatsAccepted:
+    # Regression: JSON Schema's "type": "integer" accepts any number with
+    # no fractional part, independent of its literal form -- 1.0 is a valid
+    # integer even though isinstance(1.0, int) is False in Python. A
+    # non-Python producer may legitimately emit these.
+    def test_attributes_version_as_a_whole_number_float_is_accepted(self) -> None:
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1.0})
+        decode(tampered)  # must not raise
+
+    def test_weight_as_a_whole_number_float_is_accepted(self) -> None:
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "weight": 500.0})
+        decode(tampered)  # must not raise
+
+    def test_weight_with_a_fractional_part_is_still_rejected(self) -> None:
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "weight": 500.5})
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+
+class TestNonFiniteAndSurrogateValuesRejected:
+    # Regression: Python's json module accepts NaN/Infinity/-Infinity (not
+    # valid JSON per RFC 8259) and lone UTF-16 surrogates in strings (valid
+    # Python str, not valid UTF-8) by default -- both would otherwise
+    # round-trip silently through an x_-prefixed value, producing bytes
+    # that corrupt or crash a strict downstream consumer.
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_float_in_an_x_prefixed_value_is_rejected(self, bad_value: float) -> None:
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(
+            encode(envelope), {"attributes_version": 1, "x_score": bad_value}
+        )
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    def test_non_finite_float_nested_inside_an_x_prefixed_value_is_rejected(self) -> None:
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(
+            encode(envelope),
+            {"attributes_version": 1, "x_nested": {"a": [1, 2, float("nan")]}},
+        )
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    def test_lone_surrogate_in_an_x_prefixed_string_is_rejected(self) -> None:
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "x_s": "\ud800"})
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+
+class TestHigherAttributesVersionIsPassedThrough:
+    """Spec section 46.2: "A document carrying an attributes_version higher
+    than a consumer understands MUST be stored and echoed verbatim and MUST
+    NOT be interpreted." This build only registers version 1's fields."""
+
+    def test_unregistered_name_under_a_higher_version_is_accepted_not_rejected(self) -> None:
+        # The exact opposite of TestUnregisteredNamesRejected's bare-name
+        # cases -- same unregistered key, but under attributes_version 2 it
+        # must round-trip untouched instead of being rejected as a typo.
+        attributes = {"attributes_version": 2, "severity": 3, "x_experiment": "value"}
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), attributes)
+        decoded = decode(tampered)
+        assert _payload(decoded).attributes == attributes
+
+    def test_weight_out_of_range_under_a_higher_version_is_not_interpreted(self) -> None:
+        # weight's own bounds only apply when this build actually
+        # interprets the document (version <= known) -- under a higher
+        # version, weight is just another opaque field.
+        attributes = {"attributes_version": 2, "weight": 99_999_999}
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), attributes)
+        decoded = decode(tampered)
+        assert _payload(decoded).attributes == attributes
+
+    def test_structural_bounds_still_apply_under_a_higher_version(self) -> None:
+        # Pass-through relaxes name/semantic checks, not the shared
+        # wire-hygiene bounds (size, key count) every version obeys.
+        attributes = {"attributes_version": 2, "x_blob": "a" * 2000}
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), attributes)
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    def test_a_version_at_the_known_maximum_still_enforces_strict_names(self) -> None:
+        # Boundary: version == _KNOWN_ATTRIBUTES_VERSION (1) is NOT "higher
+        # than this consumer understands" -- an unregistered name at
+        # exactly version 1 is still a rejectable typo, not pass-through.
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "severity": 3})
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+
+class TestDeeplyNestedAttributesDoesNotCrash:
+    def test_deeply_nested_x_prefixed_value_is_rejected_with_codec_error_not_recursion_error(
+        self,
+    ) -> None:
+        # Regression: the serialized-size check re-serializes the decoded
+        # document via json.dumps, which can raise a raw RecursionError for
+        # adversarially deep nesting at a shallower call depth than
+        # decode()'s own top-level json.loads guard -- must surface as
+        # CodecError like every other malformed-input path in this module.
+        nested: Any = "leaf"
+        for _ in range(3000):
+            nested = [nested]
+        envelope = _hot_ip_envelope("HotIpAdded")
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "x_deep": nested})
         with pytest.raises(CodecError):
             decode(tampered)
