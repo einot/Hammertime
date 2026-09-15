@@ -74,6 +74,21 @@ def _tamper(data: bytes, **overrides: object) -> bytes:
     return json.dumps(doc).encode("utf-8")
 
 
+def _tamper_nested(data: bytes, *, path: tuple[object, ...], value: object) -> bytes:
+    """Like `_tamper`, but overrides a value nested inside `payload`.
+
+    `path` is a sequence of dict keys / list indices, e.g.
+    `("payload", "observations", 0, "ip")`.
+    """
+
+    doc = json.loads(data)
+    target = doc
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    return json.dumps(doc).encode("utf-8")
+
+
 class TestRoundTrip:
     def test_request_observation_round_trips(self) -> None:
         payload = RequestObservation(
@@ -264,3 +279,68 @@ class TestMalformedBytes:
             pass
         except Exception as exc:
             pytest.fail(f"decode() leaked {type(exc).__name__} instead of raising CodecError")
+
+    def test_decode_rejects_pathologically_deep_nesting_as_codec_error(self) -> None:
+        # A few KB of nested arrays blows CPython's json parser recursion
+        # limit (RecursionError) well before JSONDecodeError would fire --
+        # that must still surface as CodecError, not a raw RecursionError.
+        deeply_nested = b"[" * 10_000 + b"]" * 10_000
+        with pytest.raises(CodecError):
+            decode(deeply_nested)
+
+    def test_decode_rejects_malformed_ip_in_observation_as_codec_error(self) -> None:
+        envelope = EventEnvelope(
+            agent_id="edge-17",
+            sequence=1,
+            event_type="RequestObservation",
+            config_version=1,
+            timestamp=T0,
+            payload=RequestObservation(
+                agent_id="edge-17",
+                sequence=1,
+                window_start=T0,
+                window_seconds=60,
+                observations=(Observation(ip=Address.parse("10.0.0.1"), request_count=1),),
+            ),
+        )
+        data = encode(envelope)
+        tampered = _tamper_nested(
+            data, path=("payload", "observations", 0, "ip"), value="not-an-ip-address"
+        )
+
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    def test_decode_rejects_malformed_ip_in_hot_ip_event_as_codec_error(self) -> None:
+        envelope = _hot_ip_added_envelope(event_type="HotIpAdded")
+        data = encode(envelope)
+        tampered = _tamper_nested(data, path=("payload", "ip"), value="999.999.999.999")
+
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    def test_decode_rejects_an_observations_array_over_the_schema_limit(self) -> None:
+        envelope = EventEnvelope(
+            agent_id="edge-17",
+            sequence=1,
+            event_type="RequestObservation",
+            config_version=1,
+            timestamp=T0,
+            payload=RequestObservation(
+                agent_id="edge-17",
+                sequence=1,
+                window_start=T0,
+                window_seconds=60,
+                observations=(Observation(ip=Address.parse("10.0.0.1"), request_count=1),),
+            ),
+        )
+        data = encode(envelope)
+        # schemas/observation.v1.json: observations.maxItems is 10_000.
+        oversized = _tamper_nested(
+            data,
+            path=("payload", "observations"),
+            value=[{"ip": "10.0.0.1", "request_count": 1}] * 10_001,
+        )
+
+        with pytest.raises(CodecError):
+            decode(oversized)

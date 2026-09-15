@@ -75,6 +75,7 @@ class KafkaConsumer:
         self._auto_offset_reset = auto_offset_reset
         self._client_kwargs = client_kwargs
         self._client: AIOKafkaConsumer | None = None
+        self._subscribed_topics: set[str] = set()
 
     async def start(self, *topics: str) -> None:
         """Connect to the cluster and join `group_id`, subscribed to `topics`."""
@@ -86,6 +87,7 @@ class KafkaConsumer:
             auto_offset_reset=self._auto_offset_reset,
             **self._client_kwargs,
         )
+        self._subscribed_topics = set(topics)
         await self._client.start()
 
     async def stop(self) -> None:
@@ -93,10 +95,21 @@ class KafkaConsumer:
         if self._client is not None:
             await self._client.stop()
             self._client = None
+            self._subscribed_topics = set()
 
     async def subscribe(self, topic: str) -> AsyncIterator[ConsumedMessage]:
+        """Add `topic` to this consumer's subscription and start yielding from it.
+
+        Calling this again with a topic not already subscribed extends the
+        subscription rather than ignoring it -- matching `memory.py`'s
+        `MemoryConsumer`, which tracks an independent position per topic on
+        one instance (`interface.py`: both backends must be interchangeable).
+        """
         if self._client is None:
             await self.start(topic)
+        elif topic not in self._subscribed_topics:
+            self._subscribed_topics.add(topic)
+            self._client.subscribe(topics=list(self._subscribed_topics))
         return self._consume()
 
     async def _consume(self) -> AsyncIterator[ConsumedMessage]:

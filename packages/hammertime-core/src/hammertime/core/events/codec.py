@@ -10,8 +10,10 @@ JSON Schema under `schemas/` exactly:
 * `HotIpAdded`/`HotIpRemoved` -> `schemas/hot_ip_event.v1.json`
 * `PrefixStatsChanged`  -> `schemas/prefix_stats_event.v1.json`
 
-Nothing here ever lets a raw `json.JSONDecodeError` or `KeyError` escape:
-every failure mode -- unknown `event_type`, unknown/unsupported
+Nothing here ever lets a raw `json.JSONDecodeError`, `KeyError`,
+`RecursionError` (from adversarially deep nesting), or
+`hammertime.core.errors.InvalidAddressError` (from a malformed `ip` field)
+escape: every failure mode -- unknown `event_type`, unknown/unsupported
 `schema_version`, or malformed bytes -- surfaces as `CodecError`.
 """
 
@@ -22,7 +24,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from hammertime.core.addressing.address import Address
-from hammertime.core.errors import CodecError
+from hammertime.core.errors import CodecError, InvalidAddressError
 from hammertime.core.events.envelope import SCHEMA_VERSION, EventEnvelope
 from hammertime.core.events.models import (
     HotIpAdded,
@@ -37,6 +39,12 @@ EventPayload = RequestObservation | HotIpAdded | HotIpRemoved | PrefixStatsChang
 
 _HOT_IP_EVENT_TYPES = frozenset({"HotIpAdded", "HotIpRemoved"})
 _KNOWN_EVENT_TYPES = frozenset({"RequestObservation", "PrefixStatsChanged"}) | _HOT_IP_EVENT_TYPES
+
+#: schemas/observation.v1.json: observations.maxItems. Enforced here too as
+#: a defense-in-depth backstop -- services/ingest's own limit check
+#: (services/ingest/src/hammertime/ingest/validation/limits.py) is not yet
+#: implemented, so this is currently the only place that bounds it.
+_MAX_OBSERVATIONS = 10_000
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -78,6 +86,11 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
     raw_observations = _require(data, "observations")
     if not isinstance(raw_observations, list):
         raise CodecError("observations must be an array")
+    if len(raw_observations) > _MAX_OBSERVATIONS:
+        raise CodecError(
+            f"observations has {len(raw_observations)} entries, exceeding the "
+            f"maximum of {_MAX_OBSERVATIONS} (schemas/observation.v1.json maxItems)"
+        )
     observations = []
     for item in raw_observations:
         if not isinstance(item, dict):
@@ -87,7 +100,7 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
             observations.append(
                 Observation(ip=ip, request_count=int(_require(item, "request_count")))
             )
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, InvalidAddressError) as exc:
             raise CodecError(f"malformed observation entry: {item!r}") from exc
 
     try:
@@ -121,7 +134,7 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
         sequence = int(_require(data, "sequence"))
         window_count = int(_require(data, "window_count"))
         config_version = int(_require(data, "config_version"))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, InvalidAddressError) as exc:
         raise CodecError(f"malformed {event_type} payload: {data!r}") from exc
 
     if event_type == "HotIpAdded":
@@ -223,6 +236,12 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
         document = json.loads(data)
     except json.JSONDecodeError as exc:
         raise CodecError(f"envelope is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # A deeply nested document (e.g. thousands of nested `[`) blows the
+        # interpreter's recursion limit inside json.loads before it ever
+        # gets to raise JSONDecodeError. A few KB of adversarial input is
+        # enough to trigger this, so it must surface as CodecError too.
+        raise CodecError("envelope JSON is nested too deeply to parse") from exc
 
     if not isinstance(document, dict):
         raise CodecError(f"envelope must be a JSON object, got {type(document).__name__}")
@@ -232,6 +251,10 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
         raise CodecError(f"unsupported schema_version: {schema_version!r}")
 
     event_type = _require(document, "event_type")
+    if not isinstance(event_type, str):
+        # frozenset membership would otherwise raise a raw TypeError for an
+        # unhashable event_type (a JSON array/object), instead of CodecError.
+        raise CodecError(f"event_type must be a string, got {type(event_type).__name__}")
     if event_type not in _KNOWN_EVENT_TYPES:
         raise CodecError(f"unknown event_type: {event_type!r}")
 
