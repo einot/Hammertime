@@ -17,8 +17,6 @@ escape: every failure mode -- unknown `event_type`, unknown/unsupported
 `schema_version`, or malformed bytes -- surfaces as `CodecError`.
 """
 
-from __future__ import annotations
-
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -219,6 +217,8 @@ def encode(envelope: EventEnvelope[EventPayload]) -> bytes:
         "timestamp": _format_timestamp(envelope.timestamp),
         "payload": _encode_payload(envelope.event_type, envelope.payload),
     }
+    if envelope.subject is not None:
+        document["subject"] = envelope.subject
     try:
         return json.dumps(document, separators=(",", ":")).encode("utf-8")
     except (TypeError, ValueError) as exc:
@@ -264,6 +264,10 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
 
     wire_event_id = str(_require(document, "event_id"))
 
+    raw_subject = document.get("subject")
+    if raw_subject is not None and not isinstance(raw_subject, str):
+        raise CodecError(f"subject must be a string, got {type(raw_subject).__name__}")
+
     try:
         envelope = EventEnvelope(
             schema_version=int(schema_version),
@@ -273,16 +277,19 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
             config_version=int(_require(document, "config_version")),
             timestamp=_parse_timestamp(_require(document, "timestamp"), field="timestamp"),
             payload=_decode_payload(event_type, payload_data),
+            subject=raw_subject,
         )
     except (TypeError, ValueError) as exc:
         raise CodecError(f"malformed envelope: {exc}") from exc
 
     # event_id is never trusted from the wire -- EventEnvelope always
-    # (re)derives it from (agent_id, sequence, event_type) in __post_init__.
-    # A mismatch means the bytes were corrupted or tampered with in transit.
+    # (re)derives it from (agent_id, sequence, event_type, subject) in
+    # __post_init__. A mismatch means the bytes were corrupted or tampered
+    # with in transit (including a subject that was added, removed, or
+    # altered after the fact).
     if envelope.event_id != wire_event_id:
         raise CodecError(
             f"event_id {wire_event_id!r} does not match the identity fields "
-            f"(agent_id, sequence, event_type); derived {envelope.event_id!r}"
+            f"(agent_id, sequence, event_type, subject); derived {envelope.event_id!r}"
         )
     return envelope
