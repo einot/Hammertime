@@ -1,9 +1,382 @@
-"""A resent message must not double-count.
+"""Redis-backed dedup store (issue #31): conformance to the `DedupStore` contract.
 
-Spec: section 23
+Spec: section 23 (agent duplicates and retries), section 26 (memory
+considerations / retention). ADR-0003 (time-bucketed deltas with per-agent
+sequence dedup): `ttl_seconds` SHOULD be `allowed_lateness_seconds +
+window_seconds` so a retry within the dedup retention window is always
+caught, and entries outside it are free to expire.
+
+These tests are written directly from
+`packages/hammertime-store/src/hammertime/store/interface.py`'s
+`DedupStore` Protocol docstrings, NOT from `hammertime.store.redis`'s
+implementation -- this repo's test-author convention has the coder and the
+test author work blind to each other, reconciled afterward. They
+deliberately do not assume any of `memory.py`/`dedup.py`'s internal
+`SequenceWindow` "bounded out-of-order set" behavior (high-water mark plus
+a small set of sequences seen ahead of a gap): that is documented as a
+`memory.py`-internal data structure, not part of the `DedupStore` Protocol
+itself, and nothing in `interface.py` requires a Redis backend to
+replicate it. What these tests *do* assume, from `dedup.py`'s
+`SequenceKey.cache_key()` docstring ("a stable string form, e.g. for use
+as a Redis key" -- built with an `\x1f` separator specifically so
+`(agent_id, sequence)` pairs can't collide under naive string
+concatenation), is that whatever key scheme the Redis backend actually
+uses preserves that same collision-safety -- exercised here only through
+the public `has_seen`/`mark_seen` interface, never `cache_key()` itself.
+
+No live Redis is available in this environment (and none is expected in
+plain CI either). `fakeredis`'s async fake (`fakeredis.aioredis.FakeRedis`)
+stands in for a real Redis server, per issue #31's acceptance criterion:
+cover the Redis-backed store with a well-maintained in-process fake rather
+than skipping this coverage. `fakeredis` is a dev dependency added to the
+root `pyproject.toml`'s `[dependency-groups] dev` list alongside `httpx`
+et al.
+
+TTL expiry in Redis is real wall-clock time, unlike `memory.py`'s
+injectable `Clock` -- there is no `ManualClock` equivalent to inject here.
+This environment has no Bash/network access to confirm whether the
+installed `fakeredis` version supports manually advancing its internal
+clock (some versions do), so the safe, always-correct fallback the issue
+explicitly allows is used instead: short real TTLs (1-5s) with real
+`asyncio.sleep`. If manual clock control is confirmed available later,
+these TTL tests are good candidates to speed up.
+
+ASSUMED constructor signature (not yet known -- `redis.py` is being
+written in parallel by the coder; reconcile `_store()` below against the
+merged implementation):
+
+    from hammertime.store.redis import RedisDedupStore
+    RedisDedupStore(client: redis.asyncio.Redis)
+
+mirroring `MemoryDedupStore(clock: Clock | None = None)`'s pattern of
+taking its single external dependency (there, a `Clock`; here, a Redis
+client) by constructor injection. `ttl_seconds` is NOT assumed to be fixed
+at construction -- it's passed per-call to `mark_seen`, per
+`DedupStore`'s actual Protocol signature. If the real constructor differs
+(e.g. it takes a connection URL/DSN instead of a client instance, or a
+required `key_prefix`), only `_store()` below should need to change.
 """
 
-from __future__ import annotations
+import asyncio
+
+import fakeredis.aioredis
+import pytest
+from hammertime.store.interface import DedupStore
+from hammertime.store.redis import RedisDedupStore
+
+DEFAULT_TTL_SECONDS = 30
 
 
-# TODO(hammertime): implement.
+def _store() -> tuple[RedisDedupStore, fakeredis.aioredis.FakeRedis]:
+    """A fresh `RedisDedupStore` backed by an isolated in-process fake Redis.
+
+    A brand new `FakeRedis` instance per call (no `FakeServer` shared across
+    tests) keeps each test's data isolated from every other test, the same
+    way a fresh `MemoryDedupStore` isolates in-memory tests.
+    """
+    client = fakeredis.aioredis.FakeRedis()
+    store = RedisDedupStore(client)
+    return store, client
+
+
+class TestProtocolConformance:
+    def test_redis_dedup_store_satisfies_the_dedup_store_protocol(self) -> None:
+        store, _client = _store()
+
+        assert isinstance(store, DedupStore)
+
+
+class TestInvalidTtl:
+    @pytest.mark.parametrize("ttl_seconds", [0, -1])
+    async def test_non_positive_ttl_seconds_is_rejected(self, ttl_seconds: int) -> None:
+        # Redis's SET ... EX rejects a non-positive expiry with a raw
+        # ResponseError; mark_seen must fail closed with a clear error
+        # instead of leaking that server-side detail.
+        store, _client = _store()
+
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            await store.mark_seen("agent-1", 1, ttl_seconds=ttl_seconds)
+
+
+class TestFirstSeen:
+    async def test_fresh_pair_is_not_a_duplicate(self) -> None:
+        store, _client = _store()
+
+        assert await store.has_seen("agent-1", 1) is False
+
+    async def test_checking_a_fresh_pair_does_not_mark_it_as_seen(self) -> None:
+        # has_seen() is a read: calling it should not have the side effect
+        # of marking the pair seen for the *next* call.
+        store, _client = _store()
+
+        await store.has_seen("agent-1", 1)
+
+        assert await store.has_seen("agent-1", 1) is False
+
+
+class TestMarkThenCheck:
+    async def test_marking_a_pair_seen_then_checking_reports_a_duplicate(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+    async def test_marking_an_already_seen_pair_again_is_not_an_error(self) -> None:
+        # Retries are free per ADR-0003; re-marking must not raise.
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+
+class TestAgentIsolation:
+    async def test_same_sequence_number_on_different_agents_is_independent(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 42, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 42) is True
+        assert await store.has_seen("agent-2", 42) is False
+
+    async def test_marking_one_agent_seen_does_not_affect_another_agents_same_sequence(
+        self,
+    ) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 42, ttl_seconds=DEFAULT_TTL_SECONDS)
+        await store.mark_seen("agent-2", 42, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 42) is True
+        assert await store.has_seen("agent-2", 42) is True
+
+
+class TestSequenceIsolation:
+    async def test_different_sequences_for_the_same_agent_are_tracked_independently(
+        self,
+    ) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+        assert await store.has_seen("agent-1", 2) is False
+
+    async def test_marking_multiple_sequences_for_one_agent_is_not_confused(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+        await store.mark_seen("agent-1", 2, ttl_seconds=DEFAULT_TTL_SECONDS)
+        await store.mark_seen("agent-1", 3, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+        assert await store.has_seen("agent-1", 2) is True
+        assert await store.has_seen("agent-1", 3) is True
+        assert await store.has_seen("agent-1", 4) is False
+
+
+class TestKeyCollisionSafety:
+    """`dedup.py`'s `SequenceKey.cache_key()` exists specifically because a
+    naive `agent_id + str(sequence)` concatenation can collide across
+    different pairs; it joins them with `\\x1f` instead. Whatever key
+    format the Redis backend actually uses internally, it must preserve
+    that same collision-safety -- checked here only through
+    `has_seen`/`mark_seen`, never by inspecting the backend's raw keys.
+    """
+
+    async def test_pairs_that_would_collide_under_naive_concatenation_stay_independent(
+        self,
+    ) -> None:
+        # "agent-1" + "23" == "agent-12" + "3" == "agent-123" under plain
+        # string concatenation -- these two distinct pairs must not be
+        # treated as the same dedup entry.
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 23, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 23) is True
+        assert await store.has_seen("agent-12", 3) is False
+
+
+class TestTtlExpiry:
+    async def test_entry_expires_after_its_ttl_and_is_treated_as_not_seen_again(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=1)
+        await asyncio.sleep(1.3)  # comfortably past the 1s TTL
+
+        assert await store.has_seen("agent-1", 1) is False
+
+    async def test_entry_well_before_ttl_expiry_is_still_a_duplicate(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=2)
+        await asyncio.sleep(0.3)  # well short of the 2s TTL
+
+        assert await store.has_seen("agent-1", 1) is True
+
+    async def test_expiry_is_independent_per_agent(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=1)
+        await asyncio.sleep(0.1)
+        await store.mark_seen("agent-2", 1, ttl_seconds=5)
+        # By now agent-1's entry is ~1.3s old (past its 1s ttl); agent-2's
+        # is ~1.2s old (well within its 5s ttl).
+        await asyncio.sleep(1.2)
+
+        assert await store.has_seen("agent-1", 1) is False
+        assert await store.has_seen("agent-2", 1) is True
+
+    async def test_re_marking_after_expiry_starts_a_fresh_ttl(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=1)
+        await asyncio.sleep(1.3)
+        assert await store.has_seen("agent-1", 1) is False  # expired
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+    async def test_different_ttl_seconds_can_be_passed_on_different_calls(self) -> None:
+        # ttl_seconds is a per-call parameter, not fixed at construction --
+        # confirm mark_seen accepts a different ttl_seconds per call without
+        # the calls interfering with each other.
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=1)
+        await store.mark_seen("agent-1", 2, ttl_seconds=5)
+
+        assert await store.has_seen("agent-1", 1) is True
+        assert await store.has_seen("agent-1", 2) is True
+
+    async def test_a_later_call_with_a_smaller_ttl_seconds_does_not_shorten_the_pairs_expiry(
+        self,
+    ) -> None:
+        # mark_seen's contract promises a pair stays seen "for at least
+        # ttl_seconds" (interface.py), not "for exactly ttl_seconds until
+        # overwritten" -- a later call for the *same* (agent_id, sequence)
+        # pair with a *smaller* ttl_seconds must not undercut an earlier
+        # call's longer promise. Mirrors test_memory_dedup.py's regression
+        # test for the same "at least ttl_seconds" contract.
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=5)
+        await store.mark_seen("agent-1", 1, ttl_seconds=1)
+        # Past the second call's 1s ttl, nowhere near the first's 5s.
+        await asyncio.sleep(1.3)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+    async def test_a_later_call_with_a_larger_ttl_seconds_extends_the_pairs_expiry(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=1)
+        await store.mark_seen("agent-1", 1, ttl_seconds=5)
+        # Past the first call's 1s ttl; within the second call's 5s ttl.
+        await asyncio.sleep(1.3)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+
+class TestClaim:
+    """`claim()`: the atomic check-and-mark `has_seen`+`mark_seen` cannot be.
+
+    Issue #32's ingest pipeline uses this instead of the separate
+    `is_duplicate()`/`mark_seen()` pair to close the race where two
+    concurrent requests for the same `(agent_id, sequence)` could both
+    observe "not seen" before either marks it -- backed here by a single
+    atomic `SET ... NX` (`redis.py`'s `claim`), not the two-command
+    `SET NX` + `EXPIRE GT` sequence `mark_seen` needs for its "extend an
+    existing key" case.
+    """
+
+    async def test_first_claim_of_a_fresh_pair_returns_true(self) -> None:
+        store, _client = _store()
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_first_claim_marks_the_pair_seen(self) -> None:
+        store, _client = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+    async def test_second_claim_of_the_same_pair_returns_false(self) -> None:
+        store, _client = _store()
+
+        first = await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+        second = await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert first is True
+        assert second is False
+
+    async def test_claiming_an_already_mark_seen_pair_returns_false(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is False
+
+    async def test_claim_of_a_different_sequence_for_the_same_agent_is_independent(self) -> None:
+        store, _client = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.claim("agent-1", 2, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_claim_after_the_earlier_claims_ttl_expires_returns_true_again(self) -> None:
+        store, _client = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=1)
+        await asyncio.sleep(1.3)
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_non_positive_ttl_seconds_is_rejected(self) -> None:
+        store, _client = _store()
+
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            await store.claim("agent-1", 1, ttl_seconds=0)
+
+
+class _ExpireAlwaysFalsyClient:
+    """Wraps a real client but makes every `expire()` call report failure.
+
+    Simulates the race `redis.py`'s `mark_seen` must guard against: the
+    existing key's TTL lapsing between a failed `SET ... NX` and the
+    following `EXPIRE ... GT` -- from this test's perspective, indistinguishable
+    from `EXPIRE` simply reporting "no such key" for any other reason. A real
+    client's `EXPIRE` on a vanished key also returns falsy, so this is a
+    faithful (if deterministic, rather than timing-dependent) stand-in for
+    that race, without needing a real sleep to provoke it.
+    """
+
+    def __init__(self, client: fakeredis.aioredis.FakeRedis) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._client, name)
+
+    async def expire(self, *args: object, **kwargs: object) -> bool:
+        return False
+
+
+class TestExpireRaceRecovery:
+    async def test_mark_seen_still_marks_the_pair_when_expire_reports_no_such_key(self) -> None:
+        # Regression: if EXPIRE's falsy return (whatever the cause) were
+        # ignored, this mark_seen call would silently do nothing, and the
+        # pair would wrongly report as not seen.
+        real_client = fakeredis.aioredis.FakeRedis()
+        store = RedisDedupStore(_ExpireAlwaysFalsyClient(real_client))  # type: ignore[arg-type]
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+        # A second call takes the "key already existed" branch, where EXPIRE
+        # is forced to report failure.
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
