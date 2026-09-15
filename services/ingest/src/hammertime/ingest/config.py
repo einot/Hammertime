@@ -41,6 +41,16 @@ def _parse_bind(bind: str) -> tuple[str, int]:
     return host, int(port_text)
 
 
+def _parse_positive_int(name: str, value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {parsed}")
+    return parsed
+
+
 def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
     """Load ingest settings from the environment (see `.env.example`)."""
     source = env if env is not None else os.environ
@@ -48,9 +58,13 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
     return IngestSettings(
         host=host,
         port=port,
-        max_body_bytes=int(source.get("HAMMERTIME_INGEST_MAX_BODY_BYTES", _DEFAULT_MAX_BODY_BYTES)),
-        max_observations=int(
-            source.get("HAMMERTIME_INGEST_MAX_OBSERVATIONS", _DEFAULT_MAX_OBSERVATIONS)
+        max_body_bytes=_parse_positive_int(
+            "HAMMERTIME_INGEST_MAX_BODY_BYTES",
+            source.get("HAMMERTIME_INGEST_MAX_BODY_BYTES", str(_DEFAULT_MAX_BODY_BYTES)),
+        ),
+        max_observations=_parse_positive_int(
+            "HAMMERTIME_INGEST_MAX_OBSERVATIONS",
+            source.get("HAMMERTIME_INGEST_MAX_OBSERVATIONS", str(_DEFAULT_MAX_OBSERVATIONS)),
         ),
         detection_config_path=Path(source.get("HAMMERTIME_CONFIG_PATH", _DEFAULT_CONFIG_PATH)),
     )

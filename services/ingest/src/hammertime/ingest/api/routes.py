@@ -19,13 +19,13 @@ from hammertime.core.errors import InvalidAddressError
 from hammertime.core.events.models import Observation, RequestObservation
 from hammertime.ingest.api.schemas import HealthStatus, ObservationAccepted, ObservationRequest
 from hammertime.ingest.validation import (
+    BodyTooLargeError,
     IngestValidationError,
     RequestLimitExceededError,
     SchemaValidationError,
 )
 from hammertime.ingest.validation.addresses import parse_address
 from hammertime.ingest.validation.limits import (
-    check_body_size,
     check_observation_count,
     check_window_alignment,
 )
@@ -41,6 +41,48 @@ def _get_ingest_state(request: Request) -> "IngestState":
     # avoid a routes.py <-> app.py import cycle (app.py imports `router`
     # from this module at import time).
     return request.app.state.ingest  # type: ignore[no-any-return]
+
+
+async def _read_body_within_limit(request: Request, *, max_body_bytes: int) -> bytes:
+    """Read the request body without ever buffering more than `max_body_bytes`.
+
+    `await request.body()` buffers the *entire* body into memory before
+    returning, so checking its length afterwards (`check_body_size`) is too
+    late to bound memory usage -- an attacker with no Content-Length
+    accuracy requirement (or none at all, under chunked transfer encoding)
+    can already have forced an arbitrarily large allocation by the time that
+    check runs. No agent auth/rate limiting exists yet (Epic #4), so this is
+    currently the only line of defense against an oversized body (spec
+    section 36's "request size limits") and it must actually bound memory,
+    not just reject after the fact.
+
+    Two layers: a `Content-Length` pre-check rejects an obviously oversized
+    request before reading anything (cheap, but the header can be absent or
+    understate the true size), and a streaming read aborts the moment the
+    running total exceeds the limit, which holds regardless of whether
+    `Content-Length` was present, correct, or omitted (chunked encoding).
+    """
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            declared_size = None
+        if declared_size is not None and declared_size > max_body_bytes:
+            raise BodyTooLargeError(
+                f"Content-Length {declared_size} exceeds the {max_body_bytes}-byte limit"
+            )
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_body_bytes:
+            raise BodyTooLargeError(
+                f"request body exceeds the {max_body_bytes}-byte limit while streaming"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _parse_window_start(value: str) -> datetime:
@@ -90,9 +132,8 @@ async def create_observation(request: Request) -> ObservationAccepted:
     state = _get_ingest_state(request)
     settings = state.settings
 
-    body = await request.body()
     try:
-        check_body_size(body, max_body_bytes=settings.max_body_bytes)
+        body = await _read_body_within_limit(request, max_body_bytes=settings.max_body_bytes)
     except RequestLimitExceededError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
 
@@ -101,6 +142,21 @@ async def create_observation(request: Request) -> ObservationAccepted:
     except json.JSONDecodeError as exc:
         raise HTTPException(
             status_code=400, detail=f"request body is not valid JSON: {exc}"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        # json.loads decodes bytes->str internally; invalid UTF-8 raises
+        # UnicodeDecodeError, not JSONDecodeError, before syntax is ever
+        # considered -- must not be allowed to fall through as a 500.
+        raise HTTPException(
+            status_code=400, detail=f"request body is not valid UTF-8: {exc}"
+        ) from exc
+    except RecursionError as exc:
+        # A pathologically nested body (a few KB of nested `[`/`{`) blows
+        # json.loads's recursion limit before it ever raises
+        # JSONDecodeError -- see hammertime.core.events.codec.decode, which
+        # documents and guards against this same input shape.
+        raise HTTPException(
+            status_code=400, detail="request body is nested too deeply to parse"
         ) from exc
 
     if isinstance(document, dict):
