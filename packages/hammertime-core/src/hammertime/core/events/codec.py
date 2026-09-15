@@ -239,10 +239,11 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
     if not isinstance(payload_data, dict):
         raise CodecError("payload must be a JSON object")
 
+    wire_event_id = str(_require(document, "event_id"))
+
     try:
-        return EventEnvelope(
+        envelope = EventEnvelope(
             schema_version=int(schema_version),
-            event_id=str(_require(document, "event_id")),
             agent_id=str(_require(document, "agent_id")),
             sequence=int(_require(document, "sequence")),
             event_type=str(event_type),
@@ -252,3 +253,13 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
         )
     except (TypeError, ValueError) as exc:
         raise CodecError(f"malformed envelope: {exc}") from exc
+
+    # event_id is never trusted from the wire -- EventEnvelope always
+    # (re)derives it from (agent_id, sequence, event_type) in __post_init__.
+    # A mismatch means the bytes were corrupted or tampered with in transit.
+    if envelope.event_id != wire_event_id:
+        raise CodecError(
+            f"event_id {wire_event_id!r} does not match the identity fields "
+            f"(agent_id, sequence, event_type); derived {envelope.event_id!r}"
+        )
+    return envelope

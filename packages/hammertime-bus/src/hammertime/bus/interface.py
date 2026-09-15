@@ -33,7 +33,7 @@ class Producer(Protocol):
 
     `key` selects the partition (spec section 20: ownership/shard assignment
     must be stable per IP), so callers pass a key already derived via
-    `topics.lookup(topic).key_selector`, not raw domain objects.
+    `topics.TOPICS[topic].key_selector(event)`, not raw domain objects.
     """
 
     async def publish(self, topic: str, key: bytes | str, value: bytes) -> None:

@@ -49,7 +49,7 @@ selects the same key, and different IP/prefix selects a different key.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from hammertime.bus.topics import TOPICS
@@ -58,7 +58,7 @@ from hammertime.core.events.models import HotIpAdded, HotIpRemoved, Observation,
 
 HOT_IP_TOPIC = "hammertime.hot-ip.v1"
 
-T0 = datetime(2026, 9, 14, 10, 5, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 9, 14, 10, 5, 0, tzinfo=UTC)
 
 
 def _topic_name_containing(*substrings: str, excluding: str | None = None) -> str:
@@ -67,7 +67,8 @@ def _topic_name_containing(*substrings: str, excluding: str | None = None) -> st
     matches = [
         name
         for name in TOPICS
-        if all(s in name.lower() for s in substrings) and (excluding is None or excluding not in name.lower())
+        if all(s in name.lower() for s in substrings)
+        and (excluding is None or excluding not in name.lower())
     ]
     assert matches, f"expected a topic name containing {substrings!r} in {list(TOPICS)}"
     assert len(matches) == 1, f"ambiguous topic names containing {substrings!r}: {matches}"
@@ -113,14 +114,28 @@ class TestKeySelectorForIpKeyedTopics:
         topic = TOPICS[HOT_IP_TOPIC]
         addr = Address.parse("192.168.1.42")
         added = HotIpAdded(ip=addr, timestamp=T0, sequence=1, window_count=1000, config_version=1)
-        removed = HotIpRemoved(ip=addr, timestamp=T0, sequence=999, window_count=1, config_version=42)
+        removed = HotIpRemoved(
+            ip=addr, timestamp=T0, sequence=999, window_count=1, config_version=42
+        )
 
         assert topic.key_selector(added) == topic.key_selector(removed)
 
     def test_hot_ip_topic_key_selector_differs_for_different_ips(self) -> None:
         topic = TOPICS[HOT_IP_TOPIC]
-        a = HotIpAdded(ip=Address.parse("10.0.0.1"), timestamp=T0, sequence=1, window_count=1000, config_version=1)
-        b = HotIpAdded(ip=Address.parse("10.0.0.2"), timestamp=T0, sequence=1, window_count=1000, config_version=1)
+        a = HotIpAdded(
+            ip=Address.parse("10.0.0.1"),
+            timestamp=T0,
+            sequence=1,
+            window_count=1000,
+            config_version=1,
+        )
+        b = HotIpAdded(
+            ip=Address.parse("10.0.0.2"),
+            timestamp=T0,
+            sequence=1,
+            window_count=1000,
+            config_version=1,
+        )
 
         assert topic.key_selector(a) != topic.key_selector(b)
 
@@ -134,26 +149,38 @@ class TestKeySelectorForIpKeyedTopics:
 
 
 class TestKeySelectorForPrefixStatsTopic:
-    def test_prefix_stats_topic_key_selector_derives_the_key_from_the_prefix_not_an_ip(self) -> None:
+    def test_prefix_stats_topic_key_selector_derives_the_key_from_the_prefix_not_an_ip(
+        self,
+    ) -> None:
         name = _topic_name_containing("prefix")
         topic = TOPICS[name]
-        changed = PrefixStatsChanged(prefix="10.20.30.0/24", hot_count=156, capacity=256, sequence=1, timestamp=T0)
+        changed = PrefixStatsChanged(
+            prefix="10.20.30.0/24", hot_count=156, capacity=256, sequence=1, timestamp=T0
+        )
 
         assert topic.key_selector(changed) == "10.20.30.0/24"
 
     def test_prefix_stats_topic_key_selector_differs_for_different_prefixes(self) -> None:
         name = _topic_name_containing("prefix")
         topic = TOPICS[name]
-        a = PrefixStatsChanged(prefix="10.20.30.0/24", hot_count=156, capacity=256, sequence=1, timestamp=T0)
-        b = PrefixStatsChanged(prefix="10.20.31.0/24", hot_count=16, capacity=256, sequence=1, timestamp=T0)
+        a = PrefixStatsChanged(
+            prefix="10.20.30.0/24", hot_count=156, capacity=256, sequence=1, timestamp=T0
+        )
+        b = PrefixStatsChanged(
+            prefix="10.20.31.0/24", hot_count=16, capacity=256, sequence=1, timestamp=T0
+        )
 
         assert topic.key_selector(a) != topic.key_selector(b)
 
     def test_prefix_stats_topic_key_selector_is_insensitive_to_non_prefix_fields(self) -> None:
         name = _topic_name_containing("prefix")
         topic = TOPICS[name]
-        a = PrefixStatsChanged(prefix="10.20.30.0/24", hot_count=156, capacity=256, sequence=1, timestamp=T0)
-        b = PrefixStatsChanged(prefix="10.20.30.0/24", hot_count=16, capacity=256, sequence=999, timestamp=T0)
+        a = PrefixStatsChanged(
+            prefix="10.20.30.0/24", hot_count=156, capacity=256, sequence=1, timestamp=T0
+        )
+        b = PrefixStatsChanged(
+            prefix="10.20.30.0/24", hot_count=16, capacity=256, sequence=999, timestamp=T0
+        )
 
         assert topic.key_selector(a) == topic.key_selector(b)
 
@@ -168,7 +195,9 @@ class TestLookupByName:
         # And they really are wired to different selection semantics, not
         # just distinct objects with identical behavior.
         addr = Address.parse("192.168.1.42")
-        hot_ip_event = HotIpAdded(ip=addr, timestamp=T0, sequence=1, window_count=1000, config_version=1)
+        hot_ip_event = HotIpAdded(
+            ip=addr, timestamp=T0, sequence=1, window_count=1000, config_version=1
+        )
         assert TOPICS[HOT_IP_TOPIC].key_selector(hot_ip_event) == str(addr)
 
     def test_unknown_topic_name_raises(self) -> None:

@@ -16,7 +16,7 @@ mistaken for redeliveries of each other during dedup (spec section 23).
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 #: The only wire schema version this codebase currently understands.
@@ -42,40 +42,23 @@ def compute_event_id(agent_id: str, sequence: int, event_type: str) -> str:
 class EventEnvelope[T]:
     """Wire envelope wrapping a payload with provenance and identity.
 
-    Construct via `EventEnvelope.create(...)` rather than the constructor
-    directly so `event_id` is always derived correctly and callers cannot
-    accidentally supply an inconsistent one.
+    `event_id` is derived automatically from `(agent_id, sequence,
+    event_type)` in `__post_init__` -- it is not a constructor argument, so
+    there is no way to construct an envelope whose `event_id` is
+    inconsistent with its own identity fields. `config_version`, `timestamp`
+    and `payload` play no part in the derivation (ADR-0003 amendment).
     """
 
-    schema_version: int
-    event_id: str
     agent_id: str
     sequence: int
     event_type: str
     config_version: int
     timestamp: datetime
     payload: T
+    schema_version: int = SCHEMA_VERSION
+    event_id: str = field(init=False)
 
-    @classmethod
-    def create(
-        cls,
-        *,
-        agent_id: str,
-        sequence: int,
-        event_type: str,
-        config_version: int,
-        timestamp: datetime,
-        payload: T,
-        schema_version: int = SCHEMA_VERSION,
-    ) -> EventEnvelope[T]:
-        """Build an envelope, computing `event_id` from the identity fields."""
-        return cls(
-            schema_version=schema_version,
-            event_id=compute_event_id(agent_id, sequence, event_type),
-            agent_id=agent_id,
-            sequence=sequence,
-            event_type=event_type,
-            config_version=config_version,
-            timestamp=timestamp,
-            payload=payload,
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "event_id", compute_event_id(self.agent_id, self.sequence, self.event_type)
         )

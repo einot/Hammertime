@@ -44,7 +44,7 @@ sketch above.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from hammertime.core.addressing.address import Address
@@ -59,7 +59,7 @@ from hammertime.core.events.models import (
     RequestObservation,
 )
 
-T0 = datetime(2026, 9, 14, 10, 5, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 9, 14, 10, 5, 0, tzinfo=UTC)
 
 
 def _tamper(data: bytes, **overrides: object) -> bytes:
@@ -167,7 +167,9 @@ class TestRoundTrip:
         assert decoded == envelope
         assert decoded.payload == payload
 
-    def test_prefix_stats_changed_capacity_round_trips_as_int_even_for_huge_ipv6_capacities(self) -> None:
+    def test_prefix_stats_changed_capacity_round_trips_as_int_even_for_huge_ipv6_capacities(
+        self,
+    ) -> None:
         # schemas/prefix_stats_event.v1.json encodes capacity as a decimal
         # *string* on the wire ("IPv6 capacities exceed 64-bit"), but
         # models.PrefixStatsChanged.capacity is a plain int -- the codec is
@@ -193,12 +195,15 @@ class TestRoundTrip:
         data = encode(envelope)
         decoded = decode(data)
 
+        assert isinstance(decoded.payload, PrefixStatsChanged)
         assert decoded.payload.capacity == huge_capacity
         assert isinstance(decoded.payload.capacity, int)
 
 
-def _hot_ip_added_envelope(*, event_type: str) -> EventEnvelope:
-    payload = HotIpAdded(ip=Address.parse("10.0.0.1"), timestamp=T0, sequence=1, window_count=1000, config_version=1)
+def _hot_ip_added_envelope(*, event_type: str) -> EventEnvelope[HotIpAdded]:
+    payload = HotIpAdded(
+        ip=Address.parse("10.0.0.1"), timestamp=T0, sequence=1, window_count=1000, config_version=1
+    )
     return EventEnvelope(
         agent_id="shard-3",
         sequence=1,
@@ -257,5 +262,5 @@ class TestMalformedBytes:
             decode(b"{not valid json")
         except CodecError:
             pass
-        except Exception as exc:  # noqa: BLE001 - intentional: prove no other type leaks
+        except Exception as exc:
             pytest.fail(f"decode() leaked {type(exc).__name__} instead of raising CodecError")

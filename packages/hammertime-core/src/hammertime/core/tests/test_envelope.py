@@ -34,23 +34,33 @@ against schemas/*.json. See test_codec.py for that behavior.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from hammertime.core.addressing.address import Address
 from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import HotIpAdded
 
-T0 = datetime(2026, 9, 14, 10, 5, 0, tzinfo=timezone.utc)
-T1 = datetime(2026, 9, 14, 10, 6, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 9, 14, 10, 5, 0, tzinfo=UTC)
+T1 = datetime(2026, 9, 14, 10, 6, 0, tzinfo=UTC)
 
 # A single reusable payload: identity tests only care about
 # (agent_id, sequence, event_type), so the envelope-level `event_type`
 # string need not actually match this payload's real type -- the envelope
 # is a dumb identity carrier per the module docstring above.
-_PAYLOAD = HotIpAdded(ip=Address.parse("192.168.1.42"), timestamp=T0, sequence=1, window_count=1000, config_version=1)
+_PAYLOAD = HotIpAdded(
+    ip=Address.parse("192.168.1.42"), timestamp=T0, sequence=1, window_count=1000, config_version=1
+)
 
 
-def _envelope(*, agent_id: str, sequence: int, event_type: str, config_version: int = 1, timestamp: datetime = T0, payload: object = _PAYLOAD) -> EventEnvelope:
+def _envelope(
+    *,
+    agent_id: str,
+    sequence: int,
+    event_type: str,
+    config_version: int = 1,
+    timestamp: datetime = T0,
+    payload: object = _PAYLOAD,
+) -> EventEnvelope[object]:
     return EventEnvelope(
         agent_id=agent_id,
         sequence=sequence,
@@ -89,9 +99,17 @@ class TestEventIdDeterminism:
         assert e1.event_id == e2.event_id
 
     def test_payload_contents_do_not_affect_event_id(self) -> None:
-        other_payload = HotIpAdded(ip=Address.parse("10.0.0.99"), timestamp=T1, sequence=999, window_count=1, config_version=7)
+        other_payload = HotIpAdded(
+            ip=Address.parse("10.0.0.99"),
+            timestamp=T1,
+            sequence=999,
+            window_count=1,
+            config_version=7,
+        )
         e1 = _envelope(agent_id="edge-17", sequence=42, event_type="HotIpAdded", payload=_PAYLOAD)
-        e2 = _envelope(agent_id="edge-17", sequence=42, event_type="HotIpAdded", payload=other_payload)
+        e2 = _envelope(
+            agent_id="edge-17", sequence=42, event_type="HotIpAdded", payload=other_payload
+        )
         assert e1.event_id == e2.event_id
 
 
@@ -106,7 +124,9 @@ class TestEventIdDistinctness:
         e2 = _envelope(agent_id="edge-18", sequence=1, event_type="HotIpAdded")
         assert e1.event_id != e2.event_id
 
-    def test_same_agent_and_sequence_but_different_event_type_yields_a_different_event_id(self) -> None:
+    def test_same_agent_and_sequence_but_different_event_type_yields_a_different_event_id(
+        self,
+    ) -> None:
         # This is the exact scenario called out by the ADR-0003 amendment:
         # an aggregator shard's HotIpAdded sequence counter and a trie
         # service's PrefixStatsChanged sequence counter are unrelated, so a
@@ -119,7 +139,6 @@ class TestEventIdDistinctness:
     def test_all_four_payload_event_types_pairwise_distinct_for_shared_identity(self) -> None:
         event_types = ["RequestObservation", "HotIpAdded", "HotIpRemoved", "PrefixStatsChanged"]
         ids = [
-            _envelope(agent_id="shard-3", sequence=7, event_type=et).event_id
-            for et in event_types
+            _envelope(agent_id="shard-3", sequence=7, event_type=et).event_id for et in event_types
         ]
         assert len(ids) == len(set(ids))
