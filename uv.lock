@@ -235,6 +235,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "hammertime-testkit" },
+    { name = "httpx" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
@@ -257,6 +258,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "hammertime-testkit", editable = "packages/hammertime-testkit" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "hypothesis", specifier = ">=6.100" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=8" },
