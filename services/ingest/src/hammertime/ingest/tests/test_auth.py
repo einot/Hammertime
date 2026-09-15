@@ -362,6 +362,28 @@ class TestRegistryLoading:
         assert registry.get("edge-1") is not None
         assert registry.get("edge-2") is not None
 
+    @pytest.mark.parametrize("rate_limit_rps", [0, -1])
+    def test_non_positive_rate_limit_rps_is_rejected_at_load_time(
+        self, rate_limit_rps: int
+    ) -> None:
+        # Regression: RateLimiter.check() raises a bare ValueError for a
+        # non-positive limit_rps (ratelimit/__init__.py) -- an unhandled
+        # 500 on every request for this agent if a config typo like this
+        # reached the live pipeline instead of failing at startup.
+        document = {"edge-1": {"token": "token-one", "rate_limit_rps": rate_limit_rps}}
+
+        with pytest.raises(ConfigurationError, match="rate_limit_rps"):
+            load_agent_registry_document(document)
+
+    def test_positive_rate_limit_rps_is_accepted(self) -> None:
+        document = {"edge-1": {"token": "token-one", "rate_limit_rps": 5}}
+
+        registry = load_agent_registry_document(document)
+
+        record = registry.get("edge-1")
+        assert record is not None
+        assert record.rate_limit_rps == 5
+
     def test_non_utf8_registry_file_is_a_clean_configuration_error(self, tmp_path: Path) -> None:
         # Regression: Path.read_text() raises UnicodeDecodeError for
         # non-UTF-8 bytes, which used to propagate uncaught instead of the

@@ -32,16 +32,22 @@ class ObservationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_id: str = Field(min_length=1, max_length=128)
-    sequence: int = Field(ge=0)
+    sequence: int = Field(ge=0, le=9_223_372_036_854_775_807)
     window_start: str
     window_seconds: int = Field(ge=1, le=3600)
     observations: list[ObservationEntry] = Field(min_length=1, max_length=10_000)
 
 
 class ObservationAccepted(BaseModel):
-    """202 response body: accepted, but not yet published (Epic #4 wires publishing)."""
+    """202 response body: accepted and durably published (docs/protocol/observation-v1.md)."""
 
     status: Literal["accepted"] = "accepted"
+
+
+class ObservationDuplicate(BaseModel):
+    """200 response body: `(agent_id, sequence)` was already accepted; no action taken."""
+
+    status: Literal["duplicate"] = "duplicate"
 
 
 class HealthStatus(BaseModel):

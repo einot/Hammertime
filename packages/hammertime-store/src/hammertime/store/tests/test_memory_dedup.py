@@ -242,6 +242,61 @@ class TestOutOfOrderSequences:
         assert await store.has_seen("agent-1", 3) is False
 
 
+class TestClaim:
+    """`claim()`: the atomic check-and-mark `has_seen`+`mark_seen` cannot be.
+
+    Issue #32's ingest pipeline uses this instead of the separate
+    `is_duplicate()`/`mark_seen()` pair to close the race where two
+    concurrent requests for the same `(agent_id, sequence)` could both
+    observe "not seen" before either marks it.
+    """
+
+    async def test_first_claim_of_a_fresh_pair_returns_true(self) -> None:
+        store, _clock = _store()
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_first_claim_marks_the_pair_seen(self) -> None:
+        store, _clock = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+    async def test_second_claim_of_the_same_pair_returns_false(self) -> None:
+        # Simulates two concurrent requests for the same sequence: exactly
+        # one may proceed to publish.
+        store, _clock = _store()
+
+        first = await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+        second = await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert first is True
+        assert second is False
+
+    async def test_claiming_an_already_mark_seen_pair_returns_false(self) -> None:
+        store, _clock = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is False
+
+    async def test_claim_of_a_different_sequence_for_the_same_agent_is_independent(self) -> None:
+        store, _clock = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.claim("agent-1", 2, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_claim_after_the_earlier_claims_ttl_expires_returns_true_again(self) -> None:
+        store, clock = _store(initial=0)
+
+        await store.claim("agent-1", 1, ttl_seconds=60)
+        clock.advance(61)
+
+        assert await store.claim("agent-1", 1, ttl_seconds=60) is True
+
+
 class TestBoundedAgentTracking:
     """`max_agents`: defense in depth against unbounded distinct-agent growth."""
 

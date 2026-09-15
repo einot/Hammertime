@@ -1,3 +1,7 @@
+Reject observations whose sequence exceeds 9223372036854775807
+Ingest claims an observation's (agent_id, sequence) atomically before publishing it, closing a race where concurrent retries of the same request could all be accepted; a retry after a 503 publish failure is now reported as a duplicate (200) rather than retried immediately, until the claim's dedup window lapses
+BREAKING: event envelopes carry an optional `subject` that participates in event_id derivation; builds without it reject such envelopes as event_id mismatches
+Ingest publishes accepted observations to hammertime.observations.v1 as one message per IP, keyed by that IP, returning 503 if publishing fails and 202 only once all of them are durably recorded; repeated IPs within one message are summed
 Add ingest service: POST /v1/observations validates against schemas/observation.v1.json, rejecting malformed IPs, unaligned window_start, and oversized bodies/observation arrays with 400/413; accepted requests return 202 but are not yet published (no dedup/bus/auth wiring). Add GET /healthz liveness check and a placeholder GET /metrics
 Add in-memory and Kafka-backed message bus (Producer/Consumer) with a canonical topic registry (hammertime.hot-ip.v1, observations, observations-reconciliation, prefix-stats), keyed by IP except prefix-stats which is keyed by prefix
 Add event envelope and JSON codec for RequestObservation/HotIpAdded/HotIpRemoved/PrefixStatsChanged, with a deterministic event_id derived from (agent_id, sequence, event_type) for idempotent redelivery

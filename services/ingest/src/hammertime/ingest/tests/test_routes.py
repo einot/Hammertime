@@ -15,10 +15,17 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from hammertime.ingest.app import create_app
+from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
 from hammertime.ingest.config import IngestSettings
 
 _CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
 _BUCKET_SECONDS = json.loads(_CONFIG_PATH.read_text())["bucket_seconds"]
+
+# issue #32 put auth/rate-limit/dedup/publish ahead of the validation layer
+# this file exercises -- every request below must be authenticated (and not
+# rate-limited) to actually reach the status codes these tests check for.
+_AGENT_ID = "edge-17"
+_AGENT_TOKEN = "test-token"
 
 _SETTINGS = IngestSettings(
     host="127.0.0.1",
@@ -26,18 +33,35 @@ _SETTINGS = IngestSettings(
     max_body_bytes=1_048_576,
     max_observations=10_000,
     detection_config_path=_CONFIG_PATH,
+    rate_limit_rps=1_000,
+    agents_path=Path("unused -- agent_registry is injected directly below"),
+    bus_kind="memory",
+    bus_brokers="",
+    store_kind="memory",
+    redis_url="",
 )
 
 
 def _client() -> TestClient:
     # create_app(settings=...) avoids depending on process environment
-    # variables, per app.py's own docstring.
-    return TestClient(create_app(_SETTINGS))
+    # variables, per app.py's own docstring. agent_registry is injected
+    # directly (rather than read from agents_path) so this file needs no
+    # config/agents.v1.json fixture on disk; dedup_store/bus are left
+    # unset so create_app builds a fresh in-memory one per client (no
+    # cross-test state, since store_kind/bus_kind above are both "memory").
+    registry = AgentRegistry.from_records(
+        [AgentRecord(agent_id=_AGENT_ID, token=_AGENT_TOKEN, rate_limit_rps=None)]
+    )
+    return TestClient(create_app(_SETTINGS, agent_registry=registry))
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"X-Agent-Id": _AGENT_ID, "Authorization": f"Bearer {_AGENT_TOKEN}"}
 
 
 def _valid_body(**overrides: object) -> dict[str, object]:
     doc: dict[str, object] = {
-        "agent_id": "edge-17",
+        "agent_id": _AGENT_ID,
         "sequence": 1,
         "window_start": "2026-09-14T10:00:00Z",
         "window_seconds": 60,
@@ -50,7 +74,7 @@ def _valid_body(**overrides: object) -> dict[str, object]:
 class TestHappyPath:
     def test_valid_observation_is_accepted(self) -> None:
         with _client() as client:
-            response = client.post("/v1/observations", json=_valid_body())
+            response = client.post("/v1/observations", json=_valid_body(), headers=_auth_headers())
         assert response.status_code == 202
         assert response.json() == {"status": "accepted"}
 
@@ -70,7 +94,7 @@ class TestSchemaAndAddressRejection:
     def test_malformed_ip_is_rejected(self) -> None:
         body = _valid_body(observations=[{"ip": "not-an-ip", "request_count": 1}])
         with _client() as client:
-            response = client.post("/v1/observations", json=body)
+            response = client.post("/v1/observations", json=body, headers=_auth_headers())
         assert response.status_code == 400
 
     def test_client_asserted_state_is_rejected(self) -> None:
@@ -78,14 +102,14 @@ class TestSchemaAndAddressRejection:
         # assert "IP = HOT" directly.
         body = _valid_body(state="HOT")
         with _client() as client:
-            response = client.post("/v1/observations", json=body)
+            response = client.post("/v1/observations", json=body, headers=_auth_headers())
         assert response.status_code == 400
 
     def test_unaligned_window_start_is_rejected(self) -> None:
         assert _BUCKET_SECONDS != 1  # otherwise every window is "aligned"
         body = _valid_body(window_start="2026-09-14T10:00:00.5Z")
         with _client() as client:
-            response = client.post("/v1/observations", json=body)
+            response = client.post("/v1/observations", json=body, headers=_auth_headers())
         assert response.status_code == 400
 
 
@@ -93,7 +117,7 @@ class TestSizeLimits:
     def test_oversized_observations_array_is_rejected_with_413(self) -> None:
         body = _valid_body(observations=[{"ip": "10.0.0.1", "request_count": 1}] * 10_001)
         with _client() as client:
-            response = client.post("/v1/observations", json=body)
+            response = client.post("/v1/observations", json=body, headers=_auth_headers())
         assert response.status_code == 413
 
     def test_oversized_body_is_rejected_with_413_not_buffered_unbounded(self) -> None:
@@ -106,7 +130,7 @@ class TestSizeLimits:
             response = client.post(
                 "/v1/observations",
                 content=oversized.encode("utf-8"),
-                headers={"content-type": "application/json"},
+                headers={"content-type": "application/json", **_auth_headers()},
             )
         assert response.status_code == 413
 
@@ -122,7 +146,7 @@ class TestMalformedBytesDoNotCrash:
             response = client.post(
                 "/v1/observations",
                 content=deeply_nested,
-                headers={"content-type": "application/json"},
+                headers={"content-type": "application/json", **_auth_headers()},
             )
         assert response.status_code == 400
 
@@ -131,6 +155,27 @@ class TestMalformedBytesDoNotCrash:
             response = client.post(
                 "/v1/observations",
                 content=b'\xff\xfe{"agent_id": "a"',
-                headers={"content-type": "application/json"},
+                headers={"content-type": "application/json", **_auth_headers()},
+            )
+        assert response.status_code == 400
+
+    def test_oversized_integer_literal_is_rejected_with_400_not_500(self) -> None:
+        # Regression: CPython's int-string conversion limit (default 4300
+        # digits) makes json.loads raise a bare ValueError -- neither
+        # json.JSONDecodeError nor UnicodeDecodeError -- for a body
+        # containing a many-thousand-digit integer literal, which used to
+        # fall through the handler's exception guards as an unhandled 500.
+        # Built by text substitution, not `int("9" * 5000)`: constructing
+        # that Python int would itself hit the same conversion limit before
+        # the request body even exists.
+        huge_digits = "9" * 5000
+        oversized_literal = json.dumps(_valid_body()).replace(
+            '"sequence": 1', f'"sequence": {huge_digits}', 1
+        )
+        with _client() as client:
+            response = client.post(
+                "/v1/observations",
+                content=oversized_literal.encode("utf-8"),
+                headers={"content-type": "application/json", **_auth_headers()},
             )
         assert response.status_code == 400

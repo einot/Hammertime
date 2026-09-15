@@ -96,6 +96,17 @@ def _record_from_document(agent_id: str, fields: Any) -> AgentRecord:
         raise ConfigurationError(
             f"agent {agent_id!r} field 'rate_limit_rps' must be an integer or null"
         )
+    if rate_limit_rps is not None and rate_limit_rps <= 0:
+        # RateLimiter.check() raises ValueError for a non-positive limit_rps
+        # (ratelimit/__init__.py) -- an unhandled 500 on every request for
+        # this agent, rather than the clean startup-time rejection an
+        # operator's typo deserves. There is no "rate-limited to zero"
+        # concept; disable the agent instead (`"enabled": false`).
+        raise ConfigurationError(
+            f"agent {agent_id!r} field 'rate_limit_rps' must be a positive "
+            f'integer, got {rate_limit_rps!r} -- set "enabled": false to '
+            "block an agent instead of a zero or negative rate limit"
+        )
 
     unknown = fields.keys() - {"token", "enabled", "rate_limit_rps"}
     if unknown:

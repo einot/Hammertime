@@ -122,3 +122,15 @@ class RedisDedupStore:
         extended = await self._client.expire(key, ttl_seconds, gt=True)
         if not extended:
             await self._client.set(key, _SEEN_VALUE, ex=ttl_seconds, nx=True)
+
+    async def claim(self, agent_id: str, sequence: int, *, ttl_seconds: int) -> bool:
+        # A single `SET ... NX` is atomic on its own -- no separate
+        # `EXPIRE ... GT` follow-up like `mark_seen` needs, because a
+        # `False` return here means "someone else already holds this key"
+        # and its existing TTL is left untouched (not shortened, per the
+        # "never shorten" invariant -- simply not touched at all).
+        if ttl_seconds <= 0:
+            raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds!r}")
+        key = _KEY_PREFIX + SequenceKey(agent_id, sequence).cache_key()
+        created = await self._client.set(key, _SEEN_VALUE, ex=ttl_seconds, nx=True)
+        return bool(created)

@@ -83,6 +83,17 @@ class MemoryDedupStore:
             self._expires_at[agent_id] = expires_at
             heapq.heappush(self._expiry_heap, (expires_at, agent_id))
 
+    async def claim(self, agent_id: str, sequence: int, *, ttl_seconds: int) -> bool:
+        # No `await` between the check and the mark below (`has_seen`/
+        # `mark_seen` themselves contain none either), so this coroutine
+        # runs to completion without ever yielding to the event loop --
+        # atomic in practice for a single-process asyncio deployment, the
+        # same reasoning `ratelimit/__init__.py` documents for `check()`.
+        if await self.has_seen(agent_id, sequence):
+            return False
+        await self.mark_seen(agent_id, sequence, ttl_seconds=ttl_seconds)
+        return True
+
     def _evict_if_full(self) -> None:
         if len(self._windows) < self._max_agents:
             return
