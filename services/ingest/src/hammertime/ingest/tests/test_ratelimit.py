@@ -262,3 +262,94 @@ class TestRateLimiterBurstThenRefill:
             # Allow exactly one extra second's worth of budget for the
             # initial full-bucket burst at t=0.
             assert total_accepted <= limit_rps * (elapsed_seconds + 1)
+
+
+class TestInvalidInput:
+    # Regression tests for reviewer/security-auditor findings on this
+    # component: (1) cost > limit_rps used to permanently exhaust the
+    # bucket forever instead of failing loudly -- a real, easily hit case
+    # (any limit_rps < 1 with the default cost=1.0), directly
+    # contradicting the "first request never rejected" guarantee in this
+    # module's own docstring; (2) NaN/inf limit_rps or cost silently
+    # disabled rate limiting entirely instead of being rejected.
+
+    def test_cost_exceeding_capacity_raises_immediately_rather_than_locking_out_the_agent(
+        self,
+    ) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        with pytest.raises(ValueError, match="cost"):
+            limiter.check(agent_id="edge-17", limit_rps=0.5)  # default cost=1.0 > capacity
+
+    def test_a_sub_one_limit_rps_with_explicit_matching_cost_still_works(self) -> None:
+        # The bug wasn't "fractional limit_rps is broken" -- it was
+        # specifically cost > capacity. A cost sized to fit still succeeds.
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        limiter.check(agent_id="edge-17", limit_rps=0.5, cost=0.5)  # must not raise
+
+    @pytest.mark.parametrize("bad_limit", [float("nan"), float("inf"), -float("inf")])
+    def test_non_finite_limit_rps_is_rejected(self, bad_limit: float) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        with pytest.raises(ValueError):
+            limiter.check(agent_id="edge-17", limit_rps=bad_limit)
+
+    @pytest.mark.parametrize("bad_cost", [float("nan"), float("inf")])
+    def test_non_finite_cost_is_rejected(self, bad_cost: float) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        with pytest.raises(ValueError):
+            limiter.check(agent_id="edge-17", limit_rps=5, cost=bad_cost)
+
+
+class TestBoundedAgentTracking:
+    # Regression test for the unbounded-memory-growth finding: without a
+    # cap, self._buckets grows one entry per distinct agent_id forever.
+
+    def test_bucket_count_is_bounded_by_max_agents(self) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock, max_agents=2)
+
+        limiter.check(agent_id="agent-a", limit_rps=5)
+        limiter.check(agent_id="agent-b", limit_rps=5)
+        # A third distinct agent must evict the least-recently-touched
+        # bucket (agent-a) rather than growing unboundedly.
+        limiter.check(agent_id="agent-c", limit_rps=5)
+
+        assert len(limiter._buckets) == 2
+        assert "agent-a" not in limiter._buckets
+
+    def test_evicted_agent_gets_a_fresh_full_bucket_on_return(self) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock, max_agents=1)
+        limit_rps = 3
+
+        _exhaust(limiter, "agent-a", limit_rps, max_attempts=1000)
+        with pytest.raises(RateLimitExceeded):
+            limiter.check(agent_id="agent-a", limit_rps=limit_rps)
+
+        # A different agent evicts agent-a's (exhausted) bucket entirely.
+        limiter.check(agent_id="agent-b", limit_rps=limit_rps)
+
+        # agent-a is now a "new" agent as far as the limiter is concerned
+        # -- its bucket starts full again, not still-exhausted.
+        limiter.check(agent_id="agent-a", limit_rps=limit_rps)  # must not raise
+
+    def test_touching_a_bucket_protects_it_from_lru_eviction(self) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock, max_agents=2)
+
+        limiter.check(agent_id="agent-a", limit_rps=5)
+        limiter.check(agent_id="agent-b", limit_rps=5)
+        # Re-touch agent-a so it's no longer the least-recently-used.
+        limiter.check(agent_id="agent-a", limit_rps=5)
+        # Now agent-b is the LRU entry and should be evicted, not agent-a.
+        limiter.check(agent_id="agent-c", limit_rps=5)
+
+        assert "agent-a" in limiter._buckets
+        assert "agent-b" not in limiter._buckets
