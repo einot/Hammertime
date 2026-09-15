@@ -7,5 +7,7 @@
   "minimum_hot_ips": 16,
   "minimum_hot_ratio": 0.10,
   "allowed_lateness_seconds": 30,
-  "state_retention_seconds": 600
+  "state_retention_seconds": 600,
+  "weight_function": "threshold_ratio",
+  "weight_max": 1000000
 }

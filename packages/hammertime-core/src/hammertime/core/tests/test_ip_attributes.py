@@ -39,21 +39,29 @@ from hammertime.core.events.models import HotIpAdded, HotIpRemoved
 
 T0 = datetime(2026, 9, 14, 10, 5, 0, tzinfo=UTC)
 
-_PAYLOAD_CLASSES = {"HotIpAdded": HotIpAdded, "HotIpRemoved": HotIpRemoved}
-
 
 def _hot_ip_envelope(
     event_type: str, *, attributes: dict[str, Any] | None = None, sequence: int = 1
 ) -> EventEnvelope[HotIpAdded | HotIpRemoved]:
-    cls = _PAYLOAD_CLASSES[event_type]
-    payload = cls(
-        ip=Address.parse("10.0.0.1"),
-        timestamp=T0,
-        sequence=sequence,
-        window_count=1000,
-        config_version=1,
-        attributes=attributes,
-    )
+    payload: HotIpAdded | HotIpRemoved
+    if event_type == "HotIpAdded":
+        payload = HotIpAdded(
+            ip=Address.parse("10.0.0.1"),
+            timestamp=T0,
+            sequence=sequence,
+            window_count=1000,
+            config_version=1,
+            attributes=attributes,
+        )
+    else:
+        payload = HotIpRemoved(
+            ip=Address.parse("10.0.0.1"),
+            timestamp=T0,
+            sequence=sequence,
+            window_count=1000,
+            config_version=1,
+            attributes=attributes,
+        )
     return EventEnvelope(
         agent_id="shard-3",
         sequence=sequence,
@@ -62,6 +70,25 @@ def _hot_ip_envelope(
         timestamp=T0,
         payload=payload,
     )
+
+
+def _payload(envelope: EventEnvelope[Any]) -> HotIpAdded | HotIpRemoved:
+    # decode() returns EventEnvelope[EventPayload], a union of all four
+    # payload types this codec knows -- every test in this file only ever
+    # decodes a HotIpAdded/HotIpRemoved envelope (built by _hot_ip_envelope
+    # above), so this narrows that back down for `.attributes` access.
+    payload = envelope.payload
+    assert isinstance(payload, HotIpAdded | HotIpRemoved)
+    return payload
+
+
+def _attributes(envelope: EventEnvelope[Any]) -> dict[str, object]:
+    # As `_payload` above, but for tests that index a specific key -- also
+    # narrows `attributes` itself away from `| None`, since every caller
+    # here already knows (by construction) that it built a non-None one.
+    attributes = _payload(envelope).attributes
+    assert attributes is not None
+    return attributes
 
 
 def _tamper_nested(data: bytes, *, path: tuple[object, ...], value: object) -> bytes:
@@ -97,9 +124,7 @@ class TestAttributesAbsentIsNonBreaking:
         assert "attributes" not in document["payload"]
 
     @pytest.mark.parametrize("event_type", _HOT_IP_EVENT_TYPES)
-    def test_explicit_none_matches_omitted_attributes_byte_for_byte(
-        self, event_type: str
-    ) -> None:
+    def test_explicit_none_matches_omitted_attributes_byte_for_byte(self, event_type: str) -> None:
         default_envelope = _hot_ip_envelope(event_type)
         explicit_envelope = _hot_ip_envelope(event_type, attributes=None)
         assert encode(default_envelope) == encode(explicit_envelope)
@@ -126,7 +151,7 @@ class TestAttributesAbsentIsNonBreaking:
     ) -> None:
         envelope = _hot_ip_envelope(event_type)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes is None
+        assert _payload(decoded).attributes is None
         assert decoded == envelope
 
 
@@ -135,7 +160,7 @@ class TestAttributesRoundTrip:
         attributes = {"attributes_version": 1, "weight": 500}
         envelope = _hot_ip_envelope("HotIpAdded", attributes=attributes)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes == attributes
+        assert _payload(decoded).attributes == attributes
 
     def test_valid_attributes_round_trip_exactly_on_hot_ip_removed(self) -> None:
         # Spec section 46.5: attributes on a HotIpRemoved MAY be logged (even
@@ -144,13 +169,13 @@ class TestAttributesRoundTrip:
         attributes = {"attributes_version": 1, "weight": 10}
         envelope = _hot_ip_envelope("HotIpRemoved", attributes=attributes)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes == attributes
+        assert _payload(decoded).attributes == attributes
 
     def test_minimal_document_of_only_attributes_version_round_trips(self) -> None:
         attributes = {"attributes_version": 1}
         envelope = _hot_ip_envelope("HotIpAdded", attributes=attributes)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes == attributes
+        assert _payload(decoded).attributes == attributes
 
 
 class TestAttributesVersionRequired:
@@ -165,9 +190,7 @@ class TestAttributesVersionRequired:
         self, attributes_version: int
     ) -> None:
         envelope = _hot_ip_envelope("HotIpAdded")
-        tampered = _with_attributes(
-            encode(envelope), {"attributes_version": attributes_version}
-        )
+        tampered = _with_attributes(encode(envelope), {"attributes_version": attributes_version})
         with pytest.raises(CodecError):
             decode(tampered)
 
@@ -178,14 +201,12 @@ class TestWeightBounds:
         attributes = {"attributes_version": 1, "weight": weight}
         envelope = _hot_ip_envelope("HotIpAdded", attributes=attributes)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes["weight"] == weight
+        assert _attributes(decoded)["weight"] == weight
 
     @pytest.mark.parametrize("weight", [-1, 1000001])
     def test_weight_outside_schema_bounds_is_rejected(self, weight: int) -> None:
         envelope = _hot_ip_envelope("HotIpAdded")
-        tampered = _with_attributes(
-            encode(envelope), {"attributes_version": 1, "weight": weight}
-        )
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "weight": weight})
         with pytest.raises(CodecError):
             decode(tampered)
 
@@ -196,13 +217,11 @@ class TestExperimentalKeys:
         ["a free-text experiment value", 12345, {"nested": ["any", "json", 1], "n": None}],
         ids=["string", "number", "nested-object"],
     )
-    def test_x_prefixed_keys_are_preserved_verbatim_for_any_json_value(
-        self, value: object
-    ) -> None:
+    def test_x_prefixed_keys_are_preserved_verbatim_for_any_json_value(self, value: object) -> None:
         attributes = {"attributes_version": 1, "x_experiment": value}
         envelope = _hot_ip_envelope("HotIpAdded", attributes=attributes)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes["x_experiment"] == value
+        assert _attributes(decoded)["x_experiment"] == value
 
     def test_x_prefixed_key_pattern_rejects_uppercase(self) -> None:
         # schemas/ip_attributes.v1.json patternProperties: ^x_[a-z0-9_]{1,48}$
@@ -237,9 +256,7 @@ class TestUnregisteredNamesRejected:
         # referenced from `properties`.
         envelope = _hot_ip_envelope("HotIpAdded")
         sources = [{"system": "hammertime.aggregator", "at": "2026-09-14T10:05:00Z"}]
-        tampered = _with_attributes(
-            encode(envelope), {"attributes_version": 1, "sources": sources}
-        )
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "sources": sources})
         with pytest.raises(CodecError):
             decode(tampered)
 
@@ -252,7 +269,7 @@ class TestKeyCountCap:
         assert len(attributes) == 16
         envelope = _hot_ip_envelope("HotIpAdded", attributes=attributes)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes == attributes
+        assert _payload(decoded).attributes == attributes
 
     def test_seventeen_keys_is_rejected(self) -> None:
         attributes: dict[str, Any] = {"attributes_version": 1}
@@ -285,7 +302,7 @@ class TestSerializedSizeCap:
         assert len(json.dumps(attributes)) <= 1024
         envelope = _hot_ip_envelope("HotIpAdded", attributes=attributes)
         decoded = decode(encode(envelope))
-        assert decoded.payload.attributes == attributes
+        assert _payload(decoded).attributes == attributes
 
 
 class TestMalformedAttributesShape:
@@ -297,8 +314,6 @@ class TestMalformedAttributesShape:
 
     def test_weight_of_wrong_type_is_rejected(self) -> None:
         envelope = _hot_ip_envelope("HotIpAdded")
-        tampered = _with_attributes(
-            encode(envelope), {"attributes_version": 1, "weight": "500"}
-        )
+        tampered = _with_attributes(encode(envelope), {"attributes_version": 1, "weight": "500"})
         with pytest.raises(CodecError):
             decode(tampered)

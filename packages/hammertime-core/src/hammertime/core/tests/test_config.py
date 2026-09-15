@@ -82,7 +82,9 @@ class TestWeightFunctionAndWeightMax:
     def test_accepts_the_only_registered_weight_function(self) -> None:
         DetectionConfig(weight_function="threshold_ratio")  # must not raise
 
-    @pytest.mark.parametrize("weight_function", ["", "THRESHOLD_RATIO", "made_up_function", "linear"])
+    @pytest.mark.parametrize(
+        "weight_function", ["", "THRESHOLD_RATIO", "made_up_function", "linear"]
+    )
     def test_rejects_unrecognized_weight_function(self, weight_function: str) -> None:
         with pytest.raises(ConfigurationError):
             DetectionConfig(weight_function=weight_function)

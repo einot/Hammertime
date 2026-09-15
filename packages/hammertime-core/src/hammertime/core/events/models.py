@@ -3,8 +3,6 @@
 Spec: section 4, section 19, section 32
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -37,6 +35,10 @@ class HotIpAdded:
     sequence: int
     window_count: int
     config_version: int
+    #: Optional descriptive per-IP attributes (schemas/ip_attributes.v1.json,
+    #: spec section 46, ADR-0005). Absent is equivalent to
+    #: {"attributes_version": 1}; never influences hot_count or hot_ratio.
+    attributes: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +48,9 @@ class HotIpRemoved:
     sequence: int
     window_count: int
     config_version: int
+    #: MAY be logged but MUST NOT be stored by the trie service (spec
+    #: section 46.5): a removal always deletes the attribute record.
+    attributes: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,6 +18,7 @@ escape: every failure mode -- unknown `event_type`, unknown/unsupported
 """
 
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -43,6 +44,17 @@ _KNOWN_EVENT_TYPES = frozenset({"RequestObservation", "PrefixStatsChanged"}) | _
 #: (services/ingest/src/hammertime/ingest/validation/limits.py) is not yet
 #: implemented, so this is currently the only place that bounds it.
 _MAX_OBSERVATIONS = 10_000
+
+# schemas/ip_attributes.v1.json (spec section 46, ADR-0005): registered
+# names, the experimental-namespace pattern, and the size/count caps.
+# Enforced here, not just by a separate jsonschema pass, because this codec
+# is used directly for internal bus messages that may not go through
+# schema validation.
+_REGISTERED_ATTRIBUTE_KEYS = frozenset({"attributes_version", "weight"})
+_EXPERIMENTAL_ATTRIBUTE_KEY = re.compile(r"^x_[a-z0-9_]{1,48}$")
+_MAX_ATTRIBUTES_BYTES = 1024
+_MAX_ATTRIBUTES_KEYS = 16
+_MAX_WEIGHT = 1_000_000
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -113,8 +125,58 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
         raise CodecError(f"malformed RequestObservation payload: {data!r}") from exc
 
 
+def _validate_attributes(attributes: Any) -> None:
+    """Enforce schemas/ip_attributes.v1.json's shape and size caps.
+
+    Spec section 46, ADR-0005. Applied on both the encode and decode paths.
+    """
+    if not isinstance(attributes, dict):
+        raise CodecError(f"attributes must be a JSON object, got {type(attributes).__name__}")
+
+    if len(attributes) > _MAX_ATTRIBUTES_KEYS:
+        raise CodecError(
+            f"attributes has {len(attributes)} keys, exceeding the maximum of "
+            f"{_MAX_ATTRIBUTES_KEYS} (schemas/ip_attributes.v1.json maxProperties)"
+        )
+
+    for key in attributes:
+        if key in _REGISTERED_ATTRIBUTE_KEYS or _EXPERIMENTAL_ATTRIBUTE_KEY.fullmatch(key):
+            continue
+        raise CodecError(
+            f"attributes has unregistered key {key!r}: must be one of "
+            f"{sorted(_REGISTERED_ATTRIBUTE_KEYS)} or match ^x_[a-z0-9_]{{1,48}}$"
+        )
+
+    version = attributes.get("attributes_version")
+    if version is None:
+        raise CodecError("attributes missing required field: attributes_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise CodecError(f"attributes.attributes_version must be an integer >= 1, got {version!r}")
+
+    if "weight" in attributes:
+        weight = attributes["weight"]
+        if (
+            isinstance(weight, bool)
+            or not isinstance(weight, int)
+            or not 0 <= weight <= _MAX_WEIGHT
+        ):
+            raise CodecError(
+                f"attributes.weight must be an integer in [0, {_MAX_WEIGHT}], got {weight!r}"
+            )
+
+    try:
+        size = len(json.dumps(attributes, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise CodecError(f"attributes could not be serialized: {exc}") from exc
+    if size > _MAX_ATTRIBUTES_BYTES:
+        raise CodecError(
+            f"attributes is {size} bytes serialized, exceeding the maximum of "
+            f"{_MAX_ATTRIBUTES_BYTES} (schemas/ip_attributes.v1.json)"
+        )
+
+
 def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) -> dict[str, Any]:
-    return {
+    document: dict[str, Any] = {
         "type": event_type,
         "ip": str(payload.ip),
         "family": payload.ip.family.value,
@@ -123,6 +185,10 @@ def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) ->
         "window_count": payload.window_count,
         "config_version": payload.config_version,
     }
+    if payload.attributes is not None:
+        _validate_attributes(payload.attributes)
+        document["attributes"] = payload.attributes
+    return document
 
 
 def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | HotIpRemoved:
@@ -135,6 +201,12 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
     except (TypeError, ValueError, InvalidAddressError) as exc:
         raise CodecError(f"malformed {event_type} payload: {data!r}") from exc
 
+    raw_attributes = data.get("attributes")
+    attributes: dict[str, object] | None = None
+    if raw_attributes is not None:
+        _validate_attributes(raw_attributes)
+        attributes = raw_attributes
+
     if event_type == "HotIpAdded":
         return HotIpAdded(
             ip=ip,
@@ -142,6 +214,7 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
             sequence=sequence,
             window_count=window_count,
             config_version=config_version,
+            attributes=attributes,
         )
     return HotIpRemoved(
         ip=ip,
@@ -149,6 +222,7 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
         sequence=sequence,
         window_count=window_count,
         config_version=config_version,
+        attributes=attributes,
     )
 
 
