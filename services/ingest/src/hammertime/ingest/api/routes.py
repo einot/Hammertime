@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 
 import pydantic
 from fastapi import APIRouter, HTTPException, Request, Response
-from hammertime.core.addressing.address import Address
 from hammertime.core.errors import InvalidAddressError
 from hammertime.core.events.models import Observation, RequestObservation
 from hammertime.ingest.api.schemas import HealthStatus, ObservationAccepted, ObservationRequest
@@ -24,6 +23,7 @@ from hammertime.ingest.validation import (
     RequestLimitExceededError,
     SchemaValidationError,
 )
+from hammertime.ingest.validation.addresses import parse_address
 from hammertime.ingest.validation.limits import (
     check_body_size,
     check_observation_count,
@@ -73,7 +73,7 @@ def _to_request_observation(
     check_window_alignment(window_start, bucket_seconds=bucket_seconds)
 
     observations = tuple(
-        Observation(ip=Address.parse(entry.ip), request_count=entry.request_count)
+        Observation(ip=parse_address(entry.ip), request_count=entry.request_count)
         for entry in payload.observations
     )
     return RequestObservation(
