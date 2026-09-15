@@ -36,11 +36,12 @@ it, per this repo's test-author convention):
 """
 
 from collections.abc import Iterable
+from pathlib import Path
 
 import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
-from hammertime.core.errors import HammertimeError
+from hammertime.core.errors import ConfigurationError, HammertimeError
 from hammertime.ingest.auth import (
     AgentAuthError,
     AgentDisabledError,
@@ -49,7 +50,12 @@ from hammertime.ingest.auth import (
     InvalidCredentialError,
     UnknownAgentError,
 )
-from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
+from hammertime.ingest.auth.agents import (
+    AgentRecord,
+    AgentRegistry,
+    load_agent_registry_document,
+    load_agent_registry_file,
+)
 from hammertime.ingest.auth.middleware import require_agent
 
 KNOWN_AGENT_ID = "edge-17"
@@ -128,6 +134,16 @@ class TestIncorrectCredential:
         # known agent presenting the wrong secret is authenticated-as
         # nobody, i.e. known identity, denied access, not "who are you".
         assert issubclass(InvalidCredentialError, AuthorizationError)
+
+    def test_non_ascii_token_is_rejected_cleanly_not_a_crash(self) -> None:
+        # Regression: hmac.compare_digest raises TypeError for a non-ASCII
+        # str, and Starlette decodes raw header bytes as latin-1, so any
+        # Authorization header byte >= 0x80 reaching here used to crash
+        # with an uncaught TypeError instead of a clean InvalidCredentialError.
+        registry = _registry(_known_agent())
+
+        with pytest.raises(InvalidCredentialError):
+            registry.authenticate(KNOWN_AGENT_ID, "caf\xe9-not-the-token")
 
 
 class TestDisabledAgent:
@@ -299,3 +315,59 @@ class TestRequireAgentDependency:
         )
 
         assert response.status_code == 403
+
+    def test_non_ascii_authorization_header_is_403_not_a_crash(self) -> None:
+        # Same regression as TestIncorrectCredential, exercised through the
+        # actual HTTP dependency rather than calling authenticate() directly.
+        # httpx's TestClient rejects a plain non-ASCII str header value
+        # outright (it insists on ascii-encoding str header values itself),
+        # so the header value is passed pre-encoded as latin-1 bytes here --
+        # matching what Starlette actually hands the app for a raw
+        # Authorization header byte >= 0x80 on the wire.
+        client = TestClient(_app(_registry(_known_agent())))
+
+        response = client.get(
+            "/whoami",
+            headers={
+                "X-Agent-Id": KNOWN_AGENT_ID,
+                "Authorization": "Bearer caf\xe9-not-the-token".encode("latin-1"),
+            },
+        )
+
+        assert response.status_code == 403
+
+
+class TestRegistryLoading:
+    # load_agent_registry_document/_file is the production JSON-loading
+    # path (load_agent_registry, not exercised here to avoid a real env
+    # var / disk dependency) -- these tests target it directly.
+
+    def test_duplicate_token_across_two_agents_is_rejected(self) -> None:
+        document = {
+            "edge-1": {"token": "shared-token"},
+            "edge-2": {"token": "shared-token"},
+        }
+
+        with pytest.raises(ConfigurationError, match="share the same token"):
+            load_agent_registry_document(document)
+
+    def test_distinct_tokens_across_agents_are_accepted(self) -> None:
+        document = {
+            "edge-1": {"token": "token-one"},
+            "edge-2": {"token": "token-two"},
+        }
+
+        registry = load_agent_registry_document(document)
+
+        assert registry.get("edge-1") is not None
+        assert registry.get("edge-2") is not None
+
+    def test_non_utf8_registry_file_is_a_clean_configuration_error(self, tmp_path: Path) -> None:
+        # Regression: Path.read_text() raises UnicodeDecodeError for
+        # non-UTF-8 bytes, which used to propagate uncaught instead of the
+        # module's documented ConfigurationError contract.
+        bad_file = tmp_path / "agents.json"
+        bad_file.write_bytes(b"\xff\xfe{not valid utf-8")
+
+        with pytest.raises(ConfigurationError):
+            load_agent_registry_file(bad_file)

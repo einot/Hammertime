@@ -14,7 +14,12 @@ issue.
 agent") or 403 ("unauthorized agent"). This module treats a missing/unknown
 `agent_id` as 401, and a known agent with a wrong or disabled credential as
 403 -- see `hammertime.ingest.auth`'s exception hierarchy for the exact
-split.
+split. This does mean an unauthenticated caller can distinguish "no such
+agent" from "wrong credential for a real agent", which in principle lets
+someone enumerate valid `agent_id`s without ever presenting a correct
+token; the protocol doc's own response table lists both codes as the
+answer for this one case, so this repo's spec already calls for that
+split rather than collapsing both outcomes into a single generic 401.
 
 Message-identity replay protection (spec section 23: `(agent_id, sequence)`
 dedup) is *not* implemented here -- that is issue #32's
@@ -28,6 +33,16 @@ dedup/service.py.
 Not wired into `api/routes.py`: that integration is issue #32's job, once
 rate limiting (#29) and the store issues have landed. `require_agent`
 below is meant to be usable standalone, e.g. `Depends(require_agent(registry))`.
+
+Integration contract for #32 (not enforced by this module itself, since it
+has no visibility into the request body): the `agent_id` this dependency
+returns -- the header-authenticated identity -- MUST be the only `agent_id`
+used for every downstream decision (rate limiting, dedup, published event
+attribution). If the request body also carries an `agent_id` field (per
+`schemas/observation.v1.json`), #32 MUST reject the request if it disagrees
+with the authenticated identity rather than trusting the body's value --
+otherwise an authenticated agent could submit a body claiming to be a
+*different* agent and desync that agent's dedup/rate-limit state.
 """
 
 from collections.abc import Callable

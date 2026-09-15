@@ -65,8 +65,12 @@ class AgentRegistry:
         if record is None:
             raise UnknownAgentError(f"no registered agent {agent_id!r}")
         # Constant-time comparison: token equality must not leak timing
-        # information about how many leading bytes matched.
-        if not hmac.compare_digest(record.token, token):
+        # information about how many leading bytes matched. Compared as
+        # bytes (utf-8), not str: hmac.compare_digest raises TypeError for
+        # a non-ASCII str, and Starlette decodes header bytes as latin-1,
+        # so any raw Authorization header byte >= 0x80 would otherwise
+        # crash this with an uncaught TypeError instead of a clean 401/403.
+        if not hmac.compare_digest(record.token.encode("utf-8"), token.encode("utf-8")):
             raise InvalidCredentialError(f"credential mismatch for agent {agent_id!r}")
         if not record.enabled:
             raise AgentDisabledError(f"agent {agent_id!r} is disabled")
@@ -113,6 +117,20 @@ def load_agent_registry_document(document: Any) -> AgentRegistry:
     if not isinstance(document, dict):
         raise ConfigurationError("agent registry document must be a JSON object keyed by agent_id")
     records = [_record_from_document(agent_id, fields) for agent_id, fields in document.items()]
+
+    # A copy-pasted entry that forgot to change its token would otherwise
+    # silently let one credential authenticate as multiple agent
+    # identities, defeating per-agent authorization/rate-limit/dedup
+    # boundaries -- catch it at load time instead.
+    seen_tokens: dict[str, str] = {}
+    for record in records:
+        earlier_agent_id = seen_tokens.get(record.token)
+        if earlier_agent_id is not None:
+            raise ConfigurationError(
+                f"agents {earlier_agent_id!r} and {record.agent_id!r} share the same token"
+            )
+        seen_tokens[record.token] = record.agent_id
+
     return AgentRegistry.from_records(records)
 
 
@@ -122,6 +140,8 @@ def load_agent_registry_file(path: Path) -> AgentRegistry:
         raw = path.read_text()
     except OSError as exc:
         raise ConfigurationError(f"cannot read agent registry at {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigurationError(f"agent registry at {path} is not valid UTF-8: {exc}") from exc
 
     try:
         document = json.loads(raw)
