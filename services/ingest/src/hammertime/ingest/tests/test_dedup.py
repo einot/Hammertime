@@ -60,6 +60,7 @@ required `key_prefix`), only `_store()` below should need to change.
 import asyncio
 
 import fakeredis.aioredis
+import pytest
 from hammertime.store.interface import DedupStore
 from hammertime.store.redis import RedisDedupStore
 
@@ -83,6 +84,18 @@ class TestProtocolConformance:
         store, _client = _store()
 
         assert isinstance(store, DedupStore)
+
+
+class TestInvalidTtl:
+    @pytest.mark.parametrize("ttl_seconds", [0, -1])
+    async def test_non_positive_ttl_seconds_is_rejected(self, ttl_seconds: int) -> None:
+        # Redis's SET ... EX rejects a non-positive expiry with a raw
+        # ResponseError; mark_seen must fail closed with a clear error
+        # instead of leaking that server-side detail.
+        store, _client = _store()
+
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            await store.mark_seen("agent-1", 1, ttl_seconds=ttl_seconds)
 
 
 class TestFirstSeen:
@@ -265,5 +278,43 @@ class TestTtlExpiry:
         await store.mark_seen("agent-1", 1, ttl_seconds=5)
         # Past the first call's 1s ttl; within the second call's 5s ttl.
         await asyncio.sleep(1.3)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+
+class _ExpireAlwaysFalsyClient:
+    """Wraps a real client but makes every `expire()` call report failure.
+
+    Simulates the race `redis.py`'s `mark_seen` must guard against: the
+    existing key's TTL lapsing between a failed `SET ... NX` and the
+    following `EXPIRE ... GT` -- from this test's perspective, indistinguishable
+    from `EXPIRE` simply reporting "no such key" for any other reason. A real
+    client's `EXPIRE` on a vanished key also returns falsy, so this is a
+    faithful (if deterministic, rather than timing-dependent) stand-in for
+    that race, without needing a real sleep to provoke it.
+    """
+
+    def __init__(self, client: fakeredis.aioredis.FakeRedis) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._client, name)
+
+    async def expire(self, *args: object, **kwargs: object) -> bool:
+        return False
+
+
+class TestExpireRaceRecovery:
+    async def test_mark_seen_still_marks_the_pair_when_expire_reports_no_such_key(self) -> None:
+        # Regression: if EXPIRE's falsy return (whatever the cause) were
+        # ignored, this mark_seen call would silently do nothing, and the
+        # pair would wrongly report as not seen.
+        real_client = fakeredis.aioredis.FakeRedis()
+        store = RedisDedupStore(_ExpireAlwaysFalsyClient(real_client))  # type: ignore[arg-type]
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+        # A second call takes the "key already existed" branch, where EXPIRE
+        # is forced to report failure.
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
 
         assert await store.has_seen("agent-1", 1) is True
