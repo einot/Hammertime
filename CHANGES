@@ -1,0 +1,2 @@
+Add in-memory and Kafka-backed message bus (Producer/Consumer) with a canonical topic registry (hammertime.hot-ip.v1, observations, observations-reconciliation, prefix-stats), keyed by IP except prefix-stats which is keyed by prefix
+Add event envelope and JSON codec for RequestObservation/HotIpAdded/HotIpRemoved/PrefixStatsChanged, with a deterministic event_id derived from (agent_id, sequence, event_type) for idempotent redelivery
