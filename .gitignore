@@ -17,3 +17,4 @@ data/
 snapshots/
 *.snap
 .DS_Store
+.claude/worktrees/
