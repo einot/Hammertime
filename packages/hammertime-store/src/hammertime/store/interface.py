@@ -33,6 +33,17 @@ class DedupStore(Protocol):
 
         Ingest MUST call this before publishing an observation and reject the
         message as a duplicate if it returns `True` (spec section 23).
+
+        `has_seen` then `mark_seen` is NOT atomic: two concurrent requests for
+        the same `(agent_id, sequence)` can both observe `False` before either
+        calls `mark_seen`, letting both proceed. Implementations of this
+        Protocol are not required to close that window on their own (a real
+        backend, e.g. issue #31's Redis store, MAY offer a stronger atomic
+        check-and-set operation of its own, but that is not part of this
+        Protocol today). A caller that must prevent this needs its own
+        serialization (e.g. per-agent locking, or a single-writer request
+        path) -- tracked for issue #32, which is the first caller to actually
+        wire `has_seen`/`mark_seen` together against live traffic.
         """
         ...
 

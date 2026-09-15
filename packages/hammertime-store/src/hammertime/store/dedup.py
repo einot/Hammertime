@@ -28,9 +28,17 @@ from dataclasses import dataclass, field
 #: agent's sequence numbers never closes (a permanently skipped sequence,
 #: rather than a merely-delayed one), sequences seen ahead of that gap would
 #: otherwise accumulate forever. Once the set exceeds this size, the window
-#: abandons the oldest open gap and fast-forwards the high-water mark past
-#: it, trading a small window of missed dedup coverage for a hard memory
-#: bound (spec section 26).
+#: drops its single oldest tracked sequence to make room, trading dedup
+#: coverage for *that one sequence* for a hard memory bound (spec section
+#: 26). Deliberately NOT "fast-forward the high-water mark past the whole
+#: abandoned gap": doing so would make every sequence below the new mark
+#: report as "seen", including the (likely enormous) range of sequences the
+#: agent never actually sent -- silently rejecting the agent's own later,
+#: genuinely-first-time observations in that range as false duplicates. A
+#: dropped single sequence can, in the worst case, be double-counted if its
+#: original message is retried after eviction; that is a much narrower and
+#: less harmful failure than manufacturing false duplicates across an
+#: entire unobserved range.
 DEFAULT_MAX_OUT_OF_ORDER = 10_000
 
 
@@ -61,31 +69,44 @@ class SequenceWindow:
     """Tracks which sequence numbers have been seen for a single agent.
 
     `high_water_mark` is the highest sequence for which every sequence
-    `<= high_water_mark` is considered seen. `contains()`/`add()` treat that
-    as permanent: an agent's sequence numbers are expected to be monotonic
-    (spec section 23), so once the mark passes a sequence it is not expected
-    to be legitimately reused. (An agent restarting with a lower starting
-    sequence than one it used before is out of scope here -- the mark would
-    treat the lower, genuinely-new sequence as a duplicate. Nothing in the
-    spec addresses agent sequence resets.)
+    `<= high_water_mark` is considered part of the confirmed contiguous run
+    from 0 (spec section 23: sequences start at 0, per
+    `schemas/observation.v1.json`'s `minimum: 0`). It starts at `-1` --
+    "nothing confirmed yet" -- rather than being unset, so that the very
+    first sequence an agent sends is handled exactly like any other
+    sequence: it only advances the mark directly if it *is* 0 (the
+    contiguous run's first member); any other value, including an agent's
+    first-ever message arriving as e.g. sequence 10, goes into the
+    out-of-order set like a normal gap, per this class's own out-of-order
+    design, rather than incorrectly establishing sequences 0-9 as already
+    seen. (A prior version of this class special-cased "first sequence
+    ever added" to set the mark directly, which had exactly that bug: an
+    agent's first observed message being out of order -- plausible after
+    an ingest restart with a fresh in-memory store -- would silently treat
+    every lower sequence as a duplicate it had never actually seen.)
+
+    `contains()`/`add()` treat the mark as permanent: an agent's sequence
+    numbers are expected to be monotonic (spec section 23), so once the
+    mark passes a sequence it is not expected to be legitimately reused.
+    (An agent restarting with a lower starting sequence than one it used
+    before is out of scope here -- the mark would treat the lower,
+    genuinely-new sequence as a duplicate. Nothing in the spec addresses
+    agent sequence resets.)
     """
 
-    high_water_mark: int | None = None
+    high_water_mark: int = -1
     max_out_of_order: int = DEFAULT_MAX_OUT_OF_ORDER
     _ahead: set[int] = field(default_factory=set)
 
     def contains(self, sequence: int) -> bool:
         """Whether `sequence` has already been recorded via `add()`."""
-        if self.high_water_mark is not None and sequence <= self.high_water_mark:
+        if sequence <= self.high_water_mark:
             return True
         return sequence in self._ahead
 
     def add(self, sequence: int) -> None:
         """Record `sequence` as seen. A no-op if already seen."""
         if self.contains(sequence):
-            return
-        if self.high_water_mark is None:
-            self.high_water_mark = sequence
             return
         if sequence == self.high_water_mark + 1:
             self.high_water_mark = sequence
@@ -96,7 +117,6 @@ class SequenceWindow:
 
     def _fold_contiguous_run(self) -> None:
         """Advance the mark through any already-seen sequences right after it."""
-        assert self.high_water_mark is not None
         next_sequence = self.high_water_mark + 1
         while next_sequence in self._ahead:
             self._ahead.discard(next_sequence)
@@ -104,12 +124,13 @@ class SequenceWindow:
             next_sequence += 1
 
     def _bound_out_of_order_set(self) -> None:
-        if len(self._ahead) <= self.max_out_of_order:
-            return
-        # Abandon the oldest open gap so the set cannot grow without bound.
-        self.high_water_mark = min(self._ahead)
-        self._ahead.discard(self.high_water_mark)
-        self._fold_contiguous_run()
+        # Drop the single oldest tracked sequence rather than advancing
+        # high_water_mark: see DEFAULT_MAX_OUT_OF_ORDER's docstring for why
+        # fast-forwarding the mark across the whole abandoned gap would be
+        # far worse (it would falsely mark every never-seen sequence below
+        # the new mark as a duplicate, not just the abandoned one).
+        if len(self._ahead) > self.max_out_of_order:
+            self._ahead.discard(min(self._ahead))
 
     @property
     def out_of_order_count(self) -> int:
