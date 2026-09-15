@@ -25,3 +25,13 @@ class LateEventError(HammertimeError):
 
 class InvariantViolation(HammertimeError):
     """A structural invariant was broken, e.g. hot_count < 0 (spec section 12)."""
+
+
+class CodecError(HammertimeError):
+    """An event envelope could not be encoded or decoded.
+
+    Covers an unknown `event_type`, an unknown or unsupported
+    `schema_version`, and malformed/undecodable bytes (spec section 19,
+    spec section 32) -- callers should never see a raw `json.JSONDecodeError`
+    or `KeyError` escape the codec.
+    """

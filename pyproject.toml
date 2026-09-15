@@ -59,3 +59,11 @@ mypy_path = [
     "tools/replay/src",
     "tools/trie-inspect/src",
 ]
+
+[[tool.mypy.overrides]]
+# aiokafka ships no inline types and no third-party stub package; the Kafka
+# transport (packages/hammertime-bus/src/hammertime/bus/kafka.py) needs a
+# live broker to exercise (epic #17), so there is no unit-test pressure to
+# add local stubs either.
+module = "aiokafka.*"
+ignore_missing_imports = true
