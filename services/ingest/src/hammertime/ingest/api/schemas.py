@@ -39,9 +39,15 @@ class ObservationRequest(BaseModel):
 
 
 class ObservationAccepted(BaseModel):
-    """202 response body: accepted, but not yet published (Epic #4 wires publishing)."""
+    """202 response body: accepted and durably published (docs/protocol/observation-v1.md)."""
 
     status: Literal["accepted"] = "accepted"
+
+
+class ObservationDuplicate(BaseModel):
+    """200 response body: `(agent_id, sequence)` was already accepted; no action taken."""
+
+    status: Literal["duplicate"] = "duplicate"
 
 
 class HealthStatus(BaseModel):

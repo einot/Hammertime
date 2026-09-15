@@ -80,8 +80,9 @@ from fastapi.testclient import TestClient
 from hammertime.bus.memory import InMemoryBus
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.core.addressing.address import Address
-from hammertime.core.events.codec import decode
+from hammertime.core.events.codec import EventPayload, decode
 from hammertime.core.events.envelope import EventEnvelope
+from hammertime.core.events.models import RequestObservation
 from hammertime.core.time.clock import ManualClock
 from hammertime.ingest.app import create_app
 from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
@@ -106,9 +107,7 @@ OTHER_AGENT_TOKEN = "other-s3cr3t-token"
 _AMPLE_RATE_LIMIT_RPS = 1_000
 
 
-def _agent(
-    agent_id: str, token: str, *, rate_limit_rps: int, enabled: bool = True
-) -> AgentRecord:
+def _agent(agent_id: str, token: str, *, rate_limit_rps: int, enabled: bool = True) -> AgentRecord:
     return AgentRecord(
         agent_id=agent_id, token=token, enabled=enabled, rate_limit_rps=rate_limit_rps
     )
@@ -121,6 +120,16 @@ def _settings(**overrides: object) -> IngestSettings:
         "max_body_bytes": 1_048_576,
         "max_observations": 10_000,
         "detection_config_path": _CONFIG_PATH,
+        # rate_limit_rps/agents_path/bus_kind/bus_brokers/store_kind/redis_url
+        # are all unused by _build_app below -- it injects agent_registry,
+        # rate_limiter, dedup_store, and bus directly instead -- but
+        # IngestSettings requires every field regardless.
+        "rate_limit_rps": _AMPLE_RATE_LIMIT_RPS,
+        "agents_path": Path("unused -- agent_registry is injected directly"),
+        "bus_kind": "memory",
+        "bus_brokers": "",
+        "store_kind": "memory",
+        "redis_url": "",
     }
     fields.update(overrides)
     return IngestSettings(**fields)  # type: ignore[arg-type]
@@ -149,7 +158,13 @@ def _build_app(
         dedup_store=MemoryDedupStore(clock=resolved_clock),
         bus=bus,
     )
-    return TestClient(app), bus
+    # __enter__ (not a bare TestClient(app)) runs the app's lifespan, which
+    # is what actually populates request.app.state.ingest -- every route
+    # handler depends on it. Deliberately not paired with __exit__: these
+    # are short-lived, per-test clients with no external resources (the
+    # in-memory bus/store need no teardown), and callers here call
+    # client.post(...) directly rather than via `with`.
+    return TestClient(app).__enter__(), bus
 
 
 def _headers(agent_id: str, token: str) -> dict[str, str]:
@@ -195,7 +210,7 @@ def _topic_records(
 
 def _decoded_records(
     bus: InMemoryBus, topic: str = OBSERVATIONS.name
-) -> list[tuple[bytes | None, EventEnvelope]]:
+) -> list[tuple[bytes | None, EventEnvelope[EventPayload]]]:
     return [(key, decode(value)) for key, value in _topic_records(bus, topic)]
 
 
@@ -203,13 +218,23 @@ def _canonical(ip_text: str) -> str:
     return str(Address.parse(ip_text))
 
 
+def _as_request_observation(envelope: EventEnvelope[EventPayload]) -> RequestObservation:
+    # Every message this file decodes comes off hammertime.observations.v1,
+    # which per ADR-0004 only ever carries single-entry RequestObservation
+    # payloads -- narrows the codec's general EventPayload union so callers
+    # can access RequestObservation-specific fields without a mypy complaint.
+    payload = envelope.payload
+    assert isinstance(payload, RequestObservation)
+    return payload
+
+
 class TestAuthGateRunsBeforeValidation:
     """auth MUST run before the body is even parsed (spec section 36)."""
 
-    def _invalid_body(self) -> dict[str, object]:
+    def _invalid_body(self, *, agent_id: str = KNOWN_AGENT_ID) -> dict[str, object]:
         # Malformed IP: on its own, always a 400 (test_routes.py already
         # covers that). Used here only to prove auth short-circuits first.
-        return _body(observations=[{"ip": "not-an-ip", "request_count": 1}])
+        return _body(agent_id=agent_id, observations=[{"ip": "not-an-ip", "request_count": 1}])
 
     def test_no_credentials_at_all_with_invalid_body_is_401_not_400(self) -> None:
         client, _bus = _build_app()
@@ -346,7 +371,7 @@ class TestValidRequestFansOutPerDistinctIP:
             assert key_text in by_ip
             seen_ips.add(key_text)
 
-            payload = envelope.payload
+            payload = _as_request_observation(envelope)
             assert payload.agent_id == KNOWN_AGENT_ID  # the *authenticated* agent_id
             assert payload.sequence == 1
             assert payload.window_start == WINDOW_START
@@ -387,8 +412,9 @@ class TestDuplicateIpsWithinOneRequestAreCoalesced:
         expected_ip = _canonical("10.0.0.5")
         assert key is not None
         assert key.decode("utf-8") == expected_ip
-        assert len(envelope.payload.observations) == 1
-        entry = envelope.payload.observations[0]
+        payload = _as_request_observation(envelope)
+        assert len(payload.observations) == 1
+        entry = payload.observations[0]
         assert str(entry.ip) == expected_ip
         assert entry.request_count == 10  # 4 + 6, additive deltas
 
@@ -426,7 +452,7 @@ class TestIpv6SpellingsCoalesceIntoOneGroup:
         expected_ip = _canonical(compact)
         assert key is not None
         assert key.decode("utf-8") == expected_ip
-        entry = envelope.payload.observations[0]
+        entry = _as_request_observation(envelope).observations[0]
         assert entry.request_count == 7
 
 

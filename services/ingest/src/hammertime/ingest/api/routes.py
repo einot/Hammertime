@@ -1,12 +1,11 @@
 """POST /v1/observations, GET /healthz, GET /metrics.
 
-Spec: section 4, section 37
+Spec: section 4, section 36, section 37; docs/protocol/observation-v1.md; ADR-0004
 
-No agent authentication/authorization, rate limiting, dedup, or bus
-publishing here -- that is Epic #4's territory. A request that passes
-validation is accepted (202, per docs/protocol/observation-v1.md's response
-table) but nothing is actually published behind it yet; that is an
-intentional, documented gap, not a bug.
+Pipeline for `POST /v1/observations`, per the protocol doc's response
+table: agent authentication (`Depends`, runs before the body is read) ->
+per-agent rate limiting -> body/schema/domain validation (unchanged from
+Epic #3) -> dedup check -> per-IP bus publish -> dedup mark-seen -> 202.
 """
 
 import json
@@ -14,10 +13,18 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pydantic
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from hammertime.core.errors import InvalidAddressError
 from hammertime.core.events.models import Observation, RequestObservation
-from hammertime.ingest.api.schemas import HealthStatus, ObservationAccepted, ObservationRequest
+from hammertime.ingest.api.schemas import (
+    HealthStatus,
+    ObservationAccepted,
+    ObservationDuplicate,
+    ObservationRequest,
+)
+from hammertime.ingest.publisher import RequestCountOverflowError
+from hammertime.ingest.ratelimit import RateLimitExceeded
 from hammertime.ingest.validation import (
     BodyTooLargeError,
     IngestValidationError,
@@ -43,6 +50,20 @@ def _get_ingest_state(request: Request) -> "IngestState":
     return request.app.state.ingest  # type: ignore[no-any-return]
 
 
+def _authenticate(request: Request) -> str:
+    """Auth dependency: delegate to the `require_agent` closure built once at startup.
+
+    `IngestState.authenticate` is `require_agent(registry)`, built exactly
+    once in `app.py`'s lifespan (not rebuilt per request) -- this function
+    just invokes it, mirroring `_get_ingest_state`'s "read singletons off
+    `request.app.state`" convention. It raises `HTTPException(401)`/
+    `HTTPException(403)` itself (see `auth/middleware.py`) and never touches
+    the request body, so a FastAPI `Depends` on this runs -- and can reject
+    the request -- before the body is read.
+    """
+    return _get_ingest_state(request).authenticate(request)
+
+
 async def _read_body_within_limit(request: Request, *, max_body_bytes: int) -> bytes:
     """Read the request body without ever buffering more than `max_body_bytes`.
 
@@ -51,8 +72,9 @@ async def _read_body_within_limit(request: Request, *, max_body_bytes: int) -> b
     late to bound memory usage -- an attacker with no Content-Length
     accuracy requirement (or none at all, under chunked transfer encoding)
     can already have forced an arbitrarily large allocation by the time that
-    check runs. No agent auth/rate limiting exists yet (Epic #4), so this is
-    currently the only line of defense against an oversized body (spec
+    check runs. This runs after auth and rate limiting (both header-only,
+    body-free checks), but is still the line of defense against an
+    oversized body from an authenticated, rate-limit-passing caller (spec
     section 36's "request size limits") and it must actually bound memory,
     not just reject after the fact.
 
@@ -128,9 +150,22 @@ def _to_request_observation(
 
 
 @router.post("/v1/observations", status_code=202, response_model=ObservationAccepted)
-async def create_observation(request: Request) -> ObservationAccepted:
+async def create_observation(
+    request: Request, agent_id: str = Depends(_authenticate)
+) -> ObservationAccepted | JSONResponse:
     state = _get_ingest_state(request)
     settings = state.settings
+
+    agent_record = state.registry.get(agent_id)
+    effective_limit_rps = (
+        agent_record.rate_limit_rps
+        if agent_record is not None and agent_record.rate_limit_rps is not None
+        else settings.rate_limit_rps
+    )
+    try:
+        state.rate_limiter.check(agent_id, effective_limit_rps)
+    except RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     try:
         body = await _read_body_within_limit(request, max_body_bytes=settings.max_body_bytes)
@@ -182,13 +217,51 @@ async def create_observation(request: Request) -> ObservationAccepted:
             status_code=400, detail=f"observation payload is invalid: {exc}"
         ) from exc
 
+    if payload.agent_id != agent_id:
+        # auth/middleware.py's integration-contract note: the authenticated
+        # identity is the only agent_id ever used downstream. A body that
+        # claims to be a *different* agent than the one that authenticated
+        # the request must be rejected outright, not silently trusted --
+        # otherwise an authenticated agent could desync another agent's
+        # dedup/rate-limit state.
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"request body agent_id {payload.agent_id!r} does not match the "
+                f"authenticated agent {agent_id!r}"
+            ),
+        )
+
     try:
-        _to_request_observation(payload, bucket_seconds=state.bucket_seconds)
+        observation = _to_request_observation(payload, bucket_seconds=state.bucket_seconds)
     except (IngestValidationError, InvalidAddressError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Epic #4 wires dedup and bus publishing; a validated observation is not
-    # actually published anywhere yet.
+    if await state.dedup.is_duplicate(agent_id, observation.sequence):
+        # docs/protocol/observation-v1.md: 200, previously accepted, no
+        # action taken. Returned via a plain JSONResponse rather than the
+        # route's declared 202 response_model, so the status code and body
+        # shape can both differ from the accepted case.
+        return JSONResponse(status_code=200, content=ObservationDuplicate().model_dump())
+
+    try:
+        await state.publisher.publish(observation)
+    except RequestCountOverflowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        # ADR-0004 §5: publish-then-mark. Anything the bus producer raises
+        # here means the batch is not durably recorded -- mark_seen must
+        # NOT be called, so a retry with the same sequence is not treated
+        # as a duplicate and cleanly republishes (docs/protocol/observation-v1.md's
+        # 503 row).
+        raise HTTPException(
+            status_code=503, detail=f"failed to publish observation: {exc}"
+        ) from exc
+
+    await state.dedup.mark_seen(
+        agent_id, observation.sequence, window_seconds=observation.window_seconds
+    )
+
     return ObservationAccepted()
 
 
