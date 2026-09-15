@@ -31,3 +31,14 @@ implementation code directly — delegate it to `coder`. Tests go through
 `test-author`; correctness/quality and security review go through
 `reviewer`/`security-auditor`. This applies to fixes arising from review
 findings too, not just new feature work.
+
+**Pre-1.0 exception:** until the first release (1.0) ships, the top-level
+session may finish and merge PRs itself — resolving merge conflicts
+(including regenerating lockfiles with the repo's own tooling, never by
+hand), pushing the resolution, and merging — without delegating that work.
+This does not extend to designing the change being merged, only to landing
+it. Before merging, the full suite must pass (`uv run pytest -q`, `ruff
+check`, `ruff format --check`, `mypy`); the known pre-existing `integration`
+CI gap (empty `tests/integration`/`tests/e2e`, tracked in #26) is the one
+standing exception until it's fixed — once it starts passing, hold every
+merge to that bar too.
