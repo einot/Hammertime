@@ -36,6 +36,8 @@ dev = [
     "mypy>=1.11",
     "pytest-benchmark>=4",
     "fakeredis>=2.20",
+    "types-jsonschema>=4.23",
+    "httpx>=0.27",
 ]
 
 [tool.pytest.ini_options]
