@@ -23,6 +23,13 @@
 * `(agent_id, sequence)` is the message identity. Resending an identical message
   is a no-op (§23).
 * Agents never assert state. `"state": "HOT"` in a payload is a schema violation (§36).
+* A message is accepted or rejected as a whole; entries are never partially
+  applied. If the same IP appears more than once in `observations`, the counts
+  are summed (deltas are additive) — ingest does not reject the message for it,
+  and does not apply it twice (ADR-0004).
+* Internally, ingest fans the batch out into one event per IP so each IP is
+  owned by a single shard (§20). This is invisible to the agent except that a
+  `202` is returned only once *every* one of those events is durably recorded.
 
 ## Responses
 
@@ -34,6 +41,7 @@
 | 401 / 403 | Unknown or unauthorized agent |
 | 413 | Body or observation-array limit exceeded |
 | 429 | Per-agent rate limit |
+| 503 | Accepted but could not be published; nothing was recorded. Retry with the **same** `sequence` — a retry after a partial publish is deduplicated downstream, never double-counted (ADR-0004) |
 
 ## Limits
 

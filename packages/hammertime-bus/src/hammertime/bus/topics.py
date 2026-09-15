@@ -83,8 +83,9 @@ OBSERVATIONS = TopicSpec(
     retention_seconds=_ONE_DAY_SECONDS,
     key_selector=_ip_key,
     description=(
-        "Deduplicated agent observations (RequestObservation, published "
-        "per-IP as Observation), keyed by IP for stable per-IP shard "
+        "Deduplicated agent observations, fanned out one message per IP: "
+        "each message's payload is a single-entry RequestObservation "
+        "(ADR-0004), keyed by that entry's IP for stable per-IP shard "
         "ownership (spec section 20)."
     ),
 )
