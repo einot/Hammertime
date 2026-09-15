@@ -282,6 +282,68 @@ class TestTtlExpiry:
         assert await store.has_seen("agent-1", 1) is True
 
 
+class TestClaim:
+    """`claim()`: the atomic check-and-mark `has_seen`+`mark_seen` cannot be.
+
+    Issue #32's ingest pipeline uses this instead of the separate
+    `is_duplicate()`/`mark_seen()` pair to close the race where two
+    concurrent requests for the same `(agent_id, sequence)` could both
+    observe "not seen" before either marks it -- backed here by a single
+    atomic `SET ... NX` (`redis.py`'s `claim`), not the two-command
+    `SET NX` + `EXPIRE GT` sequence `mark_seen` needs for its "extend an
+    existing key" case.
+    """
+
+    async def test_first_claim_of_a_fresh_pair_returns_true(self) -> None:
+        store, _client = _store()
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_first_claim_marks_the_pair_seen(self) -> None:
+        store, _client = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.has_seen("agent-1", 1) is True
+
+    async def test_second_claim_of_the_same_pair_returns_false(self) -> None:
+        store, _client = _store()
+
+        first = await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+        second = await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert first is True
+        assert second is False
+
+    async def test_claiming_an_already_mark_seen_pair_returns_false(self) -> None:
+        store, _client = _store()
+
+        await store.mark_seen("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is False
+
+    async def test_claim_of_a_different_sequence_for_the_same_agent_is_independent(self) -> None:
+        store, _client = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS)
+
+        assert await store.claim("agent-1", 2, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_claim_after_the_earlier_claims_ttl_expires_returns_true_again(self) -> None:
+        store, _client = _store()
+
+        await store.claim("agent-1", 1, ttl_seconds=1)
+        await asyncio.sleep(1.3)
+
+        assert await store.claim("agent-1", 1, ttl_seconds=DEFAULT_TTL_SECONDS) is True
+
+    async def test_non_positive_ttl_seconds_is_rejected(self) -> None:
+        store, _client = _store()
+
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            await store.claim("agent-1", 1, ttl_seconds=0)
+
+
 class _ExpireAlwaysFalsyClient:
     """Wraps a real client but makes every `expire()` call report failure.
 

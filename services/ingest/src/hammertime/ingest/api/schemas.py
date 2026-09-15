@@ -32,7 +32,7 @@ class ObservationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_id: str = Field(min_length=1, max_length=128)
-    sequence: int = Field(ge=0)
+    sequence: int = Field(ge=0, le=9_223_372_036_854_775_807)
     window_start: str
     window_seconds: int = Field(ge=1, le=3600)
     observations: list[ObservationEntry] = Field(min_length=1, max_length=10_000)

@@ -75,9 +75,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 from fastapi.testclient import TestClient
-from hammertime.bus.memory import InMemoryBus
+from hammertime.bus.memory import InMemoryBus, MemoryProducer
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.core.addressing.address import Address
 from hammertime.core.events.codec import EventPayload, decode
@@ -140,23 +141,26 @@ def _build_app(
     agents: list[AgentRecord] | None = None,
     settings: IngestSettings | None = None,
     clock: ManualClock | None = None,
+    bus: InMemoryBus | None = None,
 ) -> tuple[TestClient, InMemoryBus]:
     """A pipeline-ready app plus the `InMemoryBus` it publishes to.
 
     Every dependency the pipeline needs (auth registry, rate limiter, dedup
     store, bus) is explicit and freshly constructed per call, so tests
-    never share state with each other.
+    never share state with each other. `bus` defaults to a fresh
+    `InMemoryBus()`; pass e.g. a `_FailingBus()` to simulate a publish
+    failure.
     """
     default_agent = _agent(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN, rate_limit_rps=_AMPLE_RATE_LIMIT_RPS)
     registry = AgentRegistry.from_records(agents if agents is not None else [default_agent])
     resolved_clock = clock if clock is not None else ManualClock(initial=0)
-    bus = InMemoryBus()
+    resolved_bus = bus if bus is not None else InMemoryBus()
     app = create_app(
         settings if settings is not None else _settings(),
         agent_registry=registry,
         rate_limiter=RateLimiter(clock=resolved_clock),
         dedup_store=MemoryDedupStore(clock=resolved_clock),
-        bus=bus,
+        bus=resolved_bus,
     )
     # __enter__ (not a bare TestClient(app)) runs the app's lifespan, which
     # is what actually populates request.app.state.ingest -- every route
@@ -164,7 +168,26 @@ def _build_app(
     # are short-lived, per-test clients with no external resources (the
     # in-memory bus/store need no teardown), and callers here call
     # client.post(...) directly rather than via `with`.
-    return TestClient(app).__enter__(), bus
+    return TestClient(app).__enter__(), resolved_bus
+
+
+class _FailingProducer(MemoryProducer):
+    """A `MemoryProducer` whose `publish` always raises (simulated broker outage)."""
+
+    async def publish(self, topic: str, key: bytes | str, value: bytes) -> None:
+        raise RuntimeError("simulated failure: broker bootstrap.internal:9092 unreachable")
+
+
+class _FailingBus(InMemoryBus):
+    """An `InMemoryBus` whose `producer()` always fails to publish.
+
+    Named/documented server-side detail ("bootstrap.internal:9092") in
+    `_FailingProducer` above exists specifically so
+    `TestPublishFailureReturns503` can assert it never reaches the caller.
+    """
+
+    def producer(self) -> MemoryProducer:
+        return _FailingProducer(self)
 
 
 def _headers(agent_id: str, token: str) -> dict[str, str]:
@@ -505,3 +528,93 @@ class TestDuplicateSequenceDoesNotRepublish:
         assert second.status_code == 200
         # No republish, not even a "harmless" resend of the same message.
         assert len(_topic_records(bus)) == after_first
+
+
+class TestOverflowingCoalescedTotalIsRejectedBeforeClaimingDedup:
+    """ADR-0004 point 3: an overflowing coalesced sum is 400, whole batch.
+
+    This must be checked *before* the dedup claim: an overflowing batch is
+    a validation failure, not "already processed" -- a corrected retry of
+    the same `(agent_id, sequence)` must still be accepted, not told
+    "duplicate" (it would be, if the claim were consumed first).
+    """
+
+    _OVERFLOWING_OBSERVATIONS: ClassVar[list[dict[str, object]]] = [
+        {"ip": "10.0.0.1", "request_count": 999_999_999},
+        {"ip": "10.0.0.1", "request_count": 999_999_999},  # sums to > 1e9
+    ]
+
+    def test_overflowing_total_is_400_and_publishes_nothing(self) -> None:
+        client, bus = _build_app()
+        response = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=self._OVERFLOWING_OBSERVATIONS),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+
+        assert response.status_code == 400
+        assert _topic_records(bus) == []
+
+    def test_corrected_retry_of_the_same_sequence_is_still_accepted(self) -> None:
+        client, bus = _build_app()
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+
+        rejected = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=self._OVERFLOWING_OBSERVATIONS),
+            headers=headers,
+        )
+        assert rejected.status_code == 400
+
+        corrected = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=[{"ip": "10.0.0.1", "request_count": 5}]),
+            headers=headers,
+        )
+        assert corrected.status_code == 202
+        assert len(_topic_records(bus)) == 1
+
+
+class TestPublishFailureReturns503:
+    """docs/protocol/observation-v1.md: `503 | Publish failed` -- nothing durably recorded.
+
+    ADR-0004 section 5's ordering puts the dedup claim *before* publish --
+    the only way to close the race two concurrent requests for the same
+    sequence would otherwise win (`TestDuplicateSequenceDoesNotRepublish`
+    covers the already-seen case; the race itself needs a store-level test,
+    see `test_dedup.py`'s `TestClaim`). The cost, documented in
+    `api/routes.py`: a publish failure leaves the sequence claimed rather
+    than immediately retryable -- a bounded delay until the claim's TTL
+    lapses (`mark_seen`'s contract is "seen for at least ttl_seconds", not
+    forever), not the permanently lost data a naive mark-then-publish
+    ordering would risk.
+    """
+
+    def test_producer_failure_is_503_with_a_generic_detail(self) -> None:
+        client, bus = _build_app(bus=_FailingBus())
+
+        response = client.post(
+            "/v1/observations",
+            json=_body(sequence=1),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        # Must not leak the underlying transport/broker error to the caller.
+        assert "bootstrap.internal" not in detail
+        assert "RuntimeError" not in detail
+        assert _topic_records(bus) == []
+
+    def test_retry_of_the_same_sequence_after_a_publish_failure_is_a_duplicate_until_ttl_expiry(
+        self,
+    ) -> None:
+        client, _bus = _build_app(bus=_FailingBus())
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+
+        first = client.post("/v1/observations", json=_body(sequence=1), headers=headers)
+        assert first.status_code == 503
+
+        second = client.post("/v1/observations", json=_body(sequence=1), headers=headers)
+        assert second.status_code == 200
+        assert second.json() == {"status": "duplicate"}

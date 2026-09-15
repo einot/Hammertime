@@ -74,20 +74,39 @@ class ObservationPublisher:
         self._producer = producer
         self._config_version = config_version
 
-    async def publish(self, observation: RequestObservation) -> None:
-        """Coalesce, envelope, and publish `observation`, then flush once.
+    def coalesce(self, observation: RequestObservation) -> tuple[Observation, ...]:
+        """Sum `request_count` per distinct `Address` in `observation.observations`.
 
         Raises `RequestCountOverflowError` if a coalesced total overflows the
-        schema maximum (before anything is published), or propagates
-        whatever the underlying `Producer` raises on `publish`/`flush`
-        failure. Never publishes a partial batch.
+        schema maximum. Pure and synchronous: callers (`api/routes.py`) use
+        this to validate a batch *before* claiming its `(agent_id, sequence)`
+        in the dedup store, so an overflowing batch is rejected as a 400
+        without ever consuming the dedup claim a corrected retry would need.
         """
-        coalesced = _coalesce(observation.observations)
+        return _coalesce(observation.observations)
+
+    async def publish(self, observation: RequestObservation) -> None:
+        """Envelope and publish `observation`'s coalesced entries, then flush once.
+
+        Re-derives the same coalesced entries `coalesce()` above would (cheap
+        and pure -- see its docstring for why callers validate with it
+        first), then propagates whatever the underlying `Producer` raises on
+        `publish`/`flush` failure. Never publishes a partial batch: all N
+        per-IP publishes are awaited with `return_exceptions=True` so a
+        sibling's success or failure is never left running in the background
+        after this call returns, and `flush()` runs only once every sibling
+        has settled.
+        """
+        coalesced = self.coalesce(observation)
         timestamp = datetime.now(UTC)
 
-        await asyncio.gather(
-            *(self._publish_one(observation, entry, timestamp) for entry in coalesced)
+        results = await asyncio.gather(
+            *(self._publish_one(observation, entry, timestamp) for entry in coalesced),
+            return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
         await self._producer.flush()
 
     async def _publish_one(

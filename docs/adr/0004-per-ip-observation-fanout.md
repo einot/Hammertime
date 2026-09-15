@@ -101,3 +101,48 @@ recoverable by any retry the agent is allowed to make.
   correct; `topics.py`'s `OBSERVATIONS` description ("published per-IP as
   `Observation`") is accurate in intent but imprecise in wording — the unit on
   the wire is a single-entry `RequestObservation`, not a bare `Observation`.
+
+## Amendment (issue #32): claim before publish, not publish then mark
+
+Point 5 above, taken literally ("publishes... and only then records the
+sequence as seen"), has a gap security review caught once ingest actually
+wired `has_seen`/`mark_seen` against live traffic: `has_seen()` and
+`mark_seen()` are two separate calls with no atomicity between them
+(`packages/hammertime-store/src/hammertime/store/interface.py`'s
+`DedupStore.has_seen` docstring). Two concurrent requests for the same
+`(agent_id, sequence)` can both observe "not seen" before either publishes,
+so both publish — exactly the double-counted delta section 23's dedup
+exists to prevent, and the window is not microseconds: it spans the full
+per-IP publish + flush, i.e. up to `max_observations` broker round trips.
+
+Ingest now uses a new `DedupStore.claim(agent_id, sequence, *, ttl_seconds)
+-> bool` instead: a single atomic check-and-mark (`SET ... NX` for Redis; a
+same-coroutine check-then-mark for the in-process store, safe because
+neither `has_seen` nor `mark_seen` yields to the event loop). Exactly one
+concurrent caller for a given `(agent_id, sequence)` gets `True` and may
+proceed to publish; every other caller gets `False` and is rejected as a
+duplicate. This is now called *before* publishing, with the batch's full
+`allowed_lateness_seconds + window_seconds` TTL — not the short-lived,
+distinct "in-flight" marker point 5's wording implies.
+
+The tradeoff this reintroduces, which point 5 originally warned against: a
+publish failure now leaves the sequence claimed rather than immediately
+retryable. This is a bounded delay, not the "permanently lost counts...
+not recoverable by any retry" point 5 describes — `mark_seen`'s contract is
+"seen for at least `ttl_seconds`", not forever, so a retry of that exact
+sequence is accepted again once the claim's TTL lapses. Closing the
+concurrent-duplicate race (a correctness bug reachable by any authenticated
+agent simply retrying quickly, which manufactures false `COLD -> HOT`
+transitions) was judged worse than this bounded retry delay on the rarer
+path (a genuine bus/transport failure). A coalesced batch that fails
+`coalesce()`'s overflow check (point 3) is validated *before* the claim, so
+a 400 never consumes it — only an accepted, claimed batch that then fails
+to publish hits this tradeoff.
+
+A future refinement that gives `claim` its own short-lived marker distinct
+from the final long-retention "seen" state (closer to point 5's original
+"in-flight" wording) would let a publish failure self-heal immediately
+instead of waiting out the full TTL, without reopening the race. Deferred:
+`MemoryDedupStore`'s `SequenceWindow` has no clean way to "unmark" a single
+sequence once folded into its high-water mark, so building this properly
+needs its own design pass, not a quick patch alongside #32's other fixes.

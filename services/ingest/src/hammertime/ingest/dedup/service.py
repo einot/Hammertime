@@ -37,3 +37,21 @@ class DedupService:
         """
         ttl_seconds = self._allowed_lateness_seconds + window_seconds
         await self._store.mark_seen(agent_id, sequence, ttl_seconds=ttl_seconds)
+
+    async def claim(self, agent_id: str, sequence: int, *, window_seconds: int) -> bool:
+        """Atomically check-and-claim `(agent_id, sequence)` (spec section 23).
+
+        Returns `True` if the caller may proceed to publish -- it now
+        exclusively owns this sequence, marked seen for
+        `allowed_lateness_seconds + window_seconds` up front. Returns
+        `False` if this is a duplicate (already claimed by an earlier or
+        concurrent call): the caller MUST reject it without publishing.
+
+        Unlike the `is_duplicate()` + `mark_seen()` pair (two separate
+        calls, racy between them -- `DedupStore.has_seen`'s docstring),
+        this is the single atomic operation `api/routes.py` uses, closing
+        the window where concurrent identical requests could all observe
+        "not a duplicate" and all publish (ADR-0004 section 5).
+        """
+        ttl_seconds = self._allowed_lateness_seconds + window_seconds
+        return await self._store.claim(agent_id, sequence, ttl_seconds=ttl_seconds)

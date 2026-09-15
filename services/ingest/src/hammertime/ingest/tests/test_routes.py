@@ -158,3 +158,24 @@ class TestMalformedBytesDoNotCrash:
                 headers={"content-type": "application/json", **_auth_headers()},
             )
         assert response.status_code == 400
+
+    def test_oversized_integer_literal_is_rejected_with_400_not_500(self) -> None:
+        # Regression: CPython's int-string conversion limit (default 4300
+        # digits) makes json.loads raise a bare ValueError -- neither
+        # json.JSONDecodeError nor UnicodeDecodeError -- for a body
+        # containing a many-thousand-digit integer literal, which used to
+        # fall through the handler's exception guards as an unhandled 500.
+        # Built by text substitution, not `int("9" * 5000)`: constructing
+        # that Python int would itself hit the same conversion limit before
+        # the request body even exists.
+        huge_digits = "9" * 5000
+        oversized_literal = json.dumps(_valid_body()).replace(
+            '"sequence": 1', f'"sequence": {huge_digits}', 1
+        )
+        with _client() as client:
+            response = client.post(
+                "/v1/observations",
+                content=oversized_literal.encode("utf-8"),
+                headers={"content-type": "application/json", **_auth_headers()},
+            )
+        assert response.status_code == 400

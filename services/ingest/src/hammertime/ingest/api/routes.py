@@ -9,6 +9,7 @@ Epic #3) -> dedup check -> per-IP bus publish -> dedup mark-seen -> 202.
 """
 
 import json
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,8 @@ if TYPE_CHECKING:
     from hammertime.ingest.app import IngestState
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 def _get_ingest_state(request: Request) -> "IngestState":
@@ -174,14 +177,12 @@ async def create_observation(
 
     try:
         document = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"request body is not valid JSON: {exc}"
-        ) from exc
     except UnicodeDecodeError as exc:
         # json.loads decodes bytes->str internally; invalid UTF-8 raises
         # UnicodeDecodeError, not JSONDecodeError, before syntax is ever
         # considered -- must not be allowed to fall through as a 500.
+        # (UnicodeDecodeError is itself a ValueError subclass, so this must
+        # stay ahead of the bare `except ValueError` below.)
         raise HTTPException(
             status_code=400, detail=f"request body is not valid UTF-8: {exc}"
         ) from exc
@@ -192,6 +193,16 @@ async def create_observation(
         # documents and guards against this same input shape.
         raise HTTPException(
             status_code=400, detail="request body is nested too deeply to parse"
+        ) from exc
+    except ValueError as exc:
+        # Catches json.JSONDecodeError (a ValueError subclass, malformed
+        # JSON) and also CPython's int-string conversion limit: a
+        # many-thousand-digit integer literal (e.g. an oversized `sequence`)
+        # raises a bare ValueError from *inside* json.loads, before syntax
+        # is otherwise at fault -- neither of the two more specific except
+        # clauses above catches it, and it must not fall through as a 500.
+        raise HTTPException(
+            status_code=400, detail=f"request body is not valid JSON: {exc}"
         ) from exc
 
     if isinstance(document, dict):
@@ -237,7 +248,19 @@ async def create_observation(
     except (IngestValidationError, InvalidAddressError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if await state.dedup.is_duplicate(agent_id, observation.sequence):
+    try:
+        state.publisher.coalesce(observation)
+    except RequestCountOverflowError as exc:
+        # Validated (and rejected, if it overflows) before the dedup claim
+        # below, so an overflowing batch never consumes the sequence's
+        # claim -- a corrected retry with the same sequence must still be
+        # accepted, not told "duplicate" (ADR-0004 section 3/5).
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    claimed = await state.dedup.claim(
+        agent_id, observation.sequence, window_seconds=observation.window_seconds
+    )
+    if not claimed:
         # docs/protocol/observation-v1.md: 200, previously accepted, no
         # action taken. Returned via a plain JSONResponse rather than the
         # route's declared 202 response_model, so the status code and body
@@ -246,21 +269,28 @@ async def create_observation(
 
     try:
         await state.publisher.publish(observation)
-    except RequestCountOverflowError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        # ADR-0004 §5: publish-then-mark. Anything the bus producer raises
-        # here means the batch is not durably recorded -- mark_seen must
-        # NOT be called, so a retry with the same sequence is not treated
-        # as a duplicate and cleanly republishes (docs/protocol/observation-v1.md's
-        # 503 row).
+        # ADR-0004 section 5: the claim above already marks this sequence
+        # seen (for allowed_lateness_seconds + window_seconds) *before*
+        # publishing -- the only way to close the race where two concurrent
+        # requests for the same sequence both see "not a duplicate" and
+        # both publish. The cost: unlike a strict publish-then-mark order,
+        # a publish failure here leaves the sequence claimed rather than
+        # immediately retryable, so a retry of this exact sequence is
+        # rejected as a duplicate until the claim's TTL lapses rather than
+        # being reprocessed right away -- a bounded delay, not permanently
+        # lost data (mark_seen's contract is "seen for at least
+        # ttl_seconds", never permanent). The real exception is logged
+        # server-side (it may name internal bus/broker details that must
+        # not reach the caller); the agent gets a generic, retry-safe 503.
+        logger.exception(
+            "failed to publish observation for agent_id=%r sequence=%r",
+            agent_id,
+            observation.sequence,
+        )
         raise HTTPException(
-            status_code=503, detail=f"failed to publish observation: {exc}"
+            status_code=503, detail="failed to publish observation; retry is safe"
         ) from exc
-
-    await state.dedup.mark_seen(
-        agent_id, observation.sequence, window_seconds=observation.window_seconds
-    )
 
     return ObservationAccepted()
 

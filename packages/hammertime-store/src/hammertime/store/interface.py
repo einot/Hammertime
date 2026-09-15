@@ -36,14 +36,10 @@ class DedupStore(Protocol):
 
         `has_seen` then `mark_seen` is NOT atomic: two concurrent requests for
         the same `(agent_id, sequence)` can both observe `False` before either
-        calls `mark_seen`, letting both proceed. Implementations of this
-        Protocol are not required to close that window on their own (a real
-        backend, e.g. issue #31's Redis store, MAY offer a stronger atomic
-        check-and-set operation of its own, but that is not part of this
-        Protocol today). A caller that must prevent this needs its own
-        serialization (e.g. per-agent locking, or a single-writer request
-        path) -- tracked for issue #32, which is the first caller to actually
-        wire `has_seen`/`mark_seen` together against live traffic.
+        calls `mark_seen`, letting both proceed. Use `claim()` below instead
+        when that race matters (issue #32's ingest pipeline always does);
+        `has_seen` on its own remains useful for a read-only duplicate check
+        that doesn't intend to mark anything (e.g. diagnostics).
         """
         ...
 
@@ -53,5 +49,25 @@ class DedupStore(Protocol):
         `ttl_seconds` SHOULD be `allowed_lateness_seconds + window_seconds`
         (ADR-0003), so a retry within the dedup retention window is always
         caught, and entries outside it are free to expire (spec section 26).
+        """
+        ...
+
+    async def claim(self, agent_id: str, sequence: int, *, ttl_seconds: int) -> bool:
+        """Atomically check-and-mark `(agent_id, sequence)` as seen.
+
+        Returns `True` if this call is the one that marked it (it was not
+        already seen) -- the caller now exclusively owns processing this
+        sequence. Returns `False` if it was already seen, whether by an
+        earlier completed call or by a concurrent caller that claimed it
+        first; the caller MUST treat this as a duplicate and not proceed.
+
+        This closes the race `has_seen()` followed by `mark_seen()` cannot:
+        those are two separate calls with no atomicity between them (see
+        `has_seen`'s docstring), so two concurrent callers for the same
+        `(agent_id, sequence)` can both observe `False` from `has_seen()`
+        before either calls `mark_seen()`. Exactly one concurrent `claim()`
+        call for a given `(agent_id, sequence)` ever returns `True`. Same
+        `ttl_seconds` semantics as `mark_seen` (seen for at least
+        `ttl_seconds`, never shortened by a later call).
         """
         ...
