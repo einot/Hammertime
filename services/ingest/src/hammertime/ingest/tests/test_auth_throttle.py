@@ -45,11 +45,32 @@ no `create_app` clock-injection point per ADR-0007's implementation notes,
 so every test below relies on real wall-clock time between back-to-back
 `TestClient` calls, choosing small bursts and slow (per-minute) refill
 rates to keep a generous margin against real-time drift during a test run.
+
+ADR-0007 Decision 8 (added after this file's first pass, post-implementation
+security finding): the agent bucket's key is a fixed-size salted slot
+(`agent-slot:N`, `N` in `[0, 4096)`) derived from the attempted `X-Agent-Id`
+via `HMAC-SHA-256(slot_salt, agent_id)`, not the raw `agent_id` string --
+see spec section 36.5's "The agent bucket's key space MUST be bounded
+independently of the limiter's eviction policy" paragraph. This does not
+change any behaviour asserted by `TestAgentKeyedThrottle` or
+`TestMissingAgentIdUsesASharedSentinelBucket` above (those tests only ever
+observe HTTP-level 401/429 outcomes, never a literal bucket key), so
+nothing above this point needed updating for Decision 8. The classes near
+the bottom of this file cover Decision 8's own named regression properties
+specifically: deterministic same-id keying, the bounded/forceable-collision
+key space (via the test-only `agent_slot_salt`/`agent_slot_count`
+keyword-only parameters Decision 8 adds to `require_agent`), the finding
+itself (an exhausted target budget is not restored by flooding distinct
+junk ids), the anti-enumeration property (registered and unregistered ids
+throttle identically), and the `"-"` sentinel's isolation from the slot
+table.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import time
 from pathlib import Path
 
@@ -139,6 +160,8 @@ def _client(
     *,
     agents: list[AgentRecord] | None = None,
     client_address: tuple[str, int] = ("203.0.113.1", 51000),
+    agent_slot_salt: bytes | None = None,
+    agent_slot_count: int | None = None,
     **settings_overrides: object,
 ) -> TestClient:
     """A single, long-lived `TestClient` over a fresh app + registry.
@@ -148,10 +171,90 @@ def _client(
     `test_pipeline.py`'s `_build_app` convention. `client=` fixes the
     ASGI-level socket peer address Starlette's `TestClient` reports for
     every request made through this one instance.
+
+    `agent_slot_salt`/`agent_slot_count` are ADR-0007 Decision 8's
+    test-only, keyword-only parameters on `require_agent`
+    ("they exist so tests can pin the mapping"; `app.py` itself passes
+    neither and no `IngestSettings` field exists for them). This file
+    cannot read `create_app`'s actual signature (guarded, per this
+    repo's test-author convention), so forwarding them here -- the same
+    way `agent_registry` is already threaded through as an extra
+    `create_app` keyword rather than an `IngestSettings` field -- is a
+    judgment call about the plumbing shape, not a confirmed fact; tests
+    that rely on this (the `TestAgentBucketKeySpaceIsBoundedToTheSlotTable`
+    and `TestExhaustedAgentBudgetIsNotRestoredByFloodingDistinctIds`
+    classes below) may need reconciling once the real signature lands, per
+    the same note this file's module docstring already makes about
+    `require_agent`. Only forwarded when explicitly given, so every
+    existing call site (which never passes them) is untouched.
     """
     registry = AgentRegistry.from_records(agents if agents is not None else [_known_agent()])
-    app = create_app(_settings(**settings_overrides), agent_registry=registry)
+    create_app_kwargs: dict[str, object] = {"agent_registry": registry}
+    if agent_slot_salt is not None:
+        create_app_kwargs["agent_slot_salt"] = agent_slot_salt
+    if agent_slot_count is not None:
+        create_app_kwargs["agent_slot_count"] = agent_slot_count
+    app = create_app(_settings(**settings_overrides), **create_app_kwargs)
     return TestClient(app, client=client_address).__enter__()
+
+
+def _slot_for(agent_id: str, *, salt: bytes, slot_count: int) -> int:
+    """Reimplements -- from the spec, not the implementation -- ADR-0007
+    Decision 8 / spec section 36.5's slot formula exactly:
+    `slot = HMAC-SHA-256(salt, agent_id)[:8]`, read big-endian, mod
+    `slot_count`. Used only to *search* for attempted `agent_id`s that are
+    guaranteed (by this same published formula) to collide or not collide
+    under a given salt/count, so the forced-collision tests below don't
+    need to guess -- the HTTP-level assertions are what actually pin down
+    behaviour, this is just test setup.
+    """
+    digest = hmac.new(salt, agent_id.encode("utf-8"), hashlib.sha256).digest()
+    return int.from_bytes(digest[:8], "big") % slot_count
+
+
+def _find_id_with_slot(
+    target_slot: int,
+    *,
+    salt: bytes,
+    slot_count: int,
+    prefix: str,
+    exclude: str = "",
+    search_space: int = 100_000,
+) -> str:
+    for i in range(search_space):
+        candidate = f"{prefix}-{i}"
+        if candidate == exclude:
+            continue
+        if _slot_for(candidate, salt=salt, slot_count=slot_count) == target_slot:
+            return candidate
+    raise AssertionError(
+        f"no {prefix!r}-prefixed id landing in slot {target_slot} found in "
+        f"{search_space} candidates"
+    )
+
+
+def _find_id_with_different_slot(
+    avoid_slot: int,
+    *,
+    salt: bytes,
+    slot_count: int,
+    prefix: str,
+    search_space: int = 100_000,
+) -> str:
+    for i in range(search_space):
+        candidate = f"{prefix}-{i}"
+        if _slot_for(candidate, salt=salt, slot_count=slot_count) != avoid_slot:
+            return candidate
+    raise AssertionError(
+        f"no {prefix!r}-prefixed id outside slot {avoid_slot} found in {search_space} candidates"
+    )
+
+
+# 32 fixed bytes (not `secrets.token_bytes`) so the collision search above is
+# reproducible across runs -- this is standing in for "a salt drawn once per
+# process" per Decision 8, not for anything that needs to be unpredictable
+# from a test's own point of view.
+_FIXED_SLOT_SALT = bytes(range(32))
 
 
 _WRONG_TOKEN_HEADERS = _headers(KNOWN_AGENT_ID, "wrong-token")
@@ -627,3 +730,365 @@ class TestUnknownAgentTimingIsNotAShortcut:
         # noise while still catching an implementation that does no
         # hashing at all for an unknown agent_id.
         assert unknown_elapsed >= known_wrong_elapsed / 5
+
+
+# ---------------------------------------------------------------------------
+# ADR-0007 Decision 8: the agent bucket is keyed by a fixed-size salted slot,
+# not by the attempted `agent_id` directly. Decision 8 itself names three
+# regression properties explicitly ("the same attempted agent_id maps to the
+# same key across calls"; "an arbitrary stream of distinct attempted
+# agent_ids produces at most slot_count + 1 distinct limiter keys"; "a target
+# identity's exhausted budget is not restored by any number of intervening
+# distinct attempted identities") plus the anti-enumeration property
+# ("registered and unregistered identities are mapped by the identical
+# function"). The classes below cover each in turn, plus the "-" sentinel
+# staying outside the slot table.
+# ---------------------------------------------------------------------------
+
+
+class TestAgentBucketKeyIsDeterministic:
+    """ADR-0007 Decision 8, first named regression property: 'the same
+    attempted `agent_id` maps to the same key across calls.' Exercised
+    behaviourally: repeated failures against one `agent_id`, from
+    different source addresses (so only the agent bucket -- never any one
+    source's bucket -- can be accumulating), must all draw from a single
+    shared budget, and a fresh, never-before-attempted `agent_id` must
+    still see a full budget afterwards -- which is only possible if the
+    two attempted ids consistently map to two different keys (true with
+    overwhelming probability at the production 4096-slot default; the
+    forced-collision case is exercised separately below)."""
+
+    def test_repeated_attempts_against_one_agent_id_share_a_single_budget(self) -> None:
+        agent_burst = 4
+        client = _client(
+            auth_failure_agent_burst=agent_burst,
+            auth_failure_burst=_AMPLE,
+            trusted_proxy_hops=1,
+        )
+        target_headers = _headers("edge-deterministic-target", "irrelevant-token")
+
+        for i in range(agent_burst):
+            response = client.post(
+                "/v1/observations",
+                json={},
+                headers={**target_headers, "X-Forwarded-For": f"203.0.113.{i}"},
+            )
+            assert response.status_code == 401
+
+        # The same identity, from yet another fresh source, finds its
+        # shared budget already spent.
+        exhausted = client.post(
+            "/v1/observations",
+            json={},
+            headers={**target_headers, "X-Forwarded-For": "203.0.113.250"},
+        )
+        assert exhausted.status_code == 429
+
+        # A different, never-before-attempted identity is unaffected.
+        fresh_headers = _headers("edge-deterministic-fresh", "irrelevant-token")
+        fresh = client.post(
+            "/v1/observations",
+            json={},
+            headers={**fresh_headers, "X-Forwarded-For": "203.0.113.251"},
+        )
+        assert fresh.status_code == 401
+
+
+class TestAgentBucketKeySpaceIsBoundedToTheSlotTable:
+    """ADR-0007 Decision 8, second named regression property: 'an
+    arbitrary stream of distinct attempted agent_ids produces at most
+    slot_count + 1 distinct limiter keys' -- and 'collisions can only
+    subtract budget, never add it.' A small, pinned `agent_slot_count`
+    (via the test-only `agent_slot_salt`/`agent_slot_count` keyword-only
+    parameters Decision 8 adds to `require_agent`) makes a forced
+    collision between two genuinely *different* attempted `agent_id`s
+    deterministic and observable from outside the process: draining one
+    drains the other, because the limiter never sees either id, only the
+    slot they share.
+    """
+
+    def test_two_distinct_agent_ids_forced_into_the_same_slot_share_one_budget(self) -> None:
+        slot_count = 4
+        target_slot = 0
+        target_id = _find_id_with_slot(
+            target_slot, salt=_FIXED_SLOT_SALT, slot_count=slot_count, prefix="target"
+        )
+        colliding_junk_id = _find_id_with_slot(
+            target_slot,
+            salt=_FIXED_SLOT_SALT,
+            slot_count=slot_count,
+            prefix="junk",
+            exclude=target_id,
+        )
+
+        agent_burst = 3
+        client = _client(
+            auth_failure_agent_burst=agent_burst,
+            auth_failure_burst=_AMPLE,
+            trusted_proxy_hops=1,
+            agent_slot_salt=_FIXED_SLOT_SALT,
+            agent_slot_count=slot_count,
+        )
+
+        # Spend the whole budget guessing the JUNK id -- the target id is
+        # never itself attempted.
+        for i in range(agent_burst):
+            response = client.post(
+                "/v1/observations",
+                json={},
+                headers={
+                    **_headers(colliding_junk_id, "irrelevant-token"),
+                    "X-Forwarded-For": f"203.0.113.{i}",
+                },
+            )
+            assert response.status_code == 401
+
+        # The TARGET id is already throttled on its very first attempt,
+        # because it shares the junk id's slot.
+        response = client.post(
+            "/v1/observations",
+            json={},
+            headers={
+                **_headers(target_id, "irrelevant-token"),
+                "X-Forwarded-For": "203.0.113.250",
+            },
+        )
+        assert response.status_code == 429
+
+    def test_an_id_landing_in_a_genuinely_different_slot_is_unaffected(self) -> None:
+        slot_count = 4
+        target_slot = 0
+        target_id = _find_id_with_slot(
+            target_slot, salt=_FIXED_SLOT_SALT, slot_count=slot_count, prefix="target"
+        )
+        colliding_junk_id = _find_id_with_slot(
+            target_slot,
+            salt=_FIXED_SLOT_SALT,
+            slot_count=slot_count,
+            prefix="junk",
+            exclude=target_id,
+        )
+        other_slot_id = _find_id_with_different_slot(
+            target_slot, salt=_FIXED_SLOT_SALT, slot_count=slot_count, prefix="other"
+        )
+
+        agent_burst = 3
+        client = _client(
+            auth_failure_agent_burst=agent_burst,
+            auth_failure_burst=_AMPLE,
+            trusted_proxy_hops=1,
+            agent_slot_salt=_FIXED_SLOT_SALT,
+            agent_slot_count=slot_count,
+        )
+
+        for i in range(agent_burst):
+            response = client.post(
+                "/v1/observations",
+                json={},
+                headers={
+                    **_headers(colliding_junk_id, "irrelevant-token"),
+                    "X-Forwarded-For": f"203.0.113.{i}",
+                },
+            )
+            assert response.status_code == 401
+        blocked = client.post(
+            "/v1/observations",
+            json={},
+            headers={
+                **_headers(colliding_junk_id, "irrelevant-token"),
+                "X-Forwarded-For": "203.0.113.250",
+            },
+        )
+        assert blocked.status_code == 429
+
+        # An id landing in a genuinely different slot has its own,
+        # completely untouched budget.
+        response = client.post(
+            "/v1/observations",
+            json={},
+            headers={
+                **_headers(other_slot_id, "irrelevant-token"),
+                "X-Forwarded-For": "203.0.113.251",
+            },
+        )
+        assert response.status_code == 401
+
+
+class TestExhaustedAgentBudgetIsNotRestoredByFloodingDistinctIds:
+    """ADR-0007 Decision 8's own vulnerability walkthrough and its third
+    named regression property: 'a target identity's exhausted budget is
+    not restored by any number of intervening distinct attempted
+    identities' -- the finding itself. Pins `agent_slot_count=1` so every
+    non-empty `X-Agent-Id` (the real target and every junk id alike)
+    shares the single slot deterministically: under the OLD raw-string
+    keying this ADR replaces, a large enough flood of distinct junk ids
+    would eventually walk the target's own dedicated bucket out of the
+    limiter's LRU and have it recreated full on the next guess; under
+    Decision 8's fixed slot table there is no separate bucket to walk
+    out of in the first place, so the flood can only ever keep draining
+    the one shared bucket, never refill it.
+    """
+
+    def test_a_large_flood_of_distinct_junk_ids_does_not_reset_the_targets_budget(self) -> None:
+        agent_burst = 5
+        client = _client(
+            auth_failure_agent_burst=agent_burst,
+            auth_failure_burst=_AMPLE,
+            trusted_proxy_hops=1,
+            agent_slot_count=1,
+        )
+        target_headers = _headers("edge-flood-target", "irrelevant-token")
+
+        for i in range(agent_burst):
+            response = client.post(
+                "/v1/observations",
+                json={},
+                headers={**target_headers, "X-Forwarded-For": f"203.0.113.{i}"},
+            )
+            assert response.status_code == 401
+        exhausted = client.post(
+            "/v1/observations",
+            json={},
+            headers={**target_headers, "X-Forwarded-For": "203.0.113.200"},
+        )
+        assert exhausted.status_code == 429
+
+        # A flood of hundreds of distinct junk agent_ids, each attempted
+        # from its own distinct source (so only the agent bucket -- never
+        # any one source's bucket -- could plausibly be what is rejecting
+        # these): the intervening attempts the OLD raw-string keying's LRU
+        # eviction would eventually have recreated the target's bucket
+        # full in response to.
+        for i in range(300):
+            response = client.post(
+                "/v1/observations",
+                json={},
+                headers={
+                    **_headers(f"junk-flood-{i}", "irrelevant-token"),
+                    "X-Forwarded-For": f"198.51.100.{i % 256}",
+                },
+            )
+            assert response.status_code == 429
+
+        # The target's budget must still be exhausted -- not reset back to
+        # a fresh 401 the way pre-Decision-8 LRU eviction would have
+        # allowed.
+        still_exhausted = client.post(
+            "/v1/observations",
+            json={},
+            headers={**target_headers, "X-Forwarded-For": "203.0.113.201"},
+        )
+        assert still_exhausted.status_code == 429
+
+
+class TestAgentBucketKeyingDoesNotDistinguishRegisteredFromUnregistered:
+    """ADR-0007 Decision 8, anti-enumeration property: 'registered and
+    unregistered identities are mapped by the identical function, so a
+    429 discloses nothing about the roster.' Distinct from the
+    uniform-401-body/`WWW-Authenticate` property covered in
+    `TestUniformAuthenticationFailureResponse` above: this is specifically
+    about the *throttle bucket* not leaking registration status. Exercised
+    by confirming a registered agent_id (presented with the wrong token)
+    and a never-registered agent_id trip their respective agent buckets at
+    the identical burst count and receive byte-identical `429` responses --
+    there is no observable difference in throttling behaviour that would
+    let a caller infer which kind of identity it presented.
+    """
+
+    def test_registered_and_unregistered_ids_trip_the_agent_bucket_identically(self) -> None:
+        agent_burst = 3
+        registered_client = _client(
+            auth_failure_agent_burst=agent_burst,
+            auth_failure_burst=_AMPLE,
+            trusted_proxy_hops=1,
+        )
+        unregistered_client = _client(
+            auth_failure_agent_burst=agent_burst,
+            auth_failure_burst=_AMPLE,
+            trusted_proxy_hops=1,
+        )
+
+        for i in range(agent_burst):
+            registered_response = registered_client.post(
+                "/v1/observations",
+                json={},
+                headers={**_WRONG_TOKEN_HEADERS, "X-Forwarded-For": f"203.0.113.{i}"},
+            )
+            assert registered_response.status_code == 401
+            unregistered_response = unregistered_client.post(
+                "/v1/observations",
+                json={},
+                headers={**_UNKNOWN_AGENT_HEADERS, "X-Forwarded-For": f"203.0.113.{i}"},
+            )
+            assert unregistered_response.status_code == 401
+
+        # Both trip on the exact same, agent_burst-th, attempt -- neither
+        # identity got any extra slack for being (un)registered.
+        registered_blocked = registered_client.post(
+            "/v1/observations",
+            json={},
+            headers={**_WRONG_TOKEN_HEADERS, "X-Forwarded-For": "203.0.113.250"},
+        )
+        unregistered_blocked = unregistered_client.post(
+            "/v1/observations",
+            json={},
+            headers={**_UNKNOWN_AGENT_HEADERS, "X-Forwarded-For": "203.0.113.250"},
+        )
+
+        assert registered_blocked.status_code == unregistered_blocked.status_code == 429
+        assert registered_blocked.json() == unregistered_blocked.json()
+        assert (
+            registered_blocked.headers["X-RateLimit-Scope"]
+            == unregistered_blocked.headers["X-RateLimit-Scope"]
+            == "auth-failures"
+        )
+        assert int(registered_blocked.headers["Retry-After"]) >= 1
+        assert int(unregistered_blocked.headers["Retry-After"]) >= 1
+
+
+class TestMissingAgentIdSentinelIsIsolatedFromRealAgentSlots:
+    """ADR-0007 Decision 8: the `"-"` key for a missing, empty, or
+    over-long `X-Agent-Id` 'stays outside the [slot] table: the standing
+    flood of missing-header failures must not permanently drain some
+    arbitrary real agent's slot, and a caller learns nothing from a key it
+    chose by omitting its own header.' Confirms a flood that drains the
+    shared `"-"` bucket leaves a specific, named real agent_id's own
+    bucket completely untouched -- extending
+    `TestMissingAgentIdUsesASharedSentinelBucket` above (which only checks
+    that missing-agent_id attempts share a bucket with *each other*) to
+    check the sentinel bucket's isolation from a real identity's slot.
+    """
+
+    def test_a_missing_agent_id_flood_does_not_drain_a_real_agents_bucket(self) -> None:
+        agent_burst = 3
+        client = _client(
+            auth_failure_agent_burst=agent_burst,
+            auth_failure_burst=_AMPLE,
+            trusted_proxy_hops=1,
+        )
+        no_agent_id_headers = {"Authorization": "Bearer irrelevant-token"}
+
+        for i in range(agent_burst):
+            response = client.post(
+                "/v1/observations",
+                json={},
+                headers={**no_agent_id_headers, "X-Forwarded-For": f"203.0.113.{i}"},
+            )
+            assert response.status_code == 401
+        blocked = client.post(
+            "/v1/observations",
+            json={},
+            headers={**no_agent_id_headers, "X-Forwarded-For": "203.0.113.250"},
+        )
+        assert blocked.status_code == 429
+
+        # A REAL agent_id, never itself attempted, must still see the
+        # ordinary uniform 401 -- its bucket is untouched by the drained
+        # "-" sentinel bucket.
+        target_headers = _headers("edge-untouched-by-sentinel-flood", "irrelevant-token")
+        response = client.post(
+            "/v1/observations",
+            json={},
+            headers={**target_headers, "X-Forwarded-For": "203.0.113.251"},
+        )
+        assert response.status_code == 401
