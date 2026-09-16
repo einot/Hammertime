@@ -1534,6 +1534,126 @@ The server MUST derive HOT state from request observations.
 
 The service SHOULD also protect against malicious agents sending extremely large numbers or malformed IP addresses.
 
+## 36.1 Agent credentials
+
+> Subsections 36.1-36.4 added by ADR-0006. The requirements above are unchanged.
+
+An agent authenticates with `X-Agent-Id` plus `Authorization: Bearer <token>`
+(`docs/protocol/observation-v1.md`). The token is a static, long-lived, per-agent
+credential; it carries no nonce of its own, so message-level replay protection is
+Section 23's `(agent_id, sequence)` dedup, not a property of the credential.
+
+```text
+token          MUST be >= 256 bits of entropy from a CSPRNG
+server storage MUST be a keyed hash only -- never the token, at rest or in memory
+comparison     MUST be constant-time
+logs, errors, metrics, traces MUST NOT contain a token or any prefix of one
+```
+
+The hash is `HMAC-SHA-256(key, token)`, where `key` is a deployment-wide secret
+supplied out of band (`HAMMERTIME_INGEST_AGENT_TOKEN_KEY`, base64url, at least 32
+bytes decoded) and never stored in the registry document. Verification recomputes
+the HMAC of the presented token and compares digests.
+
+A slow KDF (scrypt, argon2) is deliberately NOT used: the credential is a
+high-entropy machine token rather than a human password, and this hash is computed
+on every authenticated request rather than once per login. The keyed hash instead
+protects against the case the server can no longer detect — an operator who
+provisions a weak token by hand — because a registry document that leaks without
+its key is not offline-attackable at all. See ADR-0006 for the full argument.
+
+The service MUST refuse to start if the key is missing, undecodable, or shorter
+than 32 bytes, rather than falling back to an unkeyed mode.
+
+Rotating the key invalidates every agent credential, because the server does not
+hold the plaintext tokens needed to re-derive their hashes. Key rotation is
+therefore a fleet-wide re-provisioning, and is not the mechanism for rotating one
+agent's credential (Section 36.3).
+
+## 36.2 The agent registry document
+
+Agents are registered in a JSON document read at startup
+(`HAMMERTIME_INGEST_AGENTS_PATH`, default `config/agents.v2.json`), specified by
+`schemas/agent_registry.v2.json`:
+
+```json
+{
+  "registry_version": 2,
+  "hash_algorithm": "hmac-sha256",
+  "key_id": "3f8a1c05d2b74e69",
+  "agents": {
+    "edge-17": { "token_hash": "<64 hex>", "enabled": true, "rate_limit_rps": null }
+  }
+}
+```
+
+`key_id` is the first 16 hex characters of
+`HMAC-SHA-256(key, "hammertime-agent-token-key-id")` — a fingerprint of the key
+the hashes were computed under. The service MUST recompute it at startup and
+refuse to start on a mismatch, so a misconfigured key fails visibly instead of
+rejecting every agent at request time.
+
+The service MUST reject at load:
+
+```text
+a document with no registry_version, or any record carrying a plaintext "token"
+    (the v1 format -- report it as a migration, not as a parse error)
+a key_id that does not match the configured key
+two agents sharing any hash, current or previous
+a record whose previous_token_hash equals its own token_hash
+previous_token_hash without previous_token_expires_at, or the reverse
+any unknown key, at envelope or record level
+```
+
+The document is no longer secret, but write access to it is still full
+compromise: anyone who can add a hash can mint a credential. Read access no
+longer discloses credentials; it still discloses the agent roster and per-agent
+limits.
+
+A registered agent MAY be disabled (`"enabled": false`). A disabled agent is
+known but never authorized; disabling is the way to block an agent, in preference
+to deleting its entry (which makes it indistinguishable from a typo'd
+`agent_id`) or setting a zero rate limit (which is not a defined state).
+
+## 36.3 Credential rotation
+
+`agent_id` is an identity, not a login: it derives `event_id` (ADR-0004) and keys
+dedup and rate-limit state. Rotating a credential MUST NOT require changing it.
+
+A record MAY therefore carry at most one `previous_token_hash`, accepted
+alongside `token_hash` until `previous_token_expires_at` (RFC 3339, UTC), which
+is REQUIRED whenever a previous hash is present. Expiry is evaluated per request
+against the service clock, so the overlap window closes on its own. A window that
+has already expired at load time is not a startup failure: the previous hash is
+dropped, with a warning.
+
+At most one predecessor is supported by design — an unbounded list of accepted
+hashes lets a registry accumulate forgotten live credentials, which is the
+problem this section exists to prevent.
+
+```text
+rotate:  new token issued, old hash moved to previous_token_hash + expiry
+         -> restart ingest
+         -> move the agent onto the new token
+         -> drop the previous_* keys -> restart
+```
+
+## 36.4 Provisioning
+
+Tokens MUST be generated by the provisioning tool
+(`tools/agent-token`, `hammertime-agent-token`), which is the only component that
+ever sees a token in readable form: it prints the token once, for handing to the
+agent, and writes only the hash into the registry. It never writes a token to a
+file or a log. The same tool converts a v1 plaintext registry
+(`hammertime-agent-token migrate`), which preserves each agent's existing token
+and `agent_id`, so migrating the store and rotating credentials stay separate
+operations.
+
+Because the server cannot assess the strength of a token it only sees hashed, the
+tool is also the only place a strength rule can be enforced: generated tokens are
+256-bit CSPRNG values, and an externally supplied token shorter than 32
+characters is rejected unless explicitly overridden.
+
 ## 36.5 Failed-authentication throttling
 
 > Subsections 36.5-36.7 added by ADR-0007 (failed-authentication throttling) and

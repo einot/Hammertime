@@ -1,7 +1,0 @@
-{
-  "edge-17": {
-    "token": "REPLACE_ME_local_dev_only_token",
-    "enabled": true,
-    "rate_limit_rps": null
-  }
-}

@@ -76,6 +76,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from hammertime.core.auth.tokens import hash_token
 from hammertime.ingest.app import create_app
 from hammertime.ingest.auth import AgentAuthError
 from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
@@ -85,6 +86,11 @@ _CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
 
 KNOWN_AGENT_ID = "edge-17"
 KNOWN_AGENT_TOKEN = "s3cr3t-token-value"
+
+# A fixed 32-byte deployment key, decoded form -- mirrors test_auth.py's own
+# convention (no cross-file dependency; tests never touch a real
+# HAMMERTIME_INGEST_AGENT_TOKEN_KEY env var or a file on disk).
+TEST_KEY = b"0" * 32
 
 # Known-aligned per test_routes.py's/test_pipeline.py's own happy-path fixture.
 WINDOW_START = "2026-09-14T10:00:00Z"
@@ -109,7 +115,7 @@ _SLOW_RATE_PER_MIN = 6.0
 def _known_agent(**overrides: object) -> AgentRecord:
     fields: dict[str, object] = {
         "agent_id": KNOWN_AGENT_ID,
-        "token": KNOWN_AGENT_TOKEN,
+        "token_hash": _hash_bytes(KNOWN_AGENT_TOKEN),
         "enabled": True,
         "rate_limit_rps": _AMPLE,
     }
@@ -140,6 +146,10 @@ def _settings(**overrides: object) -> IngestSettings:
     }
     fields.update(overrides)
     return IngestSettings(**fields)  # type: ignore[arg-type]
+
+
+def _hash_bytes(token: str, key: bytes = TEST_KEY) -> bytes:
+    return bytes.fromhex(hash_token(token, key=key))
 
 
 def _headers(agent_id: str, token: str) -> dict[str, str]:
@@ -191,7 +201,9 @@ def _client(
     both to `None` -- so every existing call site (which never passes
     them) is untouched.
     """
-    registry = AgentRegistry.from_records(agents if agents is not None else [_known_agent()])
+    registry = AgentRegistry.from_records(
+        agents if agents is not None else [_known_agent()], key=TEST_KEY
+    )
     # Passed as explicit, individually-typed keyword arguments (rather than
     # a `dict[str, object]` + `**splat`) so mypy strict mode can check this
     # call site against `create_app`'s real per-parameter types instead of
@@ -719,7 +731,7 @@ class TestUnknownAgentTimingIsNotAShortcut:
     """
 
     def test_unknown_agent_and_wrong_credential_paths_are_comparably_expensive(self) -> None:
-        registry = AgentRegistry.from_records([_known_agent()])
+        registry = AgentRegistry.from_records([_known_agent()], key=TEST_KEY)
         iterations = 200
 
         def _measure(agent_id: str, token: str) -> float:

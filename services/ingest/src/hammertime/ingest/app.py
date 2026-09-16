@@ -21,8 +21,13 @@ from hammertime.bus.interface import Producer
 from hammertime.bus.kafka import KafkaProducer
 from hammertime.bus.memory import InMemoryBus
 from hammertime.core.config.loader import load as load_detection_config
+from hammertime.core.time.clock import SystemClock
 from hammertime.ingest.api.routes import router
-from hammertime.ingest.auth.agents import AgentRegistry, load_agent_registry_file
+from hammertime.ingest.auth.agents import (
+    AgentRegistry,
+    load_agent_registry_file,
+    read_agent_token_key,
+)
 from hammertime.ingest.auth.middleware import require_agent
 from hammertime.ingest.config import IngestSettings, load_settings
 from hammertime.ingest.dedup.service import DedupService
@@ -102,7 +107,14 @@ def create_app(
         registry = (
             agent_registry
             if agent_registry is not None
-            else load_agent_registry_file(resolved_settings.agents_path)
+            # HAMMERTIME_INGEST_AGENT_TOKEN_KEY is read directly here, not via
+            # IngestSettings: that dataclass's repr gets logged, and this
+            # value is a secret (ADR-0006, spec section 36.1).
+            else load_agent_registry_file(
+                resolved_settings.agents_path,
+                key=read_agent_token_key(),
+                clock=SystemClock(),
+            )
         )
         resolved_rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
         resolved_auth_failure_source_limiter = (

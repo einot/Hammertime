@@ -14,9 +14,16 @@ import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from hammertime.core.auth.tokens import hash_token
 from hammertime.ingest.app import create_app
 from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
 from hammertime.ingest.config import IngestSettings
+
+# ADR-0006: AgentRegistry now requires a deployment key and stores hashed
+# credentials, not plaintext tokens -- a fixed 32-byte test key, exactly
+# as services/ingest/.../tests/test_auth.py uses, never a real env var or
+# file on disk.
+_AGENT_TOKEN_KEY = b"0" * 32
 
 _CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
 _BUCKET_SECONDS = json.loads(_CONFIG_PATH.read_text())["bucket_seconds"]
@@ -61,11 +68,13 @@ def _client() -> TestClient:
     # create_app(settings=...) avoids depending on process environment
     # variables, per app.py's own docstring. agent_registry is injected
     # directly (rather than read from agents_path) so this file needs no
-    # config/agents.v1.json fixture on disk; dedup_store/bus are left
+    # config/agents.v2.json fixture on disk; dedup_store/bus are left
     # unset so create_app builds a fresh in-memory one per client (no
     # cross-test state, since store_kind/bus_kind above are both "memory").
+    token_hash = bytes.fromhex(hash_token(_AGENT_TOKEN, key=_AGENT_TOKEN_KEY))
     registry = AgentRegistry.from_records(
-        [AgentRecord(agent_id=_AGENT_ID, token=_AGENT_TOKEN, rate_limit_rps=None)]
+        [AgentRecord(agent_id=_AGENT_ID, token_hash=token_hash, rate_limit_rps=None)],
+        key=_AGENT_TOKEN_KEY,
     )
     return TestClient(create_app(_SETTINGS, agent_registry=registry))
 

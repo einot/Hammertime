@@ -1,0 +1,12 @@
+{
+  "registry_version": 2,
+  "hash_algorithm": "hmac-sha256",
+  "key_id": "d7a9afb7ede38b4e",
+  "agents": {
+    "edge-17": {
+      "token_hash": "39534c4655f0ea1e735e9bff19809a3f5043ccdfe76b21f5827532a4273ac5d9",
+      "enabled": true,
+      "rate_limit_rps": null
+    }
+  }
+}

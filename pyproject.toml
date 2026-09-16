@@ -25,10 +25,18 @@ hammertime-ingest = { workspace = true }
 hammertime-aggregator = { workspace = true }
 hammertime-trie = { workspace = true }
 hammertime-detector = { workspace = true }
+hammertime-agent-sim = { workspace = true }
+hammertime-agent-token = { workspace = true }
+hammertime-replay = { workspace = true }
+hammertime-trie-inspect = { workspace = true }
 
 [dependency-groups]
 dev = [
     "hammertime-testkit",
+    "hammertime-agent-sim",
+    "hammertime-agent-token",
+    "hammertime-replay",
+    "hammertime-trie-inspect",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "hypothesis>=6.100",
@@ -42,7 +50,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["packages", "services", "tests"]
+testpaths = ["packages", "services", "tests", "tools"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -59,6 +67,7 @@ mypy_path = [
     "services/trie/src",
     "services/detector/src",
     "tools/agent-sim/src",
+    "tools/agent-token/src",
     "tools/replay/src",
     "tools/trie-inspect/src",
 ]

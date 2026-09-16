@@ -5,9 +5,10 @@ The authoritative architecture specification is
 Prefix Detection Service*, 46 sections (1-45 as originally written; §46 added by
 ADR-0005, which also adds pointer notes to §9, §12, §16, §29, §33, §34, §37).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
-credentials), §36.5-36.7 from ADR-0007 (failed-authentication throttling) and
-ADR-0008 (observation-scaled rate limiting), which also extend §37's ingestion
-metrics.
+credentials, registry document, rotation, provisioning), §36.5-36.7 from
+ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
+rate limiting), which also extend §37's ingestion metrics. §36's original
+requirements are unchanged.
 
 Sections are referenced by number throughout the codebase: every module docstring
 cites the section it implements, e.g. `Spec: §6, §30` for the HOT/COLD state
@@ -26,7 +27,6 @@ Section index used throughout the code:
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` |
 | 19 | Event-driven internals | `core/events`, `packages/hammertime-bus`, `docs/adr/0004` |
 | 20, 21 | Sharding & aggregation | `services/aggregator/sharding`, `services/ingest/publisher.py`, `docs/adr/0004` |
-| 46 | Per-IP attributes | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/events`, `core/config`, `docs/adr/0005` |
 | 22 | Consistency model | `docs/adr/0001` |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
 | 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `core/time/buckets.py` |
@@ -38,6 +38,7 @@ Section index used throughout the code:
 | 34 | Versioned configuration | `core/config`, `services/aggregator/reevaluate.py` |
 | 35 | IPv6 readiness | `core/addressing` |
 | 36 | Security | `services/ingest/auth` |
+| 36.1-36.4 | Agent credentials (hashed tokens, rotation, provisioning) | `services/ingest/auth/agents.py`, `core/auth/tokens.py`, `tools/agent-token`, `schemas/agent_registry.v2.json`, `docs/adr/0006` |
 | 36.5-36.7 | Auth throttling, request cost, throttled responses | `services/ingest/auth`, `services/ingest/ratelimit`, `services/ingest/api/routes.py`, `docs/adr/0007`, `docs/adr/0008` |
 | 37 | Observability | `core/telemetry`, `deploy/grafana` |
 | 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/events`, `core/config`, `docs/adr/0005` |
