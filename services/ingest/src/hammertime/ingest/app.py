@@ -70,6 +70,8 @@ def create_app(
     observation_limiter: RateLimiter | None = None,
     dedup_store: DedupStore | None = None,
     bus: InMemoryBus | None = None,
+    agent_slot_salt: bytes | None = None,
+    agent_slot_count: int | None = None,
 ) -> FastAPI:
     """Build the ingest FastAPI application.
 
@@ -85,6 +87,12 @@ def create_app(
     the same relationship `InMemoryBus.consumer(group_id)` has elsewhere in
     this repo). Any override left `None` falls back to the normal
     settings/environment-driven construction below.
+
+    `agent_slot_salt`/`agent_slot_count` are forwarded to `require_agent`
+    (ADR-0007 Decision 8) only when non-`None`; they exist purely so a test
+    can pin the attempted-id -> slot mapping deterministically and are never
+    driven by settings/environment -- production always gets `require_agent`'s
+    own defaults (a fresh random per-process salt and the default slot count).
     """
 
     @asynccontextmanager
@@ -130,12 +138,13 @@ def create_app(
         else:
             producer = InMemoryBus().producer()
 
-        app.state.ingest = IngestState(
-            settings=resolved_settings,
-            schema_validator=ObservationSchemaValidator.from_file(),
-            bucket_seconds=detection_config.bucket_seconds,
-            registry=registry,
-            authenticate=require_agent(
+        # `agent_slot_salt` accepts `None` in `require_agent` itself (meaning
+        # "draw a fresh random salt"), so it can always be forwarded as-is.
+        # `agent_slot_count` has a non-`None` default there, so it is only
+        # passed through when this caller actually overrides it -- otherwise
+        # `require_agent`'s own default applies.
+        authenticate = (
+            require_agent(
                 registry,
                 source_limiter=resolved_auth_failure_source_limiter,
                 agent_limiter=resolved_auth_failure_agent_limiter,
@@ -144,7 +153,29 @@ def create_app(
                 auth_failure_agent_rate_per_min=(resolved_settings.auth_failure_agent_rate_per_min),
                 auth_failure_agent_burst=resolved_settings.auth_failure_agent_burst,
                 trusted_proxy_hops=resolved_settings.trusted_proxy_hops,
-            ),
+                agent_slot_salt=agent_slot_salt,
+                agent_slot_count=agent_slot_count,
+            )
+            if agent_slot_count is not None
+            else require_agent(
+                registry,
+                source_limiter=resolved_auth_failure_source_limiter,
+                agent_limiter=resolved_auth_failure_agent_limiter,
+                auth_failure_rate_per_min=resolved_settings.auth_failure_rate_per_min,
+                auth_failure_burst=resolved_settings.auth_failure_burst,
+                auth_failure_agent_rate_per_min=(resolved_settings.auth_failure_agent_rate_per_min),
+                auth_failure_agent_burst=resolved_settings.auth_failure_agent_burst,
+                trusted_proxy_hops=resolved_settings.trusted_proxy_hops,
+                agent_slot_salt=agent_slot_salt,
+            )
+        )
+
+        app.state.ingest = IngestState(
+            settings=resolved_settings,
+            schema_validator=ObservationSchemaValidator.from_file(),
+            bucket_seconds=detection_config.bucket_seconds,
+            registry=registry,
+            authenticate=authenticate,
             rate_limiter=resolved_rate_limiter,
             auth_failure_source_limiter=resolved_auth_failure_source_limiter,
             auth_failure_agent_limiter=resolved_auth_failure_agent_limiter,
