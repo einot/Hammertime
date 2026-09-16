@@ -1556,7 +1556,8 @@ buckets, source bucket first:
 
 ```text
 source bucket  key = client address, IPv4 /32, IPv6 /64
-agent bucket   key = the attempted X-Agent-Id, or "-" when absent or malformed
+agent bucket   key = a fixed-size slot derived from the attempted X-Agent-Id,
+                     or "-" when it is absent or malformed
 ```
 
 If the source bucket is exhausted the agent bucket MUST NOT be charged and the
@@ -1571,6 +1572,29 @@ key is the entry that many positions from the right of that header; an absent,
 shorter, or unparsable header falls back to the socket peer. IPv6 sources are
 keyed by their `/64` prefix, because a single allocation routinely carries 2^64
 addresses.
+
+**The agent bucket's key space MUST be bounded independently of the limiter's
+eviction policy.** The attempted `X-Agent-Id` is caller-chosen, so charging a
+bucket keyed directly on it lets an attacker manufacture enough distinct keys to
+evict a target identity's bucket, which is then recreated with a full budget —
+resetting the very limit this bucket exists to impose. The service MUST
+therefore map every presented `X-Agent-Id` into a fixed table of 4096 slots
+using a keyed hash under a salt drawn once per process, and charge the slot:
+
+```text
+slot = HMAC-SHA-256(salt, X-Agent-Id) first 8 bytes, big-endian, mod 4096
+```
+
+An absent, empty, or over-long `X-Agent-Id` charges the single `"-"` key
+instead, so the agent limiter tracks at most 4097 keys for any input and no
+bucket is ever evicted. Registered and unregistered identities MUST be mapped by
+the identical function, so that a throttled response never discloses whether an
+`agent_id` is registered. Two identities sharing a slot share one budget; since
+only failures are charged, that can only reduce the guesses available to an
+attacker, never increase them. The slot count is a fixed property of the service
+and is not operator-configurable; the salt MUST NOT appear in any response, log,
+or metric. An LRU bound on the number of tracked buckets is a memory limit, not
+a budget limit, and MUST NOT be relied on as the latter.
 
 **Uniform failure response.** Every authentication failure — missing
 `X-Agent-Id`, missing or malformed `Authorization`, an over-long header value, an
