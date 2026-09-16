@@ -27,6 +27,14 @@ _BUCKET_SECONDS = json.loads(_CONFIG_PATH.read_text())["bucket_seconds"]
 _AGENT_ID = "edge-17"
 _AGENT_TOKEN = "test-token"
 
+# ADR-0007 (issue #40) / ADR-0008 (issue #41) each add several required
+# IngestSettings fields (config.py has no dataclass-level defaults of its
+# own -- load_settings() is where env-var defaults are applied); every
+# value below is deliberately generous/permissive so none of this file's
+# existing status-code assertions can be accidentally defeated by tripping
+# a new throttle or budget this file isn't testing. See
+# test_auth_throttle.py and test_ratelimit.py/test_pipeline.py's
+# observation-budget coverage for the tests that actually exercise these.
 _SETTINGS = IngestSettings(
     host="127.0.0.1",
     port=0,
@@ -39,6 +47,13 @@ _SETTINGS = IngestSettings(
     bus_brokers="",
     store_kind="memory",
     redis_url="",
+    observation_rate_limit_eps=1_000_000,
+    observation_burst=1_000_000,
+    auth_failure_rate_per_min=1_000_000,
+    auth_failure_burst=1_000_000,
+    auth_failure_agent_rate_per_min=1_000_000,
+    auth_failure_agent_burst=1_000_000,
+    trusted_proxy_hops=0,
 )
 
 
