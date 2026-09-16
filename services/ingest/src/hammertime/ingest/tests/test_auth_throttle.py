@@ -185,16 +185,27 @@ def _client(
     and `TestExhaustedAgentBudgetIsNotRestoredByFloodingDistinctIds`
     classes below) may need reconciling once the real signature lands, per
     the same note this file's module docstring already makes about
-    `require_agent`. Only forwarded when explicitly given, so every
-    existing call site (which never passes them) is untouched.
+    `require_agent`. Always forwarded as an explicit keyword argument
+    (`None` when a caller of `_client()` doesn't override it), which is
+    equivalent to omitting the keyword since `create_app` itself defaults
+    both to `None` -- so every existing call site (which never passes
+    them) is untouched.
     """
     registry = AgentRegistry.from_records(agents if agents is not None else [_known_agent()])
-    create_app_kwargs: dict[str, object] = {"agent_registry": registry}
-    if agent_slot_salt is not None:
-        create_app_kwargs["agent_slot_salt"] = agent_slot_salt
-    if agent_slot_count is not None:
-        create_app_kwargs["agent_slot_count"] = agent_slot_count
-    app = create_app(_settings(**settings_overrides), **create_app_kwargs)
+    # Passed as explicit, individually-typed keyword arguments (rather than
+    # a `dict[str, object]` + `**splat`) so mypy strict mode can check this
+    # call site against `create_app`'s real per-parameter types instead of
+    # rejecting an untypeable double-star dict unpack. `agent_slot_salt`/
+    # `agent_slot_count` both default to `None` on `create_app` itself, so
+    # forwarding `None` here when a caller of `_client()` didn't override
+    # them is equivalent to omitting the keyword entirely -- no behaviour
+    # change from the previous conditional-dict version.
+    app = create_app(
+        _settings(**settings_overrides),
+        agent_registry=registry,
+        agent_slot_salt=agent_slot_salt,
+        agent_slot_count=agent_slot_count,
+    )
     return TestClient(app, client=client_address).__enter__()
 
 
