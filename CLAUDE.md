@@ -42,3 +42,16 @@ check`, `ruff format --check`, `mypy`); the known pre-existing `integration`
 CI gap (empty `tests/integration`/`tests/e2e`, tracked in #26) is the one
 standing exception until it's fixed — once it starts passing, hold every
 merge to that bar too.
+
+## Branch protection
+
+`master` is protected: every significant change lands on a dedicated
+feature branch and reaches `master` only through a pull request, never a
+direct commit or push to `master` itself. A "significant change" is
+anything that touches code, schemas, config, or design docs (ADRs, spec
+sections) — a one-line typo fix in passing is not, but when in doubt, use a
+branch. This holds even under the pre-1.0 exception above: that exception
+covers finishing/merging a PR, not committing straight to `master`.
+Branch-per-issue (or per-design-doc) is the established convention here —
+keep it that way even as issues get split, reconciled, or stacked on each
+other.
