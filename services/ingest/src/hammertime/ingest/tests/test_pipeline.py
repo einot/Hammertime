@@ -309,14 +309,18 @@ class TestAuthGateRunsBeforeValidation:
         )
         assert response.status_code == 401
 
-    def test_wrong_credential_with_invalid_body_is_403_not_400(self) -> None:
+    def test_wrong_credential_with_invalid_body_is_401_not_400(self) -> None:
+        # ADR-0007 decision 4: a wrong credential for a known agent is now
+        # 401 (uniform body), not 403 -- 403 is reserved for a correct
+        # credential on a disabled agent (see
+        # test_disabled_agent_with_invalid_body_is_403_not_400 below).
         client, _bus = _build_app()
         response = client.post(
             "/v1/observations",
             json=self._invalid_body(),
             headers=_headers(KNOWN_AGENT_ID, "wrong-token"),
         )
-        assert response.status_code == 403
+        assert response.status_code == 401
 
     def test_disabled_agent_with_invalid_body_is_403_not_400(self) -> None:
         disabled = _agent(
@@ -871,8 +875,19 @@ class TestObservationBudgetChargedRegardlessOfOutcome:
     cannot be gamed.'"""
 
     def test_a_duplicate_request_still_charges_the_observation_budget(self) -> None:
+        # ADR-0008 §6 places the observation-budget check *before* the
+        # dedup claim -- so a request that fails the budget check never
+        # reaches the dedup claim at all, and can therefore never be
+        # answered "duplicate". A burst of exactly one charge's worth (as
+        # an earlier version of this test used) means an immediate resend
+        # is throttled (429) before it can even be recognized as a
+        # duplicate, which would prove nothing about whether duplicates are
+        # charged. Using a burst of *two* charges' worth instead lets the
+        # duplicate itself reach the dedup claim and be answered 200, while
+        # still proving it was charged: the budget is fully spent only
+        # after the duplicate, not after the first request alone.
         client, _bus = _build_app(
-            settings=_settings(observation_rate_limit_eps=2, observation_burst=2)
+            settings=_settings(observation_rate_limit_eps=4, observation_burst=4)
         )
         headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
         body = _body(
@@ -883,14 +898,18 @@ class TestObservationBudgetChargedRegardlessOfOutcome:
             ],
         )
         first = client.post("/v1/observations", json=body, headers=headers)
-        assert first.status_code == 202
+        assert first.status_code == 202  # costs 2, leaving 2 of 4 tokens
 
-        # Resending the exact same sequence is a duplicate (200), but it is
-        # charged the same 2-token cost as any other batch -- the budget is
-        # now fully spent even though nothing new was published.
+        # Resending the exact same sequence is a duplicate (200) -- it
+        # still has enough budget left (2 of 4) to reach the dedup claim --
+        # but it is charged the same 2-token cost as any other batch,
+        # leaving the budget fully spent even though nothing new was
+        # published.
         duplicate = client.post("/v1/observations", json=body, headers=headers)
         assert duplicate.status_code == 200
 
+        # A third, brand-new request now finds the budget fully spent --
+        # proof the duplicate really was charged, not silently free.
         third = client.post(
             "/v1/observations",
             json=_body(sequence=2, observations=[{"ip": "10.6.6.3", "request_count": 1}]),

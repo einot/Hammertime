@@ -49,6 +49,7 @@ rates to keep a generous margin against real-time drift during a test run.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from pathlib import Path
 
@@ -167,20 +168,14 @@ class TestUniformAuthenticationFailureResponse:
         "case_headers",
         [
             pytest.param({}, id="no_credentials_at_all"),
-            pytest.param(
-                {"Authorization": f"Bearer {KNOWN_AGENT_TOKEN}"}, id="missing_agent_id"
-            ),
+            pytest.param({"Authorization": f"Bearer {KNOWN_AGENT_TOKEN}"}, id="missing_agent_id"),
             pytest.param({"X-Agent-Id": KNOWN_AGENT_ID}, id="missing_authorization"),
             pytest.param(
                 {"X-Agent-Id": KNOWN_AGENT_ID, "Authorization": KNOWN_AGENT_TOKEN},
                 id="malformed_authorization_scheme",
             ),
-            pytest.param(
-                _headers("no-such-agent", "irrelevant-token"), id="unknown_agent_id"
-            ),
-            pytest.param(
-                _headers(KNOWN_AGENT_ID, "wrong-token"), id="wrong_token_for_known_agent"
-            ),
+            pytest.param(_headers("no-such-agent", "irrelevant-token"), id="unknown_agent_id"),
+            pytest.param(_headers(KNOWN_AGENT_ID, "wrong-token"), id="wrong_token_for_known_agent"),
             pytest.param(_headers("a" * 129, KNOWN_AGENT_TOKEN), id="oversized_agent_id"),
             pytest.param(_headers(KNOWN_AGENT_ID, "t" * 513), id="oversized_token"),
         ],
@@ -487,9 +482,8 @@ class TestTrustedProxyHopsSourceResolution:
         xff = "198.51.100.1, 203.0.113.5, 192.0.2.9"
 
         for _ in range(burst):
-            response = client.post(
-                "/v1/observations", json={}, headers={**_WRONG_TOKEN_HEADERS, "X-Forwarded-For": xff}
-            )
+            headers = {**_WRONG_TOKEN_HEADERS, "X-Forwarded-For": xff}
+            response = client.post("/v1/observations", json={}, headers=headers)
             assert response.status_code == 401
         blocked = client.post(
             "/v1/observations", json={}, headers={**_WRONG_TOKEN_HEADERS, "X-Forwarded-For": xff}
@@ -617,10 +611,8 @@ class TestUnknownAgentTimingIsNotAShortcut:
         def _measure(agent_id: str, token: str) -> float:
             start = time.perf_counter()
             for _ in range(iterations):
-                try:
+                with contextlib.suppress(AgentAuthError):
                     registry.authenticate(agent_id, token)
-                except AgentAuthError:
-                    pass
             return time.perf_counter() - start
 
         # Warm up (module/attribute lookups, etc.) before the measured runs.

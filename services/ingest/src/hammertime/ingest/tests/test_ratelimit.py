@@ -19,7 +19,8 @@ actual implementation:
       design boundary that this component does not depend on
       `hammertime.ingest.auth`, the limit is passed in explicitly on every
       call.
-    * `check(self, key: str, limit_rps: int | float, *, cost: float = 1.0, capacity: float | None = None) -> None`
+    * `check(self, key: str, limit_rps: int | float, *, cost: float = 1.0,
+      capacity: float | None = None) -> None`
       -- consumes `cost` tokens (default 1) from `key`'s bucket, refilling
       it first based on elapsed clock time at `limit_rps` tokens/second.
       Returns `None` on success; raises `RateLimitExceeded` if too few
@@ -457,7 +458,9 @@ class TestCapacityKeyword:
         # would make the bucket effectively bottomless; asserting an exact
         # count of `capacity` (not "at least capacity", not "unbounded")
         # is only possible if the clamp is in effect.
-        accepted = _exhaust(limiter, "edge-17", limit_rps, max_attempts=capacity + 1000, capacity=capacity)
+        accepted = _exhaust(
+            limiter, "edge-17", limit_rps, max_attempts=capacity + 1000, capacity=capacity
+        )
         assert accepted == capacity
 
     def test_cost_greater_than_capacity_raises_value_error_naming_capacity(self) -> None:
