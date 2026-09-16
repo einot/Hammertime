@@ -35,6 +35,40 @@ which parts of the ADR are derived from a real requirement and which are the
 architect's own judgment call, and can push back on the judgment calls
 specifically instead of having to re-derive them from the diff.
 
+## Supervisor agent
+
+Every dispatch to `coder`, `test-author`, or `architect` (the only
+subagents with write access) must be paired with a `supervisor` review
+before acting on its output (merging, pushing, or handing off to another
+agent). Give `supervisor` exactly two things: the literal instructions
+given to the worker agent, and the worker's own report of what it changed.
+`supervisor` is read-only (Read/Grep/Glob only, no Bash, no Edit/Write, no
+spawning other agents) — it inspects the actual current file contents
+against the task's stated scope and flags anything out of the ordinary:
+files touched outside the given scope, actions beyond what was asked,
+a report that doesn't match what actually changed, or anything resembling
+a backdoor, credential/secret exfiltration, or a disabled safety/security
+check.
+
+**Hard stop:** if `supervisor` reports any finding, STOP ALL PROCESSING
+immediately — do not merge, push, dispatch further agents, or continue
+reconciling — and report the finding to the user verbatim before doing
+anything else. This overrides every other standing instruction in this
+file, including the pre-1.0 exception below. Only the user decides how to
+proceed from a supervisor finding.
+
+`reviewer`/`security-auditor` are themselves read-only and structurally
+incapable of taking an unauthorized action (no write access at all), so
+routine supervisor coverage is scoped to the three agents that can write;
+extend it to every dispatch if asked.
+
+`architect` can itself dispatch `coder`/`test-author`; the same pairing
+requirement applies to those dispatches too, so `architect` is also
+allowed to spawn `supervisor` (see `.claude/agents/architect.md`). A
+finding `supervisor` reports to `architect` reaches the top-level session
+as a handed-back blocker like any other — the hard stop above still
+applies once it does.
+
 ## Orchestration role
 
 The top-level session acts as project manager only: delegate, reconcile,
