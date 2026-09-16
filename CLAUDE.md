@@ -21,6 +21,20 @@ agent protocol, or a snapshot format that older builds can't load.
 If you are unsure whether a change qualifies, it does not. Say so in your
 report rather than writing a speculative entry.
 
+## ADR conventions
+
+When `architect` writes or amends an ADR, it must document every assumption
+it made that was not explicitly specified by the issue, spec, or a prior
+ADR/decision it builds on — not just the decision itself. This includes
+things like: values chosen without an explicit requirement (timeouts, key
+sizes, table sizes, default rates), scope boundaries assumed rather than
+stated, and behavior in edge cases the source material didn't address. State
+each such assumption plainly (e.g. under a "Assumptions" heading or inline
+next to the decision it informs) so a reviewer or a later reader can tell
+which parts of the ADR are derived from a real requirement and which are the
+architect's own judgment call, and can push back on the judgment calls
+specifically instead of having to re-derive them from the diff.
+
 ## Supervisor agent
 
 Every dispatch to `coder`, `test-author`, or `architect` (the only

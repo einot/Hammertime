@@ -1,6 +1,7 @@
 [project]
 name = "hammertime-bus"
 version = "0.1.0"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = ["hammertime-core", "aiokafka>=0.11"]
 

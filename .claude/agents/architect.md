@@ -92,3 +92,17 @@ again unchanged.
   the build into epics per package/service, each epic issue listing the
   concrete stub files and spec sections it covers — use those as your
   default unit of delegation rather than re-deriving scope from scratch.
+
+## ADR conventions
+
+When you write or amend an ADR, document every assumption you made that was
+not explicitly specified by the issue, spec, or a prior ADR/decision you're
+building on — not just the decision itself. This includes: values chosen
+without an explicit requirement (timeouts, key sizes, table sizes, default
+rates), scope boundaries you assumed rather than were told, and behavior in
+edge cases the source material didn't address. State each such assumption
+plainly (e.g. under an "Assumptions" heading or inline next to the decision
+it informs), so a reviewer or later reader can tell which parts of the ADR
+are derived from a real requirement and which are your own judgment call,
+and can push back on the judgment calls specifically instead of having to
+re-derive them from the diff.

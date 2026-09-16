@@ -69,6 +69,17 @@ whose `{"status": "accepted"}` body is already established by
 asserts the documented status code, not a body shape not written down
 anywhere -- if the coder settles on a specific body, add that assertion
 during reconciliation rather than guessing it here.
+
+ADR-0008 (issue #41) additions below (`TestObservationBudget*`,
+`TestOverCapacityBatchIs413NotA500`, `TestFlatRequestRateLimitNowHasRetryAfter`):
+`IngestState.observation_limiter` (ADR-0008's implementation notes) has no
+`create_app` override keyword of its own, unlike the flat per-request
+`rate_limiter=` above (which `_build_app` always wires to a frozen
+`ManualClock`) -- so, absent one, those tests rely on real wall-clock time
+between two back-to-back `TestClient` calls staying well under one second,
+using deliberately small `observation_rate_limit_eps`/`observation_burst`
+values to keep that margin generous. Reconcile onto an injected
+`ManualClock` if/when `app.py` exposes one for this limiter.
 """
 
 from __future__ import annotations
@@ -81,6 +92,7 @@ from fastapi.testclient import TestClient
 from hammertime.bus.memory import InMemoryBus, MemoryProducer
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.core.addressing.address import Address
+from hammertime.core.auth.tokens import hash_token
 from hammertime.core.events.codec import EventPayload, decode
 from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import RequestObservation
@@ -90,6 +102,12 @@ from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
 from hammertime.ingest.config import IngestSettings
 from hammertime.ingest.ratelimit import RateLimiter
 from hammertime.store.memory import MemoryDedupStore
+
+# ADR-0006: AgentRegistry now requires a deployment key and stores hashed
+# credentials, not plaintext tokens -- a fixed 32-byte test key, exactly
+# as services/ingest/.../tests/test_auth.py uses, never a real env var or
+# file on disk.
+_AGENT_TOKEN_KEY = b"0" * 32
 
 _CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
 
@@ -109,9 +127,28 @@ _AMPLE_RATE_LIMIT_RPS = 1_000
 
 
 def _agent(agent_id: str, token: str, *, rate_limit_rps: int, enabled: bool = True) -> AgentRecord:
+    token_hash = bytes.fromhex(hash_token(token, key=_AGENT_TOKEN_KEY))
     return AgentRecord(
-        agent_id=agent_id, token=token, enabled=enabled, rate_limit_rps=rate_limit_rps
+        agent_id=agent_id, token_hash=token_hash, enabled=enabled, rate_limit_rps=rate_limit_rps
     )
+
+
+# ADR-0008 (issue #41): the observation budget is a *global* per-agent
+# limiter built once in app.py's lifespan from these two settings, with no
+# create_app() override of its own (unlike rate_limiter=/dedup_store=/bus=
+# above) -- so any test in this file that must trip or must not trip it
+# does so purely by choosing observation_rate_limit_eps/observation_burst
+# via _settings(), never by injecting a limiter instance directly.
+_AMPLE_OBSERVATION_RATE_LIMIT_EPS = 1_000_000
+_AMPLE_OBSERVATION_BURST = 1_000_000
+
+# ADR-0007 (issue #40): likewise generous defaults for the two
+# failed-authentication throttles, so no test in this file that isn't
+# specifically about #40 can accidentally trip them.
+_AMPLE_AUTH_FAILURE_RATE_PER_MIN = 1_000_000
+_AMPLE_AUTH_FAILURE_BURST = 1_000_000
+_AMPLE_AUTH_FAILURE_AGENT_RATE_PER_MIN = 1_000_000
+_AMPLE_AUTH_FAILURE_AGENT_BURST = 1_000_000
 
 
 def _settings(**overrides: object) -> IngestSettings:
@@ -131,6 +168,13 @@ def _settings(**overrides: object) -> IngestSettings:
         "bus_brokers": "",
         "store_kind": "memory",
         "redis_url": "",
+        "observation_rate_limit_eps": _AMPLE_OBSERVATION_RATE_LIMIT_EPS,
+        "observation_burst": _AMPLE_OBSERVATION_BURST,
+        "auth_failure_rate_per_min": _AMPLE_AUTH_FAILURE_RATE_PER_MIN,
+        "auth_failure_burst": _AMPLE_AUTH_FAILURE_BURST,
+        "auth_failure_agent_rate_per_min": _AMPLE_AUTH_FAILURE_AGENT_RATE_PER_MIN,
+        "auth_failure_agent_burst": _AMPLE_AUTH_FAILURE_AGENT_BURST,
+        "trusted_proxy_hops": 0,
     }
     fields.update(overrides)
     return IngestSettings(**fields)  # type: ignore[arg-type]
@@ -152,7 +196,9 @@ def _build_app(
     failure.
     """
     default_agent = _agent(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN, rate_limit_rps=_AMPLE_RATE_LIMIT_RPS)
-    registry = AgentRegistry.from_records(agents if agents is not None else [default_agent])
+    registry = AgentRegistry.from_records(
+        agents if agents is not None else [default_agent], key=_AGENT_TOKEN_KEY
+    )
     resolved_clock = clock if clock is not None else ManualClock(initial=0)
     resolved_bus = bus if bus is not None else InMemoryBus()
     app = create_app(
@@ -273,14 +319,18 @@ class TestAuthGateRunsBeforeValidation:
         )
         assert response.status_code == 401
 
-    def test_wrong_credential_with_invalid_body_is_403_not_400(self) -> None:
+    def test_wrong_credential_with_invalid_body_is_401_not_400(self) -> None:
+        # ADR-0007 decision 4: a wrong credential for a known agent is now
+        # 401 (uniform body), not 403 -- 403 is reserved for a correct
+        # credential on a disabled agent (see
+        # test_disabled_agent_with_invalid_body_is_403_not_400 below).
         client, _bus = _build_app()
         response = client.post(
             "/v1/observations",
             json=self._invalid_body(),
             headers=_headers(KNOWN_AGENT_ID, "wrong-token"),
         )
-        assert response.status_code == 403
+        assert response.status_code == 401
 
     def test_disabled_agent_with_invalid_body_is_403_not_400(self) -> None:
         disabled = _agent(
@@ -618,3 +668,353 @@ class TestPublishFailureReturns503:
         second = client.post("/v1/observations", json=_body(sequence=1), headers=headers)
         assert second.status_code == 200
         assert second.json() == {"status": "duplicate"}
+
+
+class TestFlatRequestRateLimitNowHasRetryAfter:
+    """ADR-0008 consequences: 'The existing flat `check(agent_id,
+    effective_limit_rps)` call is untouched except for gaining
+    `Retry-After` and `X-RateLimit-Scope: requests` on its 429.' Section
+    36.7: `Retry-After` MUST be present on all three throttled scopes, not
+    just the two ADR-0008 newly introduces.
+    """
+
+    def test_request_rate_limited_429_carries_retry_after_and_requests_scope(self) -> None:
+        limit_rps = 1
+        client, _bus = _build_app(
+            agents=[_agent(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN, rate_limit_rps=limit_rps)]
+        )
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+
+        first = client.post("/v1/observations", json=_body(sequence=1), headers=headers)
+        assert first.status_code == 202
+
+        second = client.post("/v1/observations", json=_body(sequence=2), headers=headers)
+        assert second.status_code == 429
+        assert second.headers["X-RateLimit-Scope"] == "requests"
+        # Section 36.7: an integer count of seconds, at least 1.
+        retry_after = int(second.headers["Retry-After"])
+        assert retry_after >= 1
+
+
+class TestObservationBudgetChargesDistinctIpsNotEntryCount:
+    """ADR-0008 decision 3: cost is the number of *distinct* IPs remaining
+    after ADR-0004's coalescing -- not `len(observations[])`."""
+
+    def test_one_ip_repeated_many_times_costs_one_not_the_entry_count(self) -> None:
+        client, bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=1, observation_burst=1)
+        )
+        # 50 entries naming the same IP coalesce to one distinct address,
+        # so this must cost exactly 1 against a capacity of 1 -- charging
+        # len(observations) (50) would make this 413 instead.
+        observations = [{"ip": "10.0.0.9", "request_count": 1}] * 50
+        response = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=observations),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+        assert response.status_code == 202
+        assert len(_topic_records(bus)) == 1
+
+    def test_repeated_ip_batch_leaves_the_budget_at_exactly_capacity_minus_one(self) -> None:
+        # Same idea, but proves the *remaining* budget rather than just the
+        # accepted/rejected outcome: if 50 repeated-IP entries had been
+        # charged per-entry (50) instead of per-distinct-IP (1) against a
+        # capacity of 1, the request would have been 413, not 202; and if
+        # they had been charged nothing at all, a second, brand-new
+        # distinct IP would still fit in the untouched budget. Charged
+        # correctly (cost 1 of 1), the very next distinct IP must find the
+        # budget already spent.
+        #
+        # Real-clock note: `observation_limiter` has no clock-injection
+        # point through `create_app` (unlike `rate_limiter=` above, which
+        # `_build_app` always wires to a frozen `ManualClock`), so this
+        # relies on two back-to-back TestClient calls completing well
+        # under one second of real time -- true in practice, but revisit
+        # with an injected clock if `app.py` ever exposes one.
+        client, bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=1, observation_burst=1)
+        )
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+        observations = [{"ip": "10.0.0.9", "request_count": 1}] * 50
+
+        first = client.post(
+            "/v1/observations", json=_body(sequence=1, observations=observations), headers=headers
+        )
+        assert first.status_code == 202
+        assert len(_topic_records(bus)) == 1
+
+        second = client.post(
+            "/v1/observations",
+            json=_body(sequence=2, observations=[{"ip": "10.0.0.10", "request_count": 1}]),
+            headers=headers,
+        )
+        assert second.status_code == 429
+        assert second.headers["X-RateLimit-Scope"] == "observations"
+        assert len(_topic_records(bus)) == 1  # the second request published nothing
+
+
+class TestZeroCountEntriesAreChargedButNeverPublished:
+    """ADR-0008 decisions 3 and 5: a zero-count entry is charged for the
+    distinct address it names, but never published -- the aggregator must
+    never see a zero-delta observation."""
+
+    def test_all_zero_count_batch_is_202_claims_dedup_and_publishes_nothing(self) -> None:
+        client, bus = _build_app()
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+        observations = [
+            {"ip": "10.1.1.1", "request_count": 0},
+            {"ip": "10.1.1.2", "request_count": 0},
+        ]
+        response = client.post(
+            "/v1/observations", json=_body(sequence=1, observations=observations), headers=headers
+        )
+        assert response.status_code == 202
+        assert response.json() == {"status": "accepted"}
+        assert _topic_records(bus) == []  # nothing published -- both entries were zero-delta
+
+        # The (agent_id, sequence) claim was still taken in full: a resend
+        # of the exact same sequence is a duplicate, not treated as fresh.
+        duplicate = client.post(
+            "/v1/observations", json=_body(sequence=1, observations=observations), headers=headers
+        )
+        assert duplicate.status_code == 200
+
+    def test_mixed_batch_publishes_only_the_non_zero_entries(self) -> None:
+        client, bus = _build_app()
+        observations = [
+            {"ip": "10.1.1.3", "request_count": 0},
+            {"ip": "10.1.1.4", "request_count": 5},
+        ]
+        response = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=observations),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+        assert response.status_code == 202
+
+        decoded = _decoded_records(bus)
+        assert len(decoded) == 1
+        key, envelope = decoded[0]
+        assert key is not None
+        assert key.decode("utf-8") == _canonical("10.1.1.4")
+        entry = _as_request_observation(envelope).observations[0]
+        assert entry.request_count == 5
+
+    def test_zero_count_entries_are_charged_against_the_observation_budget(self) -> None:
+        # Capacity 5: a first batch of 3 distinct zero-count IPs must
+        # consume 3 tokens even though it publishes nothing, leaving only
+        # 2 available for the very next request.
+        client, bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=5, observation_burst=5)
+        )
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+        zero_observations = [
+            {"ip": "10.2.2.1", "request_count": 0},
+            {"ip": "10.2.2.2", "request_count": 0},
+            {"ip": "10.2.2.3", "request_count": 0},
+        ]
+        first = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=zero_observations),
+            headers=headers,
+        )
+        assert first.status_code == 202
+        assert _topic_records(bus) == []
+
+        # Only 2 tokens remain; a batch naming 3 more distinct (non-zero)
+        # IPs must be throttled for going too fast, not silently allowed
+        # through -- which would only be possible if the zero-count batch
+        # above had been charged nothing at all.
+        second_observations = [
+            {"ip": "10.2.2.4", "request_count": 1},
+            {"ip": "10.2.2.5", "request_count": 1},
+            {"ip": "10.2.2.6", "request_count": 1},
+        ]
+        second = client.post(
+            "/v1/observations",
+            json=_body(sequence=2, observations=second_observations),
+            headers=headers,
+        )
+        assert second.status_code == 429
+        assert second.headers["X-RateLimit-Scope"] == "observations"
+        assert "Retry-After" in second.headers
+        assert _topic_records(bus) == []
+
+
+class TestObservationBudgetRateLimiting:
+    """ADR-0008 decision 2: docs/protocol/observation-v1.md's `429 |
+    ... observations (per-agent observation rate, charged per distinct
+    IP)`."""
+
+    def test_batch_exceeding_the_agents_remaining_observation_budget_is_429(self) -> None:
+        client, bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=3, observation_burst=3)
+        )
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+
+        first = client.post(
+            "/v1/observations",
+            json=_body(
+                sequence=1,
+                observations=[
+                    {"ip": "10.5.5.1", "request_count": 1},
+                    {"ip": "10.5.5.2", "request_count": 1},
+                    {"ip": "10.5.5.3", "request_count": 1},
+                ],
+            ),
+            headers=headers,
+        )
+        assert first.status_code == 202  # exactly spends the full 3-token budget
+
+        second = client.post(
+            "/v1/observations",
+            json=_body(sequence=2, observations=[{"ip": "10.5.5.4", "request_count": 1}]),
+            headers=headers,
+        )
+        assert second.status_code == 429
+        assert second.headers["X-RateLimit-Scope"] == "observations"
+        assert int(second.headers["Retry-After"]) >= 1
+        assert len(_topic_records(bus)) == 3  # only the first batch's messages
+
+
+class TestObservationBudgetChargedRegardlessOfOutcome:
+    """ADR-0008 decision 3: 'A batch found to be a duplicate at the dedup
+    claim, and a batch whose publish then fails (503), are both charged
+    too. Charging on request, not on success, is the only variant that
+    cannot be gamed.'"""
+
+    def test_a_duplicate_request_still_charges_the_observation_budget(self) -> None:
+        # ADR-0008 §6 places the observation-budget check *before* the
+        # dedup claim -- so a request that fails the budget check never
+        # reaches the dedup claim at all, and can therefore never be
+        # answered "duplicate". A burst of exactly one charge's worth (as
+        # an earlier version of this test used) means an immediate resend
+        # is throttled (429) before it can even be recognized as a
+        # duplicate, which would prove nothing about whether duplicates are
+        # charged. Using a burst of *two* charges' worth instead lets the
+        # duplicate itself reach the dedup claim and be answered 200, while
+        # still proving it was charged: the budget is fully spent only
+        # after the duplicate, not after the first request alone.
+        client, _bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=4, observation_burst=4)
+        )
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+        body = _body(
+            sequence=1,
+            observations=[
+                {"ip": "10.6.6.1", "request_count": 1},
+                {"ip": "10.6.6.2", "request_count": 1},
+            ],
+        )
+        first = client.post("/v1/observations", json=body, headers=headers)
+        assert first.status_code == 202  # costs 2, leaving 2 of 4 tokens
+
+        # Resending the exact same sequence is a duplicate (200) -- it
+        # still has enough budget left (2 of 4) to reach the dedup claim --
+        # but it is charged the same 2-token cost as any other batch,
+        # leaving the budget fully spent even though nothing new was
+        # published.
+        duplicate = client.post("/v1/observations", json=body, headers=headers)
+        assert duplicate.status_code == 200
+
+        # A third, brand-new request now finds the budget fully spent --
+        # proof the duplicate really was charged, not silently free.
+        third = client.post(
+            "/v1/observations",
+            json=_body(sequence=2, observations=[{"ip": "10.6.6.3", "request_count": 1}]),
+            headers=headers,
+        )
+        assert third.status_code == 429
+        assert third.headers["X-RateLimit-Scope"] == "observations"
+
+    def test_a_failed_publish_still_charges_the_observation_budget(self) -> None:
+        client, _bus = _build_app(
+            bus=_FailingBus(),
+            settings=_settings(observation_rate_limit_eps=1, observation_burst=1),
+        )
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+        first = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=[{"ip": "10.7.7.1", "request_count": 1}]),
+            headers=headers,
+        )
+        assert first.status_code == 503
+
+        second = client.post(
+            "/v1/observations",
+            json=_body(sequence=2, observations=[{"ip": "10.7.7.2", "request_count": 1}]),
+            headers=headers,
+        )
+        assert second.status_code == 429
+        assert second.headers["X-RateLimit-Scope"] == "observations"
+
+
+class TestOverCapacityBatchIs413NotA500:
+    """ADR-0008 decision 4: an unsatisfiable batch (cost above the
+    configured observation capacity) is `413`, never a `ValueError`-driven
+    `500` -- the route must compare cost against capacity itself and never
+    pass an over-capacity cost to `check()`."""
+
+    def test_batch_whose_cost_exceeds_capacity_is_413_naming_cost_and_ceiling(self) -> None:
+        client, bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=2, observation_burst=2)
+        )
+        observations = [
+            {"ip": "10.3.3.1", "request_count": 1},
+            {"ip": "10.3.3.2", "request_count": 1},
+            {"ip": "10.3.3.3", "request_count": 1},  # 3 distinct IPs > capacity of 2
+        ]
+        response = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=observations),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+        assert response.status_code == 413
+        detail = response.json()["detail"]
+        assert "3" in detail  # the cost
+        assert "2" in detail  # the ceiling (observation_burst)
+        assert _topic_records(bus) == []
+
+    def test_over_capacity_batch_does_not_consume_the_dedup_claim(self) -> None:
+        # ADR-0008's normative pipeline order: the observation charge sits
+        # before the dedup claim, so a rejected batch's sequence remains
+        # available for a corrected (smaller) retry.
+        client, bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=2, observation_burst=2)
+        )
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+        oversized = [
+            {"ip": "10.3.3.1", "request_count": 1},
+            {"ip": "10.3.3.2", "request_count": 1},
+            {"ip": "10.3.3.3", "request_count": 1},
+        ]
+        rejected = client.post(
+            "/v1/observations", json=_body(sequence=1, observations=oversized), headers=headers
+        )
+        assert rejected.status_code == 413
+
+        corrected = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=[{"ip": "10.3.3.1", "request_count": 1}]),
+            headers=headers,
+        )
+        assert corrected.status_code == 202
+        assert len(_topic_records(bus)) == 1
+
+    def test_over_capacity_batch_is_413_not_a_500_even_far_over_budget(self) -> None:
+        # Defense in depth: an unsatisfiable-at-any-rate batch must be a
+        # clean 413, never an unhandled ValueError escaping as a 500 --
+        # the exact failure mode ADR-0008's context section names
+        # (`RateLimiter.check` raises `ValueError` when `cost > capacity`).
+        client, bus = _build_app(
+            settings=_settings(observation_rate_limit_eps=1, observation_burst=1)
+        )
+        observations = [{"ip": f"10.4.4.{i}", "request_count": 1} for i in range(1, 6)]
+        response = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=observations),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+        assert response.status_code == 413
+        assert _topic_records(bus) == []

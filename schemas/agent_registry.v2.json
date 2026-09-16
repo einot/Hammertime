@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hammertime.dev/schemas/agent_registry.v2.json",
+  "title": "AgentRegistry",
+  "description": "The ingest agent registry document (config/agents.v2.json, HAMMERTIME_INGEST_AGENTS_PATH). Spec section 36, ADR-0006. Holds keyed hashes of agent bearer tokens, never the tokens themselves. Version 2 is the first version with a schema; version 1 was the plaintext-token format this replaces.",
+  "type": "object",
+  "required": ["registry_version", "hash_algorithm", "key_id", "agents"],
+  "additionalProperties": false,
+  "properties": {
+    "registry_version": {
+      "const": 2,
+      "description": "Format version of this document. A v1 (plaintext-token) registry has no such field and is rejected at load with a pointer to `hammertime-agent-token migrate`."
+    },
+    "hash_algorithm": {
+      "enum": ["hmac-sha256"],
+      "description": "How token_hash was derived: HMAC-SHA-256 over the utf-8 token, keyed by the deployment secret in HAMMERTIME_INGEST_AGENT_TOKEN_KEY (base64url, >= 32 bytes decoded). A slow KDF is deliberately not used: agent tokens are 256-bit CSPRNG values and this hash is computed on every authenticated request (ADR-0006)."
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{16}$",
+      "description": "Fingerprint of the key the hashes below were computed with: the first 16 hex characters of HMAC-SHA-256(key, \"hammertime-agent-token-key-id\"). Ingest recomputes this at startup and refuses to start on a mismatch, so a wrong HAMMERTIME_INGEST_AGENT_TOKEN_KEY fails loudly instead of 403-ing every agent."
+    },
+    "agents": {
+      "type": "object",
+      "description": "Registered agents, keyed by agent_id. May be empty; the deployment key is still required.",
+      "propertyNames": { "$ref": "#/$defs/agent_id" },
+      "additionalProperties": { "$ref": "#/$defs/agent_record" }
+    }
+  },
+  "$defs": {
+    "agent_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "The identity an agent presents in X-Agent-Id, and the identity used for dedup (section 23), rate limiting, and event attribution (ADR-0004). Stable across credential rotation."
+    },
+    "token_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "description": "Hex-encoded 32-byte HMAC-SHA-256 digest of the agent's bearer token. Tools emit lowercase; either case is accepted, since the loader compares decoded bytes."
+    },
+    "agent_record": {
+      "type": "object",
+      "required": ["token_hash"],
+      "dependentRequired": {
+        "previous_token_hash": ["previous_token_expires_at"],
+        "previous_token_expires_at": ["previous_token_hash"]
+      },
+      "additionalProperties": false,
+      "properties": {
+        "token_hash": {
+          "$ref": "#/$defs/token_hash",
+          "description": "Hash of the agent's current bearer token. No two agents may share a hash (current or previous): one credential authenticating as several identities would defeat the per-agent dedup and rate-limit boundaries, and the loader rejects it."
+        },
+        "previous_token_hash": {
+          "$ref": "#/$defs/token_hash",
+          "description": "Optional. Hash of the immediately previous token, accepted alongside token_hash for the duration of a rotation overlap window. At most one predecessor: an unbounded list would let a registry accumulate forgotten live credentials. Requires previous_token_expires_at, and must differ from token_hash."
+        },
+        "previous_token_expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Required whenever previous_token_hash is present (and forbidden otherwise). RFC 3339 UTC instant after which the previous token stops being accepted; ingest evaluates it per request, so the overlap window closes without a second restart. An already-past value is not a startup error: the loader drops the previous hash and warns."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Default true. A disabled agent is known but never authorized (spec section 36); disabling is how an agent is blocked, rather than deleting its entry or zeroing its rate limit."
+        },
+        "rate_limit_rps": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Per-agent override for HAMMERTIME_INGEST_RATE_LIMIT_RPS. null (the default) means use the global setting. Must be positive: there is no rate-limited-to-zero concept, use \"enabled\": false."
+        }
+      }
+    }
+  }
+}

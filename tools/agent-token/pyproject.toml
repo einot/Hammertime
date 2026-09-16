@@ -1,12 +1,11 @@
 [project]
-name = "hammertime-core"
+name = "hammertime-agent-token"
 version = "0.1.0"
-license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.8", "prometheus-client>=0.20", "structlog>=24.1"]
+dependencies = ["hammertime-core"]
 
 [project.scripts]
-
+hammertime-agent-token = "hammertime.tools.agent_token.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

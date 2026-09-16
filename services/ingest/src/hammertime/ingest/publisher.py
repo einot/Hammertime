@@ -1,6 +1,7 @@
 """Publish validated observations, keyed by IP shard to preserve per-IP order.
 
-Spec: section 19, section 20; ADR-0004 (per-IP observation fan-out)
+Spec: section 19, section 20, section 36.6; ADR-0004 (per-IP observation
+fan-out), ADR-0008 (observation-scaled rate limiting)
 
 `ObservationPublisher.publish` implements ADR-0004's decision exactly:
 
@@ -10,14 +11,21 @@ Spec: section 19, section 20; ADR-0004 (per-IP observation fan-out)
    `schemas/observation.v1.json`'s `request_count` maximum raises
    `RequestCountOverflowError` for the whole request rather than truncating
    or partially publishing.
-2. Build one single-entry `RequestObservation` `EventEnvelope` per coalesced
-   entry, with `subject` set to that entry's IP text (so each split message
-   gets its own distinct, deterministic `event_id`).
-3. Publish each envelope to `hammertime.observations.v1`, keyed via
+2. Drop any coalesced entry whose `request_count` is 0 (ADR-0008, spec
+   section 36.6): a zero delta is a no-op for the sliding window, so
+   publishing one would only create per-IP state downstream and nothing
+   else. `coalesce()` itself keeps returning zero entries -- `api/routes.py`
+   charges its observation budget against that full count, before this
+   drop -- only `publish()` filters them out.
+3. Build one single-entry `RequestObservation` `EventEnvelope` per surviving
+   coalesced entry, with `subject` set to that entry's IP text (so each
+   split message gets its own distinct, deterministic `event_id`).
+4. Publish each envelope to `hammertime.observations.v1`, keyed via
    `topic.key_selector(entry)` -- never a hard-coded `str(entry.ip)` at the
    call site, even though the two happen to agree.
-4. Publish all N messages concurrently, then `flush()` once for the whole
-   batch. Any failure propagates (never swallowed): `202` means every
+5. Publish all surviving messages concurrently, then `flush()` once for the
+   whole batch -- exactly once, even if every entry was dropped as a zero
+   delta. Any failure propagates (never swallowed): `202` means every
    message is durably recorded, and a publish failure must map to `503`
    with nothing recorded (docs/protocol/observation-v1.md).
 """
@@ -90,14 +98,19 @@ class ObservationPublisher:
 
         Re-derives the same coalesced entries `coalesce()` above would (cheap
         and pure -- see its docstring for why callers validate with it
-        first), then propagates whatever the underlying `Producer` raises on
-        `publish`/`flush` failure. Never publishes a partial batch: all N
-        per-IP publishes are awaited with `return_exceptions=True` so a
-        sibling's success or failure is never left running in the background
-        after this call returns, and `flush()` runs only once every sibling
-        has settled.
+        first), drops any entry whose coalesced `request_count` is 0 (ADR-0008,
+        spec section 36.6 -- a zero delta is never published), then
+        propagates whatever the underlying `Producer` raises on
+        `publish`/`flush` failure. Never publishes a partial batch: all
+        surviving per-IP publishes are awaited with `return_exceptions=True`
+        so a sibling's success or failure is never left running in the
+        background after this call returns, and `flush()` runs exactly once
+        every sibling has settled -- even when every entry was dropped as a
+        zero delta, so a fully-zero batch still durably records its
+        `(agent_id, sequence)` claim's effect (nothing) rather than skipping
+        `flush()` and leaving that ambiguous.
         """
-        coalesced = self.coalesce(observation)
+        coalesced = tuple(entry for entry in self.coalesce(observation) if entry.request_count > 0)
         timestamp = datetime.now(UTC)
 
         results = await asyncio.gather(

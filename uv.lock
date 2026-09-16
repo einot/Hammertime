@@ -10,6 +10,7 @@ resolution-markers = [
 members = [
     "hammertime",
     "hammertime-agent-sim",
+    "hammertime-agent-token",
     "hammertime-aggregator",
     "hammertime-bus",
     "hammertime-core",
@@ -248,7 +249,11 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "fakeredis" },
+    { name = "hammertime-agent-sim" },
+    { name = "hammertime-agent-token" },
+    { name = "hammertime-replay" },
     { name = "hammertime-testkit" },
+    { name = "hammertime-trie-inspect" },
     { name = "httpx" },
     { name = "hypothesis" },
     { name = "mypy" },
@@ -273,7 +278,11 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "fakeredis", specifier = ">=2.20" },
+    { name = "hammertime-agent-sim", editable = "tools/agent-sim" },
+    { name = "hammertime-agent-token", editable = "tools/agent-token" },
+    { name = "hammertime-replay", editable = "tools/replay" },
     { name = "hammertime-testkit", editable = "packages/hammertime-testkit" },
+    { name = "hammertime-trie-inspect", editable = "tools/trie-inspect" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "hypothesis", specifier = ">=6.100" },
     { name = "mypy", specifier = ">=1.11" },
@@ -298,6 +307,17 @@ requires-dist = [
     { name = "hammertime-core", editable = "packages/hammertime-core" },
     { name = "httpx", specifier = ">=0.27" },
 ]
+
+[[package]]
+name = "hammertime-agent-token"
+version = "0.1.0"
+source = { editable = "tools/agent-token" }
+dependencies = [
+    { name = "hammertime-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "hammertime-core", editable = "packages/hammertime-core" }]
 
 [[package]]
 name = "hammertime-aggregator"

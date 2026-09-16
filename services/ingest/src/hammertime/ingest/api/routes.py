@@ -1,11 +1,14 @@
 """POST /v1/observations, GET /healthz, GET /metrics.
 
-Spec: section 4, section 36, section 37; docs/protocol/observation-v1.md; ADR-0004
+Spec: section 4, section 36, section 36.6, section 37;
+docs/protocol/observation-v1.md; ADR-0004, ADR-0008
 
-Pipeline for `POST /v1/observations`, per the protocol doc's response
-table: agent authentication (`Depends`, runs before the body is read) ->
-per-agent rate limiting -> body/schema/domain validation (unchanged from
-Epic #3) -> dedup check -> per-IP bus publish -> dedup mark-seen -> 202.
+Pipeline for `POST /v1/observations` (spec section 36.6's normative order):
+agent authentication (`Depends`, runs before the body is read) -> flat
+per-request rate limiting (cost 1.0, still header-only) -> body/schema/
+domain validation -> coalesce -> per-agent observation-cost rate limiting
+(cost = distinct IPs, ADR-0008) -> dedup claim -> drop zero-count entries,
+publish, 202.
 """
 
 import json
@@ -26,6 +29,7 @@ from hammertime.ingest.api.schemas import (
 )
 from hammertime.ingest.publisher import RequestCountOverflowError
 from hammertime.ingest.ratelimit import RateLimitExceeded
+from hammertime.ingest.throttling import throttled_response
 from hammertime.ingest.validation import (
     BodyTooLargeError,
     IngestValidationError,
@@ -53,7 +57,7 @@ def _get_ingest_state(request: Request) -> "IngestState":
     return request.app.state.ingest  # type: ignore[no-any-return]
 
 
-def _authenticate(request: Request) -> str:
+async def _authenticate(request: Request) -> str:
     """Auth dependency: delegate to the `require_agent` closure built once at startup.
 
     `IngestState.authenticate` is `require_agent(registry)`, built exactly
@@ -63,8 +67,15 @@ def _authenticate(request: Request) -> str:
     `HTTPException(403)` itself (see `auth/middleware.py`) and never touches
     the request body, so a FastAPI `Depends` on this runs -- and can reject
     the request -- before the body is read.
+
+    `async def`, not a plain `def`: `require_agent`'s dependency is itself
+    `async def` so FastAPI dispatches it on the event loop rather than a
+    worker thread (see its docstring); this wrapper must stay `async def`
+    too so FastAPI awaits it directly instead of routing it through
+    `run_in_threadpool`, which would reintroduce the same concurrency
+    mismatch one layer up.
     """
-    return _get_ingest_state(request).authenticate(request)
+    return await _get_ingest_state(request).authenticate(request)
 
 
 async def _read_body_within_limit(request: Request, *, max_body_bytes: int) -> bytes:
@@ -168,7 +179,7 @@ async def create_observation(
     try:
         state.rate_limiter.check(agent_id, effective_limit_rps)
     except RateLimitExceeded as exc:
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
+        raise throttled_response(exc, scope="requests", detail=str(exc)) from exc
 
     try:
         body = await _read_body_within_limit(request, max_body_bytes=settings.max_body_bytes)
@@ -249,13 +260,40 @@ async def create_observation(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        state.publisher.coalesce(observation)
+        coalesced = state.publisher.coalesce(observation)
     except RequestCountOverflowError as exc:
         # Validated (and rejected, if it overflows) before the dedup claim
         # below, so an overflowing batch never consumes the sequence's
         # claim -- a corrected retry with the same sequence must still be
         # accepted, not told "duplicate" (ADR-0004 section 3/5).
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # ADR-0008 / spec section 36.6: the observation budget is charged per
+    # distinct IP -- exactly `len(coalesced)`, counted before decision 5's
+    # zero-count drop (publisher.py's `publish` does that drop; this charges
+    # the full coalesced count regardless). `load_settings` guarantees
+    # observation_burst >= max_observations, so a schema-valid batch can
+    # never cost more than the bucket can ever hold -- this comparison is
+    # defense-in-depth, and it runs *before* `check()` so an over-capacity
+    # cost is never passed to the limiter (which would raise `ValueError`).
+    cost = len(coalesced)
+    if cost > settings.observation_burst:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"batch cost {cost} (distinct IPs) exceeds the observation "
+                f"capacity of {settings.observation_burst}"
+            ),
+        )
+    try:
+        state.observation_limiter.check(
+            agent_id,
+            settings.observation_rate_limit_eps,
+            cost=cost,
+            capacity=settings.observation_burst,
+        )
+    except RateLimitExceeded as exc:
+        raise throttled_response(exc, scope="observations", detail=str(exc)) from exc
 
     claimed = await state.dedup.claim(
         agent_id, observation.sequence, window_seconds=observation.window_seconds

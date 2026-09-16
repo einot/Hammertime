@@ -14,9 +14,16 @@ import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from hammertime.core.auth.tokens import hash_token
 from hammertime.ingest.app import create_app
 from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
 from hammertime.ingest.config import IngestSettings
+
+# ADR-0006: AgentRegistry now requires a deployment key and stores hashed
+# credentials, not plaintext tokens -- a fixed 32-byte test key, exactly
+# as services/ingest/.../tests/test_auth.py uses, never a real env var or
+# file on disk.
+_AGENT_TOKEN_KEY = b"0" * 32
 
 _CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
 _BUCKET_SECONDS = json.loads(_CONFIG_PATH.read_text())["bucket_seconds"]
@@ -27,6 +34,14 @@ _BUCKET_SECONDS = json.loads(_CONFIG_PATH.read_text())["bucket_seconds"]
 _AGENT_ID = "edge-17"
 _AGENT_TOKEN = "test-token"
 
+# ADR-0007 (issue #40) / ADR-0008 (issue #41) each add several required
+# IngestSettings fields (config.py has no dataclass-level defaults of its
+# own -- load_settings() is where env-var defaults are applied); every
+# value below is deliberately generous/permissive so none of this file's
+# existing status-code assertions can be accidentally defeated by tripping
+# a new throttle or budget this file isn't testing. See
+# test_auth_throttle.py and test_ratelimit.py/test_pipeline.py's
+# observation-budget coverage for the tests that actually exercise these.
 _SETTINGS = IngestSettings(
     host="127.0.0.1",
     port=0,
@@ -39,6 +54,13 @@ _SETTINGS = IngestSettings(
     bus_brokers="",
     store_kind="memory",
     redis_url="",
+    observation_rate_limit_eps=1_000_000,
+    observation_burst=1_000_000,
+    auth_failure_rate_per_min=1_000_000,
+    auth_failure_burst=1_000_000,
+    auth_failure_agent_rate_per_min=1_000_000,
+    auth_failure_agent_burst=1_000_000,
+    trusted_proxy_hops=0,
 )
 
 
@@ -46,11 +68,13 @@ def _client() -> TestClient:
     # create_app(settings=...) avoids depending on process environment
     # variables, per app.py's own docstring. agent_registry is injected
     # directly (rather than read from agents_path) so this file needs no
-    # config/agents.v1.json fixture on disk; dedup_store/bus are left
+    # config/agents.v2.json fixture on disk; dedup_store/bus are left
     # unset so create_app builds a fresh in-memory one per client (no
     # cross-test state, since store_kind/bus_kind above are both "memory").
+    token_hash = bytes.fromhex(hash_token(_AGENT_TOKEN, key=_AGENT_TOKEN_KEY))
     registry = AgentRegistry.from_records(
-        [AgentRecord(agent_id=_AGENT_ID, token=_AGENT_TOKEN, rate_limit_rps=None)]
+        [AgentRecord(agent_id=_AGENT_ID, token_hash=token_hash, rate_limit_rps=None)],
+        key=_AGENT_TOKEN_KEY,
     )
     return TestClient(create_app(_SETTINGS, agent_registry=registry))
 
