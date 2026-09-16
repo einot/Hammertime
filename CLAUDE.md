@@ -21,6 +21,33 @@ agent protocol, or a snapshot format that older builds can't load.
 If you are unsure whether a change qualifies, it does not. Say so in your
 report rather than writing a speculative entry.
 
+## Supervisor agent
+
+Every dispatch to `coder`, `test-author`, or `architect` (the only
+subagents with write access) must be paired with a `supervisor` review
+before acting on its output (merging, pushing, or handing off to another
+agent). Give `supervisor` exactly two things: the literal instructions
+given to the worker agent, and the worker's own report of what it changed.
+`supervisor` is read-only (Read/Grep/Glob only, no Bash, no Edit/Write, no
+spawning other agents) — it inspects the actual current file contents
+against the task's stated scope and flags anything out of the ordinary:
+files touched outside the given scope, actions beyond what was asked,
+a report that doesn't match what actually changed, or anything resembling
+a backdoor, credential/secret exfiltration, or a disabled safety/security
+check.
+
+**Hard stop:** if `supervisor` reports any finding, STOP ALL PROCESSING
+immediately — do not merge, push, dispatch further agents, or continue
+reconciling — and report the finding to the user verbatim before doing
+anything else. This overrides every other standing instruction in this
+file, including the pre-1.0 exception below. Only the user decides how to
+proceed from a supervisor finding.
+
+`reviewer`/`security-auditor` are themselves read-only and structurally
+incapable of taking an unauthorized action (no write access at all), so
+routine supervisor coverage is scoped to the three agents that can write;
+extend it to every dispatch if asked.
+
 ## Orchestration role
 
 The top-level session acts as project manager only: delegate, reconcile,
