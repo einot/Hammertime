@@ -28,32 +28,61 @@ class AuthenticationError(AgentAuthError):
 
 
 class UnknownAgentError(AuthenticationError):
-    """No registered agent matches the `agent_id` presented, or none was
-    presented at all (missing `X-Agent-Id`/`Authorization` header).
+    """No registered agent matches the `agent_id` presented.
 
-    Maps to HTTP 401 -- docs/protocol/observation-v1.md's response table
-    ("401 / 403 | Unknown or unauthorized agent").
+    Maps to HTTP 401, with the uniform body and logging `outcome` ADR-0007 /
+    spec section 36.5 require: this is indistinguishable on the wire from
+    every other authentication failure, including `InvalidCredentialError`
+    below (which stays in the `AuthorizationError`/403 *exception* group,
+    since the agent genuinely is known -- only the HTTP mapping collapses).
+    """
+
+
+class MissingCredentialError(AuthenticationError):
+    """No identity claim was presented at all: missing `X-Agent-Id`, missing
+    or malformed `Authorization: Bearer <token>`, or an empty token.
+
+    Maps to HTTP 401 (spec section 36.5's `missing_credential` outcome).
+    """
+
+
+class OversizedCredentialError(AuthenticationError):
+    """An `X-Agent-Id` over 128 characters or a bearer token over 512
+    characters was presented, rejected before any hashing/comparison work
+    (spec section 36.5's `oversized_credential` outcome, a cheap DoS guard,
+    not token-strength enforcement).
+
+    Maps to HTTP 401.
     """
 
 
 class AuthorizationError(AgentAuthError):
-    """Base for every failure that maps to HTTP 403: known agent, denied.
+    """Base for every failure where a known agent's identity is established.
 
-    See `AuthenticationError` for the 401/403 split this mirrors.
+    Historically this whole group mapped to HTTP 403; ADR-0007 (spec
+    section 36.5) narrows that to `AgentDisabledError` alone --
+    `InvalidCredentialError` now maps to the same uniform 401 as every
+    other authentication failure, so that a wrong-token guess against a
+    real `agent_id` is not distinguishable from a guess against a
+    nonexistent one. The exception hierarchy itself is unchanged (both
+    errors mean "we know who you claim to be"); only the HTTP status
+    `auth/middleware.py` picks for each has changed.
     """
 
 
 class InvalidCredentialError(AuthorizationError):
     """A known agent's bearer token did not match its registered credential.
 
-    Maps to HTTP 403, distinct from `UnknownAgentError`'s 401: the agent
-    exists, but the credential presented for it is wrong.
+    Maps to HTTP 401 (ADR-0007's uniform failure response, spec section
+    36.5) -- see `AuthorizationError` above for why this no longer maps to
+    403 despite remaining in the "known agent" exception group.
     """
 
 
 class AgentDisabledError(AuthorizationError):
     """A known agent exists in the registry but is administratively disabled.
 
-    Maps to HTTP 403, same as `InvalidCredentialError`: the agent is known,
-    but not currently authorized to submit observations.
+    Maps to HTTP 403 -- the one case ADR-0007 (spec section 36.5) keeps
+    distinguishable, since learning it requires already holding the
+    agent's live token.
     """

@@ -22,6 +22,17 @@ _DEFAULT_BUS_BROKERS = "localhost:19092"
 _DEFAULT_STORE_KIND = "redis"
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
+# --- ADR-0007: failed-authentication throttling (spec section 36.5) --------
+_DEFAULT_AUTH_FAILURE_RATE_PER_MIN = 30.0
+_DEFAULT_AUTH_FAILURE_BURST = 10
+_DEFAULT_AUTH_FAILURE_AGENT_RATE_PER_MIN = 60.0
+_DEFAULT_AUTH_FAILURE_AGENT_BURST = 20
+_DEFAULT_TRUSTED_PROXY_HOPS = 0
+
+# --- ADR-0008: observation-scaled rate limiting (spec section 36.6) --------
+_DEFAULT_OBSERVATION_RATE_LIMIT_EPS = 2000.0
+_DEFAULT_OBSERVATION_BURST = 10_000
+
 _ALLOWED_BUS_KINDS = frozenset({"kafka", "memory"})
 _ALLOWED_STORE_KINDS = frozenset({"redis", "memory"})
 
@@ -56,6 +67,27 @@ class IngestSettings:
     store_kind: str
     #: HAMMERTIME_REDIS_URL: meaningful only when store_kind == "redis".
     redis_url: str
+    #: HAMMERTIME_INGEST_AUTH_FAILURE_RATE_PER_MIN: failed-auth source-bucket
+    #: refill rate, failures/min (ADR-0007, spec section 36.5).
+    auth_failure_rate_per_min: float = _DEFAULT_AUTH_FAILURE_RATE_PER_MIN
+    #: HAMMERTIME_INGEST_AUTH_FAILURE_BURST: failed-auth source-bucket capacity.
+    auth_failure_burst: int = _DEFAULT_AUTH_FAILURE_BURST
+    #: HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_RATE_PER_MIN: failed-auth
+    #: agent-bucket refill rate, failures/min, keyed by the attempted
+    #: `X-Agent-Id`.
+    auth_failure_agent_rate_per_min: float = _DEFAULT_AUTH_FAILURE_AGENT_RATE_PER_MIN
+    #: HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_BURST: failed-auth agent-bucket capacity.
+    auth_failure_agent_burst: int = _DEFAULT_AUTH_FAILURE_AGENT_BURST
+    #: HAMMERTIME_INGEST_TRUSTED_PROXY_HOPS: 0 = trust no X-Forwarded-For;
+    #: N > 0 = take the Nth-from-the-right X-Forwarded-For entry.
+    trusted_proxy_hops: int = _DEFAULT_TRUSTED_PROXY_HOPS
+    #: HAMMERTIME_INGEST_OBSERVATION_RATE_LIMIT_EPS: per-agent observation
+    #: budget refill rate, entries/second (ADR-0008, spec section 36.6).
+    observation_rate_limit_eps: float = _DEFAULT_OBSERVATION_RATE_LIMIT_EPS
+    #: HAMMERTIME_INGEST_OBSERVATION_BURST: per-agent observation budget
+    #: capacity, entries. MUST be >= max_observations (enforced by
+    #: `load_settings`).
+    observation_burst: int = _DEFAULT_OBSERVATION_BURST
 
 
 def _parse_bind(bind: str) -> tuple[str, int]:
@@ -91,10 +123,38 @@ def _parse_choice(name: str, value: str, *, allowed: frozenset[str]) -> str:
     return value
 
 
+def _parse_nonnegative_int(name: str, value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {parsed}")
+    return parsed
+
+
 def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
     """Load ingest settings from the environment (see `.env.example`)."""
     source = env if env is not None else os.environ
     host, port = _parse_bind(source.get("HAMMERTIME_INGEST_BIND", _DEFAULT_BIND))
+    max_observations = _parse_positive_int(
+        "HAMMERTIME_INGEST_MAX_OBSERVATIONS",
+        source.get("HAMMERTIME_INGEST_MAX_OBSERVATIONS", str(_DEFAULT_MAX_OBSERVATIONS)),
+    )
+    observation_burst = _parse_positive_int(
+        "HAMMERTIME_INGEST_OBSERVATION_BURST",
+        source.get("HAMMERTIME_INGEST_OBSERVATION_BURST", str(_DEFAULT_OBSERVATION_BURST)),
+    )
+    if observation_burst < max_observations:
+        # ADR-0008 / spec section 36.6: this is what guarantees every
+        # schema-valid batch (at most max_observations distinct IPs) is
+        # structurally satisfiable -- a cost above capacity must never be
+        # reachable from configuration.
+        raise ValueError(
+            "HAMMERTIME_INGEST_OBSERVATION_BURST "
+            f"({observation_burst}) must be >= HAMMERTIME_INGEST_MAX_OBSERVATIONS "
+            f"({max_observations})"
+        )
     return IngestSettings(
         host=host,
         port=port,
@@ -102,10 +162,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
             "HAMMERTIME_INGEST_MAX_BODY_BYTES",
             source.get("HAMMERTIME_INGEST_MAX_BODY_BYTES", str(_DEFAULT_MAX_BODY_BYTES)),
         ),
-        max_observations=_parse_positive_int(
-            "HAMMERTIME_INGEST_MAX_OBSERVATIONS",
-            source.get("HAMMERTIME_INGEST_MAX_OBSERVATIONS", str(_DEFAULT_MAX_OBSERVATIONS)),
-        ),
+        max_observations=max_observations,
         detection_config_path=Path(source.get("HAMMERTIME_CONFIG_PATH", _DEFAULT_CONFIG_PATH)),
         rate_limit_rps=_parse_positive_number(
             "HAMMERTIME_INGEST_RATE_LIMIT_RPS",
@@ -124,4 +181,41 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
             allowed=_ALLOWED_STORE_KINDS,
         ),
         redis_url=source.get("HAMMERTIME_REDIS_URL", _DEFAULT_REDIS_URL),
+        auth_failure_rate_per_min=_parse_positive_number(
+            "HAMMERTIME_INGEST_AUTH_FAILURE_RATE_PER_MIN",
+            source.get(
+                "HAMMERTIME_INGEST_AUTH_FAILURE_RATE_PER_MIN",
+                str(_DEFAULT_AUTH_FAILURE_RATE_PER_MIN),
+            ),
+        ),
+        auth_failure_burst=_parse_positive_int(
+            "HAMMERTIME_INGEST_AUTH_FAILURE_BURST",
+            source.get("HAMMERTIME_INGEST_AUTH_FAILURE_BURST", str(_DEFAULT_AUTH_FAILURE_BURST)),
+        ),
+        auth_failure_agent_rate_per_min=_parse_positive_number(
+            "HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_RATE_PER_MIN",
+            source.get(
+                "HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_RATE_PER_MIN",
+                str(_DEFAULT_AUTH_FAILURE_AGENT_RATE_PER_MIN),
+            ),
+        ),
+        auth_failure_agent_burst=_parse_positive_int(
+            "HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_BURST",
+            source.get(
+                "HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_BURST",
+                str(_DEFAULT_AUTH_FAILURE_AGENT_BURST),
+            ),
+        ),
+        trusted_proxy_hops=_parse_nonnegative_int(
+            "HAMMERTIME_INGEST_TRUSTED_PROXY_HOPS",
+            source.get("HAMMERTIME_INGEST_TRUSTED_PROXY_HOPS", str(_DEFAULT_TRUSTED_PROXY_HOPS)),
+        ),
+        observation_rate_limit_eps=_parse_positive_number(
+            "HAMMERTIME_INGEST_OBSERVATION_RATE_LIMIT_EPS",
+            source.get(
+                "HAMMERTIME_INGEST_OBSERVATION_RATE_LIMIT_EPS",
+                str(_DEFAULT_OBSERVATION_RATE_LIMIT_EPS),
+            ),
+        ),
+        observation_burst=observation_burst,
     )
