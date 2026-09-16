@@ -10,6 +10,7 @@ resolution-markers = [
 members = [
     "hammertime",
     "hammertime-agent-sim",
+    "hammertime-agent-token",
     "hammertime-aggregator",
     "hammertime-bus",
     "hammertime-core",
@@ -298,6 +299,17 @@ requires-dist = [
     { name = "hammertime-core", editable = "packages/hammertime-core" },
     { name = "httpx", specifier = ">=0.27" },
 ]
+
+[[package]]
+name = "hammertime-agent-token"
+version = "0.1.0"
+source = { editable = "tools/agent-token" }
+dependencies = [
+    { name = "hammertime-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "hammertime-core", editable = "packages/hammertime-core" }]
 
 [[package]]
 name = "hammertime-aggregator"

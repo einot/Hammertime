@@ -59,6 +59,7 @@ mypy_path = [
     "services/trie/src",
     "services/detector/src",
     "tools/agent-sim/src",
+    "tools/agent-token/src",
     "tools/replay/src",
     "tools/trie-inspect/src",
 ]
