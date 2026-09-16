@@ -768,7 +768,9 @@ class TestRegistryFileDuplicateJsonKeys:
         with pytest.raises(ConfigurationError):
             load_agent_registry_file(registry_file, key=TEST_KEY)
 
-    def test_a_document_without_the_duplicate_loads_fine_as_a_control(self, tmp_path: Path) -> None:
+    def test_a_document_without_the_duplicate_loads_fine_as_a_control(
+        self, tmp_path: Path
+    ) -> None:
         # Sanity control: the file-loading path itself works for a
         # well-formed document, so the failure above is attributable to the
         # duplicate key and not to some other property of hand-written raw
