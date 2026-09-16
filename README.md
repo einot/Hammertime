@@ -58,3 +58,7 @@ make load          # run the agent simulator against the local stack
 * `node.hot_count` equals the number of currently HOT `/32` descendants — always (§12).
 * Readers never observe a partially updated trie path (§28).
 * Agents supply observations, never verdicts. The server derives HOT state (§36).
+
+## License
+
+Licensed under the MIT License — see [LICENSE](LICENSE) for details.

@@ -11,31 +11,46 @@ Public surface (`hammertime.ingest.ratelimit`), reconciled against the
 actual implementation:
 
 * `class RateLimiter`
-    * `__init__(self, clock: Clock | None = None) -> None` -- follows the
-      injectable-clock convention documented in `hammertime.core.time.clock`
-      (production omits `clock` and gets a `SystemClock()`; tests always
-      pass a `ManualClock`). The limiter holds no notion of any single
-      agent's configured rate -- per the design boundary that this
-      component does not depend on `hammertime.ingest.auth`, the limit is
-      passed in explicitly on every call.
-    * `check(self, agent_id: str, limit_rps: int | float, *, cost: float = 1.0) -> None`
-      -- consumes `cost` tokens (default 1) from `agent_id`'s bucket,
-      refilling it first based on elapsed clock time at `limit_rps`
-      tokens/second. Returns `None` on success; raises `RateLimitExceeded`
-      if too few tokens are available.
-    * Bucket capacity equals `limit_rps` (one second's worth of tokens) and
-      starts full for a never-before-seen `agent_id`, so an idle agent's
-      first burst up to its configured rate always succeeds.
+    * `__init__(self, clock: Clock | None = None, *, max_keys: int = ...) -> None`
+      -- follows the injectable-clock convention documented in
+      `hammertime.core.time.clock` (production omits `clock` and gets a
+      `SystemClock()`; tests always pass a `ManualClock`). The limiter
+      holds no notion of any single caller's configured rate -- per the
+      design boundary that this component does not depend on
+      `hammertime.ingest.auth`, the limit is passed in explicitly on every
+      call.
+    * `check(self, key: str, limit_rps: int | float, *, cost: float = 1.0,
+      capacity: float | None = None) -> None`
+      -- consumes `cost` tokens (default 1) from `key`'s bucket, refilling
+      it first based on elapsed clock time at `limit_rps` tokens/second.
+      Returns `None` on success; raises `RateLimitExceeded` if too few
+      tokens are available.
+    * Bucket capacity is `capacity` if given, else `limit_rps` (one
+      second's worth of tokens), and starts full for a never-before-seen
+      `key`, so an idle caller's first burst up to its configured capacity
+      always succeeds.
+    * ADR-0007 (issue #40) renamed this module's first positional
+      parameter from `agent_id` to `key` (the limiter is keyed by whatever
+      a caller chooses -- an `agent_id`, a source-address prefix, or an
+      attempted identity -- not necessarily an authenticated agent) and
+      `max_agents` to `max_keys`; every call below therefore passes the
+      first two arguments to `check`/`allow` *positionally*, so this file
+      does not depend on the exact keyword name. `RateLimiter.__init__`'s
+      `max_keys`/`RateLimitExceeded.key` are still passed/read by keyword,
+      per that rename.
+    * ADR-0008 (issue #41) added the keyword-only `capacity` parameter:
+      `capacity=None` (the default) means "capacity equals `limit_rps`",
+      i.e. today's behaviour, unchanged.
 * `class RateLimitExceeded(HammertimeError)` -- raised by `check` on
-  exhaustion; carries `.agent_id`, `.limit_rps`, and `.retry_after`
-  (seconds until enough tokens are available), though this file only
-  asserts the exception type, not those attributes, since neither the
-  spec nor the protocol doc pins the error's shape beyond "429 semantics".
+  exhaustion; carries `.key`, `.limit_rps`, and `.retry_after` (seconds
+  until enough tokens are available), though this file only asserts the
+  exception type, not those attributes, since neither the spec nor the
+  protocol doc pins the error's shape beyond "429 semantics".
 
 Explicit gap, not resolved here: neither the spec nor the protocol doc
 says what should happen if `limit_rps` itself changes between calls for
-the same `agent_id` (e.g. a config reload). This file does not test that
-case; it always passes a fixed `limit_rps` for a given `agent_id` within
+the same `key` (e.g. a config reload). This file does not test that
+case; it always passes a fixed `limit_rps` for a given `key` within
 a single test.
 
 Clock-resolution note: `hammertime.core.time.clock.Clock.now()` returns
@@ -64,17 +79,28 @@ from hammertime.ingest.ratelimit import RateLimiter, RateLimitExceeded
 DOCUMENTED_DEFAULT_RATE_LIMIT_RPS = 50
 
 
-def _exhaust(limiter: RateLimiter, agent_id: str, limit_rps: float, *, max_attempts: int) -> int:
+def _exhaust(
+    limiter: RateLimiter,
+    agent_id: str,
+    limit_rps: float,
+    *,
+    max_attempts: int,
+    capacity: float | None = None,
+) -> int:
     """Call `check` for `agent_id` until it raises, or `max_attempts` is hit.
 
     Returns the number of calls that succeeded before the first rejection.
     Raises AssertionError if the bucket is never exhausted within
     `max_attempts` -- a generous bound so this is a real assertion, not
     an infinite loop, regardless of the exact (unknown) capacity.
+
+    `capacity` (ADR-0008, issue #41) defaults to `None`, i.e. "omit it" --
+    every pre-existing caller below is therefore exercising exactly the
+    same call shape it always has.
     """
     for accepted in range(max_attempts):
         try:
-            limiter.check(agent_id=agent_id, limit_rps=limit_rps)
+            limiter.check(agent_id, limit_rps=limit_rps, capacity=capacity)
         except RateLimitExceeded:
             return accepted
     raise AssertionError(
@@ -91,12 +117,12 @@ class TestRateLimiterHappyPath:
         # the first `limit_rps` requests must all succeed without the
         # clock moving at all.
         for _ in range(5):
-            limiter.check(agent_id="edge-17", limit_rps=5)  # must not raise
+            limiter.check("edge-17", limit_rps=5)  # must not raise
 
     def test_a_single_request_well_under_the_limit_succeeds(self) -> None:
         clock = ManualClock(initial=0)
         limiter = RateLimiter(clock=clock)
-        limiter.check(agent_id="edge-17", limit_rps=DOCUMENTED_DEFAULT_RATE_LIMIT_RPS)
+        limiter.check("edge-17", limit_rps=DOCUMENTED_DEFAULT_RATE_LIMIT_RPS)
 
 
 class TestRateLimiterRejection:
@@ -108,7 +134,7 @@ class TestRateLimiterRejection:
         # moving, so no refill can mask exhaustion.
         _exhaust(limiter, "edge-17", limit_rps, max_attempts=1000)
         with pytest.raises(RateLimitExceeded):
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
 
     def test_rate_limit_exceeded_is_a_hammertime_error(self) -> None:
         # Follows the repo-wide convention (hammertime.core.errors) that
@@ -119,7 +145,7 @@ class TestRateLimiterRejection:
         limit_rps = 1
         _exhaust(limiter, "edge-17", limit_rps, max_attempts=1000)
         with pytest.raises(HammertimeError):
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
 
     def test_rejection_does_not_raise_a_bare_exception_type(self) -> None:
         # Guards against an implementation that raises ValueError or
@@ -131,7 +157,7 @@ class TestRateLimiterRejection:
         limit_rps = 1
         _exhaust(limiter, "edge-17", limit_rps, max_attempts=1000)
         try:
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
         except RateLimitExceeded:
             pass
         else:
@@ -146,7 +172,7 @@ class TestRateLimiterRefillOverTime:
 
         _exhaust(limiter, "edge-17", limit_rps, max_attempts=1000)
         with pytest.raises(RateLimitExceeded):
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
 
         # A full second at `limit_rps` tokens/second is, by any
         # reasonable token-bucket arithmetic, enough for at least one
@@ -154,7 +180,7 @@ class TestRateLimiterRefillOverTime:
         # permanently jammed once real time (as reported by the clock)
         # has passed.
         clock.advance(1)
-        limiter.check(agent_id="edge-17", limit_rps=limit_rps)  # must not raise
+        limiter.check("edge-17", limit_rps=limit_rps)  # must not raise
 
     def test_no_refill_occurs_while_the_clock_is_unchanged(self) -> None:
         # Sanity check on the injectable-clock convention itself: two
@@ -169,9 +195,9 @@ class TestRateLimiterRefillOverTime:
         assert accepted >= 1  # the bucket allowed at least the first request
 
         with pytest.raises(RateLimitExceeded):
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
         with pytest.raises(RateLimitExceeded):
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
 
 
 class TestRateLimiterPerAgentIsolation:
@@ -182,11 +208,11 @@ class TestRateLimiterPerAgentIsolation:
 
         _exhaust(limiter, "edge-17", limit_rps, max_attempts=1000)
         with pytest.raises(RateLimitExceeded):
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
 
         # A different agent_id, same clock, same configured rate, no
         # time having passed -- must still get its own fresh bucket.
-        limiter.check(agent_id="edge-99", limit_rps=limit_rps)  # must not raise
+        limiter.check("edge-99", limit_rps=limit_rps)  # must not raise
 
     def test_two_agents_can_have_different_configured_limits(self) -> None:
         clock = ManualClock(initial=0)
@@ -230,7 +256,7 @@ class TestRateLimiterBurstThenRefill:
         # Drain the initial allowance completely.
         _exhaust(limiter, "edge-17", limit_rps, max_attempts=1000)
         with pytest.raises(RateLimitExceeded):
-            limiter.check(agent_id="edge-17", limit_rps=limit_rps)
+            limiter.check("edge-17", limit_rps=limit_rps)
 
         # Advance by exactly one second -- the clock's finest available
         # resolution (see module docstring's clock-resolution note) --
@@ -280,7 +306,7 @@ class TestInvalidInput:
         limiter = RateLimiter(clock=clock)
 
         with pytest.raises(ValueError, match="cost"):
-            limiter.check(agent_id="edge-17", limit_rps=0.5)  # default cost=1.0 > capacity
+            limiter.check("edge-17", limit_rps=0.5)  # default cost=1.0 > capacity
 
     def test_a_sub_one_limit_rps_with_explicit_matching_cost_still_works(self) -> None:
         # The bug wasn't "fractional limit_rps is broken" -- it was
@@ -288,7 +314,7 @@ class TestInvalidInput:
         clock = ManualClock(initial=0)
         limiter = RateLimiter(clock=clock)
 
-        limiter.check(agent_id="edge-17", limit_rps=0.5, cost=0.5)  # must not raise
+        limiter.check("edge-17", limit_rps=0.5, cost=0.5)  # must not raise
 
     @pytest.mark.parametrize("bad_limit", [float("nan"), float("inf"), -float("inf")])
     def test_non_finite_limit_rps_is_rejected(self, bad_limit: float) -> None:
@@ -296,7 +322,7 @@ class TestInvalidInput:
         limiter = RateLimiter(clock=clock)
 
         with pytest.raises(ValueError):
-            limiter.check(agent_id="edge-17", limit_rps=bad_limit)
+            limiter.check("edge-17", limit_rps=bad_limit)
 
     @pytest.mark.parametrize("bad_cost", [float("nan"), float("inf")])
     def test_non_finite_cost_is_rejected(self, bad_cost: float) -> None:
@@ -304,52 +330,178 @@ class TestInvalidInput:
         limiter = RateLimiter(clock=clock)
 
         with pytest.raises(ValueError):
-            limiter.check(agent_id="edge-17", limit_rps=5, cost=bad_cost)
+            limiter.check("edge-17", limit_rps=5, cost=bad_cost)
 
 
 class TestBoundedAgentTracking:
     # Regression test for the unbounded-memory-growth finding: without a
-    # cap, self._buckets grows one entry per distinct agent_id forever.
+    # cap, self._buckets grows one entry per distinct key forever.
+    # ADR-0007 (issue #40) renamed the constructor keyword from
+    # `max_agents` to `max_keys` (the limiter's key space is no longer
+    # necessarily agent_ids -- see this file's own docstring).
 
-    def test_bucket_count_is_bounded_by_max_agents(self) -> None:
+    def test_bucket_count_is_bounded_by_max_keys(self) -> None:
         clock = ManualClock(initial=0)
-        limiter = RateLimiter(clock=clock, max_agents=2)
+        limiter = RateLimiter(clock=clock, max_keys=2)
 
-        limiter.check(agent_id="agent-a", limit_rps=5)
-        limiter.check(agent_id="agent-b", limit_rps=5)
+        limiter.check("agent-a", limit_rps=5)
+        limiter.check("agent-b", limit_rps=5)
         # A third distinct agent must evict the least-recently-touched
         # bucket (agent-a) rather than growing unboundedly.
-        limiter.check(agent_id="agent-c", limit_rps=5)
+        limiter.check("agent-c", limit_rps=5)
 
         assert len(limiter._buckets) == 2
         assert "agent-a" not in limiter._buckets
 
     def test_evicted_agent_gets_a_fresh_full_bucket_on_return(self) -> None:
         clock = ManualClock(initial=0)
-        limiter = RateLimiter(clock=clock, max_agents=1)
+        limiter = RateLimiter(clock=clock, max_keys=1)
         limit_rps = 3
 
         _exhaust(limiter, "agent-a", limit_rps, max_attempts=1000)
         with pytest.raises(RateLimitExceeded):
-            limiter.check(agent_id="agent-a", limit_rps=limit_rps)
+            limiter.check("agent-a", limit_rps=limit_rps)
 
         # A different agent evicts agent-a's (exhausted) bucket entirely.
-        limiter.check(agent_id="agent-b", limit_rps=limit_rps)
+        limiter.check("agent-b", limit_rps=limit_rps)
 
         # agent-a is now a "new" agent as far as the limiter is concerned
         # -- its bucket starts full again, not still-exhausted.
-        limiter.check(agent_id="agent-a", limit_rps=limit_rps)  # must not raise
+        limiter.check("agent-a", limit_rps=limit_rps)  # must not raise
 
     def test_touching_a_bucket_protects_it_from_lru_eviction(self) -> None:
         clock = ManualClock(initial=0)
-        limiter = RateLimiter(clock=clock, max_agents=2)
+        limiter = RateLimiter(clock=clock, max_keys=2)
 
-        limiter.check(agent_id="agent-a", limit_rps=5)
-        limiter.check(agent_id="agent-b", limit_rps=5)
+        limiter.check("agent-a", limit_rps=5)
+        limiter.check("agent-b", limit_rps=5)
         # Re-touch agent-a so it's no longer the least-recently-used.
-        limiter.check(agent_id="agent-a", limit_rps=5)
+        limiter.check("agent-a", limit_rps=5)
         # Now agent-b is the LRU entry and should be evicted, not agent-a.
-        limiter.check(agent_id="agent-c", limit_rps=5)
+        limiter.check("agent-c", limit_rps=5)
 
         assert "agent-a" in limiter._buckets
         assert "agent-b" not in limiter._buckets
+
+
+class TestCapacityKeyword:
+    """ADR-0008 (issue #41), spec section 36.6: `check`/`allow` gain a
+    keyword-only `capacity: float | None = None`. Omitted or explicit
+    `None` means "capacity equals `limit_rps`" -- today's behaviour,
+    unchanged to the bit, including the existing `ValueError` guards and
+    the "a first-seen key starts full" property (it starts at `capacity`).
+    """
+
+    def test_omitting_capacity_and_passing_capacity_none_are_identical(self) -> None:
+        limit_rps = 3
+        omitted = RateLimiter(clock=ManualClock(initial=0))
+        explicit_none = RateLimiter(clock=ManualClock(initial=0))
+
+        accepted_omitted = _exhaust(omitted, "edge-17", limit_rps, max_attempts=1000)
+        accepted_explicit_none = _exhaust(
+            explicit_none, "edge-17", limit_rps, max_attempts=1000, capacity=None
+        )
+
+        assert accepted_omitted == accepted_explicit_none
+
+    def test_capacity_none_still_caps_the_bucket_at_exactly_limit_rps(self) -> None:
+        # Decision 1: "capacity is limit_rps -- today's behaviour,
+        # unchanged to the bit" -- a first-seen key starts with exactly
+        # `limit_rps` tokens when capacity is not given.
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+        limit_rps = 4
+
+        for _ in range(limit_rps):
+            limiter.check("edge-17", limit_rps)  # must not raise
+        with pytest.raises(RateLimitExceeded):
+            limiter.check("edge-17", limit_rps)
+
+    def test_capacity_larger_than_limit_rps_allows_a_bigger_burst(self) -> None:
+        # The whole point of decoupling capacity from the refill rate: an
+        # idle caller may burst up to `capacity` even though tokens only
+        # refill at `limit_rps`/second.
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+        limit_rps = 2
+        capacity = 10
+
+        accepted = _exhaust(limiter, "edge-17", limit_rps, max_attempts=1000, capacity=capacity)
+        assert accepted == capacity
+
+    def test_a_first_seen_key_starts_full_at_capacity_not_at_limit_rps(self) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+        limit_rps = 1
+        capacity = 5
+
+        # All `capacity` tokens are available immediately, with no clock
+        # movement at all -- a first-seen key starts at `capacity`.
+        for _ in range(capacity):
+            limiter.check("edge-17", limit_rps, capacity=capacity)  # must not raise
+        with pytest.raises(RateLimitExceeded):
+            limiter.check("edge-17", limit_rps, capacity=capacity)
+
+    def test_refill_after_a_long_idle_period_clamps_to_capacity(self) -> None:
+        # "Refill clamps to min(capacity, tokens + elapsed * limit_rps)"
+        # (ADR-0008 implementation notes): an enormous idle gap must not
+        # let the bucket accumulate more than `capacity` tokens.
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+        limit_rps = 100
+        capacity = 5
+
+        limiter.check("edge-17", limit_rps, capacity=capacity)  # spend one token
+        clock.advance(1_000_000)  # enough to refill far past capacity if unclamped
+
+        # If refill were not clamped, elapsed * limit_rps (100,000,000)
+        # would make the bucket effectively bottomless; asserting an exact
+        # count of `capacity` (not "at least capacity", not "unbounded")
+        # is only possible if the clamp is in effect.
+        accepted = _exhaust(
+            limiter, "edge-17", limit_rps, max_attempts=capacity + 1000, capacity=capacity
+        )
+        assert accepted == capacity
+
+    def test_cost_greater_than_capacity_raises_value_error_naming_capacity(self) -> None:
+        # ADR-0008 implementation notes: the ValueError message is updated
+        # to say "capacity", since it is no longer necessarily `limit_rps`.
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        with pytest.raises(ValueError, match="capacity"):
+            limiter.check("edge-17", 50, cost=20, capacity=10)
+
+    def test_cost_within_capacity_but_above_limit_rps_succeeds(self) -> None:
+        # A cost that could never fit in `limit_rps` tokens alone must
+        # still succeed if it fits within the larger `capacity`.
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        limiter.check("edge-17", 2, cost=8, capacity=10)  # must not raise
+
+    def test_cost_equal_to_capacity_is_the_boundary_and_still_succeeds(self) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        limiter.check("edge-17", 2, cost=10, capacity=10)  # must not raise
+
+    def test_allow_also_accepts_capacity(self) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        assert limiter.allow("edge-17", 2, cost=8, capacity=10) is True
+        # Only 2 of the original 10 tokens remain; a further 8 no longer fits.
+        assert limiter.allow("edge-17", 2, cost=8, capacity=10) is False
+
+    def test_capacity_is_isolated_per_key_like_every_other_bucket_dimension(self) -> None:
+        clock = ManualClock(initial=0)
+        limiter = RateLimiter(clock=clock)
+
+        _exhaust(limiter, "edge-17", 2, max_attempts=1000, capacity=3)
+        with pytest.raises(RateLimitExceeded):
+            limiter.check("edge-17", 2, capacity=3)
+
+        # A different key, same limiter, same clock -- must still get its
+        # own fresh bucket at its own capacity.
+        limiter.check("edge-99", 2, capacity=3)  # must not raise

@@ -1654,6 +1654,231 @@ tool is also the only place a strength rule can be enforced: generated tokens ar
 256-bit CSPRNG values, and an externally supplied token shorter than 32
 characters is rejected unless explicitly overridden.
 
+## 36.5 Failed-authentication throttling
+
+> Subsections 36.5-36.7 added by ADR-0007 (failed-authentication throttling) and
+> ADR-0008 (observation-scaled rate limiting). The requirements above are
+> unchanged. Subsections 36.1-36.4 are ADR-0006's.
+
+Authentication itself MUST be rate limited. A credential check that rejects the
+caller before any per-agent limiter is reached is an unbounded online guessing
+oracle, and — because Section 36.1 leaves the server unable to judge the strength
+of a token it only stores hashed — it is the only bound the server has on
+guessing a weak credential at all.
+
+**Only failures are throttled.** A request that authenticates successfully MUST
+NOT be rejected by this mechanism, MUST NOT consume failure budget, and MUST NOT
+reset it. Exhausting a budget therefore can never deny service to a caller
+holding a valid credential.
+
+**Two budgets.** Each failed attempt charges one token to each of two token
+buckets, source bucket first:
+
+```text
+source bucket  key = client address, IPv4 /32, IPv6 /64
+agent bucket   key = a fixed-size slot derived from the attempted X-Agent-Id,
+                     or "-" when it is absent or malformed
+```
+
+If the source bucket is exhausted the agent bucket MUST NOT be charged and the
+request is answered immediately. A bucket that is short of tokens rejects
+without consuming any, so repeated attempts while blocked do not extend the
+block.
+
+The client address is the socket peer address by default.
+`X-Forwarded-For` MUST NOT be consulted unless
+`HAMMERTIME_INGEST_TRUSTED_PROXY_HOPS` is greater than zero, in which case the
+key is the entry that many positions from the right of that header; an absent,
+shorter, or unparsable header falls back to the socket peer. IPv6 sources are
+keyed by their `/64` prefix, because a single allocation routinely carries 2^64
+addresses.
+
+**The agent bucket's key space MUST be bounded independently of the limiter's
+eviction policy.** The attempted `X-Agent-Id` is caller-chosen, so charging a
+bucket keyed directly on it lets an attacker manufacture enough distinct keys to
+evict a target identity's bucket, which is then recreated with a full budget —
+resetting the very limit this bucket exists to impose. The service MUST
+therefore map every presented `X-Agent-Id` into a fixed table of 4096 slots
+using a keyed hash under a salt drawn once per process, and charge the slot:
+
+```text
+slot = HMAC-SHA-256(salt, X-Agent-Id) first 8 bytes, big-endian, mod 4096
+```
+
+An absent, empty, or over-long `X-Agent-Id` charges the single `"-"` key
+instead, so the agent limiter tracks at most 4097 keys for any input and no
+bucket is ever evicted. Registered and unregistered identities MUST be mapped by
+the identical function, so that a throttled response never discloses whether an
+`agent_id` is registered. Two identities sharing a slot share one budget; since
+only failures are charged, that can only reduce the guesses available to an
+attacker, never increase them. The slot count is a fixed property of the service
+and is not operator-configurable; the salt MUST NOT appear in any response, log,
+or metric. An LRU bound on the number of tracked buckets is a memory limit, not
+a budget limit, and MUST NOT be relied on as the latter.
+
+**Uniform failure response.** Every authentication failure — missing
+`X-Agent-Id`, missing or malformed `Authorization`, an over-long header value, an
+unknown `agent_id`, a wrong token — MUST return the identical response:
+
+```text
+401  WWW-Authenticate: Bearer
+     {"detail": "invalid agent credentials"}
+```
+
+`403` is reserved for exactly one outcome: a **correct** credential for a
+registered but disabled agent (`{"detail": "agent is disabled"}`). Learning that
+requires already holding the agent's live token, so it discloses nothing to an
+anonymous caller.
+
+Uniformity MUST hold in timing as well as in content: when the `agent_id` is
+unknown, the service MUST still compute the presented token's HMAC and
+constant-time-compare it against a fixed dummy digest, discarding the result, so
+that an unknown identity is not measurably faster to reject than a known one.
+
+**Length bounds, evaluated before any hashing.** An `X-Agent-Id` longer than 128
+characters (`schemas/observation.v1.json`'s `agent_id` maximum) or a bearer token
+longer than 512 characters is a failed attempt, answered with the uniform 401
+above, and MUST be rejected before the credential is hashed.
+
+**A failure that arrives with either budget exhausted** is answered `429` per
+Section 36.7 with `X-RateLimit-Scope: auth-failures` and the fixed body
+`{"detail": "too many failed authentication attempts"}`. The 429 body MUST NOT
+echo the attempted `agent_id` or reveal whether it is registered.
+
+**Logging.** Every failed attempt MUST emit exactly one `WARNING` record from
+the `hammertime.ingest.auth` logger, and a successful authentication MUST emit
+none:
+
+```text
+auth_failure outcome=%s agent_id=%r source=%s path=%s
+```
+
+* `outcome` is one of `missing_credential`, `oversized_credential`,
+  `unknown_agent`, `invalid_credential`, `agent_disabled`, `throttled`.
+* `agent_id` is the *attempted* identity, truncated to 128 characters and
+  rendered with `%r` so control characters cannot forge log lines; `None` when no
+  identity was presented.
+* `source` is the bucket key from the table above.
+* The record MUST NOT contain the presented token, any prefix of it, or its hash
+  (Section 36.1).
+
+**Configuration** (`.env.example`, all optional):
+
+```text
+HAMMERTIME_INGEST_AUTH_FAILURE_RATE_PER_MIN         default 30   failures/min per source
+HAMMERTIME_INGEST_AUTH_FAILURE_BURST                default 10   source bucket capacity
+HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_RATE_PER_MIN   default 60   failures/min per attempted agent_id
+HAMMERTIME_INGEST_AUTH_FAILURE_AGENT_BURST          default 20   agent bucket capacity
+HAMMERTIME_INGEST_TRUSTED_PROXY_HOPS                default 0    0 = trust no X-Forwarded-For
+```
+
+Rates are per minute; a limiter denominated in requests per second receives
+`rate_per_min / 60`. All five MUST be rejected at startup if non-numeric, and
+the four budget values if not positive; `HAMMERTIME_INGEST_TRUSTED_PROXY_HOPS`
+MUST be a non-negative integer.
+
+This mechanism bounds credential guessing and the information each failure
+discloses. It is NOT a defence against a volumetric flood: an in-process bucket
+cannot protect the accept queue. A deployment SHOULD rate limit at the network
+edge or reverse proxy in addition to this.
+
+## 36.6 Request cost and batch scaling
+
+A rate limit MUST be denominated in something proportional to the work the
+request causes. One `POST /v1/observations` may carry up to
+`max_observations_per_message` entries, and ADR-0004 fans each distinct IP out
+into its own bus message and its own downstream per-IP state, so charging a flat
+one token per request lets a single agent's *permitted* traffic amplify by up to
+that factor.
+
+Ingest therefore maintains **two** per-agent budgets:
+
+```text
+request budget       cost 1.0 per HTTP request      HAMMERTIME_INGEST_RATE_LIMIT_RPS (existing)
+observation budget   cost = distinct IPs in batch   HAMMERTIME_INGEST_OBSERVATION_RATE_LIMIT_EPS
+```
+
+**Cost formula.** The observation charge is the number of *distinct* IP
+addresses remaining after ADR-0004's coalescing — exactly the number of bus
+messages the request will produce — not the length of `observations[]`. A batch
+naming one IP 10 000 times costs 1. The count is taken *before* zero-count
+entries are dropped: an entry with `request_count` 0 still asked the service to
+consider an address, and MUST be charged for it.
+
+A batch is charged whatever its outcome: a duplicate (`200`) and a failed
+publish (`503`) are charged the same as an accepted one.
+
+**Bucket capacity is distinct from refill rate.** The observation budget refills
+at `HAMMERTIME_INGEST_OBSERVATION_RATE_LIMIT_EPS` entries per second and holds
+`HAMMERTIME_INGEST_OBSERVATION_BURST` entries.
+
+```text
+HAMMERTIME_INGEST_OBSERVATION_RATE_LIMIT_EPS   default 2000    entries/second, per agent
+HAMMERTIME_INGEST_OBSERVATION_BURST            default 10000   entries, per agent
+```
+
+`HAMMERTIME_INGEST_OBSERVATION_BURST` MUST be greater than or equal to
+`HAMMERTIME_INGEST_MAX_OBSERVATIONS`, and the service MUST refuse to start
+otherwise. This is what guarantees every schema-valid batch is satisfiable: a
+batch can never cost more than the bucket can ever hold, so "this request could
+never succeed at any rate" is unreachable from configuration rather than
+surfacing as a `500`.
+
+**An over-capacity batch is `413`, not `429`.** Should a batch's cost
+nonetheless exceed the configured capacity, the response MUST be `413` naming
+the cost and the ceiling — the request is too large, and no `Retry-After` would
+be truthful because no wait makes it succeed. An agent that is merely going too
+fast gets `429` (Section 36.7). The service MUST NOT pass a cost above capacity
+to the limiter.
+
+**Zero-count entries are never published.** After the charge, an entry whose
+coalesced `request_count` is 0 MUST be dropped rather than published: a zero
+delta is a no-op for the sliding window (Section 5), so publishing one creates
+per-IP state (Section 26) and nothing else — an attacker-controlled cardinality
+channel. A batch all of whose entries drop out is still `202` and still consumes
+its `(agent_id, sequence)` claim (Section 23); it was valid and its effect has
+been applied in full. Consequently the aggregator never receives a zero-delta
+observation, and any future "refresh this IP without changing its count"
+behaviour must be an explicit signal rather than a zero in `observations[]`.
+
+**Pipeline order** for `POST /v1/observations` is normative:
+
+```text
+authenticate (36.5)
+  -> request budget, cost 1.0          header-only, still before the body is read
+  -> body read within max_body_bytes
+  -> JSON / schema / domain validation
+  -> coalesce
+  -> observation budget, cost = distinct IPs
+  -> dedup claim (Section 23)
+  -> drop zero-count entries, publish, 202
+```
+
+The request budget MUST remain the first throttle and MUST remain a flat,
+body-free charge: it is the only one that can run before the body is read. The
+observation charge MUST sit after coalescing (the cost is not knowable earlier)
+and before the dedup claim, so a throttled request does not consume the claim
+its own retry will need.
+
+## 36.7 Throttled responses
+
+Every throttled response in Sections 36.5 and 36.6 has the same shape:
+
+```text
+429 Too Many Requests
+Retry-After: <integer seconds, max(1, ceil(retry_after))>
+X-RateLimit-Scope: auth-failures | requests | observations
+{"detail": "<human-readable reason>"}
+```
+
+`X-RateLimit-Scope` names which budget rejected the request, so an agent (and an
+operator reading a trace) can tell "slow down your request rate" from "send
+smaller batches" from "your credential is wrong" without parsing prose.
+`Retry-After` MUST be present on all three and MUST be an integer count of
+seconds of at least 1. The `auth-failures` body MUST be the fixed string given
+in Section 36.5; the other two MAY describe the exceeded budget, and MUST NOT
+include a credential.
+
 ---
 
 # 37. Observability
@@ -1667,6 +1892,10 @@ observations_received
 observations_rejected
 duplicate_messages
 late_messages
+auth_failures                (ADR-0007, Section 36.5; labelled by outcome)
+auth_failures_throttled      (ADR-0007, Section 36.5)
+rate_limited_requests        (ADR-0008, Section 36.6; the request budget)
+rate_limited_observations    (ADR-0008, Section 36.6; the observation budget)
 ```
 
 ### Sliding-window metrics

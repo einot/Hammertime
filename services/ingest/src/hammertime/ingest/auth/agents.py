@@ -25,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +53,18 @@ _RECORD_ALLOWED_KEYS = {
     "rate_limit_rps",
 }
 _HASH_HEX_LENGTH = 64  # 32-byte HMAC-SHA-256 digest, hex-encoded
+
+#: Size in bytes of the fixed per-registry dummy digest compared against an
+#: unknown agent_id's presented token (ADR-0007, spec section 36.5). Matches
+#: the size of a real `tokens.hash_token(...)` digest decoded from hex (see
+#: `_HASH_HEX_LENGTH` above). `authenticate()`'s unknown-agent branch computes
+#: a real HMAC-SHA-256 of the presented token via `tokens.hash_token` -- the
+#: same computation the known-agent path performs -- and spends the same
+#: `hmac.compare_digest` call, against a value fixed once per registry
+#: instance (drawn with `secrets.token_bytes`) rather than per request, so an
+#: unknown identity costs exactly as much work as a known one with a wrong
+#: token.
+_DUMMY_HASH_LENGTH = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +124,9 @@ class AgentRegistry:
         self._records = dict(records)
         self._key = key
         self._clock = clock if clock is not None else SystemClock()
+        # Fixed for the lifetime of this registry instance -- see
+        # _DUMMY_HASH_LENGTH above.
+        self._dummy_hash = secrets.token_bytes(_DUMMY_HASH_LENGTH)
 
     @classmethod
     def from_records(
@@ -131,9 +147,18 @@ class AgentRegistry:
         Raises `UnknownAgentError` if no such agent is registered,
         `InvalidCredentialError` if the token does not match, or
         `AgentDisabledError` if the agent is registered but disabled.
+
+        Timing uniformity (ADR-0007, spec section 36.5): an unknown
+        `agent_id` still computes a real HMAC-SHA-256 of the presented token
+        (the same `tokens.hash_token` call the known-agent path below makes)
+        and performs the same `hmac.compare_digest` call, against a fixed
+        per-registry dummy digest, so an unknown identity is not measurably
+        faster to reject than a known one with a wrong token.
         """
         record = self._records.get(agent_id)
         if record is None:
+            presented_hash = bytes.fromhex(tokens.hash_token(token, key=self._key))
+            hmac.compare_digest(presented_hash, self._dummy_hash)
             raise UnknownAgentError(f"no registered agent {agent_id!r}")
 
         # Recompute the presented token's HMAC once, then compare the fixed-
