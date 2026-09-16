@@ -189,27 +189,12 @@ def _client(
     existing call site (which never passes them) is untouched.
     """
     registry = AgentRegistry.from_records(agents if agents is not None else [_known_agent()])
-    settings = _settings(**settings_overrides)
-    # Explicit, conditional keyword arguments rather than a `dict[str,
-    # object]` + `**splat` -- mypy strict mode can never statically verify
-    # a plain-dict splat against `create_app`'s named, non-`**kwargs`-typed
-    # parameters, whereas each literal keyword below type-checks normally.
-    # Every combination of "given"/"not given" for the two test-only
-    # parameters is enumerated so that, per this helper's own docstring,
-    # each is "only forwarded when explicitly given".
-    if agent_slot_salt is not None and agent_slot_count is not None:
-        app = create_app(
-            settings,
-            agent_registry=registry,
-            agent_slot_salt=agent_slot_salt,
-            agent_slot_count=agent_slot_count,
-        )
-    elif agent_slot_salt is not None:
-        app = create_app(settings, agent_registry=registry, agent_slot_salt=agent_slot_salt)
-    elif agent_slot_count is not None:
-        app = create_app(settings, agent_registry=registry, agent_slot_count=agent_slot_count)
-    else:
-        app = create_app(settings, agent_registry=registry)
+    create_app_kwargs: dict[str, object] = {"agent_registry": registry}
+    if agent_slot_salt is not None:
+        create_app_kwargs["agent_slot_salt"] = agent_slot_salt
+    if agent_slot_count is not None:
+        create_app_kwargs["agent_slot_count"] = agent_slot_count
+    app = create_app(_settings(**settings_overrides), **create_app_kwargs)
     return TestClient(app, client=client_address).__enter__()
 
 
