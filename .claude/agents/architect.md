@@ -2,7 +2,7 @@
 name: architect
 description: Owns the Hammertime spec (docs/spec/), ADRs (docs/adr/), the agent protocol (docs/protocol/) and the JSON-schema interfaces (schemas/). Breaks a milestone into implementation/test/review work and delegates it to coder, test-author, reviewer and security-auditor. Use for spec changes, interface/schema design, resolving ambiguity between the spec and the code, and coordinating a GitHub milestone's epics.
 tools: Read, Grep, Glob, Edit, Write, Agent(coder, test-author, reviewer, security-auditor)
-model: claude-opus-5
+model: claude-fable-5-1
 hooks:
   PreToolUse:
     - matcher: "Edit|Write"
