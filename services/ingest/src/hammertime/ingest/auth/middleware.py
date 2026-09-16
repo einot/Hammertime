@@ -49,7 +49,7 @@ be a *different* agent and desync that agent's dedup/rate-limit state.
 
 import ipaddress
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from fastapi import HTTPException, Request
 from hammertime.ingest.auth import (
@@ -179,9 +179,21 @@ def _resolve_source_address(request: Request, *, trusted_proxy_hops: int) -> str
     falls back to the socket peer rather than to a caller-supplied value,
     since an untrusted `X-Forwarded-For` is a limiter with an infinite key
     space.
+
+    Uses `Headers.getlist` rather than `Headers.get`: Starlette's `.get`
+    returns only the first raw `X-Forwarded-For` header *line*, silently
+    ignoring any duplicates. A trusted proxy that emits `X-Forwarded-For`
+    as its own separate header line (rather than appending to the client's
+    existing one -- common with HAProxy's `option forwardfor`, and various
+    CDNs/L7 gateways) would then have an attacker-forged first line read
+    instead of the proxy's real one, letting the source key be rotated at
+    will even with `trusted_proxy_hops` correctly configured. Joining every
+    line with `", "` before splitting matches RFC 9110's semantics for
+    repeated header fields (the same join uvicorn's own
+    `ProxyHeadersMiddleware` performs internally).
     """
     if trusted_proxy_hops > 0:
-        header = request.headers.get(_FORWARDED_FOR_HEADER)
+        header = ", ".join(request.headers.getlist(_FORWARDED_FOR_HEADER))
         if header:
             entries = [entry.strip() for entry in header.split(",") if entry.strip()]
             if len(entries) >= trusted_proxy_hops:
@@ -204,6 +216,15 @@ def _resolve_source_address(request: Request, *, trusted_proxy_hops: int) -> str
 def _source_bucket_key(address_text: str) -> str:
     """spec section 36.5: IPv4 /32, IPv6 /64 -- a single allocation routinely
     carries 2^64 addresses, so per-address IPv6 keying is free evasion.
+
+    An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is unwrapped to its
+    embedded `IPv4Address` and keyed with the /32 rule, not /64: it is an
+    `IPv6Address` instance as far as `ipaddress` is concerned, but
+    semantically an IPv4 client (arriving over a dual-stack socket, or via
+    a proxy that forwards `X-Forwarded-For: ::ffff:...`). Applying the /64
+    rule to it would collapse *every* IPv4-mapped client into the single
+    shared key `::/64`, letting one attacker drain the bucket and
+    deny/throttle every other IPv4 client's failed-auth attempts.
     """
     try:
         address = ipaddress.ip_address(address_text)
@@ -212,6 +233,9 @@ def _source_bucket_key(address_text: str) -> str:
         # above) -- key on the literal text, still a single fixed bucket.
         return address_text
     if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            return f"{mapped}/32"
         network = ipaddress.IPv6Network((address, 64), strict=False)
         return f"{network.network_address}/64"
     return f"{address}/32"
@@ -227,7 +251,7 @@ def require_agent(
     auth_failure_agent_rate_per_min: float = _DEFAULT_AUTH_FAILURE_AGENT_RATE_PER_MIN,
     auth_failure_agent_burst: int = _DEFAULT_AUTH_FAILURE_AGENT_BURST,
     trusted_proxy_hops: int = 0,
-) -> Callable[[Request], str]:
+) -> Callable[[Request], Awaitable[str]]:
     """Build a FastAPI dependency that authenticates the calling agent.
 
     `source_limiter`/`agent_limiter` default to a fresh `RateLimiter()` each
@@ -235,6 +259,19 @@ def require_agent(
     instance" convention) -- `app.py`'s lifespan always passes both
     explicitly, built once and shared with `IngestState`, so this default
     only matters to a caller that builds this dependency directly.
+
+    This is an `async def` dependency (not a plain `def`) so FastAPI/
+    Starlette dispatches it directly on the single asyncio event-loop thread
+    like every other request-handling code path in this service, rather
+    than via `run_in_threadpool` on a worker thread. `RateLimiter.check()`
+    (see `ratelimit/__init__.py`) is race-free only under that single-
+    event-loop-thread model -- its bucket read-modify-write is not atomic
+    across OS threads -- so a plain `def` here would let concurrent failed
+    auth requests race past the burst limit. Everything this dependency
+    calls (`AgentRegistry.authenticate`, both limiters' `.check()`) is a
+    fast, non-blocking, synchronous call, so awaiting nothing between them
+    is correct; it is `async def` purely for dispatch, not because it
+    awaits anything.
 
     On success the dependency returns the authenticated `agent_id` and also
     sets `request.state.agent_id`, for any other dependency/handler that
@@ -258,7 +295,7 @@ def require_agent(
     auth_failure_rate_rps = auth_failure_rate_per_min / 60.0
     auth_failure_agent_rate_rps = auth_failure_agent_rate_per_min / 60.0
 
-    def _dependency(request: Request) -> str:
+    async def _dependency(request: Request) -> str:
         try:
             agent_id = authenticate_request(request, registry=registry)
         except AgentAuthError as exc:

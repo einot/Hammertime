@@ -12,7 +12,7 @@ the `require_agent` dependency built from it, the `RateLimiter`, the
 `stop()`; the in-memory one needs neither.
 """
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -46,7 +46,7 @@ class IngestState:
     #: Built once via `require_agent(registry, ...)` in the lifespan below,
     #: not rebuilt per request -- `api/routes.py` calls this directly as the
     #: body of its own `Depends` dependency.
-    authenticate: Callable[[Request], str]
+    authenticate: Callable[[Request], Awaitable[str]]
     rate_limiter: RateLimiter
     #: ADR-0007 (spec section 36.5): failed-auth budgets, keyed by source
     #: address prefix and by attempted `X-Agent-Id` respectively. Charged

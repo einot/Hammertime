@@ -57,7 +57,7 @@ def _get_ingest_state(request: Request) -> "IngestState":
     return request.app.state.ingest  # type: ignore[no-any-return]
 
 
-def _authenticate(request: Request) -> str:
+async def _authenticate(request: Request) -> str:
     """Auth dependency: delegate to the `require_agent` closure built once at startup.
 
     `IngestState.authenticate` is `require_agent(registry)`, built exactly
@@ -67,8 +67,15 @@ def _authenticate(request: Request) -> str:
     `HTTPException(403)` itself (see `auth/middleware.py`) and never touches
     the request body, so a FastAPI `Depends` on this runs -- and can reject
     the request -- before the body is read.
+
+    `async def`, not a plain `def`: `require_agent`'s dependency is itself
+    `async def` so FastAPI dispatches it on the event loop rather than a
+    worker thread (see its docstring); this wrapper must stay `async def`
+    too so FastAPI awaits it directly instead of routing it through
+    `run_in_threadpool`, which would reintroduce the same concurrency
+    mismatch one layer up.
     """
-    return _get_ingest_state(request).authenticate(request)
+    return await _get_ingest_state(request).authenticate(request)
 
 
 async def _read_body_within_limit(request: Request, *, max_body_bytes: int) -> bytes:
