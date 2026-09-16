@@ -48,6 +48,13 @@ incapable of taking an unauthorized action (no write access at all), so
 routine supervisor coverage is scoped to the three agents that can write;
 extend it to every dispatch if asked.
 
+`architect` can itself dispatch `coder`/`test-author`; the same pairing
+requirement applies to those dispatches too, so `architect` is also
+allowed to spawn `supervisor` (see `.claude/agents/architect.md`). A
+finding `supervisor` reports to `architect` reaches the top-level session
+as a handed-back blocker like any other — the hard stop above still
+applies once it does.
+
 ## Orchestration role
 
 The top-level session acts as project manager only: delegate, reconcile,
