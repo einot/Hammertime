@@ -93,6 +93,15 @@ already-delegated work (applying a worker's own diff/commit, resolving a
 merge conflict per the pre-1.0 exception below) and to editing this file,
 other agent definitions, and non-code governance docs it owns directly.
 
+**Agent configuration.** The top-level session may alter agent
+configuration — `.claude/agents/*.md`, including which model backs an
+agent — when the user directly instructs it to. It may not alter it on its
+own initiative: not to work around a limitation it has run into, and not
+because the change would make the job in front of it easier or faster. If
+an agent's configuration looks like it is blocking legitimate work, say so
+and let the user decide; changing it unasked defeats the point of having
+the constraint.
+
 **Pre-1.0 exception:** until the first release (1.0) ships, the top-level
 session may finish and merge PRs itself — resolving merge conflicts
 (including regenerating lockfiles with the repo's own tooling, never by
