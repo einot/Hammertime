@@ -38,7 +38,7 @@ log. The trie is a *derived* index: it can always be rebuilt by replaying
 | `services/aggregator` | Per-IP sliding counters, lateness policy, HOT/COLD transitions, sharding |
 | `services/trie` | Single-writer binary/Patricia trie, snapshots, prefix & IP read API |
 | `services/detector` | Prefix classification and scoring, minimal-prefix selection, alerts |
-| `tools/` | Agent simulator, log replay, snapshot inspector |
+| `tools/` | Agent simulator, log replay, snapshot inspector, agent-token provisioning (§36.4) |
 | `deploy/` | docker-compose, Kubernetes manifests, dashboards |
 | `tests/` | Integration, end-to-end, and property tests spanning services |
 
