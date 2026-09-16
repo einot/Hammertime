@@ -80,6 +80,19 @@ implementation code directly — delegate it to `coder`. Tests go through
 `reviewer`/`security-auditor`. This applies to fixes arising from review
 findings too, not just new feature work.
 
+**No exception for "mechanical" edits.** Every test file change goes
+through `test-author`, full stop — including a one-line formatting fix, a
+lint-only rename, or any other change that looks too small or too
+obviously safe to bother delegating. `test-author` has no Bash and so
+cannot run a formatter itself; that means making the edit by hand with
+Edit until the content matches, not an excuse to make the edit directly
+instead. The same holds for `coder`'s and `architect`'s domains: "it's
+tiny" is never a reason to touch code, tests, or specs/schemas/ADRs
+directly. The top-level session's own tools stay limited to reconciling
+already-delegated work (applying a worker's own diff/commit, resolving a
+merge conflict per the pre-1.0 exception below) and to editing this file,
+other agent definitions, and non-code governance docs it owns directly.
+
 **Pre-1.0 exception:** until the first release (1.0) ships, the top-level
 session may finish and merge PRs itself — resolving merge conflicts
 (including regenerating lockfiles with the repo's own tooling, never by
