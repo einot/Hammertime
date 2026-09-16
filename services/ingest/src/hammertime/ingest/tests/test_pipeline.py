@@ -81,6 +81,7 @@ from fastapi.testclient import TestClient
 from hammertime.bus.memory import InMemoryBus, MemoryProducer
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.core.addressing.address import Address
+from hammertime.core.auth.tokens import hash_token
 from hammertime.core.events.codec import EventPayload, decode
 from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import RequestObservation
@@ -90,6 +91,12 @@ from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
 from hammertime.ingest.config import IngestSettings
 from hammertime.ingest.ratelimit import RateLimiter
 from hammertime.store.memory import MemoryDedupStore
+
+# ADR-0006: AgentRegistry now requires a deployment key and stores hashed
+# credentials, not plaintext tokens -- a fixed 32-byte test key, exactly
+# as services/ingest/.../tests/test_auth.py uses, never a real env var or
+# file on disk.
+_AGENT_TOKEN_KEY = b"0" * 32
 
 _CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
 
@@ -109,8 +116,9 @@ _AMPLE_RATE_LIMIT_RPS = 1_000
 
 
 def _agent(agent_id: str, token: str, *, rate_limit_rps: int, enabled: bool = True) -> AgentRecord:
+    token_hash = bytes.fromhex(hash_token(token, key=_AGENT_TOKEN_KEY))
     return AgentRecord(
-        agent_id=agent_id, token=token, enabled=enabled, rate_limit_rps=rate_limit_rps
+        agent_id=agent_id, token_hash=token_hash, enabled=enabled, rate_limit_rps=rate_limit_rps
     )
 
 
@@ -152,7 +160,9 @@ def _build_app(
     failure.
     """
     default_agent = _agent(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN, rate_limit_rps=_AMPLE_RATE_LIMIT_RPS)
-    registry = AgentRegistry.from_records(agents if agents is not None else [default_agent])
+    registry = AgentRegistry.from_records(
+        agents if agents is not None else [default_agent], key=_AGENT_TOKEN_KEY
+    )
     resolved_clock = clock if clock is not None else ManualClock(initial=0)
     resolved_bus = bus if bus is not None else InMemoryBus()
     app = create_app(
