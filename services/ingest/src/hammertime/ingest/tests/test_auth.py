@@ -5,11 +5,24 @@ replay protection, request size limits, rate limits, schema validation."
 "An untrusted agent MUST NOT be able to arbitrarily declare `IP = HOT`.")
 ADR: docs/adr/0006-hashed-agent-credentials.md.
 
-docs/protocol/observation-v1.md's response table: `401 / 403 | Unknown or
-unauthorized agent`, split as: 401 for an unknown or wholly unauthenticated
-agent (no credential presented at all, or an `agent_id` the registry has
-never heard of), 403 for a *known* agent that is not permitted (wrong
-credential, or disabled).
+docs/protocol/observation-v1.md's response table, per ADR-0007 decision 4
+(the ADR's own "one externally visible behaviour change"): `401 |
+Authentication failed -- missing, malformed, unknown or wrong credential`,
+uniformly, with body `{"detail": "invalid agent credentials"}` and
+`WWW-Authenticate: Bearer` (see `test_auth_throttle.py` for those two
+assertions in detail); `403` is retained for exactly one case, a
+*correct* credential presented for a registered but disabled agent.
+
+The `AgentAuthError` subclass hierarchy below (`AuthenticationError` /
+`AuthorizationError`, i.e. the "401 group" / "403 group" comments on
+`UnknownAgentError` / `InvalidCredentialError` / `AgentDisabledError`)
+is an internal exception-classification grouping, not a 1:1 mirror of the
+current wire status split -- `InvalidCredentialError` is still classified
+under `AuthorizationError` for that internal grouping even though
+`require_agent` now answers a wrong credential with `401` on the wire, per
+ADR-0007. Only `AgentDisabledError` still surfaces as `403` at the HTTP
+layer; see `TestRequireAgentDependency` below for the wire-level
+assertions.
 
 This file supersedes the pre-ADR-0006 version of itself, which built
 `AgentRecord`s from a plaintext `token: str` field. ADR-0006 removes that
@@ -197,6 +210,15 @@ class TestIncorrectCredential:
             registry.authenticate(KNOWN_AGENT_ID, bad_token)
 
     def test_invalid_credential_error_is_in_the_403_group(self) -> None:
+        # This is the internal exception-classification grouping only (see
+        # this module's docstring) -- as of ADR-0007, a wrong credential for
+        # a known agent actually answers `401` on the wire
+        # (`test_wrong_credential_is_401` below), not `403`. The
+        # `AuthorizationError` grouping itself is unchanged by ADR-0007:
+        # `InvalidCredentialError` still means "known identity, denied
+        # access, not 'who are you'" as a matter of internal classification,
+        # even though `require_agent` no longer maps that classification
+        # 1:1 onto the HTTP status it returns.
         assert issubclass(InvalidCredentialError, AuthorizationError)
 
     def test_non_ascii_token_is_rejected_cleanly_not_a_crash(self) -> None:
@@ -484,7 +506,11 @@ class TestRequireAgentDependency:
 
         assert response.status_code == 401
 
-    def test_wrong_credential_is_403(self) -> None:
+    def test_wrong_credential_is_401(self) -> None:
+        # ADR-0007 decision 4 ("the one externally visible behaviour change
+        # in this ADR"): a wrong credential for a *known* agent is now 401
+        # with the uniform body, not 403 -- 403 is reserved for a correct
+        # credential presented to a disabled agent (see test_disabled_agent_is_403).
         client = TestClient(_app(_registry(_known_agent())))
 
         response = client.get(
@@ -492,7 +518,7 @@ class TestRequireAgentDependency:
             headers={"X-Agent-Id": KNOWN_AGENT_ID, "Authorization": "Bearer wrong-token"},
         )
 
-        assert response.status_code == 403
+        assert response.status_code == 401
 
     def test_disabled_agent_is_403(self) -> None:
         client = TestClient(_app(_registry(_known_agent(enabled=False))))
@@ -504,7 +530,7 @@ class TestRequireAgentDependency:
 
         assert response.status_code == 403
 
-    def test_non_ascii_authorization_header_is_403_not_a_crash(self) -> None:
+    def test_non_ascii_authorization_header_is_401_not_a_crash(self) -> None:
         # Same regression as TestIncorrectCredential, exercised through the
         # actual HTTP dependency rather than calling authenticate() directly.
         # httpx's TestClient rejects a plain non-ASCII str header value
@@ -512,6 +538,9 @@ class TestRequireAgentDependency:
         # so the header value is passed pre-encoded as latin-1 bytes here --
         # matching what Starlette actually hands the app for a raw
         # Authorization header byte >= 0x80 on the wire.
+        #
+        # ADR-0007 decision 4: a bad credential for a known agent is now 401
+        # (uniform body), not 403 -- see test_wrong_credential_is_401.
         client = TestClient(_app(_registry(_known_agent())))
 
         response = client.get(
@@ -522,7 +551,7 @@ class TestRequireAgentDependency:
             },
         )
 
-        assert response.status_code == 403
+        assert response.status_code == 401
 
 
 class TestRegistryDocumentEnvelopeValidation:
