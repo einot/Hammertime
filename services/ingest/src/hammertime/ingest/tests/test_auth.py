@@ -736,3 +736,145 @@ class TestRegistryFileLoading:
 
         with pytest.raises(ConfigurationError):
             load_agent_registry_file(bad_file, key=TEST_KEY)
+
+
+class TestRegistryFileDuplicateJsonKeys:
+    # Fix commit on top of #35: a raw JSON *document* -- not a Python dict
+    # built from one, which cannot express this at all -- containing two
+    # occurrences of the same key must be rejected outright rather than
+    # silently resolved last-wins by the stdlib JSON parser. Only
+    # observable through the file-loading entry point, since
+    # load_agent_registry_document takes an already-parsed object where
+    # the duplicate has necessarily already been collapsed by whatever
+    # parsed it.
+
+    def test_duplicate_agent_id_key_under_agents_is_rejected(self, tmp_path: Path) -> None:
+        first_hash = _hash_hex("token-one")
+        second_hash = _hash_hex("token-two")
+        raw = (
+            "{\n"
+            '  "registry_version": 2,\n'
+            '  "hash_algorithm": "hmac-sha256",\n'
+            f'  "key_id": "{TEST_KEY_ID}",\n'
+            '  "agents": {\n'
+            f'    "edge-17": {{"token_hash": "{first_hash}"}},\n'
+            f'    "edge-17": {{"token_hash": "{second_hash}"}}\n'
+            "  }\n"
+            "}\n"
+        )
+        registry_file = tmp_path / "agents.json"
+        registry_file.write_text(raw)
+
+        with pytest.raises(ConfigurationError):
+            load_agent_registry_file(registry_file, key=TEST_KEY)
+
+    def test_a_document_without_the_duplicate_loads_fine_as_a_control(
+        self, tmp_path: Path
+    ) -> None:
+        # Sanity control: the file-loading path itself works for a
+        # well-formed document, so the failure above is attributable to the
+        # duplicate key and not to some other property of hand-written raw
+        # JSON.
+        first_hash = _hash_hex("token-one")
+        raw = (
+            "{\n"
+            '  "registry_version": 2,\n'
+            '  "hash_algorithm": "hmac-sha256",\n'
+            f'  "key_id": "{TEST_KEY_ID}",\n'
+            '  "agents": {\n'
+            f'    "edge-17": {{"token_hash": "{first_hash}"}}\n'
+            "  }\n"
+            "}\n"
+        )
+        registry_file = tmp_path / "agents.json"
+        registry_file.write_text(raw)
+
+        registry = load_agent_registry_file(registry_file, key=TEST_KEY)
+
+        assert registry.get("edge-17") is not None
+
+
+class TestPreviousTokenExpiresAtMustBeTimezoneAware:
+    # Fix commit on top of #35, spec 36.3 / schema `format: date-time`
+    # (RFC 3339 requires an explicit offset). A naive ISO datetime string
+    # must not be silently assumed to mean UTC.
+
+    def test_naive_previous_token_expires_at_is_rejected(self) -> None:
+        entry = _agent_entry("current-token")
+        entry["previous_token_hash"] = _hash_hex("old-token")
+        entry["previous_token_expires_at"] = "2026-09-20T09:00:00"  # no UTC offset
+        document = _document(agents={"edge-1": entry})
+
+        with pytest.raises(ConfigurationError):
+            load_agent_registry_document(document, key=TEST_KEY)
+
+    def test_offset_aware_previous_token_expires_at_is_accepted(self) -> None:
+        # Control: the same shape with an explicit offset must load fine,
+        # so the rejection above is attributable to the missing offset and
+        # not to some other property of the value.
+        entry = _agent_entry("current-token")
+        entry["previous_token_hash"] = _hash_hex("old-token")
+        entry["previous_token_expires_at"] = "2026-09-20T09:00:00+00:00"
+        document = _document(agents={"edge-1": entry})
+
+        registry = load_agent_registry_document(document, key=TEST_KEY)
+
+        assert registry.get("edge-1") is not None
+
+
+class TestAgentRecordConstructionInvariant:
+    # Fix commit on top of #35, defense-in-depth independent of the
+    # document loader: `AgentRecord` is a public constructor
+    # (`AgentRegistry.from_records`), and must reject a half-set rotation
+    # pair from any direct caller, not just from
+    # `load_agent_registry_document`'s own equivalent check.
+
+    def test_previous_token_hash_without_expiry_is_rejected_at_construction(self) -> None:
+        with pytest.raises(ConfigurationError):
+            AgentRecord(
+                agent_id=KNOWN_AGENT_ID,
+                token_hash=_hash_bytes(KNOWN_AGENT_TOKEN),
+                previous_token_hash=_hash_bytes("old-token"),
+            )
+
+    def test_previous_token_expires_at_without_hash_is_rejected_at_construction(self) -> None:
+        with pytest.raises(ConfigurationError):
+            AgentRecord(
+                agent_id=KNOWN_AGENT_ID,
+                token_hash=_hash_bytes(KNOWN_AGENT_TOKEN),
+                previous_token_expires_at=datetime(2999, 1, 1, tzinfo=UTC),
+            )
+
+    def test_neither_set_is_accepted(self) -> None:
+        record = AgentRecord(agent_id=KNOWN_AGENT_ID, token_hash=_hash_bytes(KNOWN_AGENT_TOKEN))
+
+        assert record.previous_token_hash is None
+        assert record.previous_token_expires_at is None
+
+    def test_both_set_is_accepted(self) -> None:
+        record = AgentRecord(
+            agent_id=KNOWN_AGENT_ID,
+            token_hash=_hash_bytes(KNOWN_AGENT_TOKEN),
+            previous_token_hash=_hash_bytes("old-token"),
+            previous_token_expires_at=datetime(2999, 1, 1, tzinfo=UTC),
+        )
+
+        assert record.previous_token_hash is not None
+        assert record.previous_token_expires_at is not None
+
+    def test_invalid_record_cannot_be_smuggled_in_through_from_records(self) -> None:
+        # AgentRegistry.from_records takes already-built AgentRecords, but
+        # the invariant fires at AgentRecord construction time itself, so
+        # there is no way to reach from_records with a half-set record in
+        # the first place -- pinned here so a future relaxation of
+        # AgentRecord's own check doesn't quietly reopen this gap via
+        # from_records.
+        def _invalid_records() -> Iterable[AgentRecord]:
+            yield AgentRecord(
+                agent_id=KNOWN_AGENT_ID,
+                token_hash=_hash_bytes(KNOWN_AGENT_TOKEN),
+                previous_token_hash=_hash_bytes("old-token"),
+            )
+
+        with pytest.raises(ConfigurationError):
+            AgentRegistry.from_records(_invalid_records(), key=TEST_KEY)
