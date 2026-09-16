@@ -43,11 +43,19 @@ class IngestState:
     schema_validator: ObservationSchemaValidator
     bucket_seconds: int
     registry: AgentRegistry
-    #: Built once via `require_agent(registry)` in the lifespan below, not
-    #: rebuilt per request -- `api/routes.py` calls this directly as the
+    #: Built once via `require_agent(registry, ...)` in the lifespan below,
+    #: not rebuilt per request -- `api/routes.py` calls this directly as the
     #: body of its own `Depends` dependency.
     authenticate: Callable[[Request], str]
     rate_limiter: RateLimiter
+    #: ADR-0007 (spec section 36.5): failed-auth budgets, keyed by source
+    #: address prefix and by attempted `X-Agent-Id` respectively. Charged
+    #: only inside `require_agent`'s failure path, never here directly.
+    auth_failure_source_limiter: RateLimiter
+    auth_failure_agent_limiter: RateLimiter
+    #: ADR-0008 (spec section 36.6): per-agent budget denominated in
+    #: distinct observed IPs, not requests. Charged in `api/routes.py`.
+    observation_limiter: RateLimiter
     dedup: DedupService
     publisher: ObservationPublisher
 
@@ -57,6 +65,9 @@ def create_app(
     *,
     agent_registry: AgentRegistry | None = None,
     rate_limiter: RateLimiter | None = None,
+    auth_failure_source_limiter: RateLimiter | None = None,
+    auth_failure_agent_limiter: RateLimiter | None = None,
+    observation_limiter: RateLimiter | None = None,
     dedup_store: DedupStore | None = None,
     bus: InMemoryBus | None = None,
 ) -> FastAPI:
@@ -65,9 +76,9 @@ def create_app(
     `settings` is normally left `None` so the lifespan loads it (and the
     detection config it references) from the environment at startup; tests
     may pass an explicit `IngestSettings` to avoid depending on process
-    environment variables. The four keyword-only overrides let a test
-    substitute its own `AgentRegistry` (skipping `HAMMERTIME_INGEST_AGENTS_PATH`
-    disk access), `RateLimiter`/`DedupStore` (e.g. built on a shared
+    environment variables. The keyword-only overrides let a test substitute
+    its own `AgentRegistry` (skipping `HAMMERTIME_INGEST_AGENTS_PATH` disk
+    access), `RateLimiter`s/`DedupStore` (e.g. built on a shared
     `ManualClock` for deterministic TTL/refill assertions), and `InMemoryBus`
     (so the test keeps a reference to read a topic's log back afterwards --
     `bus.producer()` is what actually gets wired into `ObservationPublisher`,
@@ -86,6 +97,17 @@ def create_app(
             else load_agent_registry_file(resolved_settings.agents_path)
         )
         resolved_rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
+        resolved_auth_failure_source_limiter = (
+            auth_failure_source_limiter
+            if auth_failure_source_limiter is not None
+            else RateLimiter()
+        )
+        resolved_auth_failure_agent_limiter = (
+            auth_failure_agent_limiter if auth_failure_agent_limiter is not None else RateLimiter()
+        )
+        resolved_observation_limiter = (
+            observation_limiter if observation_limiter is not None else RateLimiter()
+        )
 
         redis_client: Redis | None = None
         resolved_dedup_store: DedupStore
@@ -113,8 +135,20 @@ def create_app(
             schema_validator=ObservationSchemaValidator.from_file(),
             bucket_seconds=detection_config.bucket_seconds,
             registry=registry,
-            authenticate=require_agent(registry),
+            authenticate=require_agent(
+                registry,
+                source_limiter=resolved_auth_failure_source_limiter,
+                agent_limiter=resolved_auth_failure_agent_limiter,
+                auth_failure_rate_per_min=resolved_settings.auth_failure_rate_per_min,
+                auth_failure_burst=resolved_settings.auth_failure_burst,
+                auth_failure_agent_rate_per_min=(resolved_settings.auth_failure_agent_rate_per_min),
+                auth_failure_agent_burst=resolved_settings.auth_failure_agent_burst,
+                trusted_proxy_hops=resolved_settings.trusted_proxy_hops,
+            ),
             rate_limiter=resolved_rate_limiter,
+            auth_failure_source_limiter=resolved_auth_failure_source_limiter,
+            auth_failure_agent_limiter=resolved_auth_failure_agent_limiter,
+            observation_limiter=resolved_observation_limiter,
             dedup=DedupService(
                 resolved_dedup_store,
                 allowed_lateness_seconds=detection_config.allowed_lateness_seconds,

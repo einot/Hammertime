@@ -16,6 +16,7 @@ limiter to read; this module does not enforce it anywhere.
 import hmac
 import json
 import os
+import secrets
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,17 @@ from hammertime.core.errors import ConfigurationError
 from hammertime.ingest.auth import AgentDisabledError, InvalidCredentialError, UnknownAgentError
 
 _DEFAULT_AGENTS_PATH = "./config/agents.v1.json"
+
+#: Length of the fixed per-registry dummy credential compared against an
+#: unknown agent_id's presented token (ADR-0007, spec section 36.5). This
+#: repo does not yet hash tokens at rest (ADR-0006's hashed-credential
+#: rewrite has not landed on this branch), so there is no HMAC digest to
+#: compare against literally; the closest available analogue is to spend
+#: the same `hmac.compare_digest` call the known-agent path already makes,
+#: against a value fixed once per registry instance rather than per
+#: request, so an unknown identity costs the same comparison work as a
+#: known one.
+_DUMMY_TOKEN_LENGTH = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +58,9 @@ class AgentRegistry:
 
     def __init__(self, records: Mapping[str, AgentRecord]) -> None:
         self._records = dict(records)
+        # Fixed for the lifetime of this registry instance -- see
+        # _DUMMY_TOKEN_LENGTH above.
+        self._dummy_token = secrets.token_urlsafe(_DUMMY_TOKEN_LENGTH)
 
     @classmethod
     def from_records(cls, records: Iterable[AgentRecord]) -> "AgentRegistry":
@@ -60,9 +75,16 @@ class AgentRegistry:
         Raises `UnknownAgentError` if no such agent is registered,
         `InvalidCredentialError` if the token does not match, or
         `AgentDisabledError` if the agent is registered but disabled.
+
+        Timing uniformity (ADR-0007, spec section 36.5): an unknown
+        `agent_id` still performs the same `hmac.compare_digest` call the
+        known-agent path below makes, against a fixed per-registry dummy
+        credential, so an unknown identity is not measurably faster to
+        reject than a known one with a wrong token.
         """
         record = self._records.get(agent_id)
         if record is None:
+            hmac.compare_digest(self._dummy_token.encode("utf-8"), token.encode("utf-8"))
             raise UnknownAgentError(f"no registered agent {agent_id!r}")
         # Constant-time comparison: token equality must not leak timing
         # information about how many leading bytes matched. Compared as

@@ -1,3 +1,7 @@
+Return 401 with a uniform body for every failed agent authentication; 403 is now only a correct credential for a disabled agent
+Throttle failed agent authentication per source prefix and per attempted agent_id, answering 429 with Retry-After
+Charge the ingest rate limiter per distinct observed IP as well as per request; over-budget batches get 429 with Retry-After
+Drop zero-count observation entries before fan-out; they are no longer published
 Add optional `attributes` to HotIpAdded/HotIpRemoved events, validated against schemas/ip_attributes.v1.json (registered names attributes_version/weight, x_-prefixed experimental keys, 1024-byte/16-key caps); absent attributes encode byte-identically to before
 Add `weight_function` and `weight_max` config keys to detection_config, reserved for the fixed-point weight a future aggregator change will write into an IP's attributes at HOT/COLD transition
 Reject observations whose sequence exceeds 9223372036854775807
