@@ -634,6 +634,12 @@ hot_count < minimum_hot_ips
 
 This prevents small prefixes from generating false positives.
 
+> ADR-0010: this predicate has exactly one implementation,
+> `hammertime.core.state.prefix.evaluate_prefix_state`, called by both the
+> trie's read path (Section 29) and the detector — the same single-source rule
+> Section 30 imposes on `evaluate_ip_state`. In v1 it yields `NORMAL` or
+> `HOT_PREFIX` only; `BOT_NETWORK` is reserved for the Section 14 scorer.
+
 ---
 
 # 14. Prefix Classification Should Be Multi-Dimensional
@@ -1211,6 +1217,12 @@ should directly locate the `/16` trie node and return:
 }
 ```
 
+> The complete v1 response shapes (envelope fields `as_of`, `event_sequence`,
+> `config_version` per Section 22; `GET /prefixes/hot`; the detector's
+> `GET /detections`; zero-valued answers for unknown prefixes) are specified in
+> `docs/protocol/read-api-v1.md` (ADR-0010). `state` here is the Section 13
+> predicate evaluated against the trie's current configuration.
+
 An IP query — which since ADR-0005 also returns the IP's attributes while it is
 HOT (Section 46.7):
 
@@ -1429,6 +1441,11 @@ event sequence number
 
 After loading a snapshot, events after its sequence number are replayed.
 
+> ADR-0009 / Section 47.2: the trie service is not *ready* — and answers 503 on
+> its read API — until that replay has reached the end of the log as it stood
+> when the process started. On shutdown it writes a final snapshot after
+> committing its consumer position (Section 47.4).
+
 ---
 
 # 34. Configuration
@@ -1471,6 +1488,12 @@ COLD → HOT
 ```
 
 The system SHOULD provide a controlled re-evaluation mechanism instead of silently leaving stale state.
+
+> Section 47.3 (ADR-0009) defines how a running service picks a new document
+> up: polled from `HAMMERTIME_CONFIG_PATH`, applied only when `config_version`
+> strictly increases, and visible in events and read responses only after the
+> re-evaluation has been applied. `test_config_change.py`
+> (`docs/spec/integration-scenarios.md`) is the executable form of this section.
 
 ---
 
@@ -2581,3 +2604,94 @@ forbids an agent from declaring `IP = HOT`. A producer MUST validate size and
 shape before storing, and no attribute value may be used in an authorization,
 routing, or rate-limiting decision — including unrecognised `x_` values, which
 are stored and echoed as opaque data.
+
+---
+
+# 47. Service Process Lifecycle
+
+> Added by ADR-0009. Sections 1-46 are unchanged; this section specifies how a
+> service *process* starts, becomes ready, is observed, and stops, so that the
+> four deployable services (ADR-0001) behave identically under an orchestrator
+> and can be composed in-process by the cross-service tests
+> (`docs/spec/integration-scenarios.md`).
+
+## 47.1 Entry point
+
+Each service is started by its console script (`hammertime-ingest`,
+`hammertime-aggregator`, `hammertime-trie`, `hammertime-detector`), which
+calls `hammertime.<service>.__main__:main()`. `main()` MUST:
+
+1. take no arguments and read no command line;
+2. read configuration only from the environment (the keys in `.env.example`)
+   and from the detection configuration document at `HAMMERTIME_CONFIG_PATH`
+   (Section 34);
+3. reject an invalid configuration before opening any network connection,
+   exiting with status 2;
+4. delegate the remainder of the lifecycle to the shared runner in
+   `hammertime.core.runtime` (ADR-0009).
+
+Secrets MUST NOT be fields of a settings object, because settings are logged at
+startup.
+
+## 47.2 Startup and readiness
+
+A service MUST log a structured `starting` record (service name, version, bus
+and store kind, configuration path and version, bind address, consumer group)
+and a `ready` record (with the time taken) — never a credential.
+
+A service MUST tolerate its dependencies (event log, state store) being
+unavailable at startup, retrying with backoff up to a startup deadline
+(`HAMMERTIME_STARTUP_TIMEOUT_S`, default 60) before failing with status 1.
+
+A service is *ready* when it can answer correctly for everything published
+before it started:
+
+```text
+ingest      config, registry and store loaded; producer connected
+aggregator  config loaded; consumer subscribed; shard claims held (Section 20)
+trie        newest snapshot loaded and the hot-IP log replayed to its end (Section 33)
+detector    config loaded; prefix-stats log consumed to its end
+```
+
+Every service exposes `GET /healthz` (liveness), `GET /readyz` (readiness,
+200 or 503) and `GET /metrics` (Section 37) on its bind address; the
+aggregator's is `HAMMERTIME_AGGREGATOR_BIND` (default port 8083). Domain read
+endpoints (Section 29, `docs/protocol/read-api-v1.md`) and the ingestion
+endpoint MUST answer 503 while the service is not ready.
+
+## 47.3 Configuration changes
+
+A service polls `HAMMERTIME_CONFIG_PATH` every `HAMMERTIME_CONFIG_POLL_INTERVAL_S`
+seconds (default 1) and applies a document only if its `config_version` is
+strictly greater than the version in force. A document that fails validation
+is logged and ignored; the previous version stays in force. A new version
+becomes visible in emitted events and read responses only after the
+re-evaluation it triggers (Section 34) has been applied.
+
+## 47.4 Shutdown
+
+On `SIGTERM` or `SIGINT` a service MUST stop accepting new work, finish the
+message it is applying, commit its consumer position, flush its producer, and
+(trie) write a final snapshot whose recorded position is not ahead of the
+committed one — all within `HAMMERTIME_SHUTDOWN_TIMEOUT_S` (default 8) — then
+exit 0. A drain that exceeds the deadline, or is interrupted by a second
+signal, exits 1.
+
+## 47.5 Exit status
+
+```text
+0   clean shutdown after a signal
+1   runtime failure (startup deadline, non-transient dependency error,
+    main loop exited, drain timed out or aborted)
+2   configuration invalid, detected before any connection was made
+```
+
+## 47.6 Composition for tests
+
+Each service MUST provide `hammertime.<service>.service.build_service(settings,
+*, bus=None, clock=None, ...)` returning an object with `start()`, `run()`,
+`stop()` and `ready`, so that all four services can be run in one process on a
+shared in-memory event log with a controlled clock (ADR-0009 decision 3). The
+maintenance coroutines a test drives directly (`run_maintenance`,
+`snapshot_now`, `reload_config`) MUST be the same ones the service's periodic
+loops call.
