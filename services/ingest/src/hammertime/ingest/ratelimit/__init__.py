@@ -42,11 +42,22 @@ __all__ = [
 ]
 
 #: Bound on distinct keys tracked at once (LRU-evicted beyond this).
-#: Defense-in-depth against unbounded memory growth if `check()` is ever
-#: called with a caller-controlled key before authentication (or any other
-#: narrowing step) has bounded the key space (spec section 36's "request
-#: size limits" concern applies to state this limiter itself accumulates,
-#: not just request bodies).
+#:
+#: This bounds memory only -- it is NOT a budget bound, and MUST NOT be cited
+#: as one. `check()` recreates a first-seen key's bucket full, and an evicted
+#: key is indistinguishable from one never seen, so a caller free to choose
+#: this limiter's `key` can walk a target key out of the LRU and get its
+#: budget reset on demand regardless of how `max_keys` is set (ADR-0007
+#: Decision 8, which found exactly this against the auth-failure agent
+#: bucket). Every caller of this limiter MUST bound its own key space by
+#: something other than `max_keys` before `check()` ever sees a
+#: caller-controlled key: the authenticated `agent_id` (bounded by the
+#: registry), a fixed slot table (ADR-0007 Decision 8), or an address prefix
+#: whose budget is per prefix by design (the auth-failure source bucket).
+#: `max_keys` remains a defense-in-depth memory backstop against unbounded
+#: growth if some future caller's key-space narrowing turns out to be wrong
+#: (spec section 36's "request size limits" concern applies to state this
+#: limiter itself accumulates, not just request bodies).
 _DEFAULT_MAX_KEYS = 100_000
 
 

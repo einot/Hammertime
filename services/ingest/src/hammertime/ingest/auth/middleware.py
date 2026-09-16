@@ -31,7 +31,10 @@ reach `AgentRegistry`. `require_agent` charges two `RateLimiter` instances
 authentication *failure*, source bucket first: if the source bucket is
 already exhausted the agent bucket is left untouched and the request is
 answered `429` immediately. A successful authentication never touches
-either bucket.
+either bucket. Per ADR-0007 Decision 8, the agent bucket is never keyed on
+the raw attempted `X-Agent-Id` -- `_agent_bucket_key` maps it into a
+fixed-size salted slot table first, so an attacker cannot manufacture
+distinct `agent_id` values to evict and reset a targeted identity's budget.
 
 Message-identity replay protection (spec section 23: `(agent_id, sequence)`
 dedup) is *not* implemented here -- that is `hammertime.ingest.dedup`'s
@@ -47,8 +50,11 @@ value -- otherwise an authenticated agent could submit a body claiming to
 be a *different* agent and desync that agent's dedup/rate-limit state.
 """
 
+import hashlib
+import hmac
 import ipaddress
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 
 from fastapi import HTTPException, Request
@@ -78,6 +84,14 @@ _MAX_TOKEN_LENGTH = 512
 
 #: agent bucket key when no usable X-Agent-Id was presented (spec section 36.5).
 _NO_AGENT_ID_KEY = "-"
+
+#: ADR-0007 Decision 8 / spec section 36.5: fixed size of the salted slot
+#: table every presented X-Agent-Id (other than the "-" sentinel above) is
+#: mapped into before it reaches the agent limiter. Not operator-configurable
+#: -- see `require_agent`'s `agent_slot_count` parameter for the test-only
+#: escape hatch.
+_AGENT_SLOT_COUNT = 4096
+_AGENT_SLOT_KEY_PREFIX = "agent-slot:"
 
 _UNIFORM_AUTH_FAILURE_DETAIL = "invalid agent credentials"
 _AGENT_DISABLED_DETAIL = "agent is disabled"
@@ -149,18 +163,34 @@ def _attempted_agent_id(request: Request) -> str | None:
     return request.headers.get(_AGENT_ID_HEADER) or None
 
 
-def _agent_bucket_key(attempted_agent_id: str | None) -> str:
-    """spec section 36.5: agent bucket key, or "-" if absent or malformed.
+def _agent_bucket_key(attempted_agent_id: str | None, *, slot_salt: bytes, slot_count: int) -> str:
+    """spec section 36.5 / ADR-0007 Decision 8: agent bucket key.
 
-    An over-long `X-Agent-Id` is treated as malformed for keying purposes
-    (not stored verbatim) -- it can never be a valid `agent_id`
-    (`schemas/observation.v1.json`'s `maxLength`), and storing it verbatim
-    would defeat the whole point of bounding the size of keys this bucket
-    stores (spec section 36.5's length-bounds paragraph).
+    The agent limiter must never see an attacker-chosen key: Decision 3's
+    assumption that `RateLimiter`'s `max_keys` LRU eviction made a
+    caller-controlled key safe was wrong (an evicted bucket is recreated
+    full, so manufacturing enough distinct `X-Agent-Id` values resets a
+    targeted identity's budget on demand). Every presented `X-Agent-Id` is
+    therefore mapped into a fixed `slot_count`-sized table via a keyed hash
+    under a salt drawn once per process, so the agent limiter's key space is
+    exactly `slot_count + 1` regardless of the input stream.
+
+    An absent, empty, or over-long `X-Agent-Id` still returns the shared
+    `"-"` sentinel, *outside* the slot table -- unchanged semantics from
+    before Decision 8, and for the same reason: an over-long value can never
+    be a real `agent_id` (`schemas/observation.v1.json`'s `maxLength`), and
+    the standing flood of missing-header failures must not be able to
+    permanently drain some arbitrary real agent's slot.
+
+    `.encode("utf-8")` cannot fail here: Starlette decodes header bytes as
+    latin-1, so every value is a string of codepoints <= 0xFF with no
+    surrogates.
     """
-    if attempted_agent_id is None or len(attempted_agent_id) > _MAX_AGENT_ID_LENGTH:
+    if not attempted_agent_id or len(attempted_agent_id) > _MAX_AGENT_ID_LENGTH:
         return _NO_AGENT_ID_KEY
-    return attempted_agent_id
+    digest = hmac.new(slot_salt, attempted_agent_id.encode("utf-8"), hashlib.sha256).digest()
+    slot = int.from_bytes(digest[:8], "big") % slot_count
+    return f"{_AGENT_SLOT_KEY_PREFIX}{slot}"
 
 
 def _log_agent_id(attempted_agent_id: str | None) -> str | None:
@@ -251,6 +281,8 @@ def require_agent(
     auth_failure_agent_rate_per_min: float = _DEFAULT_AUTH_FAILURE_AGENT_RATE_PER_MIN,
     auth_failure_agent_burst: int = _DEFAULT_AUTH_FAILURE_AGENT_BURST,
     trusted_proxy_hops: int = 0,
+    agent_slot_salt: bytes | None = None,
+    agent_slot_count: int = _AGENT_SLOT_COUNT,
 ) -> Callable[[Request], Awaitable[str]]:
     """Build a FastAPI dependency that authenticates the calling agent.
 
@@ -259,6 +291,19 @@ def require_agent(
     instance" convention) -- `app.py`'s lifespan always passes both
     explicitly, built once and shared with `IngestState`, so this default
     only matters to a caller that builds this dependency directly.
+
+    `agent_slot_salt`/`agent_slot_count` (ADR-0007 Decision 8) control the
+    salted-slot mapping `_agent_bucket_key` applies to every attempted
+    `X-Agent-Id` before it reaches `agent_limiter`. When `agent_slot_salt` is
+    `None`, a fresh 32-byte salt is drawn via `secrets.token_bytes(32)`
+    exactly once, here at dependency-construction time -- never per request,
+    which would make every attempt land in an independently-random slot and
+    defeat the whole point of a stable per-identity budget. `app.py` passes
+    neither: both parameters exist purely so tests can pin the attempted-id
+    -> slot mapping deterministically. The salt MUST NOT appear in any
+    response, log, or metric, and is never stored anywhere but this
+    closure's scope. `agent_slot_count` MUST be positive; a non-positive
+    value raises `ValueError` immediately rather than at first use.
 
     This is an `async def` dependency (not a plain `def`) so FastAPI/
     Starlette dispatches it directly on the single asyncio event-loop thread
@@ -290,8 +335,13 @@ def require_agent(
     logged per failed attempt, regardless of which of those three responses
     it produced.
     """
+    if agent_slot_count <= 0:
+        raise ValueError(f"agent_slot_count must be positive, got {agent_slot_count!r}")
     resolved_source_limiter = source_limiter if source_limiter is not None else RateLimiter()
     resolved_agent_limiter = agent_limiter if agent_limiter is not None else RateLimiter()
+    resolved_agent_slot_salt = (
+        agent_slot_salt if agent_slot_salt is not None else secrets.token_bytes(32)
+    )
     auth_failure_rate_rps = auth_failure_rate_per_min / 60.0
     auth_failure_agent_rate_rps = auth_failure_agent_rate_per_min / 60.0
 
@@ -302,7 +352,11 @@ def require_agent(
             attempted_agent_id = _attempted_agent_id(request)
             source_address = _resolve_source_address(request, trusted_proxy_hops=trusted_proxy_hops)
             source_key = _source_bucket_key(source_address)
-            agent_key = _agent_bucket_key(attempted_agent_id)
+            agent_key = _agent_bucket_key(
+                attempted_agent_id,
+                slot_salt=resolved_agent_slot_salt,
+                slot_count=agent_slot_count,
+            )
             log_agent_id = _log_agent_id(attempted_agent_id)
 
             try:
