@@ -25,9 +25,9 @@ import hmac
 import json
 import logging
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +74,20 @@ class AgentRecord:
     #: Per-agent override for HAMMERTIME_INGEST_RATE_LIMIT_RPS; `None` means
     #: "use the global default" (issue #29 owns actually enforcing this).
     rate_limit_rps: int | None = None
+
+    def __post_init__(self) -> None:
+        # Defense-in-depth for the both-or-neither invariant (spec section
+        # 36.3): `_record_from_document` already enforces this for the
+        # document-loading path with a more specific message, but
+        # `AgentRecord` is a public constructor (`AgentRegistry.from_records`)
+        # and must not accept a half-set rotation pair from any caller.
+        has_hash = self.previous_token_hash is not None
+        has_expiry = self.previous_token_expires_at is not None
+        if has_hash != has_expiry:
+            raise ConfigurationError(
+                f"agent {self.agent_id!r} must set both 'previous_token_hash' and "
+                "'previous_token_expires_at', or neither"
+            )
 
 
 class AgentRegistry:
@@ -155,6 +169,23 @@ class AgentRegistry:
         return record
 
 
+def _reject_duplicate_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    """`object_pairs_hook` for `json.loads`: raise on a duplicate key in any JSON object.
+
+    Plain `json.loads` silently keeps only the last occurrence of a
+    duplicate key (e.g. two `"some-agent-id": {...}` entries under
+    `"agents"`), which would shadow the first entry with no error and no
+    trace of it in the loader's duplicate-hash check -- an operator reading
+    the top of the file would never see the entry actually in effect.
+    """
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigurationError(f"agent registry document has a duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
 def _parse_hash_hex(agent_id: str, field_name: str, value: Any) -> bytes:
     if not isinstance(value, str) or len(value) != _HASH_HEX_LENGTH:
         raise ConfigurationError(
@@ -180,7 +211,12 @@ def _parse_expires_at(agent_id: str, value: Any) -> datetime:
             f"agent {agent_id!r} field 'previous_token_expires_at' is not a valid "
             f"RFC 3339 date-time: {value!r}"
         ) from exc
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    if parsed.tzinfo is None:
+        raise ConfigurationError(
+            f"agent {agent_id!r} field 'previous_token_expires_at' must include an "
+            f"explicit UTC offset (RFC 3339 date-time), got {value!r} with no offset"
+        )
+    return parsed
 
 
 def _record_from_document(agent_id: str, fields: Any, *, clock: Clock) -> AgentRecord:
@@ -357,7 +393,7 @@ def load_agent_registry_file(
         raise ConfigurationError(f"agent registry at {path} is not valid UTF-8: {exc}") from exc
 
     try:
-        document = json.loads(raw)
+        document = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise ConfigurationError(f"agent registry at {path} is not valid JSON: {exc}") from exc
 

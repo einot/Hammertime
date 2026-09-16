@@ -9,14 +9,23 @@ that `config/agents.v2.json`'s hashes are computed under
 loudly without one.
 
     hammertime-agent-token new-key
-    hammertime-agent-token key-id [--key KEY]
+    hammertime-agent-token key-id [--key KEY | --key-file PATH]
     hammertime-agent-token generate --agent-id ID [--rate-limit-rps N] [--disabled]
-                                     [--registry PATH [--replace]] [--key KEY]
-    hammertime-agent-token hash --agent-id ID [--allow-weak] [--key KEY]
+                                     [--registry PATH [--replace]] [--key KEY | --key-file PATH]
+    hammertime-agent-token hash --agent-id ID [--allow-weak] [--key KEY | --key-file PATH]
     hammertime-agent-token rotate --agent-id ID --registry PATH
-                                   [--overlap-hours 24] [--drop-previous] [--key KEY]
+                                   [--overlap-hours 24] [--drop-previous]
+                                   [--key KEY | --key-file PATH]
     hammertime-agent-token migrate --in config/agents.v1.json --out config/agents.v2.json
-                                    [--key KEY]
+                                    [--force] [--key KEY | --key-file PATH]
+
+Every subcommand that takes `--key` also accepts `--key-file PATH` (the key
+read from the file, trailing whitespace stripped) as an out-of-band
+alternative: passing the deployment key on the command line with `--key`
+lands in `ps`, shell history, and CI logs, which is not "out of band" in
+any useful sense. At most one of `--key`/`--key-file` may be given;
+precedence when neither is given is the `HAMMERTIME_INGEST_AGENT_TOKEN_KEY`
+environment variable, which remains the primary, recommended path.
 
 Registry files are edited as plain JSON here, not through
 `hammertime.ingest.auth.agents`'s loader: this tool depends only on
@@ -47,9 +56,25 @@ _MIN_TOKEN_CHARS = 32
 
 
 def _resolve_key(args: argparse.Namespace) -> bytes:
-    raw = getattr(args, "key", None) or os.environ.get(_AGENT_TOKEN_KEY_ENV)
+    key_arg = getattr(args, "key", None)
+    key_file = getattr(args, "key_file", None)
+    if key_arg and key_file:
+        raise ConfigurationError("pass at most one of --key or --key-file, not both")
+
+    if key_arg:
+        raw = key_arg
+    elif key_file:
+        try:
+            raw = key_file.read_text().strip()
+        except OSError as exc:
+            raise ConfigurationError(f"cannot read --key-file {key_file}: {exc}") from exc
+    else:
+        raw = os.environ.get(_AGENT_TOKEN_KEY_ENV)
+
     if not raw:
-        raise ConfigurationError(f"no deployment key: pass --key or set {_AGENT_TOKEN_KEY_ENV}")
+        raise ConfigurationError(
+            f"no deployment key: pass --key, pass --key-file, or set {_AGENT_TOKEN_KEY_ENV}"
+        )
     return tokens.decode_key(raw)
 
 
@@ -97,6 +122,42 @@ def _atomic_write_json(path: Path, document: dict[str, Any]) -> None:
         raise
 
 
+def _duplicate_key_hook(path: Path) -> Any:
+    """`object_pairs_hook` for `json.loads`: raise on a duplicate key anywhere in the document.
+
+    Plain `json.loads` silently keeps only the last occurrence of a
+    duplicate key (e.g. two `"some-agent-id": {...}` entries under
+    `"agents"`), which would shadow the first entry with no error -- an
+    operator reading the top of the file would never see the entry
+    actually in effect. Mirrors `hammertime.ingest.auth.agents`'s loader.
+    """
+
+    def hook(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ConfigurationError(f"{path}: duplicate key {key!r} in JSON document")
+            result[key] = value
+        return result
+
+    return hook
+
+
+def _read_json_document(path: Path) -> Any:
+    """Read and parse a JSON document at `path`, raising `ConfigurationError` on any failure."""
+    try:
+        raw = path.read_text()
+    except OSError as exc:
+        raise ConfigurationError(f"cannot read {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigurationError(f"{path} is not valid UTF-8: {exc}") from exc
+
+    try:
+        return json.loads(raw, object_pairs_hook=_duplicate_key_hook(path))
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(f"{path} is not valid JSON: {exc}") from exc
+
+
 def _new_envelope(key: bytes) -> dict[str, Any]:
     return {
         "registry_version": tokens.REGISTRY_VERSION,
@@ -117,7 +178,7 @@ def _load_envelope(path: Path, *, key: bytes) -> dict[str, Any]:
     if not path.exists():
         return _new_envelope(key)
 
-    document = json.loads(path.read_text())
+    document = _read_json_document(path)
     if not isinstance(document, dict):
         raise ConfigurationError(f"{path}: registry document must be a JSON object")
     if document.get("registry_version") != tokens.REGISTRY_VERSION:
@@ -187,10 +248,18 @@ def _cmd_hash(args: argparse.Namespace) -> int:
     token = sys.stdin.read().strip()
     if not token:
         raise ConfigurationError("no token read from stdin")
-    if len(token) < _MIN_TOKEN_CHARS and not args.allow_weak:
-        raise ConfigurationError(
-            f"token is {len(token)} characters, shorter than the required "
-            f"{_MIN_TOKEN_CHARS} -- pass --allow-weak to override"
+    if len(token) < _MIN_TOKEN_CHARS:
+        if not args.allow_weak:
+            raise ConfigurationError(
+                f"token is {len(token)} characters, shorter than the required "
+                f"{_MIN_TOKEN_CHARS} -- pass --allow-weak to override"
+            )
+        # ADR-0006: --allow-weak is meant to be "an explicit, logged escape
+        # hatch rather than a silent one" -- never bypass the strength check
+        # without a trace of it having happened.
+        print(
+            "warning: --allow-weak used, credential does not meet minimum strength requirements",
+            file=sys.stderr,
         )
 
     entry = _registry_entry(tokens.hash_token(token, key=key))
@@ -239,8 +308,15 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     if args.input_path.resolve() == args.output_path.resolve():
         raise ConfigurationError("--out must be a different file from --in")
 
+    if not args.force and args.output_path.exists() and args.output_path.stat().st_size > 0:
+        raise ConfigurationError(
+            f"--out {args.output_path} already exists and is non-empty -- refusing to "
+            "overwrite it (this could destroy a live populated registry); pass --force "
+            "to overwrite it anyway"
+        )
+
     key = _resolve_key(args)
-    v1_document = json.loads(args.input_path.read_text())
+    v1_document = _read_json_document(args.input_path)
     if not isinstance(v1_document, dict):
         raise ConfigurationError(f"{args.input_path}: registry document must be a JSON object")
 
@@ -269,6 +345,27 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_key_args(parser: argparse.ArgumentParser) -> None:
+    """Add the `--key`/`--key-file` pair shared by every subcommand that needs a deployment key.
+
+    `_resolve_key` enforces that at most one of them is given and that,
+    absent both, the ${_AGENT_TOKEN_KEY_ENV} environment variable remains
+    the primary path.
+    """
+    parser.add_argument(
+        "--key",
+        help=(
+            f"Deployment key; defaults to ${_AGENT_TOKEN_KEY_ENV} (not recommended: visible "
+            "in ps/shell history/CI logs -- prefer --key-file or the environment variable)"
+        ),
+    )
+    parser.add_argument(
+        "--key-file",
+        type=Path,
+        help="Path to a file containing the deployment key (trailing whitespace stripped)",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hammertime-agent-token",
@@ -283,7 +380,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_key_id = subparsers.add_parser(
         "key-id", help="Print the fingerprint of the configured deployment key."
     )
-    p_key_id.add_argument("--key", help=f"Deployment key; defaults to ${_AGENT_TOKEN_KEY_ENV}")
+    _add_key_args(p_key_id)
     p_key_id.set_defaults(func=_cmd_key_id)
 
     p_generate = subparsers.add_parser("generate", help="Generate a fresh agent token.")
@@ -292,13 +389,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_generate.add_argument("--disabled", action="store_true")
     p_generate.add_argument("--registry", type=Path, default=None)
     p_generate.add_argument("--replace", action="store_true")
-    p_generate.add_argument("--key", help=f"Deployment key; defaults to ${_AGENT_TOKEN_KEY_ENV}")
+    _add_key_args(p_generate)
     p_generate.set_defaults(func=_cmd_generate)
 
     p_hash = subparsers.add_parser("hash", help="Hash an externally issued token read from stdin.")
     p_hash.add_argument("--agent-id", required=True)
     p_hash.add_argument("--allow-weak", action="store_true")
-    p_hash.add_argument("--key", help=f"Deployment key; defaults to ${_AGENT_TOKEN_KEY_ENV}")
+    _add_key_args(p_hash)
     p_hash.set_defaults(func=_cmd_hash)
 
     p_rotate = subparsers.add_parser("rotate", help="Rotate an agent's credential.")
@@ -306,13 +403,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rotate.add_argument("--registry", type=Path, required=True)
     p_rotate.add_argument("--overlap-hours", type=float, default=24.0)
     p_rotate.add_argument("--drop-previous", action="store_true")
-    p_rotate.add_argument("--key", help=f"Deployment key; defaults to ${_AGENT_TOKEN_KEY_ENV}")
+    _add_key_args(p_rotate)
     p_rotate.set_defaults(func=_cmd_rotate)
 
     p_migrate = subparsers.add_parser("migrate", help="Convert a v1 plaintext registry to v2.")
     p_migrate.add_argument("--in", dest="input_path", required=True, type=Path)
     p_migrate.add_argument("--out", dest="output_path", required=True, type=Path)
-    p_migrate.add_argument("--key", help=f"Deployment key; defaults to ${_AGENT_TOKEN_KEY_ENV}")
+    p_migrate.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite --out even if it already exists and is non-empty",
+    )
+    _add_key_args(p_migrate)
     p_migrate.set_defaults(func=_cmd_migrate)
 
     return parser
