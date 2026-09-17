@@ -116,9 +116,11 @@ OBSERVATIONS_RECONCILIATION = TopicSpec(
     retention_seconds=7 * _ONE_DAY_SECONDS,
     key_selector=_ip_key,
     description=(
-        "Observations whose window_start fell outside allowed_lateness "
-        "(ADR-0002): written here instead of being silently dropped from "
-        "the hot path. Keyed by IP, same rule as OBSERVATIONS."
+        "Every observation the hot path could not use, written here instead "
+        "of being silently dropped: window_start outside allowed_lateness "
+        "(ADR-0002), dated in the future, older than the window it would "
+        "land in, or otherwise unusable by the aggregator (ADR-0011 "
+        "decision 3). Keyed by IP, same rule as OBSERVATIONS."
     ),
 )
 
