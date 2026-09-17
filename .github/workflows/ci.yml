@@ -2,17 +2,37 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
+
+# Nothing in this workflow writes to the repository, so drop the token to
+# read-only rather than inheriting the repo default.
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight run for the same ref. Not applied to
+# master: a run there records whether the default branch is actually green,
+# which is worth completing even if another push lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync --all-extras --dev
+      # uv.lock must already agree with pyproject.toml. Catches a dependency
+      # edited without re-locking, which otherwise only shows up as a
+      # mismatch between what CI resolves and what a contributor installed.
+      - run: uv lock --check
       - run: uv run ruff check .
+      # Part of the merge bar in CLAUDE.md but previously not run by CI, so
+      # a formatting regression could reach a branch with CI still green.
+      - run: uv run ruff format --check .
       - run: uv run mypy packages services
       - run: uv run pytest -q
       # Tripwire for #26. The integration job below is disabled because
@@ -53,6 +73,7 @@ jobs:
   integration:
     if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
