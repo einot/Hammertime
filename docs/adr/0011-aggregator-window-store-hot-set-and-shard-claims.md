@@ -1212,13 +1212,53 @@ superseded wording quoted:
   capacity`" — became `window_evictions{shard,reason}` with a note that it
   is read from the two per-window counters (A7).
 * **Status line.** Marked amended twice.
-* **`docs/spec/hammertime_spec_1.md`, two pointer notes** (the spec's
-  restatements of this ADR, kept in step): §5's note now reads `0 <=
-  bucket_start(now) - S < window_seconds` (A4); §37's note lists
-  `observation | expiry | warmup | config` for HOT -> COLD and labels
-  `window_evictions` by `shard` as well as reason (A11, A7). No other spec
-  text changed; `docs/spec/README.md`'s section index maps the same
-  sections to the same modules and is untouched.
+* **`docs/spec/hammertime_spec_1.md`, four pointer notes** (the spec's
+  restatements of this ADR, kept in step). The amendment as first
+  committed updated the §5 and §37 notes and claimed no other spec text
+  changed; the `supervisor` review found the §26 and §30 notes still
+  restating rules A6 and A11 had superseded, and the correction pass that
+  followed (same day) updated those two and added them here. Superseded
+  wording for all four:
+  * **§5's note.** Was: "A bucket starting at `S` is live at time `now`
+    iff `bucket_start(now) - S < window_seconds`; it leaves the window at
+    exactly `now = S + window_seconds`. A delta for a bucket that is no
+    longer live can never affect a future window count and is diverted to
+    reconciliation (Section 24) rather than applied." Now: "... iff `0 <=
+    bucket_start(now) - S < window_seconds` (a bucket that has not started
+    is not live; ADR-0011 Amendment 2); ... A delta for a bucket that is
+    not live can never affect ..." (A4). The note's first and last
+    sentences are unchanged.
+  * **§26's note.** Was: "It is bounded by `state_retention_seconds` (a
+    COLD IP with an empty window is evicted once `last_seen +
+    state_retention_seconds` has passed), by ...". Now: "(a COLD IP is
+    evicted once `last_seen + state_retention_seconds <= now`, whatever
+    its running total says — every bucket it holds has necessarily left
+    the window by then, so the eviction does not test for an empty
+    window; ADR-0011 Amendment 2, item A6)" (A6; also states the deadline
+    as decision 2's `<= now` rather than "has passed"). The rest of the
+    note is unchanged.
+  * **§30's note.** Was: "... is called from exactly one place
+    (`services/aggregator/transitions.py`), on three triggers — an applied
+    observation (deltas are non-negative, so only COLD -> HOT can result),
+    an expiry sweep or warm-up end (only HOT -> COLD), and a configuration
+    re-evaluation (Section 34, either direction). Each emitted transition
+    ..." Now says four triggers, that an applied observation can go either
+    direction and why, lists the expiry sweep and warm-up end separately,
+    and names the four `reason` labels of §37 (A11; the trigger list now
+    matches decision 8's reason set). The sentence from "Each emitted
+    transition" onwards is unchanged.
+  * **§37, the aggregator metrics list and its note.** The list line was
+    "`window_evictions           (ADR-0011; labelled retention | capacity)`";
+    now "labelled shard and retention | capacity" (A7). The note was:
+    "(`observation` | `config` for COLD -> HOT; `expiry` | `warmup` |
+    `config` for HOT -> COLD), and is the emitter of ..."; now "(...;
+    `observation` | `expiry` | `warmup` | `config` for HOT -> COLD — an
+    observation can lower the running total by a count that had already
+    expired, Amendment 2 item A11), and is the emitter of ..." (A11).
+
+  No other spec text changed: the §20, §24 and §34 ADR-0011 notes restate
+  rules this amendment does not touch. `docs/spec/README.md`'s section
+  index maps the same sections to the same modules and is untouched.
 
 Decisions 1, 4, 5, 7 and 9, the Assumptions list, Consequences, Sources and
 Amendment 1 are untouched.
@@ -1576,8 +1616,42 @@ Assumptions:
   as passed by the caller), and the caller is the observation path.
   Consistency of the label with the call site beats consistency with the
   arithmetic.
-* **§37's pointer note is updated to match**, since it enumerates the
-  labels.
+* **§30's and §37's pointer notes are updated to match**, since they
+  enumerate the triggers and the labels respectively (§37 in the amendment
+  as first committed; §30 in the correction pass recorded in the edit
+  list above, which had left it saying "only COLD -> HOT can result").
+
+Footprint — every site that carries an A11 rule, listed so that a reader
+weighing whether to keep a ruling nobody asked for can find all of it
+without a search. Sites 1, 2 and 6 state the arithmetic fact A11 made
+explicit (an applied observation can lower `total`); sites 3, 4, 5, 7 and
+8 state the ruling itself (the resulting demotion is emitted and labelled
+`observation`):
+
+1. Decision 2, ring semantics, the `observe` bullet — the closing sentence
+   "Because the older occupant of a slot is always a bucket that has
+   already left the window, `observe` can *lower* `total` — this is the
+   sweep's work done early, not a negative delta (A11)."
+2. Decision 2, the `ShardWindow` `observe` bullet — "`total_after <
+   total_before` is possible for any delta when the slot's previous
+   occupant is subtracted (A11)."
+3. Decision 3, worker step 3 — "The evaluation may yield a HOT -> COLD
+   (A11)."
+4. Decision 6, the paragraph after the three maintenance steps — from "The
+   converse does not hold" through "labelled by `reason` accordingly".
+5. Decision 8 — `observation` in the `hot_to_cold_transitions` reason set.
+6. Amendment 2 item A8, ruling paragraph — "unless the slot held an
+   expired bucket (A11)".
+7. `docs/spec/hammertime_spec_1.md`, §30's ADR-0011 note — the applied
+   observation trigger is "either direction", with the reason.
+8. `docs/spec/hammertime_spec_1.md`, §37's ADR-0011 note — `observation`
+   among the HOT -> COLD labels, with the parenthetical explaining why.
+9. This item.
+
+The amendment's preamble, its edit list (which quotes the superseded
+wording of sites 1-5, 7 and 8) and its *Follow-ups* refer to A11 but state
+no rule of their own. The `observation` label for COLD -> HOT (decision 4
+step 5, decision 8) predates A11 and is not part of its footprint.
 
 Shipped code: none affected. `hammertime.core.state.machine.evaluate_ip_state`
 is pure over `(previous, count, config)` and does not know why it was

@@ -1169,8 +1169,11 @@ An IP with no observations beyond the retention period can be removed from the s
 The trie only needs currently hot IPs if the system's purpose is prefix-level hot detection.
 
 > ADR-0011: the sliding-window store is per shard and process-local. It is
-> bounded by `state_retention_seconds` (a COLD IP with an empty window is
-> evicted once `last_seen + state_retention_seconds` has passed), by
+> bounded by `state_retention_seconds` (a COLD IP is evicted once
+> `last_seen + state_retention_seconds <= now`, whatever its running total
+> says — every bucket it holds has necessarily left the window by then, so
+> the eviction does not test for an empty window; ADR-0011 Amendment 2, item
+> A6), by
 > `HAMMERTIME_AGGREGATOR_MAX_TRACKED_IPS` (the least-recently-seen COLD IP is
 > evicted to make room; a HOT IP is never evicted), and expiry is driven by a
 > schedule of next-expiry times so a sweep touches only IPs that have a
@@ -1372,10 +1375,15 @@ evaluate_ip_state(previous_state, count, configuration)
 MUST be the authoritative implementation of the HOT/COLD state machine.
 
 > ADR-0011: in the aggregator `evaluate_ip_state` is called from exactly one
-> place (`services/aggregator/transitions.py`), on three triggers — an
-> applied observation (deltas are non-negative, so only COLD -> HOT can
-> result), an expiry sweep or warm-up end (only HOT -> COLD), and a
-> configuration re-evaluation (Section 34, either direction). Each emitted
+> place (`services/aggregator/transitions.py`), on four triggers — an
+> applied observation (either direction: deltas are non-negative, but
+> applying one first subtracts the expired bucket that last occupied the
+> ring slot, so the running total can fall and a HOT IP can be demoted on
+> this path; ADR-0011 Amendment 2, item A11), an expiry sweep (only HOT ->
+> COLD), warm-up end (only HOT -> COLD, for the IPs inherited with a shard
+> claim), and a configuration re-evaluation (Section 34, either direction).
+> The transition counters of Section 37 are labelled with the trigger
+> (`observation` | `expiry` | `warmup` | `config`). Each emitted
 > transition is recorded in the shard's durable HOT set *before* the event
 > is published, and `HotIpAdded` carries `weight` (Section 46.4) computed
 > under the configuration in force at that transition.
