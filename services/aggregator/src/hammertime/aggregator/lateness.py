@@ -20,7 +20,11 @@ from hammertime.core.time.buckets import bucket_start
 
 
 class ObservationOutcome(StrEnum):
-    """What the hot path did with one observation; the value is the metric label."""
+    """What the hot path did with one observation.
+
+    For the counted outcomes the value is the metric label; `APPLIED` and
+    `UNCLAIMED` are not counted under any series (decision 8, item A19).
+    """
 
     APPLIED = "applied"
     #: now - window_start > window_seconds + allowed_lateness_seconds.
@@ -34,6 +38,9 @@ class ObservationOutcome(StrEnum):
     #: A worker outcome (codec failure, ADR-0004's one-IP-per-message
     #: invariant); never returned by `classify_observation`.
     MALFORMED = "malformed"
+    #: A worker outcome for a message whose partition is not a shard this
+    #: member holds (item A19); never returned by `classify_observation`.
+    UNCLAIMED = "unclaimed"
 
 
 def classify_observation(

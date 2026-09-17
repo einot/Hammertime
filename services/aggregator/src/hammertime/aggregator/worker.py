@@ -2,11 +2,12 @@
 
 Spec: section 19, section 20, section 24, section 30, section 37, section 39
 
-ADR-0011 decision 3 (one observation, one of six outcomes; everything the hot
-path cannot use goes to reconciliation), decision 6 (maintenance order,
-commit cadence, shutdown) and decision 7 as amended by Amendment 3 item A12
-(`apply_config` is unconditional; the version gate is
-`ConfigPoller.poll_once()`'s alone).
+ADR-0011 decision 3 as amended by Amendment 5 item A19 (one observation, one
+of seven outcomes; everything the hot path cannot use goes to reconciliation,
+and a message on a partition this member does not hold is `UNCLAIMED`),
+decision 6 (maintenance order, commit cadence, shutdown) and decision 7 as
+amended by Amendment 3 item A12 (`apply_config` is unconditional; the version
+gate is `ConfigPoller.poll_once()`'s alone).
 
 One `asyncio.Lock` serialises everything that touches a `ShardWindow`:
 message handling, the maintenance sweep, the configuration pass, and the
@@ -206,7 +207,7 @@ class AggregatorWorker:
     # --- the three coroutines the periodic loops and the tests share ---------
 
     async def handle(self, message: ConsumedMessage) -> ObservationOutcome:
-        """Apply one consumed message; decision 3's six outcomes."""
+        """Apply one consumed message; decision 3's seven outcomes."""
         async with self._lock:
             return await self._handle(message)
 
@@ -279,16 +280,19 @@ class AggregatorWorker:
         if window is None:
             # Decision 1: an IP's shard is its message's partition, so a
             # message for a partition this member does not hold has nothing
-            # to be applied to. Decision 3 says nothing about the outcome of
-            # a message the worker does not own; nothing is emitted,
-            # diverted or counted for it.
+            # to be applied to. Item A19: the outcome is `UNCLAIMED` --
+            # reachable in normal operation, because a rebalance can revoke a
+            # partition between a message being fetched and being handled --
+            # and the message is logged and skipped, deliberately counted
+            # under no series, not decoded and not diverted. It belongs to
+            # whichever member holds the partition, not to this one.
             logger.warning(
                 "unclaimed_partition topic=%s partition=%d offset=%d",
                 message.topic,
                 message.partition,
                 message.offset,
             )
-            return ObservationOutcome.MALFORMED
+            return ObservationOutcome.UNCLAIMED
 
         decoded = self._decode(message)
         if decoded is None:
