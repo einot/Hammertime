@@ -49,7 +49,7 @@ Section index used throughout the code:
 | 27 | Trie representation | `services/trie/structure/patricia.py` |
 | 28 | Atomicity | `services/trie/worker.py` |
 | 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010` |
-| 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `docs/adr/0011` |
+| 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `core/state/transitions.py`, `docs/adr/0011` |
 | 32, 33 | Persistence & snapshots | `services/trie/snapshot` |
 | 34 | Versioned configuration | `core/config`, `services/aggregator/reevaluate.py`, `docs/adr/0011` |
 | 35 | IPv6 readiness | `core/addressing` |

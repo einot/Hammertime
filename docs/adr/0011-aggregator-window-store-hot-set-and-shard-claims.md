@@ -1,14 +1,18 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted; amended 2026-09-17 twice (see "Amendment 1" and
-"Amendment 2" at the end. Amendment 1 records the partition count of
-`hammertime.observations.v1` changing from 32 to 128 and pins two edge cases
-decisions 1 and 5 left ambiguous. Amendment 2 pins eight edge cases of the
-window store, the counter and the lateness classifier that surfaced while
-the M3 window/lateness tests were written. Both amendments rewrite decision
-bodies in place to state the rule now in force directly; each amendment's
-opening lists every such edit, and quotes the superseded wording, so the
-before/after is recoverable from this document alone)
+Status: accepted; amended 2026-09-17 three times (see "Amendment 1",
+"Amendment 2" and "Amendment 3" at the end. Amendment 1 records the
+partition count of `hammertime.observations.v1` changing from 32 to 128 and
+pins two edge cases decisions 1 and 5 left ambiguous. Amendment 2 pins eight
+edge cases of the window store, the counter and the lateness classifier that
+surfaced while the M3 window/lateness tests were written. Amendment 3 pins
+three interfaces the M3 worker/transitions tests had to assume — where the
+configuration version gate lives and what `apply_config` returns, the Python
+surface of `AggregatorMetrics`, and what `EmittedTransition.transition` is —
+plus two smaller points raised alongside them. All three amendments rewrite
+decision bodies in place to state the rule now in force directly; each
+amendment's opening lists every such edit, and quotes the superseded
+wording, so the before/after is recoverable from this document alone)
 
 Scope note: this ADR settles the interfaces milestone M3 (epics #5, #6, #7
 and issue #48) implements against — what the aggregator keeps per IP, how
@@ -238,7 +242,7 @@ class ShardWindow:
     def state(self, ip: Address) -> IpState: ...    # COLD when untracked
     def is_tracked(self, ip: Address) -> bool: ...
     def is_inherited(self, ip: Address) -> bool: ...
-    def set_state(self, ip: Address, state: IpState) -> None: ...
+    def set_state(self, ip: Address, state: IpState) -> None: ...   # KeyError for an untracked IP (A15)
     def finish_warmup_if_due(self) -> frozenset[Address] | None: ...
     def expire_due(self) -> list[WindowChange]: ...
     def evict_due(self) -> int: ...
@@ -302,8 +306,9 @@ class ShardWindow:
   grows past the cap rather than drop a HOT IP; that condition is logged.
   Inherited IPs count towards `tracked_count` here like any other entry
   (A5).
-* `set_state(ip, COLD)` clears the `inherited` flag for that IP;
-  `finish_warmup_if_due()` returns — exactly once, the first time it is
+* `set_state(ip, state)` requires `ip` to be tracked and raises `KeyError`
+  otherwise — it never creates an entry (A15). `set_state(ip, COLD)` clears
+  the `inherited` flag for that IP; `finish_warmup_if_due()` returns — exactly once, the first time it is
   called with `clock.now() >= warm_until` — the set of inherited IPs that
   are still HOT, clears every `inherited` flag and sets `warm_until` to
   `None`; every other call returns `None`.
@@ -423,10 +428,12 @@ def transition_attributes(window_count: int, config: DetectionConfig) -> dict[st
 
 ```python
 # hammertime.aggregator.transitions   (Spec: section 6, section 19, section 30, section 46.4)
+from hammertime.core.state.transitions import StateTransition   # (previous, current); A14
+
 @dataclass(frozen=True, slots=True)
 class EmittedTransition:
     ip: Address
-    transition: StateTransition
+    transition: StateTransition        # StateTransition(previous=previous, current=new)
     sequence: int
     window_count: int
     config_version: int
@@ -464,8 +471,13 @@ side effects — while `window.in_warmup and window.is_inherited(ip)`
    `await` it (both bus producers return only once the broker has
    acknowledged; no separate flush per transition).
 5. `window.set_state(ip, new)`; count the transition under `reason`
-   (`observation`, `expiry`, `warmup`, `config`); return the
-   `EmittedTransition`.
+   (`observation`, `expiry`, `warmup`, `config`) —
+   `metrics.increment("cold_to_hot_transitions" | "hot_to_cold_transitions",
+   shard=window.shard, config_version=config.config_version, reason=reason)`
+   (decision 8); return the `EmittedTransition`, whose `transition` is
+   `hammertime.core.state.transitions.StateTransition(previous=previous,
+   current=new)` — the value type core already ships for exactly this edge
+   (A14).
 
 Identity follows the ADR-0003 amendment and ADR-0004: `agent_id` is the
 producing shard, `sequence` is the shard's own counter (persisted, decision
@@ -581,8 +593,27 @@ is needed at shutdown; the HOT set is always current.
 
 ### 7. A configuration change re-evaluates every tracked IP, and the version is visible only afterwards
 
-`reload_config()` / the poll loop apply a document per ADR-0009 decision 6
-(strictly greater version; rejected documents ignored). Applying version
+The version rule of ADR-0009 decision 6 (strictly greater version; rejected
+documents ignored) is enforced in exactly one place: `ConfigPoller.poll_once()`
+(ADR-0009 A5). The aggregator's service object constructs the poller with
+`apply=worker.apply_config`, so `AggregatorService.reload_config()` is
+`await poller.poll_once()` and the periodic loop is `poller.run()`, both as
+ADR-0009 A5 and A8 have them. The hook itself is
+
+```python
+# hammertime.aggregator.worker
+class AggregatorWorker:
+    config: DetectionConfig                                      # property: the version in force at the worker
+    async def apply_config(self, config: DetectionConfig) -> None: ...
+```
+
+and is **unconditional**: it applies whatever `DetectionConfig` it is given,
+performs no version comparison of its own, and returns `None` so that it is
+assignable to the poller's `apply: Callable[[DetectionConfig],
+Awaitable[None]]` without an adapter (A12). Its only production caller is
+the poller, which never calls it with a version `<=` the one in force; a
+direct caller (a test, a tool) that passes a lower or equal version gets it
+applied, because the worker is not where the rule lives. Applying version
 `v` means, under the worker lock so that no observation is processed
 mid-pass:
 
@@ -596,7 +627,14 @@ mid-pass:
    IPs (default 1000) so the admin endpoints stay responsive; it is not
    otherwise rate-limited — the log between aggregator and trie is the
    back-pressure.
-3. Adopt `v` as the config in force; `reload_config()` returns it.
+3. Adopt `v` as the config in force at the worker (`worker.config` now
+   reports it) and log `INFO event=config_reevaluated config_version=<v>
+   transitions=<N>`, `N` being the sum of `reevaluate_shard`'s returns over
+   the claimed shards (decision 8). `apply_config` then returns; the poller
+   sets its own `current` to `v`, logs ADR-0009 A7's `config_applied`, and
+   `reload_config()` returns the poller's `current` — which is `v` after a
+   successful apply and the previous version otherwise (a rejected or
+   non-increasing document never reaches the worker).
 
 Holding the lock is what makes ADR-0009's rule ("visible in emitted events
 only after the re-evaluation it triggered has been applied") hold without
@@ -613,6 +651,32 @@ Maintained as plain counters in `hammertime.aggregator.metrics`
 (`AggregatorMetrics`); exporting them on `/metrics` is the telemetry
 epic's (§37, ADR-0009 decision 4 says `/metrics` may be empty until then):
 
+```python
+# hammertime.aggregator.metrics   (Spec: section 37)
+class AggregatorMetrics:
+    def __init__(self) -> None: ...
+    def increment(self, name: str, **labels: object) -> None: ...          # += 1 on an event counter
+    def get(self, name: str, **labels: object) -> int: ...                 # 0 for a series never touched
+    def bind_windows(self, windows: Callable[[], Iterable[ShardWindow]]) -> None: ...
+```
+
+One series is one `(name, label values)` pair, exactly as Prometheus
+identifies a time series (see Sources); label values are compared as
+`str(value)`, so `shard=0` and `shard="0"` name the same series. `name`
+MUST be one of the nine below and `labels` MUST carry exactly that series'
+label names (no more, no fewer); anything else is a `ValueError` from
+`increment` and `get` alike. The four **event counters** —
+`cold_to_hot_transitions`, `hot_to_cold_transitions`, `late_messages`,
+`observations_rejected` — are the only series `increment` accepts; the
+emitter and the worker bump them at the points decisions 3 and 4 name. The
+five **window-derived series** — `tracked_ips`, `active_ips`, `hot_ips`,
+`window_evictions`, `shards_claimed` — are never stored: `get` computes
+them on each call from the windows the bound source returns, which is how
+A7's "read at export time" actually happens (A13). `bind_windows` is called
+once by `AggregatorWorker.__init__` with a callable yielding the currently
+claimed `ShardWindow`s; until it is called, every window-derived series
+reads 0. Rendering on `/metrics` is not defined here.
+
 ```text
 tracked_ips{shard}                      ShardWindow.tracked_count
 active_ips{shard}                       ShardWindow.active_count
@@ -622,13 +686,16 @@ hot_to_cold_transitions{shard,config_version,reason}    reason = observation | e
 late_messages{reason}                   reason = late | future | expired_bucket
 observations_rejected{reason}           reason = window_too_long | malformed   (aggregator-side)
 window_evictions{shard,reason}          reason = retention | capacity; read from ShardWindow.retention_evictions /
-                                        .capacity_evictions of each claimed shard (A7)
-shards_claimed                          gauge
+                                        .capacity_evictions of each claimed shard (A7); `get` with a shard
+                                        no bound window has, or a `reason` outside the two, reads 0
+shards_claimed                          gauge; the number of windows the bound source yields
 ```
 
 Structured log events (ADR-0009 decision 5 conventions): `shard_claimed`,
-`shard_revoked`, `no_shards_assigned`, `warmup_complete`, `config_applied`
-(with `transitions=N`), `malformed_observation`, `store_over_capacity`.
+`shard_revoked`, `no_shards_assigned`, `warmup_complete`,
+`config_reevaluated` (`config_version`, `transitions`; emitted by the worker
+at the end of `apply_config`, before the poller's own `config_applied` of
+ADR-0009 A7 — A12), `malformed_observation`, `store_over_capacity`.
 
 ### 9. Settings and module layout
 
@@ -646,17 +713,20 @@ Structured log events (ADR-0009 decision 5 conventions): `shard_claimed`,
 
 ```text
 services/aggregator/src/hammertime/aggregator/
-  __init__.py, __main__.py, service.py        ADR-0009 (composition root; wraps the worker)
+  __init__.py, __main__.py, service.py        ADR-0009 (composition root; wraps the worker; owns the ConfigPoller
+                                               with apply=worker.apply_config; reload_config() -> DetectionConfig is
+                                               poller.poll_once())
   config.py                                    AggregatorSettings, load_settings, parse_shard_ids
   lateness.py                                  ObservationOutcome, classify_observation
   window/counter.py                            IpCounter
   window/store.py                              ShardWindow, WindowChange (expiry, retention, capacity)
   sharding/assignment.py                       ShardClaims (AssignmentListener; claim, warm-up, revoke)
-  transitions.py                               TransitionEmitter, EmittedTransition
+  transitions.py                               TransitionEmitter, EmittedTransition (transition: core StateTransition)
   reevaluate.py                                reevaluate_shard(window, emitter, *, config, ips=None, batch_size=1000) -> int
   worker.py                                    AggregatorWorker: consume loop, handle(message) -> ObservationOutcome,
-                                               run_maintenance(), apply_config(), commit cadence
-  metrics.py                                   AggregatorMetrics
+                                               run_maintenance(), apply_config(config) -> None (unconditional; the
+                                               poller's hook), config (property), commit cadence
+  metrics.py                                   AggregatorMetrics (increment, get, bind_windows)
   tests/                                       test_window.py, test_lateness.py, test_hysteresis.py,
                                                test_sharding.py, test_reevaluate.py, test_worker.py
 ```
@@ -851,6 +921,20 @@ reading can be checked against the original.
   `DefaultPartitioner` — the hook assumption 1 chose not to use.
 * The readthedocs rendering of the same API was not reachable from this
   environment; the raw source above is the primary reference.
+
+Consulted for the series/label model decision 8's `AggregatorMetrics`
+follows (Amendment 3, A13):
+
+* Prometheus data model (source of the published page,
+  `https://raw.githubusercontent.com/prometheus/docs/main/docs/concepts/data_model.md`;
+  `prometheus.io` itself was not reachable from this environment): "Every
+  time series is uniquely identified by its metric name and optional
+  key-value pairs called labels"; "Label values MAY contain any UTF-8
+  characters"; "The change of any label's value, including adding or
+  removing labels, will create a new time series". Taken from it: one
+  series per `(name, label values)`, label values are strings, and a
+  different label set is a different series — hence `str(value)` keying
+  and the exact-label-names rule.
 
 ## Amendment 1 (2026-09-17) — 128 partitions; `next_sequence` never moves backwards; an empty static shard set is refused
 
@@ -1672,3 +1756,393 @@ called.
   `total_after < total_before` `WindowChange` on `observe` into a stale
   slot, and — in T5's scope — a `HotIpRemoved` emitted with
   `reason="observation"` (A11); `window_evictions{shard,reason}` (A7).
+
+## Amendment 3 (2026-09-17) — the version gate has one home, `AggregatorMetrics` has a Python surface, `StateTransition` is core's, `set_state` on an untracked IP, and the aggregator's own log records
+
+Why: the `test-author` writing the M3 worker/transitions/claims/re-evaluation
+tests (`test_hysteresis.py`, `test_sharding.py`, `test_reevaluate.py`,
+`test_worker.py`, commit `abaf12b`) had to assume three interfaces this ADR
+named but did not pin, and a `supervisor` review confirmed the first of them
+contradicts ADR-0009 as written: (1) the tests pin the configuration version
+gate *on* `AggregatorWorker.apply_config` and give it a `DetectionConfig`
+return, while ADR-0009 A5 puts the gate in `ConfigPoller.poll_once()` and
+types the hook as returning `None` — so the hook as tested could not be
+wired into the poller under mypy, and the gate would have existed twice;
+(2) decision 8 named `AggregatorMetrics` and its series but no constructor,
+increment or read path; (3) decision 4's `EmittedTransition.transition:
+StateTransition` named a type with no module path. Two smaller points came
+with them: C4 implemented `ShardWindow.set_state` on an untracked IP as a
+bare `KeyError` and asked for a ruling, and the T5 brief asked for a
+`shard_claimed ... inherited_hot=2` log assertion that T5 declined to write.
+
+Each item says whether the point was (a) already determined and missed, (b)
+genuinely unspecified and ruled now, or (c) left open with consequences, and
+whether it changes any shipped code. **None changes shipped code on
+`master`**: at the time of writing `worker.py`, `transitions.py`,
+`reevaluate.py`, `metrics.py`, `config.py`, `sharding/assignment.py` and
+`service.py` are docstring-only stubs (or absent), and C4's `ShardWindow` /
+`IpCounter` / `classify_observation` (commit `90276eb`, on a branch not
+checked out here and not readable from this working tree) is affected only
+by A15, which ratifies what C4 reported. ADR-0009 is **not** amended: every
+rule below is consistent with ADR-0009 decision 6 and A5/A7/A8 as written,
+and A12 exists precisely to make this ADR agree with them. The four shipped
+T5 test files are consistent with A13, A14, A15 and A16 as written; the
+assertions A12 invalidates are listed under *Follow-ups*, for a `test-author`
+pass.
+
+As with Amendments 1 and 2, decision bodies were rewritten in place. Every
+edit outside this section, with the superseded wording quoted:
+
+* **Decision 7, opening paragraph.** Was: "`reload_config()` / the poll
+  loop apply a document per ADR-0009 decision 6 (strictly greater version;
+  rejected documents ignored). Applying version `v` means, under the worker
+  lock so that no observation is processed mid-pass:". Now names
+  `ConfigPoller.poll_once()` as the only place the version rule is
+  enforced, says the service constructs the poller with
+  `apply=worker.apply_config`, gives the `apply_config(config) -> None`
+  signature and the `config` property in a code block, and says the hook is
+  unconditional (A12).
+* **Decision 7, step 3.** Was: "Adopt `v` as the config in force;
+  `reload_config()` returns it." Now: adopt `v` at the worker, log
+  `config_reevaluated`, return; the poller then sets `current`, logs
+  `config_applied`, and `reload_config()` returns the poller's `current`
+  (A12).
+* **Decision 8, opening.** Gained the `AggregatorMetrics` code block and
+  the paragraph after it (series identity, `str(value)` keying, the
+  name/label-name validation rule, event counters versus window-derived
+  series, `bind_windows`) — normative text that did not exist before
+  (A13).
+* **Decision 8, the series table.** `window_evictions{shard,reason}`'s
+  comment gained "`get` with a shard no bound window has, or a `reason`
+  outside the two, reads 0"; `shards_claimed` — was "gauge" — is now
+  "gauge; the number of windows the bound source yields" (A13).
+* **Decision 8, the log events sentence.** Was: "`warmup_complete`,
+  `config_applied` (with `transitions=N`), `malformed_observation`". Now:
+  "`warmup_complete`, `config_reevaluated` (`config_version`,
+  `transitions`; emitted by the worker at the end of `apply_config`, before
+  the poller's own `config_applied` of ADR-0009 A7 — A12),
+  `malformed_observation`" (A12).
+* **Decision 4, the `EmittedTransition` code block.** Gained the import
+  line `from hammertime.core.state.transitions import StateTransition` and
+  the comment "`StateTransition(previous=previous, current=new)`" on the
+  `transition` field (A14).
+* **Decision 4, step 5.** Was: "`window.set_state(ip, new)`; count the
+  transition under `reason` (`observation`, `expiry`, `warmup`, `config`);
+  return the `EmittedTransition`." Now also spells the `metrics.increment`
+  call and says `transition` is core's `StateTransition(previous=previous,
+  current=new)` (A13, A14).
+* **Decision 2, the `ShardWindow` code block.** `set_state`'s line gained
+  the comment "`KeyError` for an untracked IP (A15)".
+* **Decision 2, the `set_state` bullet.** Was: "`set_state(ip, COLD)`
+  clears the `inherited` flag for that IP; `finish_warmup_if_due()`
+  returns ...". Now opens with "`set_state(ip, state)` requires `ip` to be
+  tracked and raises `KeyError` otherwise — it never creates an entry
+  (A15)." and continues as before.
+* **Decision 9, the module layout.** `service.py`'s line now says it owns
+  the `ConfigPoller` with `apply=worker.apply_config` and that
+  `reload_config() -> DetectionConfig` is `poller.poll_once()`;
+  `transitions.py`'s line gained "(transition: core `StateTransition`)";
+  `worker.py`'s line — was "`run_maintenance(), apply_config(), commit
+  cadence`" — now reads "`run_maintenance(), apply_config(config) -> None
+  (unconditional; the poller's hook), config (property), commit cadence`";
+  `metrics.py`'s line — was "`AggregatorMetrics`" — now
+  "`AggregatorMetrics (increment, get, bind_windows)`".
+* **Sources.** Gained the Prometheus data-model citation A13 relies on.
+* **Status line.** Marked amended three times.
+* **`docs/spec/README.md`, the §30/§39 row.** Gained
+  `core/state/transitions.py`, which A14 makes the carrier of the
+  transition value the aggregator emits. No other row changed.
+
+Decisions 1, 3, 5 and 6, the Assumptions list, Consequences, Amendment 1
+and Amendment 2 are untouched. `docs/spec/hammertime_spec_1.md` is
+untouched: its §30, §34, §37 and §47.3 ADR pointer notes were re-read for
+restatements of the three rules — §47.3 already says the poller is shared
+and `reload_config()` is one poll of it returning the configuration in
+force, which is exactly A12; §37 lists the series without a Python API; §30
+does not name the transition value type; and no spec text names the
+aggregator's `config_applied (with transitions=N)` record (§47.7's
+`config_applied` is ADR-0009's, which is unchanged). `docs/protocol/` has
+no restatement of any of the three. `docs/spec/integration-scenarios.md`
+§4 step 4 asserts the non-increasing rule through `publish_config` ->
+`reload_config()`, i.e. through the poller — consistent with A12 and
+untouched. ADR-0009 was grepped for the same rules; A5 and A7 already state
+what A12 relies on and are unchanged.
+
+### A12. The version gate lives in `ConfigPoller.poll_once()` only; `apply_config(config) -> None` is unconditional
+
+**Classification: (a), already determined by ADR-0009 A5 read with this
+ADR's decision 7, and missed — by the T5 brief and by this ADR's own
+imprecision.** ADR-0009 A5 is explicit on both halves: `poll_once()` returns
+`current` unchanged, silently, when `candidate.config_version <=
+current.config_version` and never calls `apply` for it; the hook is typed
+`Callable[[DetectionConfig], Awaitable[None]]`; and "the aggregator, trie
+and detector MUST use `ConfigPoller` for decision 6 rather than
+reimplementing it (their `apply` is their re-evaluation: `reevaluate.py`,
+...)". Decision 7 of this ADR deferred to "ADR-0009 decision 6" for the
+rule and listed `apply_config()` in decision 9 without a signature, which
+left room for the T5 brief to say "a version `<=` the one in force is
+ignored" *of `apply_config`* and "the returned config is the one in force"
+— the two statements ADR-0009 makes of `poll_once()`. T5 followed the brief.
+The result was a hook returning `DetectionConfig`, which is not assignable
+to `Awaitable[None]` (`Awaitable` is covariant and `DetectionConfig` is not
+a subtype of `None`), and a gate in two places.
+
+Ruling, now stated in decision 7 and decision 9:
+
+* `AggregatorWorker.apply_config(config: DetectionConfig) -> None`. It is
+  decision 7's three steps under the worker lock, then a
+  `config_reevaluated` record, then return. It compares no versions. It is
+  the callable the service passes as `ConfigPoller(..., apply=
+  worker.apply_config)`.
+* `AggregatorWorker.config` is a read-only property giving the version in
+  force at the worker: the constructor's `config` until the first
+  successful `apply_config`, then the last one applied.
+* `AggregatorService.reload_config() -> DetectionConfig` is `await
+  poller.poll_once()` — ADR-0009 A5's rule verbatim — and returns the
+  poller's `current`. The gate, the `config_rejected` record and the
+  `config_applied` record are the poller's; the aggregator adds nothing to
+  them and duplicates none of them.
+* Decision 8's aggregator-side record is renamed from `config_applied (with
+  transitions=N)` to `config_reevaluated` with fields `config_version` and
+  `transitions`. This is a consequence, not a separate ruling: ADR-0009 A7
+  pins `config_applied`'s fields as `path, config_version,
+  previous_config_version` and says the names and fields are contract, so
+  a second `config_applied` with different fields from a different emitter
+  would contradict it, and under this ruling both would fire on every
+  change. The worker's record fires first (inside `apply_config`), the
+  poller's second.
+
+What `poll_once` does about "its own gate": nothing changes — it *is* the
+gate. There is no second one to reconcile.
+
+Why the poller and not the worker, given the caller said either was
+defensible: the rule is ADR-0009's and is already implemented and tested in
+core (`test_runtime.py::TestConfigPoller`, including the version-visible-
+only-after-apply property); the trie and detector will wire the same
+poller the same way, so the aggregator having its own copy would be the one
+service where the rule could drift; and a hook that trusts its caller is
+the shape A5's `_Applier` test double already has. The cost is that the
+worker-level tests that asserted the gate on `apply_config` have to move to
+the seam where the gate is (*Follow-ups*).
+
+Assumptions (push back individually):
+
+* **`apply_config` applies a lower or equal version rather than raising.**
+  A `ValueError` precondition was the alternative. Rejected because it is a
+  second, refusing gate under another name — the thing this item removes —
+  and because a direct caller re-applying the version in force is a useful
+  way to force a full re-evaluation pass (nothing else exposes one).
+* **A failed pass leaves partial effects.** If step 2 raises (a store
+  failure, decision 4 / assumption 7), the exception propagates out of
+  `apply_config` and `poll_once()`; `worker.config` and the poller's
+  `current` are unchanged, but windows re-bucketed in step 1 keep the new
+  geometry and transitions already emitted carry `v`. Decision 7 said this
+  before ("a failure here propagates") and A9's "the target window's
+  `bucket_seconds`" already keeps observations aligned in that state; the
+  next poll retries the same document (ADR-0009 A5). Whether the pass
+  should instead be made atomic is **left open** and is not ruled here.
+* **`config_reevaluated` carries `config_version` and `transitions` only.**
+  A per-shard breakdown was considered and not added; nothing asked for it.
+* **The worker keeps its own `config` rather than reading the poller's
+  `current`.** The worker is constructed without a poller (the tests build
+  it with a `DetectionConfig` and no path) and must work that way; the two
+  values agree except during the instant between `apply_config` returning
+  and the poller assigning `current`, during which no observation is
+  processed under the poller's value because the worker never reads it.
+
+Shipped code: none affected. Binding on the C5 brief; invalidates the T5
+assertions listed under *Follow-ups*.
+
+### A13. `AggregatorMetrics`: constructor, increment path, read path, and how the window-derived series are read
+
+**Classification: (b).** Decision 8 named nine series and their labels and
+said "plain counters", nothing more. T5 assumed `AggregatorMetrics()` with
+no required arguments and `metrics.get(name, **labels) -> int` returning 0
+for an untouched series, behind a `_counter()` helper; both are ratified.
+The ruling is decision 8's new code block and paragraph; restated here with
+the reasons:
+
+* `AggregatorMetrics()` — no arguments. One instance per process, built by
+  the service and handed to the worker and the emitter.
+* `increment(name, **labels) -> None` adds 1 to one series. Only the four
+  event counters accept it: `cold_to_hot_transitions` and
+  `hot_to_cold_transitions` (`shard`, `config_version`, `reason`; called by
+  the emitter, decision 4 step 5), `late_messages` (`reason`) and
+  `observations_rejected` (`reason`; both called by the worker, decision 3
+  steps 1-2).
+* `get(name, **labels) -> int` reads one series: an event counter's value
+  (0 if never incremented), or a window-derived value computed on the call.
+* `bind_windows(windows: Callable[[], Iterable[ShardWindow]]) -> None` is
+  how the derived series get their source. `AggregatorWorker.__init__`
+  binds a callable that yields the currently claimed windows (through
+  `ShardClaims.shards` / `window(p)`; how it is spelled is the
+  implementation's). On each `get` of a derived series the callable is
+  invoked and the answer computed from the windows it yields:
+  `tracked_ips{shard}` / `active_ips{shard}` / `hot_ips{shard}` are the
+  named window's `tracked_count` / `active_count` / `hot_count`;
+  `window_evictions{shard,reason=retention|capacity}` is its
+  `retention_evictions` / `capacity_evictions`; `shards_claimed` is the
+  number of windows yielded. A `shard` value no yielded window has, or a
+  `reason` outside the two, reads 0; before `bind_windows` every derived
+  series reads 0. A revoked shard's series therefore vanish with its window,
+  exactly as A7 said.
+* Identity: a series is `(name, tuple of (label name, str(value)) in a
+  fixed order)`. `name` must be one of the nine; the label names passed
+  must equal the series' label names exactly; `ValueError` otherwise from
+  both methods. Label *values* are not validated.
+
+Assumptions (push back individually):
+
+* **Strict names and label names.** A registry that accepted any string
+  would turn a typo (`hot_to_cold_transition`) into a silently empty series;
+  Prometheus client libraries require label names to be declared up front
+  for the same reason. The cost is that adding a series is an edit to this
+  table and to the module — which is the point.
+* **`str(value)` keying.** Follows the Prometheus data model cited under
+  Sources (label values are strings; a different value is a different
+  series) and lets callers pass `shard=window.shard` (an `int`) without
+  converting.
+* **Derived series computed on read through a bound callable, rather than
+  gauges the worker sets.** The alternative — `set_gauge` calls after every
+  `observe`, `evict_due` and claim — is the bookkeeping A7 rejected for
+  `window_evictions`, and it would let a gauge lag reality. Computing on
+  read is O(claimed shards) per call, which is fine for a test and for a
+  scrape. `bind_windows` as a mutating method (rather than a constructor
+  argument) is what lets `AggregatorMetrics()` stay argument-free and be
+  built before the worker.
+* **`increment` is by 1 only.** No caller needs another amount; a
+  `count=` parameter can be added without breaking anything.
+* **No enumeration or rendering surface.** What `/metrics` needs beyond
+  `get` (enumerating the label sets that exist, Prometheus naming such as
+  a `_total` suffix on counters) is the telemetry epic's to add; ADR-0009
+  decision 4 lets `/metrics` be empty until then, and pinning an export
+  shape here would be designing that epic's interface without its
+  requirements.
+* **Not thread-safe.** A plain dict; every caller is on the one event
+  loop.
+
+Shipped code: none affected (`metrics.py` does not exist). The T5
+`_counter()` helper and every `metrics.get(...)` call site in
+`test_hysteresis.py` and `test_worker.py` use exactly the names and label
+names above and need no change. Closes T5's gap 8 (`test_sharding.py`
+module docstring): `window_evictions{shard,reason}` is now assertable
+through `get` on a worker's metrics (*Follow-ups*).
+
+### A14. `EmittedTransition.transition` is `hammertime.core.state.transitions.StateTransition`
+
+**Classification: (a), already determined and missed — by this ADR, which
+named the type without its module, and by the T5 brief and T5, which took
+"no module" to mean "undefined".** The type exists and has shipped since
+before this ADR: `packages/hammertime-core/src/hammertime/core/state/transitions.py`
+(docstring `Spec: section 19, section 30`) defines
+`@dataclass(frozen=True, slots=True) class StateTransition(previous:
+IpState, current: IpState)` with `became_hot` and `became_cold` properties
+and the docstring "A COLD->HOT or HOT->COLD edge. Non-transitions are never
+represented." That is precisely what decision 4 emits.
+
+Ruling (decision 4 now says this): `EmittedTransition.transition =
+StateTransition(previous=previous, current=new)` where `previous =
+window.state(ip)` read at the top of `evaluate` and `new` is
+`evaluate_ip_state`'s result. A promotion therefore has `transition.became_hot`
+true and a demotion `transition.became_cold` true, and the two compare
+unequal (frozen dataclass equality), which is what T5's
+`test_the_two_directions_are_distinguishable_on_the_transition_field`
+already asserts. The module is imported directly
+(`hammertime.core.state.transitions`); it is not re-exported from
+`hammertime.core.state.__init__` today and this amendment does not ask for
+that.
+
+Assumptions: none beyond ratifying the shipped type. No enum of direction
+names is introduced; `became_hot`/`became_cold` are the direction.
+
+Shipped code: none affected. `docs/spec/README.md`'s §30/§39 row gains
+`core/state/transitions.py`.
+
+### A15. `ShardWindow.set_state` on an untracked IP is a `KeyError`
+
+**Classification: (b) by omission; ratifies C4's disclosed default.**
+Decision 2 listed `set_state(ip, state) -> None` and said only what
+`set_state(ip, COLD)` does to the `inherited` flag. C4 implemented the
+untracked case as a bare `KeyError` and flagged it.
+
+Ruling (decision 2 now says this): `set_state` requires a tracked IP and
+raises `KeyError` otherwise; it never creates an entry. The emitter cannot
+reach that path: decision 4 reads `window.state(ip)` (`COLD` when
+untracked) and `window.total(ip)` (0 when untracked), so an untracked IP
+evaluates `COLD -> COLD` and `evaluate` returns `None` before step 5; and
+because `evaluate` runs under the worker lock (decisions 6 and 7), no
+`evict_due()` can remove the entry between the read and the
+`set_state`. So the `KeyError` is a caller-bug signal, not a runtime path.
+
+Assumptions: **raise rather than create.** Creating an entry on
+`set_state` would give the store a second way to admit an IP with no
+observation behind it, alongside `inherited_hot`, and would make
+`tracked_count` move on a call whose name says nothing about tracking.
+`KeyError` rather than `ValueError` because the argument is a missing key,
+which is what C4 chose and what a dict-backed store raises naturally.
+
+Shipped code: C4's `ShardWindow` (commit `90276eb`, not readable from this
+tree) is reported to do exactly this; nothing changes.
+
+### A16. The aggregator's own log records are not given a unit-test seam here
+
+**Classification: (c), left open with the consequence stated.** The T5
+brief asked for an assertion on `shard_claimed shard=p inherited_hot=N`
+(Amendment 2, A5). T5 did not write it, on the grounds that ADR-0009 A7
+pins a record shape only through `configure_logging`'s JSON carrier and a
+`logger=` injection seam that exists on `connect_with_retry` and
+`ConfigPoller` — not on anything in this ADR. That reading is correct: the
+event names and fields in decision 8 are contract, and the carrier is A7's,
+but no `logger=` parameter is pinned on `ShardClaims` or `AggregatorWorker`,
+so a unit test has no way to capture the record short of configuring
+process-wide logging.
+
+Ruling: no seam is added by this amendment, and the `inherited_hot=2`
+assertion is **not** an outstanding brief item. The observable half is
+already asserted on the window (`hot_count == 2`,
+`test_every_inherited_ip_is_a_tracked_entry_from_construction`). If a
+later pass wants the records assertable, the established shape is
+ADR-0009 A2's `logger: Any = None` parameter (an object with
+`info`/`warning`/`error(event, **fields)`) on `ShardClaims` and
+`AggregatorWorker`; that is a small, separate ruling and is deliberately
+not made here, because nothing in Q1-Q3 depends on it.
+
+Assumption: that the telemetry epic, which owns `/metrics` and the log
+pipeline, is the natural place to decide whether every component takes a
+`logger=`; pinning it piecemeal per ADR was judged worse than leaving it.
+
+### Follow-ups (not part of this amendment; for the top-level session to dispatch)
+
+* `test-author` (`test_reevaluate.py`), required by A12:
+  * Module docstring ASSUMPTION 1 (lines 25-32): `apply_config` returns
+    `None` and performs no version comparison; the gate is
+    `ConfigPoller.poll_once()`'s (ADR-0009 A5), and `reload_config()` on
+    the service is that poll.
+  * `test_the_version_in_force_afterwards_is_the_new_one` (lines 272-284):
+    drop `returned = ...` and the two `returned.*` assertions (278-281);
+    keep the `worker.config.*` and window assertions. May assert
+    `await worker.apply_config(V2) is None`.
+  * `TestTheVersionGate` (lines 321-377): `test_a_lower_version_is_ignored`
+    (325-337) and `test_the_version_in_force_is_ignored_even_with_different_thresholds`
+    (339-356) assert a gate `apply_config` no longer has and are wrong
+    under A12. Re-point them at the poller: build the worker as now, write
+    the candidate document to a `tmp_path` file, construct
+    `ConfigPoller(path, worker.config, apply=worker.apply_config)` and
+    `await poller.poll_once()`; assert the poller's returned config, the
+    worker's `config`, and that no records were emitted. That is the wiring
+    `AggregatorService.reload_config()` performs (decision 9), asserted
+    without a service-level construction seam, and it is also the static
+    demonstration that `apply_config` is assignable to the hook (mypy runs
+    strict over the tests). `test_a_descriptive_only_change_is_adopted_and_produces_no_transitions`
+    (358-377): drop the two `returned.*` assertions (372-373); keep the
+    rest; the class docstring (322-323) should say which tests go through
+    the poller.
+* `test-author`, optional under A13 and A14: assert
+  `metrics.get("window_evictions", shard=0, reason="retention") == 1` and
+  `metrics.get("shards_claimed") == 1` on a running worker after a
+  retention eviction (closes `test_sharding.py`'s gap 8); assert
+  `promotion.transition.became_hot` / `demotion.transition.became_cold` in
+  `test_hysteresis.py`; assert `ValueError` from `increment`/`get` for an
+  unknown name or a wrong label set.
+* Open, not ruled (A12's second assumption): whether a failed
+  re-evaluation pass should be atomic.
