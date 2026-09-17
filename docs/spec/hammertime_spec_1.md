@@ -244,6 +244,14 @@ window_count(IP)
 
 is O(1) after bucket maintenance.
 
+> ADR-0011: the aggregator's ring holds exactly `window_seconds /
+> bucket_seconds` buckets. A bucket starting at `S` is live at time `now` iff
+> `bucket_start(now) - S < window_seconds`; it leaves the window at exactly
+> `now = S + window_seconds`. A delta for a bucket that is no longer live can
+> never affect a future window count and is diverted to reconciliation
+> (Section 24) rather than applied. Counters are process-local, one store per
+> owned shard (Section 20).
+
 ---
 
 ## 6. HOT/COLD State Transitions
@@ -920,6 +928,17 @@ IP
 
 This minimizes distributed coordination for individual IP state.
 
+> ADR-0011: a shard is a partition of `hammertime.observations.v1`.
+> `hash(IP) -> shard` is the bus's key partitioner acting on the per-IP key
+> ingest publishes under (ADR-0004); the aggregator computes no IP hash of
+> its own. Ownership is the `hammertime-aggregator` consumer group's partition
+> assignment (ADR-0009 decision 9), delivered through the bus's assignment
+> listener; `HAMMERTIME_SHARD_IDS=auto` lets the group coordinator assign,
+> an explicit set pins a member to those partitions. The sliding counters are
+> process-local; the set of HOT IPs per shard is kept in a durable state
+> store and inherited on claim, so a restart or handover never leaves the
+> trie holding an IP no owner remembers.
+
 ---
 
 # 21. Prefix Aggregation Across Shards
@@ -1081,6 +1100,18 @@ allowed_lateness = 30 seconds
 
 Events older than the accepted lateness horizon MAY be dropped, corrected, or sent through a reconciliation path.
 
+> ADR-0011 fixes the aggregator's policy. With `age = now - window_start` on
+> the service clock at processing time: `age < 0` (`future`) and
+> `age > window_seconds + allowed_lateness_seconds` (`late`, the ADR-0002
+> horizon with the configured window) are diverted, byte-for-byte, to
+> `hammertime.observations-reconciliation.v1` and counted in `late_messages`.
+> An observation inside that horizon whose bucket has already left the
+> window (`expired_bucket`) is diverted the same way — it is never applied
+> and never silently dropped. A message whose `window_seconds` exceeds the
+> configured window is diverted too (ADR-0010 decision 6). Only a message
+> that fails decoding or the ADR-0004 one-IP-per-message invariant is
+> dropped, with a log record.
+
 ---
 
 # 25. Time Buckets
@@ -1130,6 +1161,17 @@ state retention = 10 minutes
 An IP with no observations beyond the retention period can be removed from the sliding-window store.
 
 The trie only needs currently hot IPs if the system's purpose is prefix-level hot detection.
+
+> ADR-0011: the sliding-window store is per shard and process-local. It is
+> bounded by `state_retention_seconds` (a COLD IP with an empty window is
+> evicted once `last_seen + state_retention_seconds` has passed), by
+> `HAMMERTIME_AGGREGATOR_MAX_TRACKED_IPS` (the least-recently-seen COLD IP is
+> evicted to make room; a HOT IP is never evicted), and expiry is driven by a
+> schedule of next-expiry times so a sweep touches only IPs that have a
+> bucket to expire. Only the currently HOT IPs of each shard are persisted
+> (`ShardStateStore`), so the HOT set — the part the trie depends on —
+> survives a restart or a shard handover while the counters rebuild within
+> one window.
 
 ---
 
@@ -1323,6 +1365,15 @@ evaluate_ip_state(previous_state, count, configuration)
 
 MUST be the authoritative implementation of the HOT/COLD state machine.
 
+> ADR-0011: in the aggregator `evaluate_ip_state` is called from exactly one
+> place (`services/aggregator/transitions.py`), on three triggers — an
+> applied observation (deltas are non-negative, so only COLD -> HOT can
+> result), an expiry sweep or warm-up end (only HOT -> COLD), and a
+> configuration re-evaluation (Section 34, either direction). Each emitted
+> transition is recorded in the shard's durable HOT set *before* the event
+> is published, and `HotIpAdded` carries `weight` (Section 46.4) computed
+> under the configuration in force at that transition.
+
 ---
 
 # 31. Avoiding Nested False Positives
@@ -1494,6 +1545,14 @@ The system SHOULD provide a controlled re-evaluation mechanism instead of silent
 > strictly increases, and visible in events and read responses only after the
 > re-evaluation has been applied. `test_config_change.py`
 > (`docs/spec/integration-scenarios.md`) is the executable form of this section.
+
+> ADR-0011: in the aggregator, applying a new version re-evaluates every
+> tracked IP of every owned shard under the new thresholds, with the
+> observation stream paused for the pass, so every transition it produces —
+> and every event emitted afterwards — carries the new `config_version`. A
+> change to `bucket_seconds` or `window_seconds` re-buckets existing counts
+> by `bucket_start(S, new_bucket_seconds)` before re-evaluating; no count is
+> lost, and counts whose bucket falls outside the new window expire at once.
 
 ---
 
@@ -1929,7 +1988,18 @@ active_ips
 hot_ips
 cold_to_hot_transitions
 hot_to_cold_transitions
+window_evictions           (ADR-0011; labelled retention | capacity)
+shards_claimed             (ADR-0011)
 ```
+
+> ADR-0011: the aggregator labels the two transition counters by `shard`,
+> `config_version` and `reason` (`observation` | `config` for COLD -> HOT;
+> `expiry` | `warmup` | `config` for HOT -> COLD), and is the emitter of
+> `late_messages` (labelled `late` | `future` | `expired_bucket`) and of an
+> aggregator-side `observations_rejected` (`window_too_long` | `malformed`),
+> since it — not ingest — judges lateness (Section 24). `tracked_ips` counts
+> every IP in the window store, `active_ips` those with a non-zero window
+> total, `hot_ips` those currently HOT.
 
 ### Trie metrics
 
