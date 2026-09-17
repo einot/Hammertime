@@ -1,6 +1,14 @@
-"""Redis-backed store with TTLs matching state_retention_seconds.
+"""Redis-backed stores: dedup keys with TTLs, shard state without.
 
-Spec: section 26
+Spec: section 20, section 26, section 32
+
+Two backends, one Redis. `RedisDedupStore` (spec section 26) holds ingest's
+dedup records, where TTL-based expiry matching `state_retention_seconds` is
+the whole point. `RedisShardStateStore` (spec section 20, section 32;
+ADR-0011 decision 5) holds the aggregator's per-shard HOT set and sequence
+counter, which carry *no* TTL at all -- see that class's docstring for why
+the two opposite retention rules are both correct, and why the second one
+raises the stakes on the deployment's eviction policy.
 
 `RedisDedupStore` implements `hammertime.store.interface.DedupStore` against
 a real Redis (or Redis-compatible) backend -- the production counterpart to
@@ -53,20 +61,45 @@ key still existing with `gt` false, the retried `SET NX` correctly no-ops
 against the still-live, already-sufficient TTL.
 """
 
+from hammertime.core.addressing.address import Address
+from hammertime.core.state.enums import IpState
 from hammertime.store.dedup import SequenceKey
+from hammertime.store.interface import ShardState
 from redis.asyncio import Redis
 
 #: Placeholder value stored at each dedup key. Only the key's existence and
 #: TTL matter; the value itself carries no information.
 _SEEN_VALUE = b"1"
 
-#: Namespaces every key this module writes. `SequenceKey.cache_key()` has no
+#: Namespaces every dedup key this module writes. `SequenceKey.cache_key()` has no
 #: prefix of its own, and this store is deployed against a shared Redis --
 #: `deploy/docker-compose.yml` points ingest and the (not yet implemented)
 #: aggregator Redis counter store at the same `redis://redis:6379/0` -- so an
 #: unprefixed key risks colliding with a future, unrelated key scheme in the
 #: same keyspace.
 _KEY_PREFIX = "hammertime:dedup:"
+
+#: Namespaces every key `RedisShardStateStore` writes, one pair per shard:
+#: `hammertime:agg:{shard}:hot` and `hammertime:agg:{shard}:seq`. ADR-0011
+#: names this keyspace explicitly -- the deploy epic's `noeviction`
+#: requirement is written against this prefix, so it is load-bearing beyond
+#: tidiness.
+_SHARD_KEY_PREFIX = "hammertime:agg:"
+
+
+def _hot_key(shard: int) -> str:
+    """The SET of IP text this shard currently has as HOT."""
+    return f"{_SHARD_KEY_PREFIX}{shard}:hot"
+
+
+def _sequence_key(shard: int) -> str:
+    """The sequence this shard's next transition will use."""
+    return f"{_SHARD_KEY_PREFIX}{shard}:seq"
+
+
+def _as_text(value: bytes | str) -> str:
+    """Decode a SET member, whichever `decode_responses` the client was built with."""
+    return value.decode() if isinstance(value, bytes) else value
 
 
 class RedisDedupStore:
@@ -134,3 +167,84 @@ class RedisDedupStore:
         key = _KEY_PREFIX + SequenceKey(agent_id, sequence).cache_key()
         created = await self._client.set(key, _SEEN_VALUE, ex=ttl_seconds, nx=True)
         return bool(created)
+
+
+class RedisShardStateStore:
+    """`ShardStateStore` backed by a real Redis: a SET plus a counter per shard.
+
+    Two keys per shard under `hammertime:agg:{shard}:` -- `:hot`, a SET of
+    IP text (`str(Address)`, the canonical form `Address.parse`
+    round-trips and the same form ADR-0011 decision 4 puts in an envelope's
+    `subject`), and `:seq`, the sequence the shard's next transition will
+    use. Takes an already-constructed client by injection, exactly as
+    `RedisDedupStore` does, for the same reason: connection lifecycle is
+    the caller's.
+
+    **No TTL, deliberately** (ADR-0011 decision 5): a shard's HOT set has
+    to outlive every process that touches it. That makes the deployment
+    warning in `RedisDedupStore`'s docstring apply here with more force. An
+    expiring or evicted dedup key costs a re-accepted duplicate; an
+    expiring or evicted `hammertime:agg:*` key costs the aggregator its
+    memory of which IPs it announced as HOT, so it never emits the matching
+    `HotIpRemoved` and the trie holds them forever -- silently recreating
+    the exact permanent divergence (spec section 12) this store exists to
+    close, with nothing to detect it. A deployment running this store MUST
+    either give the `hammertime:agg:` keyspace a dedicated, non-evicting
+    Redis instance/logical DB, or run `maxmemory-policy noeviction`, so
+    running out of memory surfaces as a loud write failure. An
+    `allkeys-lru`/`allkeys-lfu` policy is specifically unsafe here:
+    `volatile-*` would at least leave these (TTL-less) keys alone, but
+    `allkeys-*` will not. Tracked for the deploy/integration epic (#17),
+    not fixed at the application level here.
+
+    `load` is a pure read (two commands in one MULTI/EXEC, so the HOT set
+    and the sequence are a coherent snapshot of one instant) and never
+    creates a key: `SMEMBERS` on a missing key returns an empty set and
+    `GET` returns `None`, which is exactly `ShardState(frozenset(), 0)`.
+    """
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
+
+    async def load(self, shard: int) -> ShardState:
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.smembers(_hot_key(shard))
+            pipe.get(_sequence_key(shard))
+            members, sequence = await pipe.execute()
+        return ShardState(
+            hot_ips=frozenset(Address.parse(_as_text(member)) for member in members),
+            next_sequence=int(sequence) if sequence is not None else 0,
+        )
+
+    async def record_transition(
+        self, shard: int, ip: Address, state: IpState, sequence: int
+    ) -> None:
+        if sequence < 0:
+            raise ValueError(f"sequence must be non-negative, got {sequence!r}")
+        # One MULTI/EXEC per call, per ADR-0011 decision 5: Redis runs the
+        # queued commands as a unit, so no reader ever sees the membership
+        # change without the matching sequence or vice versa. Note what is
+        # *not* transactional: SREM leaving the set empty deletes the `:hot`
+        # key (Redis drops empty collections), but `:seq` is a plain string
+        # and survives -- demoting a shard's last HOT IP must not restart
+        # its numbering, or a later transition could reproduce an earlier
+        # `event_id`.
+        #
+        # This is a plain MULTI/EXEC, not a WATCH/optimistic-retry loop: no
+        # command here reads a value it then writes back (SADD/SREM/SET are
+        # each unconditional), so there is nothing for a concurrent writer
+        # to invalidate. If EXEC fails -- connection loss, a Redis error,
+        # OOM under `noeviction` -- `execute()` raises and neither key is
+        # modified; the exception propagates to the caller, which per
+        # decision 4 must then abandon the publish rather than announce a
+        # transition it did not durably record.
+        async with self._client.pipeline(transaction=True) as pipe:
+            if state is IpState.HOT:
+                pipe.sadd(_hot_key(shard), str(ip))
+            else:
+                # SREM of an absent member is a no-op that still leaves the
+                # sequence update below to run: decision 4's recovery path
+                # demotes inherited IPs that may never have been recorded.
+                pipe.srem(_hot_key(shard), str(ip))
+            pipe.set(_sequence_key(shard), sequence + 1)
+            await pipe.execute()
