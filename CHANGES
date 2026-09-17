@@ -1,3 +1,6 @@
+Add aggregator service: consumes hammertime.observations.v1 per shard, maintains per-IP sliding windows, and emits HotIpAdded/HotIpRemoved with weight in attributes
+Aggregator diverts late, future, expired-bucket and over-long-window observations to hammertime.observations-reconciliation.v1 and counts them in late_messages/observations_rejected
+Aggregator persists each shard's HOT IP set (memory or Redis under hammertime:agg:*) and inherits it on restart or shard handover with a one-window warm-up
 Aggregator settings: HAMMERTIME_SHARD_IDS accepts auto (default) or an explicit partition set; HAMMERTIME_SHARD_COUNT is removed; add HAMMERTIME_AGGREGATOR_COMMIT_INTERVAL_S, HAMMERTIME_AGGREGATOR_MAX_TRACKED_IPS, HAMMERTIME_AGGREGATOR_REEVALUATION_BATCH
 Bus consumers accept an assignment listener and an optional static partition set on subscribe; an empty static set is rejected with ValueError before any broker call, while group-managed assignment of no partitions stays valid; the in-memory bus assigns its single partition 0
 Add a durable per-shard aggregator HOT set and monotonic transition sequence in Redis keys hammertime:agg:{shard}:hot and hammertime:agg:{shard}:seq, which carry no TTL and require maxmemory-policy noeviction (an allkeys-* policy silently loses the HOT set); a recorded transition never moves the shard's sequence backwards

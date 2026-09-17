@@ -3,7 +3,7 @@ name = "hammertime-aggregator"
 version = "0.1.0"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["hammertime-core", "hammertime-bus", "hammertime-store"]
+dependencies = ["hammertime-core", "hammertime-bus", "hammertime-store", "uvicorn>=0.30"]
 
 [project.scripts]
 hammertime-aggregator = "hammertime.aggregator.__main__:main"
