@@ -39,12 +39,18 @@ would re-run its lifespan and silently reset every limiter's accumulated
 state, defeating exactly the cross-request accumulation these tests need
 to observe.
 
-Real-clock note: like `test_pipeline.py`'s ADR-0008 additions, the two new
-limiters (`auth_failure_source_limiter`, `auth_failure_agent_limiter`) have
-no `create_app` clock-injection point per ADR-0007's implementation notes,
-so every test below relies on real wall-clock time between back-to-back
-`TestClient` calls, choosing small bursts and slow (per-minute) refill
-rates to keep a generous margin against real-time drift during a test run.
+Clock note: nothing in this module refills against wall time. Like
+`test_pipeline.py`'s `_build_app`, the `_client()` helper below wires
+*every* limiter `create_app` accepts -- the flat per-request
+`rate_limiter=`, ADR-0007's two failed-authentication limiters
+(`auth_failure_source_limiter=`, `auth_failure_agent_limiter=`) and
+ADR-0008's `observation_limiter=` -- plus the dedup store to a single
+frozen `ManualClock` injected through `create_app`. Any limiter left to
+`create_app`'s own fallback would run on the `SystemClock` and refill with
+real time between back-to-back `TestClient` calls, which is exactly what
+makes a "this budget is exhausted" assertion flaky under load; with the
+frozen clock, exhaustion is exact and the bursts chosen per test below are
+the only thing that determines when a 429 appears.
 
 ADR-0007 Decision 8 (added after this file's first pass, post-implementation
 security finding): the agent bucket's key is a fixed-size salted slot
@@ -77,10 +83,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from hammertime.core.auth.tokens import hash_token
+from hammertime.core.time.clock import ManualClock
 from hammertime.ingest.app import create_app
 from hammertime.ingest.auth import AgentAuthError
 from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
 from hammertime.ingest.config import IngestSettings
+from hammertime.ingest.ratelimit import RateLimiter
+from hammertime.store.memory import MemoryDedupStore
 
 _CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
 
@@ -101,14 +110,15 @@ WINDOW_SECONDS = 60
 _AMPLE = 1_000_000
 
 # Deliberately slow (6 failures/min = 0.1 tokens/sec) baseline default for
-# the two failure *rates* (as opposed to burst/capacity). A test that only
-# overrides `auth_failure_burst`/`auth_failure_agent_burst` downward to
-# force exhaustion, without also slowing the corresponding rate, would
-# otherwise inherit `_AMPLE` as the refill rate too -- refilling most of
-# the bucket back within a single millisecond and undoing the exhaustion
-# before the next `TestClient` call lands. Real-clock note in this file's
-# module docstring applies: at 0.1 tokens/sec even whole seconds of test
-# slowness refill a negligible fraction of one token.
+# the two failure *rates* (as opposed to burst/capacity), kept distinct
+# from `_AMPLE` so a test that only overrides
+# `auth_failure_burst`/`auth_failure_agent_burst` downward to force
+# exhaustion doesn't silently inherit `_AMPLE` as its refill rate as well.
+# What makes exhaustion *exact* is the frozen `ManualClock` `_client()`
+# wires into every limiter (see this file's module docstring): no time
+# passes between two `TestClient` calls, so no bucket refills mid-test at
+# any rate. This slow rate additionally keeps the `Retry-After` values the
+# 429 assertions read back comfortably above zero.
 _SLOW_RATE_PER_MIN = 6.0
 
 
@@ -172,6 +182,7 @@ def _client(
     client_address: tuple[str, int] = ("203.0.113.1", 51000),
     agent_slot_salt: bytes | None = None,
     agent_slot_count: int | None = None,
+    clock: ManualClock | None = None,
     **settings_overrides: object,
 ) -> TestClient:
     """A single, long-lived `TestClient` over a fresh app + registry.
@@ -181,6 +192,11 @@ def _client(
     `test_pipeline.py`'s `_build_app` convention. `client=` fixes the
     ASGI-level socket peer address Starlette's `TestClient` reports for
     every request made through this one instance.
+
+    `clock` defaults to a fresh, frozen `ManualClock(initial=0)` shared by
+    every limiter and the dedup store, exactly as `test_pipeline.py`'s
+    `_build_app` does it, so no bucket in this app refills against wall
+    time while a test is running.
 
     `agent_slot_salt`/`agent_slot_count` are ADR-0007 Decision 8's
     test-only, keyword-only parameters on `require_agent`
@@ -204,6 +220,7 @@ def _client(
     registry = AgentRegistry.from_records(
         agents if agents is not None else [_known_agent()], key=TEST_KEY
     )
+    resolved_clock = clock if clock is not None else ManualClock(initial=0)
     # Passed as explicit, individually-typed keyword arguments (rather than
     # a `dict[str, object]` + `**splat`) so mypy strict mode can check this
     # call site against `create_app`'s real per-parameter types instead of
@@ -212,11 +229,29 @@ def _client(
     # forwarding `None` here when a caller of `_client()` didn't override
     # them is equivalent to omitting the keyword entirely -- no behaviour
     # change from the previous conditional-dict version.
+    #
+    # EVERY limiter `create_app` accepts is wired to the one frozen
+    # `ManualClock` above -- not just the two failed-authentication
+    # limiters this file is about. Any limiter left to `create_app`'s own
+    # fallback gets a bare `RateLimiter()` on the `SystemClock`, so its
+    # tokens refill with wall time; that makes every "this budget is still
+    # exhausted" assertion below timing-dependent, and at the deliberately
+    # slow `_SLOW_RATE_PER_MIN` (0.1 tokens/sec) a slow enough test run
+    # hands a later request a token it should not have and turns an
+    # expected 429 back into a 401. The ~300-request flood in
+    # `TestExhaustedAgentBudgetIsNotRestoredByFloodingDistinctIds` is the
+    # worst case, and it fails only under load. A frozen clock makes
+    # exhaustion exact: nothing refills mid-test.
     app = create_app(
         _settings(**settings_overrides),
         agent_registry=registry,
         agent_slot_salt=agent_slot_salt,
         agent_slot_count=agent_slot_count,
+        rate_limiter=RateLimiter(clock=resolved_clock),
+        auth_failure_source_limiter=RateLimiter(clock=resolved_clock),
+        auth_failure_agent_limiter=RateLimiter(clock=resolved_clock),
+        observation_limiter=RateLimiter(clock=resolved_clock),
+        dedup_store=MemoryDedupStore(clock=resolved_clock),
     )
     return TestClient(app, client=client_address).__enter__()
 
