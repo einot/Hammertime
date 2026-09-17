@@ -13,6 +13,16 @@ in "What this ADR does not cover" so that nobody mistakes their absence for
 an oversight. Normative summary: pointer notes added to spec §5, §24, §26,
 §34 and §46.4.
 
+Revision note (2026-09-17): a second pass closed eight gaps that surfaced
+while the M3 test suites were written against §9 — the `EXPIRED` row of
+decision 2 (bucket liveness, not raw age), the `shard_ids` default
+(derived from `shard_count`), `get_or_create`'s treatment of
+`last_observed`, `rebucket`'s effect on the store's own geometry, empty
+environment values, malformed `HAMMERTIME_AGGREGATOR_BIND`, the recorded
+shape of `StateTransition`, and the payload `sequence` on a published
+transition. Nothing else changed; each new judgement call is listed under
+"Assumptions".
+
 ## Context
 
 Spec §5 says the window SHOULD be fixed-size buckets with a maintained
@@ -105,8 +115,25 @@ second) and `now`, in this order:
 | --- | --- | --- |
 | `FUTURE` | `window_start > now` | not applied; published to `hammertime.observations-reconciliation.v1`; `future_messages += 1` |
 | `LATE` | `not is_within_lateness(window_start, now, W, L)` i.e. `now - window_start > W + L` | not applied; published to reconciliation; `late_messages += 1` (§37) |
-| `EXPIRED` | within the lateness horizon but `not live(S, now)`, i.e. `W <= now - window_start <= W + L` | not applied; published to reconciliation; `expired_on_arrival += 1` |
-| `APPLY` | otherwise: `S` is live | applied to bucket `S` in full (ADR-0010 decision 6) |
+| `EXPIRED` | `is_within_lateness(window_start, now, W, L)` holds but `not live(S, now)`, where `S = bucket_start(window_start, B)`: the bucket containing the observation has already left the window | not applied; published to reconciliation; `expired_on_arrival += 1` |
+| `APPLY` | otherwise: `live(S, now)` | applied to bucket `S` in full (ADR-0010 decision 6) |
+
+`EXPIRED` versus `APPLY` is judged on the **bucket** `S`, never on the raw
+age of `window_start`. `FUTURE` and `LATE` remain raw-age tests on
+`window_start` itself (the lateness horizon is a policy on event age, not
+on bucket geometry). For an aligned `window_start` — the only kind ingest
+publishes (`docs/protocol/observation-v1.md`: unaligned windows are
+rejected with 400) — the two readings coincide and `EXPIRED` is exactly
+the age band `W <= now - window_start <= W + L`. For an unaligned
+`window_start` they diverge and the bucket rule wins: at `now = 1000`,
+`W = 300`, `B = 10`, `window_start = 705` has raw age 295 but `S = 700`
+and `700 + 300 <= 1000`, so it is `EXPIRED`; `window_start = 715` has
+`S = 710`, which is live, so it is `APPLY`. This is not a free choice:
+decision 4 applies an `APPLY` observation with `counter.observe(S, …)`,
+which raises `ValueError` for a dead `S`, so an age-based `classify` would
+turn a valid observation into a crash on the per-observation path. The
+four dispositions remain total and disjoint under this rule: a live `S`
+implies `now - window_start < W`, so nothing is both `LATE` and live.
 
 "Published to reconciliation" means the *original* consumed bytes under the
 *original* key are republished unchanged, so the reconciliation consumer
@@ -132,6 +159,16 @@ signatures). One `IpEntry` per tracked IP: its `IpCounter`, its `IpState`,
 and `last_observed` — the service-clock time at which an observation was
 last *applied* (not the observation's event time, and not refreshed by an
 observation that was diverted to reconciliation).
+
+`last_observed` is written in exactly two places. `get_or_create(ip,
+now=)` sets it to `now` when it **creates** an entry, so a brand-new entry
+is never immediately evictable; on an **existing** entry `get_or_create`
+does not touch it — the `now=` argument is used only for creation. The
+worker sets it after a successful `counter.observe` (decision 4). Nothing
+else refreshes it: a lookup, a re-evaluation, a `rebucket`, an expiry sweep
+or a diverted observation all leave it alone. The cap-eviction victim and
+the retention check below therefore both read "time of the last applied
+observation, or creation if none was ever applied".
 
 Retention (§26, `expiry.py::evict_idle`): an entry is evicted when
 `state is COLD and now - last_observed >= state_retention_seconds`. HOT
@@ -238,23 +275,46 @@ differs from `previous`, else `None`. It calls `evaluate_ip_state`; it
 does not restate the comparison (§30). Both the observation path and
 re-evaluation go through it.
 
+`StateTransition` is the M1 value object in `core/state/transitions.py`
+(verified on `master`, recorded in §9, not changed here): a frozen
+dataclass with two fields, `previous: IpState` and `current: IpState`, and
+two derived properties, `became_hot` (`previous is COLD and current is
+HOT`) and `became_cold` (`previous is HOT and current is COLD`). `decide`
+returns `StateTransition(previous=previous, current=<the evaluated
+state>)`. `build_event` dispatches on those properties: `became_hot`
+yields `HotIpAdded`, `became_cold` yields `HotIpRemoved`, and a transition
+with `previous is current` (which the type does not forbid but `decide`
+never produces) raises `ValueError`, because §19 has no event for a
+non-transition.
+
 `build_event(ip, transition, window_count=, config=, now=)`:
 
 | Field | `HotIpAdded` | `HotIpRemoved` |
 | --- | --- | --- |
 | `ip` | the address | the address |
 | `timestamp` | `now` as an aware UTC `datetime` (the transition time) | same |
-| `sequence` | assigned by the publisher below | same |
+| `sequence` | `0` as built — a placeholder meaning "not yet published"; `TransitionPublisher.publish` replaces it (below) | same |
 | `window_count` | the count that produced the edge | the count after the expiry/observation that produced it (0 when the whole window expired) |
 | `config_version` | the config in force at the decision | same |
 | `attributes` | `build_attributes(window_count, config)` = `{"attributes_version": 1, "weight": threshold_ratio(...)}` (§46.4, #48) | `None` — absent on the wire (§46.5: never stored) |
 
-`TransitionPublisher(producer, *, producer_id, initial_sequence=0)` wraps
-each event in an `EventEnvelope` with `agent_id=producer_id`,
-`sequence=<next>`, `event_type="HotIpAdded"|"HotIpRemoved"`,
+`TransitionPublisher(producer, *, producer_id, initial_sequence=0)` takes
+the next sequence `n`, makes a copy of the event with that sequence
+(`dataclasses.replace(event, sequence=n)` — the event passed in is frozen
+and is not mutated), and wraps the **copy** in an `EventEnvelope` with
+`agent_id=producer_id`, `sequence=n`, `event_type="HotIpAdded"|"HotIpRemoved"`,
 `config_version=event.config_version`, `timestamp=event.timestamp`,
 `subject=str(event.ip)`, encodes it with `hammertime.core.events.codec.encode`
 and publishes to `hammertime.hot-ip.v1` under `HOT_IP.key_selector(event)`.
+So on the wire and on the returned envelope `envelope.sequence ==
+envelope.payload.sequence == n`, the same relation ingest maintains between
+a `RequestObservation` envelope and its payload
+(`services/ingest/publisher.py`); the codec encodes the two fields
+separately, so the rewrite is what keeps them from disagreeing. The
+placeholder `0` that `build_event` wrote is never published. A caller that
+compares the returned `envelope.payload` to the event it passed in must
+compare through `replace(event, sequence=envelope.sequence)`, not by
+identity or plain equality.
 
 * **One sequence counter per publisher for the whole hot-ip stream**, shared
   by both event types and starting at `initial_sequence`. ADR-0003's
@@ -324,6 +384,18 @@ exactly the schema's maximum, so a clamped weight is always encodable.
    state instead of resetting it (which would mass-transition every HOT IP
    to COLD for no reason) or refusing the document (which would leave the
    aggregator's `config_version` behind the trie's and detector's).
+   `store.rebucket` also replaces the store's **own** geometry — the
+   `window_seconds`/`bucket_seconds` it was constructed with and exposes as
+   read-only properties — so every entry `get_or_create` makes afterwards
+   gets a counter of the new shape. Without that, an observation arriving
+   for a new IP after a re-evaluation would be classified under the new
+   geometry by `lateness.classify` (which reads `config`) and then
+   validated against the old one by its counter. `rebucket` validates the
+   new geometry up front, with the same rule as `IpCounter.__init__`
+   (`ValueError` unless both `> 0` and `window_seconds % bucket_seconds ==
+   0`), even when the store is empty and no counter would be rebuilt. It
+   touches only counters: `state`, `last_observed` and first-seen order are
+   preserved, and no entry is evicted, however many of its buckets die.
 3. If any of `hot_threshold`, `cold_threshold`, `window_seconds`,
    `bucket_seconds` changed, every entry is visited in store order (first
    observed first) and `decide(entry.state, counter.total, current)` is
@@ -390,6 +462,9 @@ class Disposition(StrEnum):
 def window_start_epoch(window_start: datetime) -> int          # naive datetimes are UTC
 def is_live(bucket_start: int, now: int, window_seconds: int) -> bool
 def classify(window_start: int, now: int, config: DetectionConfig) -> Disposition
+    # FUTURE: window_start > now.  LATE: not is_within_lateness(window_start, now, W, L).
+    # Otherwise S = bucket_start(window_start, config.bucket_seconds):
+    # APPLY iff is_live(S, now, W), else EXPIRED (decision 2: judged on S, not raw age)
 
 
 # hammertime.aggregator.window.counter      Spec: section 5, section 25
@@ -418,19 +493,31 @@ class StoreFullError(HammertimeError): ...        # defined here; not added to c
 class IpEntry:
     counter: IpCounter
     state: IpState              # IpState.COLD on creation
-    last_observed: int          # service-clock time of the last applied observation
+    last_observed: int          # service-clock time of the last applied observation, or of
+                                #   creation if none was applied yet (decision 3)
 
 class InMemoryWindowStore:
     def __init__(self, *, window_seconds: int, bucket_seconds: int,
                  max_tracked_ips: int = 1_000_000) -> None
+        # same geometry rule as IpCounter: ValueError unless both > 0 and W % B == 0
+    window_seconds: int; bucket_seconds: int   # read-only properties: the geometry a new
+                                               #   entry's counter gets; replaced by rebucket
     def __len__(self) -> int
     def __contains__(self, ip: Address) -> bool
     def get(self, ip: Address) -> IpEntry | None
     def get_or_create(self, ip: Address, *, now: int) -> IpEntry
-        # evicts the COLD entry with the oldest last_observed when full; StoreFullError if none
+        # existing ip: returns the same IpEntry object untouched -- last_observed is NOT
+        #   refreshed, nothing is evicted, first-seen order is unchanged; `now` is ignored
+        # new ip: IpEntry(counter=IpCounter(<store geometry>), state=COLD, last_observed=now),
+        #   appended in first-seen order; when full, first evicts the COLD entry with the
+        #   oldest last_observed (ties: the earlier-seen one); StoreFullError if no COLD entry
     def remove(self, ip: Address) -> None                          # no-op when absent
     def entries(self) -> list[tuple[Address, IpEntry]]             # snapshot in first-seen order
     def rebucket(self, *, window_seconds: int, bucket_seconds: int, now: int) -> None
+        # validates the geometry first (ValueError as __init__), then sets the store's own
+        # window_seconds/bucket_seconds and replaces every entry's counter with
+        # IpCounter.rebuild(counter.buckets(), ...) at `now`; state, last_observed and order
+        # are kept; nothing is evicted; harmless on an empty store or an unchanged geometry
     @property
     def tracked_ips(self) -> int
     @property
@@ -446,16 +533,33 @@ def evict_idle(store: InMemoryWindowStore, *, now: int, state_retention_seconds:
     # removes COLD entries with now - last_observed >= state_retention_seconds; returns how many
 
 
+# hammertime.core.state.transitions         Spec: section 19, section 30
+# (M1, already on master; recorded here because decision 5 builds on it -- not changed)
+@dataclass(frozen=True, slots=True)
+class StateTransition:
+    previous: IpState
+    current: IpState
+    @property
+    def became_hot(self) -> bool       # previous is COLD and current is HOT
+    @property
+    def became_cold(self) -> bool      # previous is HOT and current is COLD
+
+
 # hammertime.aggregator.transitions         Spec: section 6, section 19, section 30, section 46.4
 def decide(previous: IpState, window_count: int, config: DetectionConfig) -> StateTransition | None
+    # StateTransition(previous=previous, current=evaluate_ip_state(...)) iff they differ
 def build_event(ip: Address, transition: StateTransition, *, window_count: int,
                 config: DetectionConfig, now: int) -> HotIpAdded | HotIpRemoved
+    # became_hot -> HotIpAdded; became_cold -> HotIpRemoved; neither -> ValueError.
+    # sequence=0 (placeholder; the publisher assigns the real one), timestamp=now as aware UTC
 
 class TransitionPublisher:
     def __init__(self, producer: Producer, *, producer_id: str, initial_sequence: int = 0) -> None
     @property
     def next_sequence(self) -> int
     async def publish(self, event: HotIpAdded | HotIpRemoved) -> EventEnvelope[HotIpAdded | HotIpRemoved]
+        # n = next_sequence; payload = dataclasses.replace(event, sequence=n); the returned
+        # (and published) envelope has sequence == payload.sequence == n; `event` is not mutated
     async def flush(self) -> None
 
 
@@ -513,9 +617,19 @@ class AggregatorSettings:
     store_kind: str                 # HAMMERTIME_STORE_KIND          redis | memory, default redis
     redis_url: str                  # HAMMERTIME_REDIS_URL           default redis://localhost:6379/0
     shard_count: int                # HAMMERTIME_SHARD_COUNT         default 64, > 0
-    shard_ids: tuple[int, ...]      # HAMMERTIME_SHARD_IDS           default 0-63; "a-b" ranges and commas,
-                                    #   sorted, deduplicated, non-empty, each in [0, shard_count)
-    host: str; port: int            # HAMMERTIME_AGGREGATOR_BIND     default 0.0.0.0:8083
+    shard_ids: tuple[int, ...]      # HAMMERTIME_SHARD_IDS           default: every id in [0, shard_count),
+                                    #   i.e. tuple(range(shard_count)) of the *parsed* shard_count --
+                                    #   derived, never the literal "0-63", so a lowered shard_count
+                                    #   never invalidates its own default. When set: split on ",",
+                                    #   each part stripped, a part is "a" or "a-b" (a <= b, inclusive);
+                                    #   result sorted, deduplicated, non-empty, each in [0, shard_count).
+                                    #   Malformed: an empty part (so "" / "   " / "," are all rejected),
+                                    #   a non-integer, "a-" / "-b" / "-", a reversed range "7-3".
+    host: str; port: int            # HAMMERTIME_AGGREGATOR_BIND     default 0.0.0.0:8083; split on the
+                                    #   LAST ":" (rpartition); malformed unless a ":" is present, host
+                                    #   is non-empty and port is a decimal integer in [0, 65535]
+                                    #   (0 = ephemeral, integration-scenarios.md). Host is not
+                                    #   otherwise validated; "[::1]:8083" passes through as-is.
     maintenance_interval_s: float   # HAMMERTIME_AGGREGATOR_MAINTENANCE_INTERVAL_S  default 1.0, > 0
     config_poll_interval_s: float   # HAMMERTIME_CONFIG_POLL_INTERVAL_S             default 1.0, > 0
     startup_timeout_s: float        # HAMMERTIME_STARTUP_TIMEOUT_S                  default 60, > 0
@@ -524,7 +638,13 @@ class AggregatorSettings:
     commit_every: int               # HAMMERTIME_AGGREGATOR_COMMIT_EVERY            default 100, > 0
 
 def load_settings(env: Mapping[str, str] | None = None) -> AggregatorSettings
-    # env=None -> os.environ; malformed/out-of-range -> ValueError naming the variable; unknown keys ignored
+    # env=None -> os.environ; unknown keys ignored. Only a MISSING key takes its default
+    # (env.get(key, default) semantics, as services/ingest/config.py): an empty or
+    # whitespace-only value is a value, and every key -- including the free-text ones
+    # (HAMMERTIME_CONFIG_PATH, HAMMERTIME_BUS_BROKERS, HAMMERTIME_REDIS_URL) -- rejects it as
+    # malformed. Malformed/out-of-range -> ValueError whose message names the variable.
+    # No other trimming or case-folding: bus_kind/store_kind must match exactly ("KAFKA" is
+    # rejected); "> 0" keys reject 0 and negatives; the interval/timeout keys accept decimals.
 ```
 
 ## Assumptions
@@ -588,6 +708,62 @@ or a prior ADR. Push back on them individually.
   not reopen this module. Nothing in M3 reads them.
 * **`__main__.py` deferred to Epic A** rather than pulling
   `core/runtime.py` into M3 (decision 8).
+
+Added by the 2026-09-17 revision:
+
+* **`EXPIRED`/`APPLY` are judged on the bucket `S`, not on raw age.** The
+  original table gave both readings joined by "i.e."; they differ only for
+  an unaligned `window_start`, which ingest never publishes. The bucket
+  reading is the one decision 4's pipeline can survive (an age-based
+  `APPLY` with a dead `S` would make `counter.observe` raise); the raw-age
+  band `[W, W + L]` is kept only as the description for aligned starts.
+  `LATE`/`FUTURE` stay raw-age tests — no source says a lateness policy
+  should be rounded to bucket edges, and rounding them would change ADR-0002.
+* **`shard_ids` defaults to `range(shard_count)` of the parsed
+  `shard_count`.** `.env.example` writes the default as the literal `0-63`;
+  a literal default breaks the moment `HAMMERTIME_SHARD_COUNT` is lowered,
+  so the loader derives it instead. Same observable value at the defaults.
+* **`get_or_create` never refreshes `last_observed` on an existing entry;
+  `now=` seeds a new entry only.** Follows from "time of the last *applied*
+  observation" plus the worker setting it after `observe`; nothing in M3
+  calls `get_or_create` without applying, so no behaviour depends on the
+  alternative. Cap-eviction ties on `last_observed` break towards the
+  earlier-seen entry — an arbitrary but deterministic choice.
+* **`rebucket` replaces the store's own geometry and validates it up
+  front.** The alternative (rebuilt counters carry the new shape while new
+  entries get the old one) would make `classify` and `IpCounter.observe`
+  disagree for every IP first seen after a re-evaluation. Validating even
+  on an empty store is so that an invalid geometry cannot be latched
+  silently and surface only on the next `get_or_create`.
+  `window_seconds`/`bucket_seconds` are exposed as read-only store
+  properties so that this is observable without creating an entry.
+* **An empty or whitespace-only environment value is malformed for every
+  key, never "unset".** `services/ingest/config.py` already has these
+  semantics for its validated keys (`env.get(k, default)` then parse); the
+  aggregator extends the same rule to its three free-text keys, which
+  ingest passes through, because an empty broker list, Redis URL or config
+  path is never a working configuration and failing at load is what §47.1
+  asks for. Diverges from ingest only in rejecting those three.
+* **`HAMMERTIME_AGGREGATOR_BIND` follows ingest's `_parse_bind`
+  (`rpartition(":")`, non-empty host, digit-only port) plus an upper bound
+  of 65535.** The bound is not in ingest; it is the only value a port can
+  never take and costs one comparison. `0` is accepted because
+  `integration-scenarios.md` binds every service to `127.0.0.1:0`. The host
+  is not validated (bracketed IPv6 literals pass through unchanged).
+* **`build_event` raises `ValueError` for a `StateTransition` whose
+  `previous is current`.** The M1 type does not forbid constructing one
+  and `decide` never returns one; refusing it is safer than picking an
+  event type arbitrarily. `StateTransition`'s shape itself is recorded, not
+  designed, here.
+* **`build_event` writes `sequence=0` as a placeholder and
+  `TransitionPublisher.publish` rewrites it with `dataclasses.replace`.**
+  `HotIpAdded`/`HotIpRemoved` require a `sequence` and `build_event` has
+  no access to the counter; passing the sequence into `build_event` would
+  change a signature the tests already use. Rewriting is what makes
+  `envelope.sequence == payload.sequence`, the relation ingest already
+  keeps for observations; publishing the placeholder would put a constant
+  `0` on every hot-ip payload. Consequence: the envelope's `payload` is a
+  copy, not the caller's object.
 
 ## Consequences
 
