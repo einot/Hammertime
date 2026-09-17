@@ -45,8 +45,10 @@ class AggregatorMetrics:
     """
 
     observations_applied: int = 0
-    #: Undecodable bytes, a payload of the wrong type, `request_count < 1`,
-    #: or a store with no room -- never applied to a window.
+    #: Malformed -- undecodable bytes, a payload of the wrong type, an entry
+    #: count other than one, or `request_count < 1` -- which is never
+    #: republished; plus a store with no room, which is (ADR-0011 decisions
+    #: 2 and 3). Never applied to a window.
     observations_rejected: int = 0
     late_messages: int = 0
     future_messages: int = 0
@@ -59,19 +61,6 @@ class AggregatorMetrics:
     #: `apply_config` calls that actually applied a document (ADR-0009
     #: decision 6: strictly greater versions only).
     config_reloads: int = 0
-
-
-@dataclass(slots=True)
-class _MessageOutcome:
-    """Whether a decoded message must be republished, and under which cause.
-
-    A message is classified once -- `window_start` belongs to the payload, not
-    to an individual entry -- so a multi-entry payload is republished at most
-    once, however many of its entries were diverted (ADR-0011 decision 2).
-    """
-
-    disposition: Disposition | None = None
-    reconcile: bool = False
 
 
 class AggregatorWorker:
@@ -136,14 +125,20 @@ class AggregatorWorker:
     async def apply_message(self, message: ConsumedMessage) -> None:
         """Apply one consumed observation, or divert it, or reject it.
 
-        Every well-formed observation is applied to the window **or**
-        republished to `hammertime.observations-reconciliation.v1` under its
-        original key and original bytes -- never both, never neither
-        (ADR-0011 decision 2). A message that cannot be decoded, or that
-        carries a payload type other than `RequestObservation`, is counted
-        and skipped rather than retried: a poison message must not wedge a
+        A message is **well-formed** when all four of ADR-0011 decision 2's
+        rules hold, checked in this order: it decodes; its payload is a
+        `RequestObservation`; `payload.observations` carries *exactly one*
+        entry (ADR-0004 decision 2's shape, which its decision 4 grants a
+        consumer the right to assert); and that entry's `request_count >= 1`.
+
+        A well-formed message is applied to the window **or** republished to
+        `hammertime.observations-reconciliation.v1` under its original key and
+        original bytes -- exactly one of the two, never both, never neither. A
+        message that fails any rule is *rejected* before its lateness is
+        judged: `observations_rejected += 1`, one warning, no disposition
+        counter, and neither topic. A poison message must not wedge a
         partition, and it is not a well-formed observation the aggregator
-        declined, so it reaches neither topic.
+        declined, so it has nothing to reconcile.
         """
 
         async with self._lock:
@@ -173,29 +168,44 @@ class AggregatorWorker:
             )
             return
 
+        # ADR-0011 decision 2 rule 3: exactly one entry. Every entry other than
+        # the key's IP was routed to this shard by a key that is not its own,
+        # so a multi-entry payload is rejected whole rather than partly
+        # applied -- which is also what makes "applied XOR reconciled" true,
+        # since a later entry meeting a full store would otherwise republish a
+        # message whose first entry had already been counted.
+        if len(payload.observations) != 1:
+            self.metrics.observations_rejected += 1
+            logger.warning(
+                "discarding an observation on %s carrying %d entries: exactly one is required",
+                message.topic,
+                len(payload.observations),
+            )
+            return
+
+        entry = payload.observations[0]
+        # ADR-0011 decision 2 rule 4: a non-positive delta carries no count, so
+        # it is refused before the lateness policy is consulted -- ingest never
+        # publishes one (ADR-0008), but the aggregator must not trust that.
+        if entry.request_count < 1:
+            self.metrics.observations_rejected += 1
+            logger.warning(
+                "discarding an observation for %s on %s: request_count %d is not positive",
+                entry.ip,
+                message.topic,
+                entry.request_count,
+            )
+            return
+
         window_start = window_start_epoch(payload.window_start)
         disposition = classify(window_start, now, self._config)
+        if disposition is not Disposition.APPLY:
+            self._count_disposition(disposition)
+            await self._reconcile(message)
+            return
+
         start = bucket_start(window_start, self._config.bucket_seconds)
-        outcome = _MessageOutcome()
-
-        for entry in payload.observations:
-            # ADR-0011 decision 4: a non-positive delta is refused before the
-            # lateness policy is consulted -- ingest never publishes one
-            # (ADR-0008), but the aggregator must not trust that.
-            if entry.request_count < 1:
-                self.metrics.observations_rejected += 1
-                continue
-            if disposition is not Disposition.APPLY:
-                outcome.disposition = disposition
-                outcome.reconcile = True
-                continue
-            applied = await self._apply_entry(entry.ip, entry.request_count, start=start, now=now)
-            if not applied:
-                outcome.reconcile = True
-
-        if outcome.disposition is not None:
-            self._count_disposition(outcome.disposition)
-        if outcome.reconcile:
+        if not await self._apply_entry(entry.ip, entry.request_count, start=start, now=now):
             await self._reconcile(message)
 
     async def _apply_entry(self, ip: Address, delta: int, *, start: int, now: int) -> bool:
@@ -329,12 +339,18 @@ class AggregatorWorker:
         the trie: the producer is flushed and only then is the consumer
         position committed, so a committed offset never lies ahead of a
         transition that has not reached the log. A final flush and commit run
-        on the way out, whichever way this returns (ADR-0009 decision 7).
+        on the way out -- except on cancellation, which is abort and not
+        shutdown: `CancelledError` propagates, nothing is flushed or
+        committed, and the uncommitted batch is redelivered at least once
+        (ADR-0011 decision 4, ADR-0009 decision 7's amendment). Whichever way
+        this leaves, the worker is left so that a concurrent or later `stop()`
+        returns rather than waits forever.
         """
 
         self._running = True
         self._finished.clear()
         since_commit = 0
+        cancelled = False
         stop_waiter: asyncio.Future[Any] = asyncio.ensure_future(self._stop_requested.wait())
         try:
             iterator = await consumer.subscribe(topic)
@@ -347,13 +363,27 @@ class AggregatorWorker:
                 if since_commit >= self._commit_every:
                     await self._flush_and_commit(consumer)
                     since_commit = 0
+        except asyncio.CancelledError:
+            # Cancelling this task is abort, not shutdown: the error is
+            # re-raised untouched and the final drain below is skipped
+            # (ADR-0011 decision 4, ADR-0009 decision 7's amendment).
+            cancelled = True
+            raise
         finally:
             stop_waiter.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await stop_waiter
-            await self._flush_and_commit(consumer)
-            self._running = False
-            self._finished.set()
+            try:
+                # Skipping the commit is always safe: at-least-once redelivery
+                # re-applies the uncommitted batch (ADR-0003), while a commit
+                # taken here could lie ahead of an unpublished transition.
+                if not cancelled:
+                    await self._flush_and_commit(consumer)
+            finally:
+                # Set even when the final flush is itself cancelled, so a
+                # concurrent stop() can never wait forever.
+                self._running = False
+                self._finished.set()
 
     async def _next_message(
         self, iterator: AsyncIterator[ConsumedMessage], stop_waiter: "asyncio.Future[Any]"
@@ -365,16 +395,31 @@ class AggregatorWorker:
         cancelled -- but a message it had already produced in the same tick is
         still returned, so stopping can never drop a message whose consumer
         position has already advanced.
+
+        Cancelling the *reader* is this method's own business; cancelling the
+        task running `run()` is not, and the two are indistinguishable to an
+        `except CancelledError` around the read. So there is none: the
+        reader's outcome is inspected rather than awaited, which reads a
+        cancelled read as `None` while letting an external cancellation
+        propagate (ADR-0011 decision 4). Either way no pending `anext` task is
+        left behind.
         """
 
         reader = asyncio.ensure_future(anext(iterator))
         waiters: set[asyncio.Future[Any]] = {reader, stop_waiter}
-        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-        if not reader.done():
-            reader.cancel()
         try:
-            return await reader
-        except (asyncio.CancelledError, StopAsyncIteration):
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            if not reader.done():
+                reader.cancel()
+                await asyncio.wait({reader})
+        except asyncio.CancelledError:
+            reader.cancel()
+            raise
+        if reader.cancelled():
+            return None
+        try:
+            return reader.result()
+        except StopAsyncIteration:
             return None
 
     async def _flush_and_commit(self, consumer: Consumer) -> None:

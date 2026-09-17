@@ -40,7 +40,13 @@ class IpEntry:
 
 
 class InMemoryWindowStore:
-    """One `IpEntry` per tracked IP, in first-seen order."""
+    """One `IpEntry` per tracked IP, in first-seen order.
+
+    The geometry must satisfy `IpCounter`'s rule (both positive,
+    `window_seconds % bucket_seconds == 0`) and `max_tracked_ips` must be at
+    least 1; both are refused at construction with `ValueError` (ADR-0011
+    section 9).
+    """
 
     __slots__ = ("_bucket_seconds", "_entries", "_max_tracked_ips", "_window_seconds")
 
@@ -55,6 +61,12 @@ class InMemoryWindowStore:
         # could take would otherwise fail only on the first get_or_create,
         # long after the operator could act on it.
         validate_geometry(window_seconds, bucket_seconds)
+        # ADR-0011 decision 3 / section 9: a cap of 0 (or negative) builds a
+        # store on which every first get_or_create raises StoreFullError, and
+        # decision 4 maps that to a reconciliation publish -- an aggregator
+        # that silently diverts all of its traffic while appearing healthy.
+        if max_tracked_ips < 1:
+            raise ValueError(f"max_tracked_ips must be at least 1, got {max_tracked_ips}")
         self._window_seconds = window_seconds
         self._bucket_seconds = bucket_seconds
         self._max_tracked_ips = max_tracked_ips
