@@ -26,7 +26,7 @@ from fastapi import FastAPI
 from hammertime.bus.memory import InMemoryBus
 from hammertime.core.config.loader import load as load_detection_config
 from hammertime.core.config.models import DetectionConfig
-from hammertime.core.runtime import ConfigPoller, Readiness, config_poll_interval_s
+from hammertime.core.runtime import ConfigPoller, Readiness
 from hammertime.core.telemetry.logging import get_logger
 from hammertime.core.time.clock import Clock, SystemClock
 from hammertime.ingest.app import IngestState, create_app
@@ -89,7 +89,7 @@ class IngestService:
             detection_config,
             apply=self._apply_config,
             poll_interval_s=(
-                config_poll_interval_s() if poll_interval_s is None else poll_interval_s
+                settings.config_poll_interval_s if poll_interval_s is None else poll_interval_s
             ),
             logger=self._log,
         )

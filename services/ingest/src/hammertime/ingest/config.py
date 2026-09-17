@@ -1,6 +1,6 @@
 """Service settings: bind address, limits, and auth/rate-limit/bus/store wiring.
 
-Spec: section 4, section 36
+Spec: section 4, section 36, section 47
 
 Everything `app.py`'s lifespan needs to construct the `AgentRegistry`,
 `RateLimiter`, `DedupStore`, and bus `Producer` (issue #32) is read here.
@@ -32,6 +32,9 @@ _DEFAULT_TRUSTED_PROXY_HOPS = 0
 # --- ADR-0008: observation-scaled rate limiting (spec section 36.6) --------
 _DEFAULT_OBSERVATION_RATE_LIMIT_EPS = 2000.0
 _DEFAULT_OBSERVATION_BURST = 10_000
+
+# --- ADR-0009: process lifecycle (spec section 47) -------------------------
+_DEFAULT_CONFIG_POLL_INTERVAL_S = 1.0
 
 _ALLOWED_BUS_KINDS = frozenset({"kafka", "memory"})
 _ALLOWED_STORE_KINDS = frozenset({"redis", "memory"})
@@ -88,6 +91,12 @@ class IngestSettings:
     #: capacity, entries. MUST be >= max_observations (enforced by
     #: `load_settings`).
     observation_burst: int = _DEFAULT_OBSERVATION_BURST
+    #: HAMMERTIME_CONFIG_POLL_INTERVAL_S: how often the detection config
+    #: document is re-read (ADR-0009 decision 6, spec section 47.3). A
+    #: settings field rather than a direct `os.environ` read so that an
+    #: in-process test driving the service off an assembled environment
+    #: controls it the same way it controls every other knob.
+    config_poll_interval_s: float = _DEFAULT_CONFIG_POLL_INTERVAL_S
 
 
 def _parse_bind(bind: str) -> tuple[str, int]:
@@ -218,4 +227,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
             ),
         ),
         observation_burst=observation_burst,
+        config_poll_interval_s=_parse_positive_number(
+            "HAMMERTIME_CONFIG_POLL_INTERVAL_S",
+            source.get("HAMMERTIME_CONFIG_POLL_INTERVAL_S", str(_DEFAULT_CONFIG_POLL_INTERVAL_S)),
+        ),
     )
