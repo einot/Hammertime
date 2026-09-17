@@ -1,7 +1,7 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted; amended 2026-09-17 three times (see "Amendment 1",
-"Amendment 2" and "Amendment 3" at the end. Amendment 1 records the
+Status: accepted; amended 2026-09-17 four times (see "Amendment 1",
+"Amendment 2", "Amendment 3" and "Amendment 4" at the end. Amendment 1 records the
 partition count of `hammertime.observations.v1` changing from 32 to 128 and
 pins two edge cases decisions 1 and 5 left ambiguous. Amendment 2 pins eight
 edge cases of the window store, the counter and the lateness classifier that
@@ -9,7 +9,9 @@ surfaced while the M3 window/lateness tests were written. Amendment 3 pins
 three interfaces the M3 worker/transitions tests had to assume — where the
 configuration version gate lives and what `apply_config` returns, the Python
 surface of `AggregatorMetrics`, and what `EmittedTransition.transition` is —
-plus two smaller points raised alongside them. All three amendments rewrite
+plus two smaller points raised alongside them. Amendment 4 pins the order of
+`observe`'s alignment and liveness checks and completes Amendment 3's
+follow-up list. All four amendments rewrite
 decision bodies in place to state the rule now in force directly; each
 amendment's opening lists every such edit, and quotes the superseded
 wording, so the before/after is recoverable from this document alone)
@@ -191,8 +193,11 @@ Ring semantics (`B = bucket_seconds`, `N = bucket_count`, `W = B * N`;
   arrives and leaves the window at exactly `now = S + W`.
 * `observe(S, delta, now)`: `S % B != 0` is a `ValueError` (the caller
   floors; A9) and `delta < 0` is a `ValueError`; neither changes anything.
-  If `S` is not live — including a future `S` — return `False` and change
-  nothing. Otherwise, if the slot holds an older bucket, subtract that
+  The alignment check comes **before** the liveness test: an unaligned `S`
+  raises for every `now`, whether or not the bucket it falls in would be
+  live (A17). If an aligned `S` is not live — including a future `S` —
+  return `False` and change nothing. Otherwise, if the slot holds an older
+  bucket, subtract that
   bucket's count from `total` and reset the slot to `S`; then add `delta`
   to the slot and to `total`; return `True`. `delta == 0` is applied like
   any other delta (returns `True`; a stale occupant of the slot is still
@@ -270,7 +275,10 @@ class ShardWindow:
   with it on the next new IP exactly as with any other all-HOT store.
 * `observe(ip, bucket_start, delta)` requires `bucket_start` to be a
   multiple of `config.bucket_seconds` (the worker floors it, decision 3;
-  the counter raises `ValueError` otherwise). It creates the entry for an
+  the counter raises `ValueError` otherwise). That check is the first
+  thing the call does — before the liveness test and before any entry is
+  created: an unaligned `bucket_start` raises whatever the clock says and
+  leaves the store untouched (A17). It creates the entry for an
   untracked IP (state `COLD`, empty ring), applies the delta with `now =
   clock.now()`, sets `last_seen = max(last_seen, bucket_start)`, and
   returns the change — for `delta == 0` as well (A8): a zero delta creates
@@ -2118,6 +2126,11 @@ pipeline, is the natural place to decide whether every component takes a
     `None` and performs no version comparison; the gate is
     `ConfigPoller.poll_once()`'s (ADR-0009 A5), and `reload_config()` on
     the service is that poll.
+  * Module docstring ASSUMPTION 2 (lines 33-35): `reevaluate_shard`'s
+    `int` return is the `transitions` field of the worker's
+    `config_reevaluated` record, not of `config_applied` — after A12 that
+    name is the poller's record, and ADR-0009 A7 gives it `path`,
+    `config_version` and `previous_config_version` only.
   * `test_the_version_in_force_afterwards_is_the_new_one` (lines 272-284):
     drop `returned = ...` and the two `returned.*` assertions (278-281);
     keep the `worker.config.*` and window assertions. May assert
@@ -2134,9 +2147,11 @@ pipeline, is the natural place to decide whether every component takes a
     without a service-level construction seam, and it is also the static
     demonstration that `apply_config` is assignable to the hook (mypy runs
     strict over the tests). `test_a_descriptive_only_change_is_adopted_and_produces_no_transitions`
-    (358-377): drop the two `returned.*` assertions (372-373); keep the
-    rest; the class docstring (322-323) should say which tests go through
-    the poller.
+    (358-377): drop the `returned = ...` assignment (370) and the two
+    `returned.*` assertions (372-373) — `await worker.apply_config(v4)`
+    stays as a bare statement, or as `assert await worker.apply_config(v4)
+    is None`; keep the rest; the class docstring (322-323) should say
+    which tests go through the poller.
 * `test-author`, optional under A13 and A14: assert
   `metrics.get("window_evictions", shard=0, reason="retention") == 1` and
   `metrics.get("shards_claimed") == 1` on a running worker after a
@@ -2146,3 +2161,164 @@ pipeline, is the natural place to decide whether every component takes a
   unknown name or a wrong label set.
 * Open, not ruled (A12's second assumption): whether a failed
   re-evaluation pass should be atomic.
+
+## Amendment 4 (2026-09-17) — `observe` checks alignment before liveness; Amendment 3's follow-up list completed
+
+Why: two `supervisor` reviews. The first, of the T4b test pass (commit
+`814620e`), found that every one of the five new alignment tests in
+`test_window.py` (`TestIpCounterAlignment`, lines 295-316, and the two
+`ShardWindow` tests at lines 603-622) passes an `S` that is unaligned *and*
+not live — `S = BASE + offset` with the clock at `BASE`, so A4's
+`bucket_start(now, B) - S` is negative — and expects `ValueError`. A4 says a
+non-live `S` returns `False`/`None` and changes nothing; A9 says an
+unaligned `S` raises. Both rules apply to those inputs and neither
+amendment said which is tested first, so the tests were pinning an order
+the ADR had not stated. The user ruled that the ADR should pin the order
+rather than the tests be loosened; A17 does that. The second review, of
+Amendment 3, found its *Follow-ups* list short by two items of test text
+that follow from A12's `config_reevaluated` rename; they are added to that
+list in place, and the edit is recorded below.
+
+This amendment rules on one point and nothing else. Every edit outside
+this section, with the superseded wording quoted:
+
+* **Decision 2, ring semantics, `observe` bullet.** Was: "`observe(S,
+  delta, now)`: `S % B != 0` is a `ValueError` (the caller floors; A9) and
+  `delta < 0` is a `ValueError`; neither changes anything. If `S` is not
+  live — including a future `S` — return `False` and change nothing.
+  Otherwise, ..." Now inserts, after "neither changes anything.", the
+  sentence "The alignment check comes **before** the liveness test: an
+  unaligned `S` raises for every `now`, whether or not the bucket it falls
+  in would be live (A17)." and reads "If an aligned `S` is not live ..."
+  (A17). The rest of the bullet is unchanged.
+* **Decision 2, `ShardWindow` `observe` bullet.** Was: "`observe(ip,
+  bucket_start, delta)` requires `bucket_start` to be a multiple of
+  `config.bucket_seconds` (the worker floors it, decision 3; the counter
+  raises `ValueError` otherwise). It creates the entry for an untracked IP
+  ..." Now inserts, after "otherwise).", the sentence "That check is the
+  first thing the call does — before the liveness test and before any
+  entry is created: an unaligned `bucket_start` raises whatever the clock
+  says and leaves the store untouched (A17)." (A17). The rest of the
+  bullet is unchanged.
+* **Amendment 3, *Follow-ups*, the `test_reevaluate.py` item.** Gained a
+  second sub-bullet, between the ASSUMPTION 1 and
+  `test_the_version_in_force_afterwards_is_the_new_one` sub-bullets:
+  "Module docstring ASSUMPTION 2 (lines 33-35): `reevaluate_shard`'s `int`
+  return is the `transitions` field of the worker's `config_reevaluated`
+  record, not of `config_applied` — after A12 that name is the poller's
+  record, and ADR-0009 A7 gives it `path`, `config_version` and
+  `previous_config_version` only." The
+  `test_a_descriptive_only_change_is_adopted_and_produces_no_transitions`
+  instruction — was: "(358-377): drop the two `returned.*` assertions
+  (372-373); keep the rest; the class docstring (322-323) should say which
+  tests go through the poller." — now: "(358-377): drop the `returned =
+  ...` assignment (370) and the two `returned.*` assertions (372-373) —
+  `await worker.apply_config(v4)` stays as a bare statement, or as `assert
+  await worker.apply_config(v4) is None`; keep the rest; the class
+  docstring (322-323) should say which tests go through the poller." Both
+  are consequences of A12 as already ruled; neither is a new ruling, and
+  the line numbers are those of `test_reevaluate.py` at commit `abaf12b`,
+  verified against the working tree.
+* **Status line.** Marked amended four times, with a one-sentence summary
+  of this amendment.
+
+Decisions 1 and 3-9, the Assumptions list, Consequences, Sources,
+Amendments 1 and 2, and every item of Amendment 3 other than the follow-up
+list are untouched. Before closing this list, `docs/spec/`, `docs/adr/` and
+`docs/protocol/` were grepped for restatements of `observe`'s rejection
+behaviour (`ValueError`, `not live`, `is_live`, `aligned`, `unaligned`,
+`multiple of`). Findings: the spec's §5 ADR-0011 note restates the
+liveness rule and that a non-live delta is diverted rather than applied,
+but says nothing about the counter's `ValueError` or the order of checks;
+`docs/spec/integration-scenarios.md` §2.4 restates the protocol's
+alignment requirement and the counting rule, not the store's contract;
+`docs/protocol/observation-v1.md` states the agent-facing "MUST be
+aligned" requirement and ingest's `400`, which A9 left unchanged and this
+amendment does not touch; ADR-0010 decision 6 lands the delta in
+`bucket_start(window_start, bucket_seconds)` and says nothing about
+rejection. No ADR other than this one names `IpCounter.observe` or
+`ShardWindow.observe`. So no text outside this ADR restates the rule A17
+pins, and `docs/spec/hammertime_spec_1.md`, `docs/spec/README.md` and
+`docs/protocol/` are untouched. No `CHANGES` entry: the order of two
+in-process precondition checks is not something an agent or operator can
+observe.
+
+### A17. `observe` checks alignment before liveness, in `IpCounter` and in `ShardWindow`
+
+**Classification: (b), genuinely unspecified and ruled now.** A9 states
+the `ValueError` and A4 states the refusal, and each says what happens for
+its own input, but for an `S` that is both unaligned and not live the two
+rules both apply and no sentence ordered them. A9's *purpose* points one
+way — its stated reason for the `ValueError` is that flooring in the store
+"would hide a worker that forgot to", and a check that runs only after the
+liveness test would hide exactly that worker whenever the unaligned `S` is
+also expired or future — but an implementation that tested liveness first
+would not have contradicted any sentence of decision 2 as it stood, so
+this is a ruling, not a recovery of one already made.
+
+Ruling (decision 2 now says this, in both `observe` bullets):
+
+* `IpCounter.observe(S, delta, now)` tests `S % B != 0` before it tests
+  whether `S` is live. An unaligned `S` therefore raises `ValueError` for
+  every `now` — past, present or future relative to `S` — and changes
+  nothing. The `False` return of A4 is reserved for an *aligned* `S` that
+  is not live.
+* `ShardWindow.observe(ip, bucket_start, delta)` does the same: the
+  alignment check (against the window's `config.bucket_seconds`) is the
+  first thing the call does, before the liveness test and before any
+  entry is created. An unaligned `bucket_start` raises `ValueError`
+  whatever the clock says, creates no entry, refreshes no `last_seen` and
+  leaves the store untouched. The `None` return of A4 is reserved for an
+  aligned `bucket_start` that is not live. Decision 2 already put entry
+  creation after the liveness test ("no entry created ... when the bucket
+  is not live"), so the full sequence is: alignment, liveness, create the
+  entry if needed, apply the delta, refresh `last_seen`.
+
+Why alignment first: the alignment check is a property of the arguments
+alone, and the liveness test is a property of the arguments *and the
+clock*. Putting the clock-independent check first means the set of calls
+that raise does not depend on `now`, which is the only order under which
+A9's "caller bug" framing holds — a precondition violation that is
+reported only when the clock happens to make the bucket live is a
+precondition that is not enforced. A worker that forgot to floor (A9)
+would, under the other order, be caught only for observations whose bucket
+was still live, and silently refused for the rest; a lagging aggregator
+processes many of the rest. The other order also has no advantage to set
+against that: it saves nothing, since both checks are O(1) and the
+alignment test is a single modulo.
+
+Assumptions (push back individually):
+
+* **The order is contract, not an implementation detail.** That is what
+  the user ruled in asking for the ADR to pin it rather than the tests to
+  avoid it; the T4b tests may and do depend on it.
+* **The same order in both classes.** Nothing required the store to
+  mirror the counter, but the two `observe` methods share A4's and A9's
+  rules and a caller sees one contract; a store that could return `None`
+  for an input its own counter would raise on would be a second rule in
+  disguise.
+* **Scope: the `delta < 0` check is not ordered here.** Decision 2 lists a
+  third rejection, `delta < 0` is a `ValueError`. This item says nothing
+  about whether that check precedes or follows the liveness test — the
+  question raised was alignment versus liveness, and the shipped tests
+  that use a negative delta (`test_window.py` lines 172-182) do so with a
+  live `S`, so nothing depends on it. It is named so that a reader does
+  not infer an ordering for it from this item.
+* **"Whatever the clock says" includes a `now` earlier than any bucket.**
+  No test or implementation was found that could observe a difference,
+  but the rule is stated without a carve-out so that none arises.
+
+Shipped code: C4's `IpCounter` / `ShardWindow` (commit `90276eb`, on a
+branch not checked out here; `window/counter.py` and `window/store.py` in
+this working tree are docstring-only stubs) could not be read for this
+item. The top-level session reports that the five T4b tests pass against
+it, which is possible only under this order, so the ruling ratifies C4's
+behaviour rather than changing it; the `coder` brief that lands C4 should
+cite A17 in the two `observe` docstrings. Shipped tests: every `observe`
+call in `test_window.py`, `test_hysteresis.py`, `test_reevaluate.py` and
+`test_sharding.py` was read; the only unaligned bucket starts are the five
+T4b tests above, all expecting `ValueError`, all now ratified, and the two
+hypothesis strategies (`_LIVE_BUCKET`, `test_slot_reuse_needs_no_explicit_expire_call`)
+generate aligned buckets only. **No committed test is invalidated.** No
+follow-up test is called for: the T4b tests already demonstrate the
+ruled order, on both classes.
