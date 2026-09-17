@@ -934,10 +934,15 @@ This minimizes distributed coordination for individual IP state.
 > its own. Ownership is the `hammertime-aggregator` consumer group's partition
 > assignment (ADR-0009 decision 9), delivered through the bus's assignment
 > listener; `HAMMERTIME_SHARD_IDS=auto` lets the group coordinator assign,
-> an explicit set pins a member to those partitions. The sliding counters are
+> an explicit set pins a member to those partitions (an explicitly empty set
+> is a configuration error, ADR-0011 Amendment 1). The sliding counters are
 > process-local; the set of HOT IPs per shard is kept in a durable state
 > store and inherited on claim, so a restart or handover never leaves the
-> trie holding an IP no owner remembers.
+> trie holding an IP no owner remembers. Because the partitioner maps an IP
+> to a partition as a function of the partition count, that count is the
+> ceiling on aggregator parallelism and is fixed for the life of a
+> deployment: changing it once the topic carries data remaps every IP and
+> invalidates the persisted per-shard HOT sets (ADR-0011 Amendment 1, A1).
 
 ---
 
