@@ -239,12 +239,16 @@ def _build(
     clock: ManualClock | None = None,
     commit_every: int = 100,
     bus: InMemoryBus | None = None,
+    max_tracked_ips: int = 1_000_000,
 ) -> tuple[AggregatorWorker, InMemoryBus, ManualClock]:
     """An `AggregatorWorker` over an in-memory store, bus and `ManualClock`.
 
     ADR-0011 section 9's constructor, with the store's geometry taken from
     the same `DetectionConfig` the worker is given (ADR-0011 consequences:
-    that is how `build_service` will compose it).
+    that is how `build_service` will compose it). `max_tracked_ips` is the
+    store's hard cap (decision 3; section 9's default is 1 000 000), exposed
+    here so a test can drive the full-store path without restating the
+    geometry the config already fixes.
     """
 
     resolved_config = config if config is not None else _config()
@@ -255,6 +259,7 @@ def _build(
         store=InMemoryWindowStore(
             window_seconds=resolved_config.window_seconds,
             bucket_seconds=resolved_config.bucket_seconds,
+            max_tracked_ips=max_tracked_ips,
         ),
         producer=resolved_bus.producer(),
         producer_id=PRODUCER_ID,
@@ -717,6 +722,9 @@ class TestObservationDisposition:
     _FUTURE = Address.parse("10.40.0.2")
     _EXPIRED = Address.parse("10.40.0.3")
     _APPLIED = Address.parse("10.40.0.4")
+    _REJECTED = Address.parse("10.40.0.5")
+    _FULL_A = Address.parse("10.40.0.6")
+    _FULL_B = Address.parse("10.40.0.7")
 
     async def test_an_observation_beyond_the_lateness_horizon_is_reconciled(self) -> None:
         # W + L = 330; an age of 400 is LATE.
@@ -806,6 +814,95 @@ class TestObservationDisposition:
         assert len(_records(bus, OBSERVATIONS_RECONCILIATION.name)) == 3
         assert metrics.observations_rejected == 0
 
+    async def test_a_full_store_diverts_to_reconciliation_without_losing_what_was_applied(
+        self,
+    ) -> None:
+        # ADR-0011 decision 3: `get_or_create` on a full store with no COLD
+        # entry to evict raises `StoreFullError`, "which the worker maps to a
+        # reconciliation publish and `observations_rejected += 1`". Decision 2
+        # (third pass) states the consequence honestly: this is the one message
+        # that is deliberately double-labelled, so it is the only case in which
+        # `applied + reconciled + rejected` exceeds the messages consumed.
+        worker, bus, _clock = _build(max_tracked_ips=1)
+        first = _message(self._FULL_A, 1200, window_start=T0, sequence=1)
+        second = _message(self._FULL_B, 100, window_start=T0, sequence=2)
+
+        await worker.apply_message(first)
+        await worker.apply_message(second)
+
+        assert worker.metrics.observations_rejected == 1
+        assert worker.metrics.reconciliation_published == 1
+        # The diverted message reaches reconciliation as the *original* bytes
+        # under the *original* key (decision 2), byte for byte.
+        assert _records(bus, OBSERVATIONS_RECONCILIATION.name) == [(second.key, second.value)]
+        assert self._FULL_B not in worker.store
+        assert worker.store.get(self._FULL_B) is None
+        # Nothing already applied is rolled back or re-counted: A keeps the
+        # state its own observation earned.
+        entry = worker.store.get(self._FULL_A)
+        assert entry is not None
+        assert entry.state is IpState.HOT
+        assert worker.metrics.observations_applied == 1
+        assert worker.metrics.cold_to_hot_transitions == 1
+        assert len(_records(bus, HOT_IP.name)) == 1
+
+    async def test_the_accounting_identity_holds_over_a_mixed_batch(self) -> None:
+        # ADR-0011 decision 2's accounting paragraph: "observations_applied +
+        # reconciliation_published + observations_rejected == messages
+        # consumed holds exactly over any run in which the store never
+        # filled". Seven messages, one of each shape the pipeline knows:
+        # LATE, FUTURE and EXPIRED are reconciled (decision 2's table);
+        # undecodable, empty-list and zero-delta are rejected before
+        # `classify` is reached (decision 2's well-formedness rules 1, 3, 4);
+        # exactly one is applied.
+        worker, bus, _clock = _build()
+        empty_source = _message(self._REJECTED, 100, window_start=T0, sequence=6)
+        zero_source = _message(self._REJECTED, 1, window_start=T0, sequence=7)
+        undecodable = _consumed(
+            str(self._REJECTED).encode("utf-8"), b"\x00\x01\xffnot json at all", offset=5
+        )
+        messages = [
+            _message(self._LATE, 100, window_start=T0 - 400, sequence=1),
+            _message(self._FUTURE, 100, window_start=T0 + 10, sequence=2),
+            _message(self._EXPIRED, 100, window_start=T0 - 300, sequence=3),
+            _message(self._APPLIED, 100, window_start=T0 - 290, sequence=4),
+            undecodable,
+            _consumed(
+                empty_source.key or b"",
+                _tamper_nested(empty_source.value, path=("payload", "observations"), value=[]),
+                offset=6,
+            ),
+            _consumed(
+                zero_source.key or b"",
+                _tamper_nested(
+                    zero_source.value,
+                    path=("payload", "observations", 0, "request_count"),
+                    value=0,
+                ),
+                offset=7,
+            ),
+        ]
+        for message in messages:
+            await worker.apply_message(message)
+
+        metrics = worker.metrics
+        accounted = (
+            metrics.observations_applied
+            + metrics.reconciliation_published
+            + metrics.observations_rejected
+        )
+        assert accounted == len(messages) == 7
+        assert metrics.observations_applied == 1
+        assert metrics.reconciliation_published == 3
+        assert metrics.observations_rejected == 3
+        # The disposition counters move only for well-formed messages, so the
+        # three rejects contribute to none of them.
+        assert metrics.late_messages == 1
+        assert metrics.future_messages == 1
+        assert metrics.expired_on_arrival == 1
+        assert len(_records(bus, OBSERVATIONS_RECONCILIATION.name)) == 3
+        assert self._REJECTED not in worker.store
+
 
 # ---------------------------------------------------------------------------
 # 6. Rejects (ADR-0011 decision 4: counted, skipped, never reconciled).
@@ -814,6 +911,7 @@ class TestObservationDisposition:
 
 class TestWorkerRejects:
     _IP = Address.parse("10.50.0.1")
+    _OTHER = Address.parse("10.50.0.2")
 
     async def test_undecodable_bytes_are_counted_and_published_nowhere(self) -> None:
         worker, bus, _clock = _build()
@@ -873,6 +971,97 @@ class TestWorkerRejects:
         assert worker.store.get(self._IP) is None
         assert _records(bus, HOT_IP.name) == []
         assert _records(bus, OBSERVATIONS_RECONCILIATION.name) == []
+
+    async def test_an_empty_observation_list_is_rejected_before_lateness_is_judged(self) -> None:
+        # ADR-0011 decision 2 rule 3 (third pass): an empty `observations`
+        # list is malformed -- `schemas/observation.v1.json` declares
+        # `minItems: 1` -- so it is `observations_rejected += 1` and nothing
+        # else. Decision 4 puts the validity checks *before* `classify`, so
+        # this message's LATE `window_start` (age 400 > W + L = 330) must move
+        # no disposition counter and reach neither topic: the old per-entry
+        # loop let such a message move no counter at all, which is the hole
+        # the third pass closed.
+        worker, bus, _clock = _build()
+        late = _message(self._IP, 5000, window_start=T0 - 400, sequence=1)
+        tampered = _tamper_nested(late.value, path=("payload", "observations"), value=[])
+
+        await worker.apply_message(_consumed(late.key or b"", tampered))
+
+        assert worker.metrics.observations_rejected == 1
+        assert worker.metrics.late_messages == 0
+        assert worker.metrics.reconciliation_published == 0
+        assert worker.metrics.observations_applied == 0
+        assert _records(bus, HOT_IP.name) == []
+        assert _records(bus, OBSERVATIONS_RECONCILIATION.name) == []
+        assert self._IP not in worker.store
+
+    async def test_a_multi_entry_payload_is_rejected_whole(self) -> None:
+        # ADR-0011 decision 2 rule 3 (third pass): exactly one entry, which is
+        # ADR-0004 decision 2's shape and ADR-0004 decision 4's granted
+        # assertion. The earlier "apply entry by entry" reading is reversed
+        # because it could apply the first entry and then republish the whole
+        # message on a later one -- applied *and* reconciled -- and because
+        # every entry other than the key's IP was routed here by a key that is
+        # not its own (section 20's one-owner rule). Either entry below would
+        # go HOT on its own; nothing is partially applied.
+        worker, bus, _clock = _build()
+        started = datetime.fromtimestamp(T0, UTC)
+        payload = RequestObservation(
+            agent_id=AGENT_ID,
+            sequence=1,
+            window_start=started,
+            window_seconds=10,
+            observations=(
+                Observation(ip=self._IP, request_count=1200),
+                Observation(ip=self._OTHER, request_count=1200),
+            ),
+        )
+        envelope = EventEnvelope(
+            agent_id=AGENT_ID,
+            sequence=1,
+            event_type="RequestObservation",
+            config_version=1,
+            timestamp=started,
+            payload=payload,
+            subject=str(self._IP),
+        )
+
+        await worker.apply_message(_consumed(str(self._IP).encode("utf-8"), encode(envelope)))
+
+        assert worker.metrics.observations_rejected == 1
+        assert worker.metrics.observations_applied == 0
+        assert worker.metrics.reconciliation_published == 0
+        assert self._IP not in worker.store
+        assert self._OTHER not in worker.store
+        assert worker.store.get(self._IP) is None
+        assert worker.store.get(self._OTHER) is None
+        assert _records(bus, HOT_IP.name) == []
+        assert _records(bus, OBSERVATIONS_RECONCILIATION.name) == []
+
+    async def test_a_late_message_with_a_zero_delta_is_only_rejected(self) -> None:
+        # ADR-0011 decision 4 (third pass), stated so nobody has to guess it:
+        # "a LATE message carrying `request_count == 0` is
+        # `observations_rejected += 1` and nothing else -- no `late_messages`,
+        # no reconciliation record". Validity precedes disposition, and
+        # republishing a zero delta would hand the reconciliation consumer a
+        # message it must reject by the same rule.
+        worker, bus, _clock = _build()
+        late = _message(self._IP, 1, window_start=T0 - 400, sequence=1)
+        tampered = _tamper_nested(
+            late.value,
+            path=("payload", "observations", 0, "request_count"),
+            value=0,
+        )
+
+        await worker.apply_message(_consumed(late.key or b"", tampered))
+
+        assert worker.metrics.observations_rejected == 1
+        assert worker.metrics.late_messages == 0
+        assert worker.metrics.reconciliation_published == 0
+        assert worker.metrics.observations_applied == 0
+        assert _records(bus, OBSERVATIONS_RECONCILIATION.name) == []
+        assert _records(bus, HOT_IP.name) == []
+        assert self._IP not in worker.store
 
 
 # ---------------------------------------------------------------------------
@@ -1267,3 +1456,63 @@ class TestRunAndStop:
         message = await self._read_one(bus, CONSUMER_GROUP)
         assert message.value == third
         assert worker.metrics.observations_applied == 2  # the stopped worker took no more
+
+    async def test_cancelling_the_run_task_propagates_and_does_not_wedge_stop(self) -> None:
+        # ADR-0011 decision 4 (third pass) / ADR-0009 decision 7's amendment:
+        # cancelling the task running `run()` is abort, not shutdown.
+        # `CancelledError` propagates -- it is never swallowed, and `run()`
+        # must not return normally as though `stop()` had completed -- and
+        # whatever way `run()` exits, a concurrent or later `stop()` returns
+        # rather than waiting forever.
+        bus = InMemoryBus()
+        worker, _bus, _clock = _build(bus=bus, commit_every=1)
+        await self._publish(bus, self._FIRST, 1200, sequence=1)
+
+        task = asyncio.create_task(worker.run(bus.consumer(CONSUMER_GROUP)))
+        try:
+            # Once the first message has been applied the loop is back at the
+            # read, blocked on a message that never comes: that is the state
+            # the cancellation has to land in.
+            await _wait_until(lambda: worker.metrics.observations_applied == 1)
+            task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+        assert task.cancelled()
+        # The worker is left so that `stop()` returns; a `stop()` that waited
+        # for a `run()` which has already gone would hang here.
+        await asyncio.wait_for(worker.stop(), timeout=1.0)
+
+    async def test_cancellation_abandons_the_final_commit(self) -> None:
+        # ADR-0011 decision 4 (third pass): on cancellation "the final
+        # flush-and-commit is skipped, so the committed position stays at the
+        # last batch commit and redelivery is at-least-once (ADR-0003)". With
+        # commit_every=100 no batch commit can have happened, so the committed
+        # position is still where the group started. `InMemoryBus` starts an
+        # uncommitted group at the beginning of the log
+        # (`packages/hammertime-bus/.../tests/test_memory_bus.py::
+        # test_uncommitted_progress_is_not_persisted_across_new_instances`),
+        # so a fresh consumer in the same group is redelivered the very
+        # message the cancelled worker had already applied.
+        bus = InMemoryBus()
+        worker, _bus, _clock = _build(bus=bus, commit_every=100)
+        first = await self._publish(bus, self._FIRST, 1200, sequence=1)
+
+        task = asyncio.create_task(worker.run(bus.consumer(CONSUMER_GROUP)))
+        try:
+            await _wait_until(lambda: worker.metrics.observations_applied == 1)
+            task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+        message = await self._read_one(bus, CONSUMER_GROUP)
+        assert message.value == first
+        assert worker.metrics.observations_applied == 1

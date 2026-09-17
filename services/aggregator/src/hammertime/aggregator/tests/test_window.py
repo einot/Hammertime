@@ -952,6 +952,18 @@ class TestStoreGauges:
 class TestStoreCapacity:
     """ADR-0011 decision 3's hard cap and its eviction rule."""
 
+    @pytest.mark.parametrize("max_tracked_ips", [0, -1])
+    def test_rejects_a_capacity_below_one(self, max_tracked_ips: int) -> None:
+        # ADR-0011 section 9 and its third-pass assumption: `max_tracked_ips`
+        # must be >= 1, checked at construction with ValueError. A cap of 0
+        # (or negative) builds a store on which every first get_or_create
+        # raises StoreFullError, and decision 4 maps that to a reconciliation
+        # publish -- an aggregator that silently diverts 100% of its traffic
+        # while appearing healthy. Refused before the first insert, for the
+        # same reason the geometry already is.
+        with pytest.raises(ValueError):
+            _store(max_tracked_ips=max_tracked_ips)
+
     def test_oldest_cold_entry_is_evicted_when_full(self) -> None:
         store = _store(max_tracked_ips=2)
         store.get_or_create(IP_A, now=1000)
