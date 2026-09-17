@@ -13,7 +13,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
-from hammertime.bus.interface import AssignmentListener, ConsumedMessage
+from hammertime.bus.interface import AssignmentListener, ConsumedMessage, static_partitions
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +116,9 @@ class MemoryConsumer:
         Every `InMemoryBus` topic has exactly one partition, 0 (ADR-0011
         decision 1, assumption 22), so both the group-managed default and a
         static `{0}` claim `{(topic, 0)}`; any other static set names a
-        partition this bus does not have and is a `ValueError`.
+        partition this bus does not have and is a `ValueError`. An empty
+        static set is a `ValueError` too, on every transport (ADR-0011
+        amendment 1, item A3).
 
         The listener is awaited here, before the iterator is handed back, so
         a caller that has finished `subscribe()` is holding its shard claims
@@ -132,7 +134,7 @@ class MemoryConsumer:
         """The `(topic, partition)` pairs this subscription claims."""
         if partitions is None:
             return frozenset({(topic, 0)})
-        requested = set(partitions)
+        requested = static_partitions(topic, partitions)
         if requested != {0}:
             raise ValueError(
                 f"InMemoryBus has one partition per topic; cannot statically "

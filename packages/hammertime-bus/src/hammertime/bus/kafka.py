@@ -13,7 +13,7 @@ from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.abc import ConsumerRebalanceListener
-from hammertime.bus.interface import AssignmentListener, ConsumedMessage
+from hammertime.bus.interface import AssignmentListener, ConsumedMessage, static_partitions
 
 
 def _shard_claims(partitions: Iterable[Any]) -> frozenset[tuple[str, int]]:
@@ -162,17 +162,25 @@ class KafkaConsumer:
         mix the two on one client, which is the per-process form of ADR-0011
         decision 1's "MUST NOT mix static and group-managed members".
 
+        An empty static set raises `ValueError` before the client is even
+        started, so no `assign([])` is ever issued and no listener is called
+        (ADR-0011 amendment 1, item A3). A group-managed member the
+        coordinator happens to give nothing is untouched by that rule: it
+        still becomes ready, because a later rebalance can hand it shards.
+
         When a listener is in force, this coroutine waits for the initial
         assignment before returning, so a caller that has finished
         `subscribe()` is holding its shard claims (spec section 47 readiness).
         """
+        # Validated before `start()`: a bad static set must not reach a broker.
+        claimed = None if partitions is None else static_partitions(topic, partitions)
         await self.start()
         if listener is not None:
             self._listener = listener
-        if partitions is None:
+        if claimed is None:
             await self._subscribe_group_managed(topic)
         else:
-            await self._assign_statically(topic, partitions)
+            await self._assign_statically(topic, claimed)
         return self._consume()
 
     async def _subscribe_group_managed(self, topic: str) -> None:
@@ -195,8 +203,12 @@ class KafkaConsumer:
         if self._listener is not None:
             await adapter.first_assignment.wait()
 
-    async def _assign_statically(self, topic: str, partitions: Iterable[int]) -> None:
-        """Take `partitions` of `topic` directly and announce them ourselves."""
+    async def _assign_statically(self, topic: str, partitions: frozenset[int]) -> None:
+        """Take `partitions` of `topic` directly and announce them ourselves.
+
+        `partitions` has already been through `static_partitions`, so it is
+        never empty and `assign()` is never called with nothing.
+        """
         client = self._require_client()
         claimed = {TopicPartition(topic, partition) for partition in partitions}
         self._static_assignment |= claimed
