@@ -19,6 +19,14 @@
 # https://code.claude.com/docs/en/hooks) and checks tool_input.file_path,
 # falling back to tool_input.path (Grep/Glob).
 #
+# Unscoped content tools are DENIED for guarded agents. Grep and Glob take
+# an optional `path`; without one they search the whole project, and
+# Grep's `output_mode: content` then returns matching lines from files the
+# guard is supposed to hide. Passing such a call through (as this script
+# did before) made the guard advisory rather than enforced. A guarded
+# agent must therefore name an in-scope path it wants to search. The same
+# applies to a `path` that resolves to the project root itself.
+#
 # Caveat (documented, not a bug): this only intercepts the tool calls named
 # in the subagent's own `matcher` (Edit|Write or Read|Grep|Glob). It does
 # NOT inspect Bash commands, so an agent that also has the Bash tool could
@@ -29,22 +37,22 @@
 set -f -e -u -o pipefail
 
 input="$(cat)"
+tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
 file_path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.path // empty')"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
 
-# Unrecognized tool_input shape -> don't block on it, just pass through.
-if [[ -z "$file_path" ]]; then
-  exit 0
+# A guard is in force for this agent if it constrains paths at all.
+guarded=0
+if [[ -n "${DENY_GLOBS:-}" || -n "${ALLOW_GLOBS:-}" ]]; then
+  guarded=1
 fi
 
-# Normalize to a path relative to the project/worktree root when possible.
-project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
-rel="$file_path"
-if [[ -n "$cwd" && "$file_path" == "$cwd"/* ]]; then
-  rel="${file_path#"$cwd"/}"
-elif [[ -n "$project_dir" && "$file_path" == "$project_dir"/* ]]; then
-  rel="${file_path#"$project_dir"/}"
-fi
+# Tools whose RESULTS can disclose the contents or existence of files
+# anywhere under the search root, not just at one named path.
+content_tool=0
+case "$tool_name" in
+  Read | Grep | Glob) content_tool=1 ;;
+esac
 
 deny() {
   local reason="$1"
@@ -57,6 +65,41 @@ deny() {
   }'
   exit 2
 }
+
+# No path at all. For a guarded agent this is an unscoped Grep/Glob over
+# the whole project, which can return guarded content; deny it and say how
+# to proceed. Any other tool shape passes through as before.
+if [[ -z "$file_path" ]]; then
+  if (( guarded && content_tool )); then
+    deny "Hammertime path guard: an unscoped ${tool_name} would search the whole project and can return files this agent may not read. Re-run it with an explicit in-scope 'path' (for example 'docs', 'schemas', or a specific tests directory)."
+  fi
+  exit 0
+fi
+
+# Normalize to a path relative to the project/worktree root when possible.
+# Note the exact-match arm: without it, a path equal to the root itself
+# fell through with `rel` still absolute and matched no glob at all.
+project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
+rel="$file_path"
+for base in "$cwd" "$project_dir"; do
+  [[ -z "$base" ]] && continue
+  base="${base%/}"
+  if [[ "$file_path" == "$base" ]]; then
+    rel="."
+    break
+  elif [[ "$file_path" == "$base"/* ]]; then
+    rel="${file_path#"$base"/}"
+    break
+  fi
+done
+
+# The path resolved to the project root: same exposure as no path at all.
+if [[ "$rel" == "." || "$rel" == "./" || -z "$rel" ]]; then
+  if (( guarded && content_tool )); then
+    deny "Hammertime path guard: a project-root ${tool_name} would search every file and can return files this agent may not read. Re-run it with an explicit in-scope 'path'."
+  fi
+  exit 0
+fi
 
 matches_any() {
   local path="$1"; shift
