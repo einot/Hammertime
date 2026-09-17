@@ -254,6 +254,19 @@ tighter of the two governs); the drain must finish inside that or the
 container is SIGKILLed mid-snapshot, which is exactly the outcome the trie's
 final snapshot exists to prevent.
 
+Amendment (2026-09-17, with ADR-0011's third pass): "aborts it immediately"
+— on a second signal, or when the drain deadline is exceeded — is
+implemented by **cancelling the task running `service.run()`**, the same
+thing `docs/spec/integration-scenarios.md` §2's `kill_trie()` does to
+simulate a crash. A `Service.run()` that is cancelled from outside MUST let
+`CancelledError` propagate (never return normally as though `stop()` had
+completed), MUST NOT commit its consumer position, write a snapshot, or
+otherwise complete any part of the drain, and MUST leave the service in a
+state where a concurrent or later `stop()` returns rather than waits
+forever. Skipping the commit is always safe under ADR-0003's at-least-once
+redelivery; completing it "immediately" is not always possible. The
+aggregator worker's statement of this is ADR-0011 decision 4.
+
 ### 8. Exit codes
 
 ```text
@@ -343,6 +356,17 @@ Push back on them individually.
 * **`build_service` takes an `InMemoryBus`, not a `Producer`/`Consumer`
   pair.** Mirrors `create_app(bus=...)` and the reason given in its docstring:
   a test keeps one bus reference and reads every topic back.
+
+Added by the 2026-09-17 amendment to decision 7:
+
+* **Abort is task cancellation, and a cancelled `run()` commits nothing.**
+  Nothing in the spec names a mechanism for "abort immediately"; task
+  cancellation is the only one asyncio offers, and `integration-scenarios.md`
+  already uses it for `kill_trie()`. "Commits nothing" was chosen over
+  "commits what it can" because a commit racing a second cancellation can
+  leave the service half-stopped, and because an uncommitted batch costs
+  only a redelivery (ADR-0003) whereas a commit ahead of an unpublished
+  transition would lose one.
 
 ## Consequences
 

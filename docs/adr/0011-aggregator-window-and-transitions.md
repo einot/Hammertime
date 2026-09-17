@@ -23,6 +23,20 @@ shape of `StateTransition`, and the payload `sequence` on a published
 transition. Nothing else changed; each new judgement call is listed under
 "Assumptions".
 
+Revision note (2026-09-17, third pass): a third pass closed four gaps found
+while M3 was implemented against §9, plus one question about task
+cancellation. Decision 2's "applied XOR reconciled" was false on two paths
+— an empty `observations` list vanished with no counter moved, and a
+multi-entry payload could be partly applied *and* republished whole — so
+decision 2 now defines "well-formed" (which includes ADR-0004's
+single-entry shape, asserted) and decision 4's pipeline is rewritten
+around it, with the validity-before-disposition order stated as a rule.
+§9 now gives one reading of the bind port (ASCII digits only), a `>= 1`
+rule for `InMemoryWindowStore(max_tracked_ips=)`, and a cancellation
+contract for `run()` (mirrored by an amendment to ADR-0009 decision 7).
+Each new judgement call is under "Assumptions" in a third dated sub-list;
+the one earlier assumption this reverses is marked in place.
+
 ## Context
 
 Spec §5 says the window SHOULD be fixed-size buckets with a maintained
@@ -106,10 +120,52 @@ Consequences for the per-IP counter (`window/counter.py`, decision 9):
 * `expire(now)` is idempotent and is run before every `observe`, so the
   total is correct at the moment a state decision is taken.
 
-### 2. Every consumed observation is either applied to the window or published to the reconciliation topic — never both, never neither
+### 2. Every well-formed consumed observation is either applied to the window or published to the reconciliation topic — never both, never neither; a malformed message is rejected and reaches neither
 
-`lateness.py` classifies an observation from `window_start` (as an epoch
-second) and `now`, in this order:
+A consumed message is **well-formed** when all four of these hold, checked
+in this order by decision 4's pipeline:
+
+1. `decode(message.value)` succeeds (no `CodecError`);
+2. the payload is a `RequestObservation`;
+3. `payload.observations` has **exactly one** entry — the shape ADR-0004
+   decision 2 gives every message on `hammertime.observations.v1`, which
+   ADR-0004 decision 4 says a consumer MAY assert and this consumer does;
+4. that entry's `request_count >= 1`.
+
+A message that fails any of them is **rejected**: `observations_rejected +=
+1`, one WARNING log naming the cause, nothing applied, nothing republished,
+no disposition counter — `classify` is not even called. The reconciliation
+topic is defined as well-formed observations the aggregator declined, and a
+malformed message has nothing to reconcile: an empty entry list or a zero
+delta carries no count (schema `minItems: 1`; ADR-0008 decision 5), and a
+negative delta or a multi-entry payload is a producer bug, since ingest
+emits neither (schema `request_count.minimum: 0`; ADR-0004 decision 2).
+
+The invariant is therefore exact at message granularity: every consumed
+message ends in exactly one of *applied*, *reconciled*, or
+*rejected-as-malformed*. In counters, `observations_applied +
+reconciliation_published + observations_rejected == messages consumed`
+holds exactly over any run in which the store never filled; the one case
+that breaks the equality is decision 3's full store, which is a reconciled
+message that is *additionally* labelled `observations_rejected`, so in
+general the left side exceeds the right by the number of store-full
+diversions. (A separate `store_full` counter would make the identity
+unconditional; that is the telemetry epic's to add.)
+
+The previous wording — "every consumed observation" — was false on two
+paths, both traced to decision 4's old per-entry loop with a per-message
+republish. An empty `observations` list (which `schemas/observation.v1.json`
+forbids but the M1 codec does not currently reject; see "Assumptions")
+never entered the loop, so a LATE, FUTURE or EXPIRED message with no
+entries was neither applied nor reconciled and moved no counter at all. A
+multi-entry payload could have its first entry applied and then be
+republished whole when a later entry met a full store, so a reconciliation
+consumer would re-see a count that had already been applied. Rule 3 closes
+both: it is the single-entry shape that makes "one message, one
+observation, one outcome" true.
+
+For a well-formed message, `lateness.py` classifies the observation from
+`window_start` (as an epoch second) and `now`, in this order:
 
 | Disposition | Condition | Effect |
 | --- | --- | --- |
@@ -216,20 +272,54 @@ issue #7's shard handover, which faces the identical question.
 now = clock.now()
 envelope = decode(message.value)                 # CodecError -> observations_rejected += 1, log, return
 payload must be RequestObservation               # otherwise the same
-for entry in payload.observations:               # ADR-0004: exactly one in practice; all are applied if more
-    if entry.request_count < 1:                  # observations_rejected += 1; continue
-    disposition = classify(window_start_epoch(payload.window_start), now, config)
-    if disposition is not APPLY:                 # decision 2; the whole message is republished once
-        continue
-    S = bucket_start(window_start_epoch, config.bucket_seconds)
-    ip_entry = store.get_or_create(entry.ip, now=now)   # StoreFullError -> reconciliation, rejected += 1
-    count = ip_entry.counter.observe(S, entry.request_count, now=now)
-    ip_entry.last_observed = now
-    observations_applied += 1
-    transition = decide(ip_entry.state, count, config)   # decision 5
-    if transition: ip_entry.state = transition.current; publish event; count the edge
+len(payload.observations) must be 1              # otherwise the same (decision 2 rule 3: ADR-0004's shape, asserted)
+entry = payload.observations[0]
+if entry.request_count < 1:                      # observations_rejected += 1, log, return
+disposition = classify(window_start_epoch(payload.window_start), now, config)
+if disposition is not APPLY:                     # decision 2: count the cause, republish the message, return
+S = bucket_start(window_start_epoch, config.bucket_seconds)
+ip_entry = store.get_or_create(entry.ip, now=now)   # StoreFullError -> observations_rejected += 1, republish, return
+count = ip_entry.counter.observe(S, entry.request_count, now=now)
+ip_entry.last_observed = now
+observations_applied += 1
+transition = decide(ip_entry.state, count, config)   # decision 5
+if transition: ip_entry.state = transition.current; publish event; count the edge
 ```
 
+There is no loop: a well-formed message carries one observation (decision
+2 rule 3), so "the message" and "the observation" are the same unit on
+every path — applied once, republished once, or rejected once.
+
+* **Validity is checked before disposition, and every check ends the
+  message.** The four well-formedness rules of decision 2 run in the order
+  shown, before `classify`. Consequence, stated so nobody has to guess it:
+  a message that is both malformed and LATE/FUTURE/EXPIRED is counted
+  once, as `observations_rejected`; `late_messages`, `future_messages` and
+  `expired_on_arrival` move only for well-formed messages; and nothing
+  malformed is ever republished. In particular a LATE message carrying
+  `request_count == 0` is `observations_rejected += 1` and nothing else —
+  no `late_messages`, no reconciliation record. This is deliberate: the
+  §37 disposition counters measure the lateness of real observations, and
+  republishing a zero or negative delta would hand the reconciliation
+  consumer a message it must reject by the same rule.
+* **Cancellation of the task running `run()` is abort, not shutdown.**
+  ADR-0009 decision 7 says a second signal during the drain "aborts it
+  immediately", and `docs/spec/integration-scenarios.md` §2's `kill_trie()`
+  simulates a crash by cancelling a service's `run()` task "without calling
+  `stop()` (no final snapshot, no commit)"; task cancellation is the only
+  asyncio mechanism either can mean. So when `run()` is cancelled from
+  outside: `CancelledError` propagates out of `run()` — it is never
+  swallowed, which means the read-versus-stop race inside the loop must
+  distinguish its *own* cancellation of a pending read from a cancellation
+  of the task (`asyncio.Task.cancelling()` is available at the repo's
+  Python floor of 3.12); the final flush-and-commit is **skipped**, so the
+  committed position stays at the last batch commit and redelivery is
+  at-least-once (ADR-0003) — a commit that could lie ahead of an
+  unpublished transition is never attempted; and whatever way `run()`
+  exits — normally, by exception, or by cancellation, including a
+  cancellation that lands during the final flush itself — the worker is
+  left so that a concurrent or later `stop()` returns rather than waiting
+  forever. `stop()` remains the only path that drains.
 * `apply_message`, `run_maintenance` and `apply_config` all acquire the
   same `asyncio.Lock`, so a re-evaluation never interleaves with an
   observation and ADR-0009 decision 6's visibility rule ("the new version
@@ -245,11 +335,12 @@ for entry in payload.observations:               # ADR-0004: exactly one in prac
   `commit_every` messages; in M3 they are re-applied to an empty store, so
   no double count is possible (decision 3's deferral note covers the
   durable case).
-* A message that cannot be decoded, or decodes to a payload type other
-  than `RequestObservation`, is counted and skipped, not retried: a poison
+* A message that cannot be decoded, decodes to a payload type other than
+  `RequestObservation`, carries other than exactly one entry, or carries a
+  non-positive delta, is counted and skipped, not retried: a poison
   message must not wedge a partition. It is *not* republished to
   reconciliation, because the reconciliation topic is defined as
-  well-formed observations the aggregator declined.
+  well-formed observations the aggregator declined (decision 2).
 * The worker does not check shard ownership. ADR-0004 guarantees it only
   sees IPs it owns by partition; enforcing that is issue #7's.
 
@@ -499,7 +590,10 @@ class IpEntry:
 class InMemoryWindowStore:
     def __init__(self, *, window_seconds: int, bucket_seconds: int,
                  max_tracked_ips: int = 1_000_000) -> None
-        # same geometry rule as IpCounter: ValueError unless both > 0 and W % B == 0
+        # same geometry rule as IpCounter: ValueError unless both > 0 and W % B == 0;
+        # ValueError unless max_tracked_ips >= 1 (a cap of 0 would refuse every first
+        # insert, diverting 100% of traffic to reconciliation; validated here, at
+        # construction, for the same reason the geometry is)
     window_seconds: int; bucket_seconds: int   # read-only properties: the geometry a new
                                                #   entry's counter gets; replaced by rebucket
     def __len__(self) -> int
@@ -582,7 +676,9 @@ async def reevaluate(store: InMemoryWindowStore, *, previous: DetectionConfig,
 @dataclass(slots=True)
 class AggregatorMetrics:
     observations_applied: int = 0
-    observations_rejected: int = 0      # undecodable, wrong payload type, request_count < 1, store full
+    observations_rejected: int = 0      # malformed (undecodable, wrong payload type, not exactly one
+                                        #   entry, request_count < 1) -- never republished; PLUS store
+                                        #   full, which is republished too (decisions 2 and 3)
     late_messages: int = 0              # §37
     future_messages: int = 0
     expired_on_arrival: int = 0
@@ -605,7 +701,11 @@ class AggregatorWorker:
     async def run_maintenance(self) -> None
     async def apply_config(self, config: DetectionConfig) -> ReevaluationReport | None
     async def run(self, consumer: Consumer, *, topic: str = OBSERVATIONS.name) -> None
+        # returns after stop(): final flush then commit. If the task running it is
+        # cancelled: CancelledError propagates, no final flush/commit (decision 4)
     async def stop(self) -> None
+        # asks run() to return and waits until it has -- by ANY exit path, including
+        # cancellation; never waits forever once run() has exited
 
 
 # hammertime.aggregator.config              Spec: section 20, section 47.1; ADR-0009 decision 2
@@ -627,9 +727,15 @@ class AggregatorSettings:
                                     #   a non-integer, "a-" / "-b" / "-", a reversed range "7-3".
     host: str; port: int            # HAMMERTIME_AGGREGATOR_BIND     default 0.0.0.0:8083; split on the
                                     #   LAST ":" (rpartition); malformed unless a ":" is present, host
-                                    #   is non-empty and port is a decimal integer in [0, 65535]
-                                    #   (0 = ephemeral, integration-scenarios.md). Host is not
-                                    #   otherwise validated; "[::1]:8083" passes through as-is.
+                                    #   is non-empty, and port is a non-empty run of ASCII decimal
+                                    #   digits `0`-`9` ONLY -- no sign, no surrounding whitespace, no
+                                    #   radix prefix, no non-ASCII digit -- whose value is <= 65535.
+                                    #   So "host:-1", "host: 8083", "host:8083 " and "host:0x1f" are
+                                    #   all malformed even though int() would accept the first three;
+                                    #   leading zeros are accepted and read as decimal ("host:08083"
+                                    #   is port 8083). 0 is accepted (ephemeral, integration-
+                                    #   scenarios.md). Host is not otherwise validated; "[::1]:8083"
+                                    #   passes through as-is.
     maintenance_interval_s: float   # HAMMERTIME_AGGREGATOR_MAINTENANCE_INTERVAL_S  default 1.0, > 0
     config_poll_interval_s: float   # HAMMERTIME_CONFIG_POLL_INTERVAL_S             default 1.0, > 0
     startup_timeout_s: float        # HAMMERTIME_STARTUP_TIMEOUT_S                  default 60, > 0
@@ -686,7 +792,9 @@ or a prior ADR. Push back on them individually.
   delta cannot arrive.
 * **Multi-entry payloads are applied entry by entry.** ADR-0004 says
   consumers MAY assert single-entry; applying all is the more forgiving
-  reading and costs nothing.
+  reading and costs nothing. *Reversed by the third pass (below): it cost
+  the invariant. A payload with other than exactly one entry is now
+  rejected as malformed (decision 2 rule 3).*
 * **One sequence counter for both hot-ip event types; restarts at
   `initial_sequence` (0) per process; `subject = ip`.** See decision 5.
   `producer_id` format `aggregator-<shard_id>` is a recommendation to
@@ -745,11 +853,15 @@ Added by the 2026-09-17 revision:
   path is never a working configuration and failing at load is what §47.1
   asks for. Diverges from ingest only in rejecting those three.
 * **`HAMMERTIME_AGGREGATOR_BIND` follows ingest's `_parse_bind`
-  (`rpartition(":")`, non-empty host, digit-only port) plus an upper bound
-  of 65535.** The bound is not in ingest; it is the only value a port can
-  never take and costs one comparison. `0` is accepted because
-  `integration-scenarios.md` binds every service to `127.0.0.1:0`. The host
-  is not validated (bracketed IPv6 literals pass through unchanged).
+  (`rpartition(":")`, non-empty host, digit-only port — narrowed to ASCII
+  digits by the third pass, below) plus an upper bound of 65535.** The
+  bound is not in ingest; it is the only value a port can never take and
+  costs one comparison. `0` is accepted because `integration-scenarios.md`
+  binds every service to `127.0.0.1:0`. The host is not validated
+  (bracketed IPv6 literals pass through unchanged). §9's earlier phrase "a
+  decimal integer in [0, 65535]" was read by one implementer as `int()`
+  semantics, which accepts `"host: 8083"`; §9 now says digits-only, so the
+  two agree.
 * **`build_event` raises `ValueError` for a `StateTransition` whose
   `previous is current`.** The M1 type does not forbid constructing one
   and `decide` never returns one; refusing it is safer than picking an
@@ -764,6 +876,97 @@ Added by the 2026-09-17 revision:
   keeps for observations; publishing the placeholder would put a constant
   `0` on every hot-ip payload. Consequence: the envelope's `payload` is a
   copy, not the caller's object.
+
+Added by the 2026-09-17 third pass:
+
+* **The aggregator asserts ADR-0004's single-entry shape; a payload with
+  zero or several entries is rejected as malformed, not applied and not
+  reconciled.** Three reasons, in order of weight. (1) It is the only
+  reading under which "applied XOR reconciled" is exactly true: any
+  per-entry application of a multi-entry payload can apply entry 1 and
+  then meet a full store on entry 2, and the reconciliation unit is the
+  original bytes, so the message would be both. (2) On the IP-keyed
+  observations topic every entry other than the key's IP has been routed
+  to this shard by a key that is not its own; applying it here would count
+  an IP on a shard that does not own it, against §20's one-owner rule. So
+  "forgiving" was not merely lenient, it was wrong. (3) ADR-0004 decision
+  4 explicitly grants consumers the assertion. Cost: a buggy producer's
+  multi-entry messages are dropped and counted rather than partly applied
+  — the same poison-pill policy as an undecodable message. **Not
+  asserted:** that `message.key`/`subject` equals the entry's IP; issue
+  #7's shard-ownership check (hash the entry's IP, compare to owned
+  shards) subsumes that and is the right place for it.
+* **An empty entry list is malformed, and the codec should say so too.**
+  `schemas/observation.v1.json` declares `minItems: 1`, but
+  `hammertime.core.events.codec._decode_request_observation` enforces only
+  the `maxItems` bound (`_MAX_OBSERVATIONS`), so `{"observations": []}`
+  decodes to `observations == ()`. That is M1 code outside M3 and is not
+  changed by this ADR; the recommendation is that the codec reject
+  `minItems` on decode exactly as it rejects `maxItems`, on the same
+  defence-in-depth reasoning its own comment gives (it resembles issue
+  #50, schema ranges unenforced at the loader). Until then, and after, the
+  worker's own `len == 1` check is what makes decision 2 true; the
+  observable outcome — `observations_rejected += 1`, nothing on either
+  topic — is identical whichever layer refuses the message, so a worker
+  test written against decision 2 stays valid when the codec change lands.
+* **Validity checks precede the disposition, so a malformed message that
+  is also late/future/expired counts only as rejected.** The alternative
+  — classify first, so a LATE zero-count message is republished and
+  `late_messages` moves — was rejected because the disposition counters
+  are meant to measure the lateness of real observations, and because the
+  reconciliation consumer would then have to re-derive the same validity
+  rules to throw the message away. Ingest never produces the combination
+  (ADR-0008 decision 5, §36.6), so nothing observable changes today; the
+  rule exists so that the next implementer does not have to guess it.
+* **The full-store case stays labelled both `observations_rejected` and
+  `reconciliation_published`.** Decision 3 already said so; this pass only
+  states the resulting accounting identity honestly (decision 2) rather
+  than adding a `store_full` counter, which would change `AggregatorMetrics`
+  and belongs with the telemetry epic's mapping onto Prometheus.
+* **The bind port is ASCII digits `0`-`9` only, value `<= 65535`; leading
+  zeros are read as decimal.** Chosen over `int()` semantics because
+  `int()` silently accepts surrounding whitespace and a sign, and a
+  configuration value that parses "by accident" is exactly what §47.1's
+  fail-at-load rule is meant to prevent. Chosen over bare `str.isdigit()`
+  (ingest's rule) because `isdigit()` is true for characters `int()` then
+  rejects — `"²".isdigit()` is `True` but `int("²")` raises — which would
+  surface as a `ValueError` that does not name the variable; and because
+  `int()` does accept other Unicode decimal digits (`"٣"` is 3), which an
+  operator reading a log line cannot be expected to recognise. `isascii()
+  and isdigit()` is the tightest rule that guarantees `int()` succeeds and
+  the value is what the operator typed. Leading zeros are accepted because
+  refusing them would reject nothing an operator plausibly means and the
+  value is unambiguous. **Finding, not fixed here:** ingest's `_parse_bind`
+  (`services/ingest/src/hammertime/ingest/config.py`) has the
+  `isdigit()`-without-`isascii()` gap; it is outside this ADR and M3.
+* **`InMemoryWindowStore(max_tracked_ips=)` must be `>= 1`, checked at
+  construction with `ValueError`.** A cap of `0` (or negative) builds a
+  store on which every first `get_or_create` raises `StoreFullError`, and
+  decision 4 maps that to a reconciliation publish — an aggregator that
+  silently diverts all of its traffic while appearing healthy. The
+  settings key already enforces `> 0`, so `build_service` can never
+  produce it; the rule is the constructor's own contract for direct
+  callers (tests, a future durable variant), placed at construction for
+  the reason the geometry check already gives (fail before the first
+  insert). `1` remains valid, as `test_capacity_one_still_admits_new_cold_ips`
+  already relies on.
+* **Cancelling the `run()` task is abort: `CancelledError` propagates, no
+  final flush or commit, `stop()` never hangs.** Not derived from a
+  requirement that says "cancellation", but from two sources that can
+  mean nothing else: ADR-0009 decision 7's "a second signal during the
+  drain aborts it immediately" and `integration-scenarios.md` §2's
+  `kill_trie()` ("cancel the trie's `run()` task ... without calling
+  `stop()` (no final snapshot, no commit)"). Two alternatives were
+  rejected. *Best-effort flush-and-commit on cancellation* (what the
+  original code did) is not "immediately", and a second cancellation
+  landing inside that commit would skip the `_finished` signal and leave a
+  concurrent `stop()` waiting forever — the narrow bug that prompted the
+  question. *Declaring it out of scope* would leave Epic A's runner with
+  no contract for the abort path it must implement. Skipping the commit is
+  always safe: at-least-once redelivery re-applies the uncommitted batch
+  (ADR-0003), and in M3 state dies with the process anyway (decision 3).
+  The contract is stated for `AggregatorWorker.run()` here and for every
+  `Service.run()` by an amendment to ADR-0009 decision 7.
 
 ## Consequences
 

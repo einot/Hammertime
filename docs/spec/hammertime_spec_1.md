@@ -1096,10 +1096,15 @@ Events older than the accepted lateness horizon MAY be dropped, corrected, or se
 > bucket has already left the window of Section 5), or `APPLY`. Anything not
 > applied is republished unchanged to
 > `hammertime.observations-reconciliation.v1` and counted (`late_messages`,
-> `future_messages`, `expired_on_arrival`); an observation is never both
-> applied and reconciled, and never neither. `allowed_lateness_seconds` does
-> not widen what is counted; its load-bearing role is ingest's dedup retention
-> (ADR-0003). Implemented in `services/aggregator/lateness.py`.
+> `future_messages`, `expired_on_arrival`); a well-formed observation — one
+> that decodes to a `RequestObservation` with exactly one entry (ADR-0004)
+> whose `request_count >= 1` — is never both applied and reconciled, and
+> never neither. A message that is not well-formed is rejected before its
+> lateness is judged: counted as `observations_rejected`, logged, and sent
+> to neither the window nor the reconciliation topic.
+> `allowed_lateness_seconds` does not widen what is counted; its
+> load-bearing role is ingest's dedup retention (ADR-0003). Implemented in
+> `services/aggregator/lateness.py` and `services/aggregator/worker.py`.
 
 ---
 
