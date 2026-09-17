@@ -45,7 +45,13 @@
 | 403 | A **correct** credential for a disabled agent, or a body `agent_id` that disagrees with the authenticated one |
 | 413 | Body limit, observation-array limit, or a batch whose distinct-IP count exceeds the per-agent observation capacity (§36.6) — send a smaller batch; retrying unchanged will not help |
 | 429 | A budget was exceeded. `X-RateLimit-Scope` names which one — `requests` (per-agent request rate), `observations` (per-agent observation rate, charged per distinct IP), or `auth-failures` (repeated failed authentication). Always carries `Retry-After` in whole seconds (§36.7) |
-| 503 | Accepted but could not be published; nothing was recorded. Retry with the **same** `sequence` — a retry after a partial publish is deduplicated downstream, never double-counted (ADR-0004) |
+| 503 | Accepted but could not be published; nothing was recorded. Body `{"detail": "failed to publish observation; retry is safe"}`. Retry with the **same** `sequence` — a retry after a partial publish is deduplicated downstream, never double-counted (ADR-0004) |
+| 503 | **Service not ready** (§47.2, ADR-0009 A9). Body is exactly what `GET /readyz` answers: `{"status":"starting"}` before ingest has completed startup, `{"status":"stopping"}` once a shutdown has begun. `Content-Type: application/json`. Nothing was read, authenticated, charged or recorded — this gate runs before authentication and both rate budgets. Retry with the **same** `sequence` after `/readyz` answers 200 |
+
+The two 503 bodies are deliberately different shapes: `{"status": ...}` is the
+readiness body every Hammertime service shares (`docs/protocol/read-api-v1.md`),
+`{"detail": ...}` is the shape of every other ingest error. A client that only
+needs "retry later" can treat them alike; a probe can tell them apart.
 
 ## Limits
 
@@ -56,7 +62,9 @@ partially applied.
 Two rate budgets apply per agent (§36.6): one charged 1 per request, one charged
 the number of *distinct* IPs the batch resolves to after duplicate IPs are
 summed. A batch is charged that cost whatever its outcome, including a duplicate
-`200` and a failed-publish `503`. Entries with `request_count: 0` are charged
+`200` and a failed-publish `503` — the one exception is the not-ready `503`
+above, which is answered before either budget is consulted. Entries with
+`request_count: 0` are charged
 but never published — a zero delta changes nothing, so it is dropped rather than
 allowed to create per-IP state. An `agent_id` or bearer token longer than 128 /
 512 characters respectively is rejected as an authentication failure (§36.5).

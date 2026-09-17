@@ -56,4 +56,4 @@ Section index used throughout the code:
 | 36.5-36.7 | Auth throttling, request cost, throttled responses | `services/ingest/auth`, `services/ingest/ratelimit`, `services/ingest/api/routes.py`, `docs/adr/0007`, `docs/adr/0008` |
 | 37 | Observability | `core/telemetry`, `deploy/grafana` |
 | 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/events`, `core/config`, `docs/adr/0005` |
-| 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `docs/adr/0009`, `docs/protocol/read-api-v1.md` |
+| 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `docs/adr/0009`, `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |
