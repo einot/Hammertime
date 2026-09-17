@@ -119,12 +119,12 @@ class TestThresholdRatioWorkedValues:
         ],
     )
     def test_exact_values_at_a_tiny_hot_threshold(self, window_count: int, expected: int) -> None:
-        # NOTE: ADR-0011 decision 6's worked list prints `(1) == 334` while
-        # annotating it `(1000 + 1) // 3`, which is 333 -- an arithmetic slip
-        # in the ADR's prose. Spec section 46.4's formula (and
-        # schemas/ip_attributes.v1.json's restatement of it) is normative and
-        # yields 333: 1000/3 = 333.33, which rounds *down* under any rounding
-        # rule. This test follows the formula.
+        # ADR-0011 decision 6's worked list agrees with spec section 46.4
+        # here: it prints `(1) == 333`, annotated `(1000 + 1) // 3`, and
+        # 1001 // 3 is 333 (1000/3 = 333.33, which rounds *down* under any
+        # rounding rule). The formula in section 46.4 -- restated by
+        # schemas/ip_attributes.v1.json -- is the normative source these
+        # values are taken from; the ADR's worked list is a cross-check.
         config = _config(hot_threshold=3)
         assert threshold_ratio(window_count, config) == expected
         assert _model(window_count, 3, 1000000) == expected

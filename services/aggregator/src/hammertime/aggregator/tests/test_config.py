@@ -14,6 +14,14 @@ parsed because they are settings (ADR-0011 decision 8).
 Every test passes an explicit `env=` mapping -- the same convention as
 `services/ingest/.../tests/test_config.py` -- so the suite never depends on
 the process environment, and one test below pins that independence down.
+
+Two rules from ADR-0011 section 9 run through the whole file. First, only a
+*missing* key takes its default (`env.get(key, default)`): an empty or
+whitespace-only value is a value, and a malformed one, for every key --
+including the three free-text keys that are otherwise passed through
+verbatim. Second, every rejection raises a `ValueError` whose message names
+the offending variable, which is what makes section 47.1's "refuse to start"
+actionable, so every `pytest.raises` below matches on the key.
 """
 
 from __future__ import annotations
@@ -38,6 +46,19 @@ POSITIVE_NUMERIC_KEYS = [
     "HAMMERTIME_AGGREGATOR_MAX_TRACKED_IPS",
     "HAMMERTIME_AGGREGATOR_COMMIT_EVERY",
 ]
+
+# The keys whose value is carried through as text with no further validation
+# (ADR-0011 section 9). They still reject an empty value: an empty broker
+# list, Redis URL or detection-config path is never a working configuration.
+FREE_TEXT_KEYS = [
+    "HAMMERTIME_CONFIG_PATH",
+    "HAMMERTIME_BUS_BROKERS",
+    "HAMMERTIME_REDIS_URL",
+]
+
+# Every value that is present but carries no information. ADR-0011 section 9:
+# these are malformed, never "unset".
+EMPTY_VALUES = ["", "   "]
 
 
 class TestDefaults:
@@ -228,6 +249,153 @@ class TestShardIds:
             load_settings({"HAMMERTIME_SHARD_IDS": "7-3"})
 
 
+class TestShardIdsDefaultIsDerived:
+    """ADR-0011 section 9: the default is `tuple(range(shard_count))` of the
+    *parsed* `shard_count`, never the literal `0-63` `.env.example` prints.
+
+    A literal default breaks the moment `HAMMERTIME_SHARD_COUNT` is lowered:
+    the loader would reject its own default for holding ids outside
+    `[0, shard_count)`. Deriving it means a lowered ring still owns every
+    shard in it.
+    """
+
+    def test_a_lowered_shard_count_narrows_the_default(self) -> None:
+        settings = load_settings({"HAMMERTIME_SHARD_COUNT": "4"})
+
+        assert settings.shard_count == 4
+        assert settings.shard_ids == (0, 1, 2, 3)
+
+    def test_a_raised_shard_count_widens_the_default(self) -> None:
+        settings = load_settings({"HAMMERTIME_SHARD_COUNT": "128"})
+
+        assert settings.shard_count == 128
+        assert settings.shard_ids == tuple(range(128))
+
+    def test_a_single_shard_owns_only_shard_zero(self) -> None:
+        settings = load_settings({"HAMMERTIME_SHARD_COUNT": "1"})
+
+        assert settings.shard_ids == (0,)
+
+    @pytest.mark.parametrize("shard_count", ["1", "4", "64", "128"])
+    def test_the_derived_default_is_always_in_range(self, shard_count: str) -> None:
+        # The property the derivation exists to guarantee: the default set is
+        # non-empty and every id in it satisfies 0 <= id < shard_count, so it
+        # would survive the same validation an explicit value gets.
+        settings = load_settings({"HAMMERTIME_SHARD_COUNT": shard_count})
+
+        assert settings.shard_ids
+        assert all(0 <= shard_id < settings.shard_count for shard_id in settings.shard_ids)
+        assert settings.shard_ids == tuple(sorted(set(settings.shard_ids)))
+
+    def test_an_explicit_value_still_wins_over_the_derived_default(self) -> None:
+        settings = load_settings({"HAMMERTIME_SHARD_COUNT": "4", "HAMMERTIME_SHARD_IDS": "1-2"})
+
+        assert settings.shard_ids == (1, 2)
+
+
+class TestFreeTextKeys:
+    """ADR-0011 section 9: passed through verbatim, but never empty."""
+
+    @pytest.mark.parametrize("key", FREE_TEXT_KEYS)
+    @pytest.mark.parametrize("value", EMPTY_VALUES)
+    def test_an_empty_value_is_rejected(self, key: str, value: str) -> None:
+        # This is where the aggregator diverges from
+        # `services/ingest/config.py`, which passes its free-text keys
+        # through unchecked: section 47.1 asks for an invalid configuration
+        # to be rejected at load, and none of these three is usable empty.
+        with pytest.raises(ValueError, match=key):
+            load_settings({key: value})
+
+    @pytest.mark.parametrize(
+        ("key", "field", "expected"),
+        [
+            ("HAMMERTIME_CONFIG_PATH", "detection_config_path", Path("config/detection.v1.json")),
+            ("HAMMERTIME_BUS_BROKERS", "bus_brokers", "localhost:19092"),
+            ("HAMMERTIME_REDIS_URL", "redis_url", "redis://localhost:6379/0"),
+        ],
+    )
+    def test_a_missing_key_still_takes_its_default(
+        self, key: str, field: str, expected: object
+    ) -> None:
+        # The contrast that gives "empty is malformed" its meaning: absence is
+        # the only thing that selects a default. The other two free-text keys
+        # are supplied, so only the one under test is missing.
+        env = {other: "supplied" for other in FREE_TEXT_KEYS if other != key}
+
+        assert getattr(load_settings(env), field) == expected
+
+    def test_a_value_is_not_trimmed_or_rewritten(self) -> None:
+        env = {
+            "HAMMERTIME_CONFIG_PATH": "/etc/hammertime/detection.json",
+            "HAMMERTIME_BUS_BROKERS": "broker-1:9092,broker-2:9092",
+            "HAMMERTIME_REDIS_URL": "redis://cache:6380/3",
+        }
+
+        settings = load_settings(env)
+
+        assert settings.detection_config_path == Path(env["HAMMERTIME_CONFIG_PATH"])
+        assert settings.bus_brokers == env["HAMMERTIME_BUS_BROKERS"]
+        assert settings.redis_url == env["HAMMERTIME_REDIS_URL"]
+
+
+class TestBindParsing:
+    """ADR-0011 section 9: `HAMMERTIME_AGGREGATOR_BIND` splits on the LAST
+    ":"; the host must be non-empty and is not otherwise validated; the port
+    must be a decimal integer in `[0, 65535]`.
+
+    Port `0` is accepted (integration-scenarios.md binds every service to
+    `127.0.0.1:0`); that case is asserted by
+    `TestExplicitValues::test_bind_accepts_an_ephemeral_port` above and is not
+    repeated here.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "8083",  # no colon at all
+            ":8083",  # empty host
+            "host:",  # empty port
+            "host:abc",  # non-decimal port
+            "host:65536",  # one past the largest port there is
+        ],
+    )
+    def test_a_malformed_bind_is_rejected(self, value: str) -> None:
+        with pytest.raises(ValueError, match="HAMMERTIME_AGGREGATOR_BIND"):
+            load_settings({"HAMMERTIME_AGGREGATOR_BIND": value})
+
+    @pytest.mark.parametrize("value", EMPTY_VALUES)
+    def test_an_empty_bind_is_rejected(self, value: str) -> None:
+        with pytest.raises(ValueError, match="HAMMERTIME_AGGREGATOR_BIND"):
+            load_settings({"HAMMERTIME_AGGREGATOR_BIND": value})
+
+    @pytest.mark.parametrize("value", ["host:-1", "host: 8083", "host:8083 ", "host:0x1f"])
+    def test_a_port_that_is_not_plain_digits_is_rejected(self, value: str) -> None:
+        # "a decimal integer": a sign, surrounding space or a radix prefix is
+        # not one, even where int() would accept it.
+        with pytest.raises(ValueError, match="HAMMERTIME_AGGREGATOR_BIND"):
+            load_settings({"HAMMERTIME_AGGREGATOR_BIND": value})
+
+    def test_a_bracketed_ipv6_literal_passes_through_as_is(self) -> None:
+        # Splitting on the *last* colon keeps the address together, and the
+        # host is not validated any further.
+        settings = load_settings({"HAMMERTIME_AGGREGATOR_BIND": "[::1]:8083"})
+
+        assert settings.host == "[::1]"
+        assert settings.port == 8083
+
+    def test_the_highest_port_is_accepted(self) -> None:
+        settings = load_settings({"HAMMERTIME_AGGREGATOR_BIND": "127.0.0.1:65535"})
+
+        assert settings.host == "127.0.0.1"
+        assert settings.port == 65535
+
+    def test_a_hostname_is_accepted_unvalidated(self) -> None:
+        settings = load_settings({"HAMMERTIME_AGGREGATOR_BIND": "aggregator.internal:8083"})
+
+        assert settings.host == "aggregator.internal"
+        assert settings.port == 8083
+
+
 class TestNumericValidation:
     """Section 47.1: an invalid configuration is rejected before any network
     connection is opened, and the message names the offending variable."""
@@ -240,6 +408,15 @@ class TestNumericValidation:
     @pytest.mark.parametrize("key", POSITIVE_NUMERIC_KEYS)
     @pytest.mark.parametrize("value", ["0", "-1"])
     def test_non_positive_value_is_rejected(self, key: str, value: str) -> None:
+        with pytest.raises(ValueError, match=key):
+            load_settings({key: value})
+
+    @pytest.mark.parametrize("key", POSITIVE_NUMERIC_KEYS)
+    @pytest.mark.parametrize("value", EMPTY_VALUES)
+    def test_an_empty_value_is_malformed_never_unset(self, key: str, value: str) -> None:
+        # ADR-0011 section 9: only a *missing* key takes its default. An
+        # exported-but-empty variable -- the usual shape of a broken
+        # deployment template -- is a value, and not a number.
         with pytest.raises(ValueError, match=key):
             load_settings({key: value})
 
@@ -270,12 +447,12 @@ class TestKindValidation:
     def test_known_store_kinds_are_accepted(self, kind: str) -> None:
         assert load_settings({"HAMMERTIME_STORE_KIND": kind}).store_kind == kind
 
-    @pytest.mark.parametrize("kind", ["other", "", "KAFKA", "rabbitmq"])
+    @pytest.mark.parametrize("kind", ["other", "", "   ", "KAFKA", "rabbitmq"])
     def test_unknown_bus_kind_is_rejected(self, kind: str) -> None:
         with pytest.raises(ValueError, match="HAMMERTIME_BUS_KIND"):
             load_settings({"HAMMERTIME_BUS_KIND": kind})
 
-    @pytest.mark.parametrize("kind", ["other", "", "REDIS", "postgres"])
+    @pytest.mark.parametrize("kind", ["other", "", "   ", "REDIS", "postgres"])
     def test_unknown_store_kind_is_rejected(self, kind: str) -> None:
         with pytest.raises(ValueError, match="HAMMERTIME_STORE_KIND"):
             load_settings({"HAMMERTIME_STORE_KIND": kind})

@@ -20,20 +20,26 @@ section 9 interface reference plus the M1 names it composes
 from the spec formulas -- the section 6 threshold table and section 46.4's
 `threshold_ratio` -- never copied from an implementation.
 
-Assumptions that are *not* pinned by spec/ADR/schema, flagged so they can be
-reconciled rather than re-derived:
+The first two notes below were open questions when this file was written and
+are now settled by ADR-0011's 2026-09-17 revision; the rest are assumptions
+still not pinned by spec/ADR/schema, flagged so they can be reconciled rather
+than re-derived:
 
-* `StateTransition` is only ever inspected through `.current`, the one
-  attribute ADR-0011 decision 4 names (`ip_entry.state = transition.current`).
-  Its other field names are not documented anywhere, so the *direction* of a
-  transition is additionally asserted through the event `build_event`
-  produces for it (section 19: COLD -> HOT is `HotIpAdded`, HOT -> COLD is
-  `HotIpRemoved`), which is documented.
-* `TransitionPublisher.publish` is asserted to assign the *envelope*
-  `sequence` (ADR-0011 decision 5). ADR-0011's `build_event` table says the
-  payload's own `sequence` is "assigned by the publisher below" without
-  saying whether the publisher rewrites the payload it was handed, so no
-  assertion is made about `payload.sequence`.
+* `StateTransition`'s shape is recorded (not designed) by ADR-0011 section 9:
+  a frozen dataclass with `previous` and `current` plus the derived
+  `became_hot` / `became_cold`, which decision 5 says `build_event` dispatches
+  on. Those fields are asserted directly, and the *direction* of a transition
+  is asserted a second time through the event `build_event` produces for it
+  (section 19: COLD -> HOT is `HotIpAdded`, HOT -> COLD is `HotIpRemoved`).
+* `TransitionPublisher.publish` assigns its sequence to *both* the envelope
+  and the payload: ADR-0011 decision 5 publishes
+  `dataclasses.replace(event, sequence=n)`, so the envelope's payload is a
+  **copy** of the event handed in with `build_event`'s placeholder `0`
+  rewritten, and `envelope.sequence == envelope.payload.sequence == n`. A
+  test comparing the payload back to the event it published must therefore
+  compare through `replace(event, sequence=envelope.sequence)` -- never by
+  identity, and never by plain equality, which only happens to hold when the
+  assigned sequence is the placeholder `0`.
 * Topic logs are read back through `bus._logs[...]`, the precedent set by
   `services/ingest/.../tests/test_pipeline.py::_topic_records` (a live
   `subscribe()` iterator blocks on the *next* message, which is awkward to
@@ -50,6 +56,7 @@ reconciled rather than re-derived:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -74,6 +81,7 @@ from hammertime.core.events.models import (
     RequestObservation,
 )
 from hammertime.core.state import IpState, evaluate_ip_state
+from hammertime.core.state.transitions import StateTransition
 from hammertime.core.time.clock import ManualClock
 
 # docs/spec/integration-scenarios.md section 2: T0 = 1_800_000_000
@@ -300,7 +308,11 @@ class TestSectionSixTableCaseByCase:
         transition = decide(IpState.COLD, HOT_THRESHOLD, config)
 
         assert transition is not None
+        assert transition.previous is IpState.COLD
         assert transition.current is IpState.HOT
+        # ADR-0011 section 9: the two properties build_event dispatches on.
+        assert transition.became_hot is True
+        assert transition.became_cold is False
         # Section 19: a COLD -> HOT edge is a HotIpAdded, never a removal.
         event = build_event(
             Address.parse("10.0.0.1"),
@@ -320,7 +332,10 @@ class TestSectionSixTableCaseByCase:
         transition = decide(IpState.HOT, COLD_THRESHOLD - 1, config)
 
         assert transition is not None
+        assert transition.previous is IpState.HOT
         assert transition.current is IpState.COLD
+        assert transition.became_cold is True
+        assert transition.became_hot is False
         event = build_event(
             Address.parse("10.0.0.1"),
             transition,
@@ -357,6 +372,9 @@ class TestSectionSixTableCaseByCase:
             assert transition is None
         else:
             assert transition is not None
+            # ADR-0011 section 9: StateTransition(previous=previous,
+            # current=evaluate_ip_state(...)), so both ends are reported.
+            assert transition.previous is previous
             assert transition.current is expected
 
 
@@ -461,6 +479,24 @@ class TestBuildEvent:
         assert event.timestamp == datetime.fromtimestamp(T0 + 310, UTC)
         assert event.attributes is None
 
+    @pytest.mark.parametrize("state", [IpState.COLD, IpState.HOT])
+    def test_a_transition_that_goes_nowhere_has_no_event_and_is_refused(
+        self, state: IpState
+    ) -> None:
+        # ADR-0011 decision 5: `build_event` dispatches on became_hot /
+        # became_cold, and section 19 has no event for `previous is current`.
+        # The M1 type does not forbid constructing such a value and `decide`
+        # never returns one, so build_event refuses it rather than picking an
+        # event type arbitrarily.
+        with pytest.raises(ValueError):
+            build_event(
+                self._IP,
+                StateTransition(previous=state, current=state),
+                window_count=1200,
+                config=_config(),
+                now=T0,
+            )
+
 
 # ---------------------------------------------------------------------------
 # 3. TransitionPublisher (ADR-0011 decision 5, ADR-0003 amendment, ADR-0004).
@@ -502,7 +538,14 @@ class TestTransitionPublisher:
         assert envelope.subject == str(self._IP)
         assert envelope.config_version == event.config_version == 3
         assert envelope.timestamp == event.timestamp
-        assert envelope.payload == event
+        # ADR-0011 decision 5: the publisher wraps a *copy* of the event with
+        # the assigned sequence written in, so the payload matches the event
+        # in every field but `sequence` -- which it matches the envelope on.
+        assert envelope.payload == dataclasses.replace(event, sequence=envelope.sequence)
+        assert envelope.payload.sequence == envelope.sequence
+        # The frozen event handed in is not mutated: build_event's placeholder
+        # `0` still stands on it, and is never what reaches the wire.
+        assert event.sequence == 0
 
     async def test_removed_envelope_names_its_own_event_type(self) -> None:
         bus = InMemoryBus()
@@ -537,11 +580,23 @@ class TestTransitionPublisher:
             bus.producer(), producer_id=PRODUCER_ID, initial_sequence=17
         )
         assert publisher.next_sequence == 17
+        added = self._added()
+        removed = self._removed()
 
-        first = await publisher.publish(self._added())
-        second = await publisher.publish(self._removed())
+        first = await publisher.publish(added)
+        second = await publisher.publish(removed)
 
         assert [first.sequence, second.sequence] == [17, 18]
+        # ADR-0011 decision 5: the payload carries the same sequence as its
+        # envelope. At initial_sequence=17 that is visibly not build_event's
+        # placeholder `0`, so this is the case that pins the rewrite down --
+        # at a fresh publisher's first sequence the two coincide by accident.
+        assert first.payload.sequence == first.sequence == 17
+        assert second.payload.sequence == second.sequence == 18
+        assert first.payload == dataclasses.replace(added, sequence=17)
+        assert second.payload == dataclasses.replace(removed, sequence=18)
+        # Neither event was mutated in place.
+        assert (added.sequence, removed.sequence) == (0, 0)
 
     async def test_record_lands_on_the_hot_ip_topic_keyed_by_the_ip(self) -> None:
         bus = InMemoryBus()

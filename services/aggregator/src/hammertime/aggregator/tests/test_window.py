@@ -16,6 +16,12 @@ just expired; every boundary case here is a restatement of that sentence
 rather than a remembered constant, and `_live_model` below is the same rule
 written out so the property test and the re-bucketing tests can derive their
 expectations instead of guessing them.
+
+The same sentence is what decides `classify`'s `EXPIRED`/`APPLY` split
+(ADR-0011 decision 2: judged on the bucket `S`, never on the raw age of
+`window_start`), what `rebucket` installs as the store's own geometry
+(decision 7 step 2), and what `get_or_create` does *not* touch on an existing
+entry (decision 3: `now=` seeds a new entry only).
 """
 
 from __future__ import annotations
@@ -600,6 +606,14 @@ class TestClassify:
     horizon is 330 seconds and the `[300, 330]` band is the zone where an
     observation is inside the horizon but its bucket has already left the
     window.
+
+    `EXPIRED` versus `APPLY` is judged on the **bucket**
+    `S = bucket_start(window_start, B)` -- `APPLY` iff `is_live(S, now, W)` --
+    never on the raw age of `window_start`; `FUTURE` and `LATE` stay raw-age
+    tests, because the lateness horizon is a policy on event age rather than
+    on bucket geometry. For the aligned `window_start` that ingest publishes
+    the two readings coincide, so most cases below read the same either way;
+    the unaligned cases are the ones that tell them apart.
     """
 
     config = DetectionConfig()
@@ -643,6 +657,44 @@ class TestClassify:
     def test_every_live_bucket_is_applied(self, window_start: int) -> None:
         assert classify(window_start, NOW, self.config) is Disposition.APPLY
 
+    def test_an_unaligned_start_is_judged_on_its_bucket_not_on_its_age(self) -> None:
+        # ADR-0011 decision 2's worked example. 705 has a raw age of 295 --
+        # inside the window as an age -- but bucket_start(705, 10) is 700,
+        # which left the window at exactly 1000, so it is EXPIRED. 715 rounds
+        # down to 710, which is live, so it is APPLY. The bucket rule is not a
+        # free choice: decision 4 applies an APPLY observation with
+        # counter.observe(S, ...), which raises for a dead S, so an age-based
+        # reading would turn a valid observation into a crash.
+        assert bucket_start(705, BUCKET_SECONDS) == 700
+        assert not is_live(700, NOW, WINDOW_SECONDS)
+        assert classify(705, NOW, self.config) is Disposition.EXPIRED
+
+        assert bucket_start(715, BUCKET_SECONDS) == 710
+        assert is_live(710, NOW, WINDOW_SECONDS)
+        assert classify(715, NOW, self.config) is Disposition.APPLY
+
+    def test_an_unaligned_now_does_not_move_the_bucket_edge(self) -> None:
+        # `now` is never rounded either: liveness is `S <= now < S + W` against
+        # the service clock as it stands. At now = 1005, 700 is still dead
+        # (700 + 300 <= 1005) and 710 is still live (710 + 300 > 1005).
+        assert classify(700, 1005, self.config) is Disposition.EXPIRED
+        assert classify(710, 1005, self.config) is Disposition.APPLY
+        assert classify(705, 1005, self.config) is Disposition.EXPIRED
+        assert classify(715, 1005, self.config) is Disposition.APPLY
+
+    def test_a_live_bucket_is_never_also_late(self) -> None:
+        # The four dispositions stay total and disjoint under the bucket rule:
+        # a live S implies now - window_start < W, so nothing is both LATE and
+        # countable (ADR-0011 decision 2).
+        for window_start in range(600, 1101):
+            disposition = classify(window_start, NOW, self.config)
+            live = is_live(bucket_start(window_start, BUCKET_SECONDS), NOW, WINDOW_SECONDS)
+            if disposition is Disposition.APPLY:
+                assert live
+                assert NOW - window_start < WINDOW_SECONDS
+            else:
+                assert not (live and window_start <= NOW)
+
     def test_allowed_lateness_does_not_widen_what_is_counted(self) -> None:
         # ADR-0011 decision 2: a bucket that has left the window cannot
         # contribute whatever the policy says. A huge lateness allowance only
@@ -665,6 +717,45 @@ class TestClassify:
         # total over the integers around the boundaries.
         for window_start in range(600, 1100):
             assert classify(window_start, NOW, self.config) in set(Disposition)
+
+
+class TestStoreConstruction:
+    """ADR-0011 section 9: the store owns a geometry, under IpCounter's rule.
+
+    `window_seconds` / `bucket_seconds` are read-only properties reporting the
+    shape every counter the store creates will have, so the geometry in force
+    is observable without creating an entry.
+    """
+
+    def test_geometry_is_exposed(self) -> None:
+        store = _store()
+
+        assert store.window_seconds == WINDOW_SECONDS
+        assert store.bucket_seconds == BUCKET_SECONDS
+
+    def test_a_non_default_geometry_is_the_one_new_entries_get(self) -> None:
+        store = _store(window_seconds=600, bucket_seconds=20)
+
+        entry = store.get_or_create(IP_A, now=NOW)
+
+        assert store.window_seconds == 600
+        assert store.bucket_seconds == 20
+        assert entry.counter.window_seconds == 600
+        assert entry.counter.bucket_seconds == 20
+        assert entry.counter.bucket_count == 30
+
+    @pytest.mark.parametrize(
+        ("window_seconds", "bucket_seconds"),
+        [(305, 10), (300, 7), (10, 300), (0, 10), (300, 0), (-300, 10), (300, -10)],
+    )
+    def test_rejects_exactly_the_geometries_the_counter_rejects(
+        self, window_seconds: int, bucket_seconds: int
+    ) -> None:
+        # Same rule as IpCounter.__init__: both > 0 and W % B == 0. A store
+        # whose geometry no counter could take would fail only on the first
+        # get_or_create, long after the operator could act on it.
+        with pytest.raises(ValueError):
+            _store(window_seconds=window_seconds, bucket_seconds=bucket_seconds)
 
 
 class TestStoreLookup:
@@ -702,6 +793,24 @@ class TestStoreLookup:
         assert again is entry
         assert again.counter.total == 4
         assert len(store) == 1
+
+    def test_get_or_create_does_not_refresh_last_observed_on_a_known_ip(self) -> None:
+        # ADR-0011 decision 3: `now=` seeds a *new* entry only; on an existing
+        # one it is ignored. `last_observed` is the time of the last *applied*
+        # observation, which the worker writes itself after counter.observe,
+        # so a bare lookup must not make an idle entry look fresh to
+        # retention.
+        store = _store()
+        entry = store.get_or_create(IP_A, now=NOW)
+
+        again = store.get_or_create(IP_A, now=NOW + 5_000)
+
+        assert again is entry
+        assert again.last_observed == NOW
+        # The observable consequence: the entry is still evictable on the
+        # schedule its creation time set, not the lookup's.
+        assert evict_idle(store, now=NOW + 600, state_retention_seconds=600) == 1
+        assert IP_A not in store
 
     def test_get_returns_the_same_entry_object(self) -> None:
         store = _store()
@@ -998,6 +1107,65 @@ class TestStoreRebucket:
         store.rebucket(window_seconds=WINDOW_SECONDS, bucket_seconds=20, now=NOW)
 
         assert len(store) == 0
+
+    def test_rebucket_replaces_the_stores_own_geometry(self) -> None:
+        # ADR-0011 decision 7 step 2: the store's window_seconds /
+        # bucket_seconds are replaced too, not just the rebuilt counters'.
+        store = _store()
+
+        store.rebucket(window_seconds=600, bucket_seconds=20, now=NOW)
+
+        assert store.window_seconds == 600
+        assert store.bucket_seconds == 20
+
+    def test_an_entry_created_after_rebucket_gets_the_new_geometry(self) -> None:
+        # Without this, an observation arriving for an IP first seen after a
+        # re-evaluation would be classified under the new geometry by
+        # `classify` (which reads the config) and then validated against the
+        # old one by its counter.
+        store = _store()
+        store.get_or_create(IP_A, now=NOW)
+
+        store.rebucket(window_seconds=600, bucket_seconds=20, now=NOW)
+        fresh = store.get_or_create(IP_B, now=NOW)
+
+        assert fresh.counter.window_seconds == 600
+        assert fresh.counter.bucket_seconds == 20
+        assert fresh.counter.bucket_count == 30
+        # 700 is dead under the old 300 s window and live under the new 600 s
+        # one, so this only succeeds if the new entry really took the new
+        # geometry rather than the constructor's.
+        assert fresh.counter.observe(700, 3, now=NOW) == 3
+
+    @pytest.mark.parametrize(
+        ("window_seconds", "bucket_seconds"),
+        [(305, 10), (300, 7), (10, 300), (0, 10), (300, 0), (-300, 10)],
+    )
+    def test_rebucket_rejects_an_invalid_geometry_even_on_an_empty_store(
+        self, window_seconds: int, bucket_seconds: int
+    ) -> None:
+        # ADR-0011 decision 7 step 2: validated up front, with the same rule
+        # as IpCounter.__init__, so an invalid geometry cannot be latched
+        # silently and surface only on the next get_or_create.
+        store = _store()
+
+        with pytest.raises(ValueError):
+            store.rebucket(window_seconds=window_seconds, bucket_seconds=bucket_seconds, now=NOW)
+
+        assert store.window_seconds == WINDOW_SECONDS
+        assert store.bucket_seconds == BUCKET_SECONDS
+
+    def test_rebucket_rejects_an_invalid_geometry_on_a_populated_store(self) -> None:
+        store = _store()
+        entry = store.get_or_create(IP_A, now=NOW)
+        entry.counter.observe(1000, 5, now=NOW)
+
+        with pytest.raises(ValueError):
+            store.rebucket(window_seconds=305, bucket_seconds=10, now=NOW)
+
+        assert store.window_seconds == WINDOW_SECONDS
+        assert store.bucket_seconds == BUCKET_SECONDS
+        assert entry.counter.total == 5
 
 
 class TestExpireBuckets:
