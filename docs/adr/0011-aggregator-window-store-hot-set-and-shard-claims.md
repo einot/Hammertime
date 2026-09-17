@@ -1,12 +1,14 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted; amended 2026-09-17 (see "Amendment 1" at the end. The
-amendment records the partition count of `hammertime.observations.v1`
-changing from 32 to 128 and pins two edge cases decisions 1 and 5 left
-ambiguous. Decisions 1 and 5 were rewritten in place to state the new
-rules directly; the amendment's opening lists every such edit, and quotes
-the superseded wording, so the before/after is recoverable from this
-document alone)
+Status: accepted; amended 2026-09-17 twice (see "Amendment 1" and
+"Amendment 2" at the end. Amendment 1 records the partition count of
+`hammertime.observations.v1` changing from 32 to 128 and pins two edge cases
+decisions 1 and 5 left ambiguous. Amendment 2 pins eight edge cases of the
+window store, the counter and the lateness classifier that surfaced while
+the M3 window/lateness tests were written. Both amendments rewrite decision
+bodies in place to state the rule now in force directly; each amendment's
+opening lists every such edit, and quotes the superseded wording, so the
+before/after is recoverable from this document alone)
 
 Scope note: this ADR settles the interfaces milestone M3 (epics #5, #6, #7
 and issue #48) implements against — what the aggregator keeps per IP, how
@@ -175,16 +177,26 @@ Ring semantics (`B = bucket_seconds`, `N = bucket_count`, `W = B * N`;
 `bucket_start` is `hammertime.core.time.buckets.bucket_start`):
 
 * A bucket starting at `S` (always a multiple of `B`) is **live** at time
-  `now` iff `bucket_start(now, B) - S < W`. It enters the ring when its
-  first delta arrives and leaves the window at exactly `now = S + W`. The
-  live buckets at any `now` are the `N` buckets ending with the one that
-  contains `now`, so two live buckets never share a slot
-  (`slot = (S // B) % N`, `core.time.buckets.bucket_index`).
-* `observe(S, delta, now)`: if `S` is not live, return `False` and change
+  `now` iff `0 <= bucket_start(now, B) - S < W` — equivalently, `S` is one
+  of the `N` buckets ending with the one that contains `now`. A bucket that
+  has not started yet (`S > bucket_start(now, B)`) is **not** live: the
+  lower bound is what keeps two live buckets from ever sharing a slot
+  (`slot = (S // B) % N`, `core.time.buckets.bucket_index`), because a
+  future bucket's slot is occupied by a bucket that is still live
+  (Amendment 2, item A4). A bucket enters the ring when its first delta
+  arrives and leaves the window at exactly `now = S + W`.
+* `observe(S, delta, now)`: `S % B != 0` is a `ValueError` (the caller
+  floors; A9) and `delta < 0` is a `ValueError`; neither changes anything.
+  If `S` is not live — including a future `S` — return `False` and change
   nothing. Otherwise, if the slot holds an older bucket, subtract that
   bucket's count from `total` and reset the slot to `S`; then add `delta`
-  to the slot and to `total`; return `True`. `delta < 0` is a `ValueError`;
-  `delta == 0` is applied (returns `True`, changes nothing).
+  to the slot and to `total`; return `True`. `delta == 0` is applied like
+  any other delta (returns `True`; a stale occupant of the slot is still
+  subtracted; a slot whose count is zero is not a live bucket for
+  `live_buckets`/`next_expiry`, so on a fresh counter it changes nothing
+  observable). Because the older occupant of a slot is always a bucket that
+  has already left the window, `observe` can *lower* `total` — this is the
+  sweep's work done early, not a negative delta (A11).
 * `expire(now)`: zero every slot whose bucket is no longer live, subtract
   the zeroed counts from `total`, and return the amount removed.
 * `next_expiry()`: `min(S) + W` over slots with a non-zero count, `None`
@@ -239,31 +251,57 @@ class ShardWindow:
     def active_count(self) -> int: ...              # tracked IPs whose total > 0
     @property
     def hot_count(self) -> int: ...
-    capacity_evictions: int                         # counter, decision 8
-    retention_evictions: int
+    capacity_evictions: int                         # counter, decision 8; += 1 per IP evicted for capacity
+    retention_evictions: int                        # counter, decision 8; += 1 per IP removed by evict_due()
 ```
 
-* `observe` creates the entry for an untracked IP (state `COLD`, empty
-  ring), applies the delta with `now = clock.now()`, sets
-  `last_seen = max(last_seen, bucket_start)`, and returns the change. It
-  returns `None` and leaves the store untouched — no entry created, no
-  `last_seen` refresh — when the bucket is not live; the caller has already
-  classified that case (decision 3).
+* Every IP in `inherited_hot` is a tracked entry from construction (A5):
+  state `HOT`, `inherited` flag set, an empty ring, and
+  `last_seen = clock.now()` at construction. It is therefore in
+  `tracked_ips()`, counted by `tracked_count`, in `hot_ips()`, not in
+  `active_count` (its total is 0 until its first applied observation), and
+  it occupies a `max_tracked_ips` slot. Construction never evicts and never
+  fails on account of the cap: a shard whose inherited set alone exceeds
+  `max_tracked_ips` starts over capacity, and the capacity rule below deals
+  with it on the next new IP exactly as with any other all-HOT store.
+* `observe(ip, bucket_start, delta)` requires `bucket_start` to be a
+  multiple of `config.bucket_seconds` (the worker floors it, decision 3;
+  the counter raises `ValueError` otherwise). It creates the entry for an
+  untracked IP (state `COLD`, empty ring), applies the delta with `now =
+  clock.now()`, sets `last_seen = max(last_seen, bucket_start)`, and
+  returns the change — for `delta == 0` as well (A8): a zero delta creates
+  the entry and refreshes `last_seen` like any other applied observation,
+  and returns a `WindowChange` whose `total_after` equals `total_before`
+  unless the slot held an expired bucket. `total_after < total_before` is
+  possible for any delta when the slot's previous occupant is subtracted
+  (A11). `observe` returns `None` and leaves the store untouched — no entry
+  created, no `last_seen` refresh — when the bucket is not live (past or
+  future, A4); the caller has already classified that case (decision 3).
 * `expire_due()` calls `IpCounter.expire(now)` only on IPs whose
   `next_expiry() <= now` (an expiry schedule ordered by `next_expiry`, in
   the style of `MemoryDedupStore._expiry_heap`) and returns one
   `WindowChange` per IP whose total actually dropped. A sweep therefore
   costs O(expiring IPs · log n), never O(tracked IPs).
-* `evict_due()` removes every IP that is `COLD`, has `total == 0`, and
-  whose `last_seen + config.state_retention_seconds <= now` (§26); returns
-  the number removed. A HOT IP is never evicted; because
-  `state_retention_seconds >= window_seconds` (`DetectionConfig`), a HOT IP
-  always reaches `total == 0` and is demoted (decision 6) before its
-  retention deadline can pass.
+* `evict_due()` removes every IP that is `COLD` and whose
+  `last_seen + config.state_retention_seconds <= now` (§26), increments
+  `retention_evictions` once per IP removed, and returns the number
+  removed. It is self-sufficient: it does not require a preceding
+  `expire_due()` and does not consult the running total (A6). An IP that
+  meets the condition necessarily holds no live bucket — every applied
+  bucket has `S <= last_seen`, and `state_retention_seconds >=
+  window_seconds` (`DetectionConfig`), so every such bucket left the
+  window at or before `last_seen + window_seconds <= now` — and its
+  `total`, if still non-zero, is only a sweep the schedule had not yet
+  run. The entry is dropped whole: no `WindowChange` is produced for it and
+  nothing is counted as expiry. A HOT IP is never evicted; by the same
+  arithmetic a HOT IP always reaches `total == 0` and is demoted (decision
+  6) before its retention deadline can pass.
 * Capacity: when a new IP would make `tracked_count` exceed
   `max_tracked_ips`, the `COLD` IP with the smallest `last_seen` is evicted
   first (`capacity_evictions += 1`). If every tracked IP is HOT the store
   grows past the cap rather than drop a HOT IP; that condition is logged.
+  Inherited IPs count towards `tracked_count` here like any other entry
+  (A5).
 * `set_state(ip, COLD)` clears the `inherited` flag for that IP;
   `finish_warmup_if_due()` returns — exactly once, the first time it is
   called with `clock.now() >= warm_until` — the set of inherited IPs that
@@ -301,12 +339,43 @@ def classify_observation(
 ```
 
 `classify_observation` is pure and checks, in this order: `WINDOW_TOO_LONG`
-(ADR-0010 decision 6), `FUTURE`, `LATE` (the shipped
-`is_within_lateness` horizon, config window), `EXPIRED_BUCKET`
-(`bucket_start(now) - bucket_start(window_start) >= config.window_seconds`,
-i.e. `IpCounter.is_live` is false), else `APPLIED`. `now` is the service
-clock at processing time, not the envelope timestamp: a lagging aggregator
-diverts what it can no longer count rather than counting it into the past.
+(`window_seconds > config.window_seconds`, ADR-0010 decision 6), `FUTURE`
+(`window_start > now`), `LATE` (`now - window_start > config.window_seconds
++ config.allowed_lateness_seconds` — the shipped `is_within_lateness`
+horizon, config window), `EXPIRED_BUCKET`
+(`bucket_start(now, B) - bucket_start(window_start, B) >=
+config.window_seconds` with `B = config.bucket_seconds`, i.e.
+`IpCounter.is_live` is false for the bucket the delta would land in), else
+`APPLIED`. `now` is the service clock at processing time, not the envelope
+timestamp: a lagging aggregator diverts what it can no longer count rather
+than counting it into the past.
+
+Two things about the arithmetic are deliberate and are stated so that no
+test or implementation has to derive them (A9, A10):
+
+* `LATE` and `FUTURE` are judged on the raw age `now - window_start`;
+  `EXPIRED_BUCKET` is judged on *bucket* age, after flooring both ends to
+  `B`. The two measures differ inside the last bucket: with `now` on a
+  bucket boundary and the shipped defaults, an age of 291 s already floors
+  into the bucket 300 s back and is `EXPIRED_BUCKET`, while an aligned
+  `window_start` 290 s back is `APPLIED`. `classify_observation` floors
+  `window_start` itself and does not require it to be aligned; an
+  unaligned `window_start` is never `MALFORMED` (ADR-0010 decision 6 already
+  lands the delta in `bucket_start(window_start, B)`).
+* Every age `>= config.window_seconds` is either `LATE` or
+  `EXPIRED_BUCKET`, never `APPLIED`, for every config and every `now`:
+  `bucket_start(now, B) - bucket_start(now - age, B)` is at least
+  `age - (age mod B)` — the largest multiple of `B` not above `age` — for
+  every position of `now` within its bucket, and that is `>=
+  window_seconds` whenever `age >= window_seconds` because `window_seconds`
+  is itself a multiple of `B` (`DetectionConfig`). In particular an age of
+  exactly `window_seconds + allowed_lateness_seconds` (330 s with the
+  shipped defaults) is inside the horizon (the `LATE` test is strictly
+  `>`) and is always `EXPIRED_BUCKET`. `APPLIED` therefore requires `0 <=
+  age < config.window_seconds` *and* the bucket test; which ages below the
+  window are `APPLIED` depends on where `now` falls within its own bucket,
+  so a test that pins exact ages must pin `now` (the shipped tests use a
+  bucket-aligned `now`).
 
 The worker (`hammertime.aggregator.worker`) handles one consumed message as:
 
@@ -316,15 +385,22 @@ The worker (`hammertime.aggregator.worker`) handles one consumed message as:
    `CodecError`, is `MALFORMED`: logged at `WARNING event=malformed_observation`
    with the topic, partition and offset, counted, and skipped. A poison
    message never stops the consumer.
-2. `classify_observation(...)`. `LATE`, `FUTURE`, `EXPIRED_BUCKET` and
-   `WINDOW_TOO_LONG` are **diverted**: the consumed bytes are republished
-   unchanged, under the same key, to
+2. `classify_observation(...)` with `window_start` as a whole UTC epoch
+   second — the floor of the payload's `window_start` (an aware
+   `datetime`; the codec admits sub-second precision, which is discarded
+   because no `bucket_seconds >= 1` can distinguish it, A9), `now =
+   clock.now()`, and `config` the config in force. `LATE`, `FUTURE`,
+   `EXPIRED_BUCKET` and `WINDOW_TOO_LONG` are **diverted**: the consumed
+   bytes are republished unchanged, under the same key, to
    `hammertime.observations-reconciliation.v1` (same `event_id`, so a
    reconciliation consumer can dedupe against the hot path), and counted
    (decision 8). The window store is not touched.
-3. `APPLIED`: `window.observe(ip, bucket_start(window_start), request_count)`
-   on the `ShardWindow` of `message.partition`, then decision 4 for that IP
-   with `reason="observation"`.
+3. `APPLIED`: `window.observe(ip, bucket_start(window_start,
+   window.config.bucket_seconds), request_count)` on the `ShardWindow` of
+   `message.partition` — the worker floors with the target window's own
+   `bucket_seconds`, so the store always receives an aligned bucket — then
+   decision 4 for that IP with `reason="observation"`. The evaluation may
+   yield a HOT -> COLD (A11).
 
 Consumption is at-least-once (ADR-0003). Counters are process-local, so a
 redelivery after a crash rebuilds counters that died with the process
@@ -476,11 +552,20 @@ claimed shard, under the worker lock:
    reason="warmup")`.
 3. `window.evict_due()`.
 
-Because deltas are non-negative, an observation can only raise a count and
-a sweep can only lower one: COLD -> HOT happens on the observation path (or
-config re-evaluation), HOT -> COLD only on the sweep, warm-up end, or config
-re-evaluation. `hot_to_cold_transitions` is labelled by `reason`
-accordingly.
+Deltas are non-negative, so a sweep can only lower a count and COLD -> HOT
+happens only on the observation path (or config re-evaluation). The
+converse does not hold: `IpCounter.observe` subtracts a slot's expired
+occupant before adding the delta (decision 2), so an observation that lands
+in a slot the sweep has not yet cleared can lower the running total — by an
+amount the next sweep would have removed anyway — and the evaluation that
+follows it (decision 3, step 3) can then demote the IP. That demotion is
+correct (the count is exact) and is counted under `reason="observation"`
+(A11). HOT -> COLD therefore happens on the sweep, at warm-up end, on config
+re-evaluation, or on the observation path; `hot_to_cold_transitions` is
+labelled by `reason` accordingly. Step 3 above does not depend on step 1
+having run — `evict_due()` is self-sufficient (decision 2, A6) — but the
+order stays normative: expiring before evaluating is what turns an expired
+count into a `HotIpRemoved` in the same sweep.
 
 The consumer position is committed every
 `HAMMERTIME_AGGREGATOR_COMMIT_INTERVAL_S` seconds of wall time (default 1.0;
@@ -533,10 +618,11 @@ tracked_ips{shard}                      ShardWindow.tracked_count
 active_ips{shard}                       ShardWindow.active_count
 hot_ips{shard}                          ShardWindow.hot_count
 cold_to_hot_transitions{shard,config_version,reason}    reason = observation | config
-hot_to_cold_transitions{shard,config_version,reason}    reason = expiry | warmup | config
+hot_to_cold_transitions{shard,config_version,reason}    reason = observation | expiry | warmup | config   (A11)
 late_messages{reason}                   reason = late | future | expired_bucket
 observations_rejected{reason}           reason = window_too_long | malformed   (aggregator-side)
-window_evictions{reason}                reason = retention | capacity
+window_evictions{shard,reason}          reason = retention | capacity; read from ShardWindow.retention_evictions /
+                                        .capacity_evictions of each claimed shard (A7)
 shards_claimed                          gauge
 ```
 
@@ -1015,3 +1101,500 @@ This item requires no change to shipped code (`MemoryConsumer.subscribe`
 and `KafkaConsumer.subscribe` do not yet take `partitions`; there is no
 `parse_shard_ids`); it is binding on the bus and aggregator briefs and on
 their `test-author`s.
+
+## Amendment 2 (2026-09-17) — future buckets, inherited entries, retention without a sweep, eviction counters, zero deltas, bucket-aligned lateness, the horizon boundary, and demotion on the observation path
+
+Why: the `test-author` writing the M3 window and lateness tests
+(`services/aggregator/src/hammertime/aggregator/tests/test_window.py`,
+`test_lateness.py`) worked from decisions 2 and 3 and surfaced seven places
+where the text either did not decide a case, decided it only by
+implication, or — in two places — decided it in a way the worker did not
+recognise. An eighth item (A11) was not asked about; it fell out of
+answering A8 and contradicts a sentence in decision 6, so it is settled
+here rather than left for the worker brief to trip over. Each item says
+whether the point was (a) already determined by the ADR as written, (b)
+genuinely unspecified and ruled now, or (c) deliberately left open, and
+whether it changes any shipped code. **None does**: at the time of writing
+there is no `IpCounter`, `ShardWindow`, `classify_observation`,
+`AggregatorWorker` or `AggregatorMetrics` in the tree
+(`services/aggregator/src/hammertime/aggregator/window/counter.py`,
+`window/store.py`, `lateness.py`, `worker.py` are docstring-only stubs, and
+`packages/` was grepped for every one of those names: the only hits are
+docstring cross-references in `hammertime-store` and `hammertime-bus`), so
+every ruling is binding on the C4 (`coder`, window store and classifier)
+and T5 (`test-author`, worker/transitions/claims) briefs rather than a
+correction to code. The two shipped test files are consistent with every
+ruling below; where a ruling goes beyond what they assert, the gap is listed
+under *Follow-ups*.
+
+As with Amendment 1, decision bodies were rewritten in place so that a
+reader sees the rule now in force. Every edit outside this section, with the
+superseded wording quoted:
+
+* **Decision 2, ring semantics, first bullet.** Was: "A bucket starting at
+  `S` (always a multiple of `B`) is **live** at time `now` iff
+  `bucket_start(now, B) - S < W`. It enters the ring when its first delta
+  arrives and leaves the window at exactly `now = S + W`. The live buckets
+  at any `now` are the `N` buckets ending with the one that contains
+  `now`, so two live buckets never share a slot (`slot = (S // B) % N`,
+  `core.time.buckets.bucket_index`)." Now gives the rule as `0 <=
+  bucket_start(now, B) - S < W`, says a bucket that has not started is not
+  live, and says why (A4).
+* **Decision 2, ring semantics, `observe` bullet.** Was: "`observe(S,
+  delta, now)`: if `S` is not live, return `False` and change nothing.
+  Otherwise, if the slot holds an older bucket, subtract that bucket's
+  count from `total` and reset the slot to `S`; then add `delta` to the
+  slot and to `total`; return `True`. `delta < 0` is a `ValueError`;
+  `delta == 0` is applied (returns `True`, changes nothing)." Now: an
+  unaligned `S` is a `ValueError` (A9); a future `S` is not live (A4); the
+  `delta == 0` sentence is corrected — a zero delta still subtracts a stale
+  slot occupant, so "changes nothing" holds only for a fresh slot (A8);
+  and a sentence was added stating that `observe` can lower `total` (A11).
+* **Decision 2, `ShardWindow` code block, last two attributes.** The
+  comments "`# counter, decision 8`" (on `capacity_evictions`) and none (on
+  `retention_evictions`) became one comment each stating what increments
+  the counter (A7).
+* **Decision 2, `ShardWindow` bullets.** A new first bullet states that
+  every inherited IP is a tracked entry from construction, what its
+  `last_seen` is, and that construction never evicts (A5). The `observe`
+  bullet — was: "`observe` creates the entry for an untracked IP (state
+  `COLD`, empty ring), applies the delta with `now = clock.now()`, sets
+  `last_seen = max(last_seen, bucket_start)`, and returns the change. It
+  returns `None` and leaves the store untouched — no entry created, no
+  `last_seen` refresh — when the bucket is not live; the caller has already
+  classified that case (decision 3)." — now also requires an aligned
+  `bucket_start` (A9), states the zero-delta case explicitly (A8), states
+  that `total_after < total_before` is possible (A11), and says "not live
+  (past or future)" (A4). The `evict_due()` bullet — was: "`evict_due()`
+  removes every IP that is `COLD`, has `total == 0`, and whose `last_seen +
+  config.state_retention_seconds <= now` (§26); returns the number removed.
+  A HOT IP is never evicted; because `state_retention_seconds >=
+  window_seconds` (`DetectionConfig`), a HOT IP always reaches `total == 0`
+  and is demoted (decision 6) before its retention deadline can pass." —
+  now drops the `total == 0` clause, says the method is self-sufficient and
+  why, says it increments `retention_evictions`, and says no `WindowChange`
+  is produced (A6, A7). The capacity bullet gained a closing sentence that
+  inherited IPs count towards `tracked_count` (A5).
+* **Decision 3, the `classify_observation` paragraph.** Was:
+  "`classify_observation` is pure and checks, in this order:
+  `WINDOW_TOO_LONG` (ADR-0010 decision 6), `FUTURE`, `LATE` (the shipped
+  `is_within_lateness` horizon, config window), `EXPIRED_BUCKET`
+  (`bucket_start(now) - bucket_start(window_start) >=
+  config.window_seconds`, i.e. `IpCounter.is_live` is false), else
+  `APPLIED`. `now` is the service clock at processing time, not the envelope
+  timestamp: a lagging aggregator diverts what it can no longer count rather
+  than counting it into the past." Now spells each predicate out with `B =
+  config.bucket_seconds` explicit, and is followed by two new bullets:
+  raw-age versus bucket-age, flooring, and unaligned `window_start` never
+  being `MALFORMED` (A9); and the proof that every age `>= window_seconds`
+  is `LATE` or `EXPIRED_BUCKET`, including the exact horizon (A10).
+* **Decision 3, worker step 2.** Was: "`classify_observation(...)`. `LATE`,
+  `FUTURE`, ..." Now says what `window_start`, `now` and `config` are
+  passed, including the whole-second floor of the payload's `datetime`
+  (A9). The diversion sentence is unchanged.
+* **Decision 3, worker step 3.** Was: "`APPLIED`: `window.observe(ip,
+  bucket_start(window_start), request_count)` on the `ShardWindow` of
+  `message.partition`, then decision 4 for that IP with
+  `reason="observation"`." Now names the bucket size used for the floor
+  (the target window's `config.bucket_seconds`, A9) and notes that the
+  evaluation may demote (A11).
+* **Decision 6, the paragraph after the three maintenance steps.** Was:
+  "Because deltas are non-negative, an observation can only raise a count
+  and a sweep can only lower one: COLD -> HOT happens on the observation
+  path (or config re-evaluation), HOT -> COLD only on the sweep, warm-up
+  end, or config re-evaluation. `hot_to_cold_transitions` is labelled by
+  `reason` accordingly." Rewritten: the second half was false under
+  decision 2's own slot-reuse rule (A11); the paragraph now also records
+  that step 3 does not depend on step 1 (A6) and why the order stays.
+* **Decision 8.** `hot_to_cold_transitions{shard,config_version,reason}`'s
+  reason set — was "`expiry | warmup | config`" — gained `observation`
+  (A11). `window_evictions{reason}` — was "`reason = retention |
+  capacity`" — became `window_evictions{shard,reason}` with a note that it
+  is read from the two per-window counters (A7).
+* **Status line.** Marked amended twice.
+* **`docs/spec/hammertime_spec_1.md`, two pointer notes** (the spec's
+  restatements of this ADR, kept in step): §5's note now reads `0 <=
+  bucket_start(now) - S < window_seconds` (A4); §37's note lists
+  `observation | expiry | warmup | config` for HOT -> COLD and labels
+  `window_evictions` by `shard` as well as reason (A11, A7). No other spec
+  text changed; `docs/spec/README.md`'s section index maps the same
+  sections to the same modules and is untouched.
+
+Decisions 1, 4, 5, 7 and 9, the Assumptions list, Consequences, Sources and
+Amendment 1 are untouched.
+
+### A4. A bucket that has not started is not live; the counter refuses it
+
+**Classification: (b), with a contradiction in the text.** Decision 2's
+formula `bucket_start(now, B) - S < W` is satisfied by every `S > now`, but
+the sentence after it — "the live buckets at any `now` are the `N` buckets
+ending with the one that contains `now`" — excludes them. The two cannot
+both hold, and the difference matters: the slot of a future bucket `S =
+bucket_start(now) + kB` (`1 <= k < N`) is the slot of `S - W`, which *is*
+live at `now`. Admitting the future bucket would evict a live bucket from
+the ring on a write — a corruption of exactly the invariant ("two live
+buckets never share a slot") the ring depends on. The prose was right and
+the formula was incomplete.
+
+Ruling: `IpCounter.is_live(S, now)` is `0 <= bucket_start(now, B) - S < W`.
+`observe(S, delta, now)` with a future `S` returns `False` and changes
+nothing, exactly as for an expired `S`. `ShardWindow.observe` therefore
+returns `None` for it, with no entry created and no `last_seen` refresh.
+This is defence in depth, not a second policy: decision 3 filters `FUTURE`
+before the store is reached, and after that filter `now >= window_start`
+implies `bucket_start(now) >= bucket_start(window_start)`, so decision 3's
+"i.e. `IpCounter.is_live` is false" reading of `EXPIRED_BUCKET` is
+unchanged by the added lower bound.
+
+Assumptions:
+
+* **Refuse rather than raise.** A future `S` reaching the counter is a
+  caller bug (the classifier should have diverted it), so a `ValueError`
+  was the alternative. Refusing keeps `observe`'s contract two-valued
+  (applied or not) and keeps the store's "not live -> `None`, untouched"
+  rule uniform; a test can still tell the two apart through `is_live`.
+* **"Future" is judged against `bucket_start(now, B)`, not `now`.** For an
+  aligned `S` the two are the same test; stating it on the floored value
+  keeps the formula in one currency.
+
+Shipped code: none affected. The shipped tests never call `is_live` or
+`observe` with `now < S`; a future-bucket test is a follow-up.
+
+### A5. An inherited HOT IP is a tracked entry from construction
+
+**Classification: (a) by implication, now stated.** Decision 2 lists what
+the store holds "per tracked IP" — counter, state, `last_seen`, `inherited`
+flag — and decision 5 gives an inherited IP a state and a flag; decision 4
+reads `window.state(ip)`, which "is `COLD` when untracked", so an IP that
+is to report `HOT` must be tracked; and decision 7 re-evaluates "a snapshot
+of `window.tracked_ips()`" and says "the warm-up exemption of decision 5
+still applies", which only means anything if inherited IPs are in that
+snapshot. Nothing in the ADR admits a HOT-but-untracked IP. The worker was
+right that the consequences — `tracked_count`, the capacity slot,
+`last_seen` — were never written down.
+
+Ruling (decision 2 now says this): every IP in `inherited_hot` is an entry
+from construction — `is_tracked` true, in `tracked_ips()` and
+`tracked_count`, in `hot_ips()`/`hot_count`, not in `active_count` until
+its first applied observation (`total == 0`), and occupying a
+`max_tracked_ips` slot. Its `last_seen` is `clock.now()` at construction.
+Construction never evicts: a shard whose inherited set alone exceeds the
+cap starts over capacity, and the existing all-HOT rule applies on the next
+new IP (grow past the cap, log `store_over_capacity`). Its first
+observation returns `WindowChange(state=HOT, total_before=0,
+total_after=delta)`.
+
+Assumptions:
+
+* **`last_seen = clock.now()` at construction**, not `0`/`None` and not the
+  bucket boundary. Decision 2 defines `last_seen` as the event time of the
+  newest applied bucket, which an inherited IP does not have. `clock.now()`
+  is the last moment the process *knew* the IP mattered (the claim), so
+  retention runs from the claim: an inherited IP demoted at warm-up end
+  (`claim + window_seconds`) becomes evictable at `claim +
+  state_retention_seconds` — the same deadline an IP observed at claim time
+  would get. `0` would make it evictable on the first sweep after
+  demotion, which is defensible but makes retention mean two things.
+  Service time and event time are the same axis in this ADR (decision 2
+  compares `clock.now()` with `bucket_start` directly), so no unit is mixed.
+* **No log at construction for an over-cap inherited set.** The
+  `shard_claimed` record already carries `inherited_hot=N`; the
+  `store_over_capacity` record fires when the cap first actually bites.
+* **`inherited_hot` is de-duplicated silently** (it is consumed into a
+  set); passing an IP twice is not an error.
+
+Shipped code: none affected. The shipped tests assert `state`,
+`is_inherited`, `hot_ips()` and `total == 0` for inherited IPs and never
+`tracked_count` with a non-empty `inherited_hot`; that assertion is a
+follow-up.
+
+### A6. `evict_due()` is self-sufficient; the running total is not part of the retention test
+
+**Classification: (b).** Decision 2 made eviction conditional on `total ==
+0`, and `total` is lowered only by `expire()`, which only `expire_due()`
+calls. Read literally, an IP whose last bucket left the window but whose
+sweep has not run reports `total > 0` and survives `evict_due()`. Decision
+6 orders the sweep before eviction, so in the maintenance loop the literal
+reading and the intended one coincide — but the ADR never said that
+`evict_due()` *presumes* the order, and the worker could not tell whether
+a standalone `evict_due()` was allowed to expire internally, so it
+(correctly) deleted the test it had written.
+
+Ruling: the `total == 0` clause is removed from the retention condition,
+not because the intent changed but because it is implied. `evict_due()`
+removes every IP that is `COLD` and has `last_seen +
+config.state_retention_seconds <= now`, whatever its running total says.
+The implication: `last_seen` is `>=` every applied bucket start `S`
+(decision 2's `max`), and `state_retention_seconds >= window_seconds` is
+enforced by `DetectionConfig`, so every bucket of such an IP satisfies `S +
+window_seconds <= last_seen + window_seconds <= last_seen +
+state_retention_seconds <= now` — it has left the window. A non-zero
+`total` on such an IP is only a sweep the schedule had not yet reached.
+`apply_config` does not break this: it re-buckets each `(S, count)` to
+`bucket_start(S, B') <= S` and does not touch `last_seen`, and the config
+in force always satisfies the retention inequality. Consequences:
+
+* `evict_due()` needs no preceding `expire_due()` and may be called at any
+  time; calling it alone at the deadline evicts.
+* It drops the entry whole. It produces no `WindowChange`, and the count it
+  discards is not reported as expiry — no transition can be lost, because
+  only `COLD` IPs are eligible and decision 6 only evaluates `HOT` ones on
+  expiry.
+* Decision 6's order (expire, warm-up, evict) stays normative for the
+  reason given there: a `HOT` IP must be expired *and evaluated* in the
+  sweep that empties it, and that is step 1's job, not step 3's.
+* A stale schedule entry for an evicted IP is the implementation's to
+  ignore (lazy deletion, as `MemoryDedupStore._expiry_heap` does).
+
+Assumptions:
+
+* **Redefine rather than document the precondition.** The alternative was
+  to keep `total == 0` and state "`evict_due()` assumes `expire_due()` ran
+  at this `now`". Rejected: a hidden ordering dependency between two
+  public methods is exactly the kind of thing the next reader misses, and
+  the redefinition costs nothing because the clause was redundant.
+* **The capacity path is unchanged.** It evicts the least-recently-seen
+  `COLD` IP whether or not its window is empty (assumption 16); only the
+  retention path was ambiguous.
+
+Shipped code: none affected. The shipped retention tests all call
+`expire_due()` before `evict_due()` and pass under either reading; a
+standalone-`evict_due()` test is a follow-up.
+
+### A7. `retention_evictions` counts IPs removed by `evict_due()`; `window_evictions` is per shard
+
+**Classification: (b) by omission.** Decision 2 said `capacity_evictions
++= 1` for the capacity path and listed `retention_evictions: int` with no
+sentence incrementing it; decision 8 needed a `window_evictions{reason=
+retention}` fed from somewhere.
+
+Ruling: `ShardWindow.retention_evictions` is incremented by one for every
+IP `evict_due()` removes, so `evict_due()`'s return value equals the
+counter's increase across the call. Both eviction counters start at 0 at
+construction, are monotonic for the window's life, and are per
+`ShardWindow`. Decision 8's metric becomes
+`window_evictions{shard,reason}`, read directly from the two counters of
+each claimed shard at export time — the same shape and lifecycle as
+`tracked_ips{shard}`: when a shard is revoked its window and its series go
+away together, and no process-level carry has to be kept.
+
+Assumptions:
+
+* **A `shard` label rather than a process-level accumulator.** The
+  alternative (process totals maintained by the worker after each
+  `observe`/`evict_due`, or folded in at `on_revoked`) keeps a Prometheus
+  counter from ever appearing to drop, but needs bookkeeping at every call
+  site that can evict. Per-shard series already exist for the gauges and
+  the transition counters, and a series that stops at revocation is the
+  normal per-shard shape. This is a metric-shape choice the telemetry epic
+  can revisit before `/metrics` exports it (ADR-0009 decision 4 says it
+  may be empty until then).
+* **Construction and `apply_config` never increment either counter.**
+  Neither removes an entry (A5; decision 2's `apply_config` bullet).
+
+Shipped code: none affected (`metrics.py` is a stub). The shipped test
+`test_retention_eviction_is_counted` asserts exactly this increment.
+
+### A8. A zero delta is an observation: it creates the entry and returns a change
+
+**Classification: (a) by composition, now stated.** Decision 2's counter
+applies `delta == 0` and returns `True`; decision 2's store "creates the
+entry for an untracked IP ... applies the delta ... and returns the
+change". Nothing carves out zero, so a zero delta creates a tracked entry
+whose total is 0 — tracked but not active under §37's definition — and
+refreshes `last_seen`. The worker's `active_count` test relies on precisely
+this and is right to.
+
+Ruling (decision 2 now says this): `ShardWindow.observe(ip, S, 0)` for a
+live `S` creates the entry if absent, sets `last_seen = max(last_seen,
+S)`, and returns `WindowChange(ip, state, total_before, total_after)` — not
+`None`, which is reserved for "bucket not live". `total_after ==
+total_before` unless the slot held an expired bucket (A11). The counter's
+"changes nothing" wording was corrected for the same reason: a zero delta
+into a slot with a stale occupant resets the slot, and `live_buckets` /
+`next_expiry` — defined over non-zero slots — do not report the zero-count
+slot.
+
+Assumptions:
+
+* **Not refused, not special-cased.** Ingest never publishes a zero delta
+  (`services/ingest/.../publisher.py` drops them before fan-out, per
+  ADR-0008), so on the hot path this case is reachable only from a
+  hand-built or foreign message. Refusing it at the store would need a
+  third return value or a `ValueError` for something that is not an error;
+  treating it as an ordinary applied observation costs one bounded entry
+  (retention and the cap still apply). Whether ingest's drop should be
+  relaxed is not this ADR's question.
+* **A zero delta refreshes `last_seen`.** It is an observation the agent
+  chose to send; distinguishing "seen with nothing to report" from "seen"
+  would be a new concept.
+
+Shipped code: none affected. The shipped store test
+(`test_active_means_a_non_zero_total`) asserts `tracked_count == 2` /
+`active_count == 1` after a zero delta and never inspects the return value;
+the `WindowChange` return is a follow-up assertion.
+
+### A9. `EXPIRED_BUCKET` is judged on bucket age; `window_start` is floored, never rejected for alignment
+
+**Classification: (a) for the bucket formula; (a) for flooring; (b) for
+the counter's treatment of an unaligned `S` and for the `datetime` to
+epoch-second conversion.**
+
+The bucket formula: decision 3 wrote `EXPIRED_BUCKET` as `bucket_start(now)
+- bucket_start(window_start) >= config.window_seconds` and glossed it as
+"`IpCounter.is_live` is false". That is the bucket-age reading, and it is
+the only one consistent with the ring: the counter can only take a delta
+whose *bucket* is live, and the raw age `now - window_start` says nothing
+about that inside the last bucket. The apparent conflict in the T4 brief —
+"`EXPIRED_BUCKET` for age in [300, 330]" and "at `S + 299` it is live" —
+is not one: the first is about the classifier with a bucket-aligned `now`,
+the second about `is_live(S, now)` for an aligned `S`, and both follow from
+the same formula. The shipped test
+`test_liveness_is_judged_on_buckets_not_on_the_raw_age` (age 291 with an
+aligned `now` is `EXPIRED_BUCKET`) is ratified; an implementation of the
+plainer `now - window_start >= window_seconds` is wrong and will fail it.
+
+Alignment: `docs/protocol/observation-v1.md` requires `window_start` to be
+"aligned to `bucket_seconds`" and ingest rejects an unaligned one with
+`400` (`services/ingest/.../validation/limits.py`,
+`check_window_alignment`). That guarantees alignment to *ingest's*
+configured `bucket_seconds` at acceptance, which is not always the
+aggregator's: during a config rollout ingest may be on a version whose
+`bucket_seconds` is not a multiple of the aggregator's, and a message on
+the bus may come from a producer other than ingest. ADR-0010 decision 6
+already lands the delta "in the bucket containing `window_start` —
+`bucket_start(window_start, bucket_seconds)`", i.e. it floors. Ruling: the
+aggregator floors and never treats misalignment as `MALFORMED`.
+`classify_observation` floors both `now` and `window_start` itself (so its
+callers need not); the worker floors `window_start` with the **target
+window's** `config.bucket_seconds` before `ShardWindow.observe`; and
+`ShardWindow.observe`/`IpCounter.observe` require an aligned bucket start
+and raise `ValueError` for an unaligned one — that is an in-process caller
+bug, not a message property, and `MALFORMED` remains reserved for the
+codec and the ADR-0004 invariant (decision 3, step 1).
+
+Conversion: `RequestObservation.window_start` is an aware `datetime` and
+`classify_observation` takes an `int`; the codec (`_parse_timestamp`)
+accepts sub-second precision. The worker passes the whole-second floor of
+the UTC epoch value. Sub-seconds cannot change the bucket (`bucket_seconds
+>= 1` and the floor of a floor is the floor), so nothing is lost for
+counting; they are discarded rather than rounded so that `FUTURE`/`LATE`
+compare integers with the integer `Clock.now()`.
+
+Assumptions:
+
+* **`ValueError` at the counter for an unaligned `S`, rather than
+  flooring twice.** Flooring in the store as well would be harmless but
+  would hide a worker that forgot to, and would make "which `B`?" a
+  question in two places. One floor, at the boundary where the message's
+  geometry meets the window's, is easier to reason about.
+* **The target window's `bucket_seconds`, not the service's config in
+  force.** Outside decision 7's locked pass the two are identical; inside
+  it, step 1 has already given the window the new geometry and no
+  observation is processed until step 3, so they are identical there too.
+  Naming the window's value makes alignment hold by construction rather
+  than by an argument about lock ordering.
+* **Floor, not round or reject, for sub-second `window_start`.** Rejecting
+  would make the codec's accepted input the aggregator's `MALFORMED`,
+  which ADR-0004's invariant check does not cover; rounding could move a
+  value across `now`.
+* **The protocol text is not changed.** "MUST be aligned" stays an agent
+  requirement enforced by ingest; this item only says what the aggregator
+  does when the bus carries something else. No `CHANGES` entry: nothing an
+  agent or operator can observe changes.
+
+Shipped code: none affected. `bucket_start`, `is_within_lateness`
+(`hammertime.core.time.buckets`) and ingest's alignment check are
+consistent with this item and untouched.
+
+### A10. An age of exactly `window_seconds + allowed_lateness_seconds` is `EXPIRED_BUCKET`, for every config and every `now`
+
+**Classification: (a), determined by decision 3's arithmetic; the worker
+missed it, then pinned it anyway.** The shipped tests parametrise `age`
+over `[300, 301, 305, 310, 329, 330]` and assert `EXPIRED_BUCKET`, and the
+property test's `_expected` mirror pins 330 to `EXPIRED_BUCKET` for every
+sampled config. Ratified, and generalised in decision 3 so nobody has to
+derive it again:
+
+With `age = now - window_start >= 0`, `r = now mod B` and `a = age`,
+`bucket_start(now, B) - bucket_start(now - a, B)` equals `B * ceil((a - r)
+/ B)`. Since `0 <= r < B`, that is at least `B * floor(a / B)` — the largest
+multiple of `B` not above `a` — and `window_seconds` is a multiple of `B`,
+so `a >= window_seconds` gives a bucket age `>= window_seconds`:
+`EXPIRED_BUCKET` if inside the horizon, `LATE` if past it. At the horizon
+itself (`a = window_seconds + allowed_lateness_seconds`) the `LATE` test is
+strictly `>`, so the outcome is `EXPIRED_BUCKET`; with the shipped
+defaults that is age 330. `APPLIED` requires `0 <= age < window_seconds`
+*and* the bucket test, and exactly which sub-window ages pass depends on
+`r` — for `r = 0` (a bucket-aligned `now`, which is what the shipped tests
+use) an aligned `window_start` passes iff `age <= window_seconds - B`.
+
+Assumptions: none beyond the arithmetic. The stale sentence in
+`test_lateness.py`'s module docstring (lines 42-46: "the tests below assert
+only that it is not `LATE`") describes a hedge the tests do not make; it
+is listed under *Follow-ups* for a `test-author` pass.
+
+Shipped code: none affected.
+
+### A11. HOT -> COLD can happen on the observation path; `reason="observation"` is a legal demotion label
+
+**Classification: (b), not asked; forced by decision 2.** Decision 6 said
+"an observation can only raise a count and a sweep can only lower one" and
+"HOT -> COLD only on the sweep, warm-up end, or config re-evaluation", and
+decision 8 listed only `expiry | warmup | config` for
+`hot_to_cold_transitions`. But decision 2's `observe` subtracts a slot's
+older occupant before adding the delta, and that occupant is always a
+bucket that has already left the window (its start is `S - W` or earlier).
+So an observation for bucket `S` that arrives after `S` has begun but
+before the maintenance tick that would have expired `S - W` lowers the
+running total — by the expired count, which the next sweep would have
+removed anyway — and decision 3's step 3 then evaluates the IP on the
+exact, lower count. With a 1 s maintenance interval and 10 s buckets this
+is reached in normal operation: any observation processed in the first
+second of a bucket, for that bucket, for an IP whose slot held a non-zero
+count one window earlier. If the exact count is below `cold_threshold`,
+`evaluate_ip_state` returns `COLD`, and decision 4 has no rule saying not to
+emit it.
+
+Ruling: the demotion is emitted. It is correct (the count is exact and
+would have produced the same `HotIpRemoved` on the next sweep, a second
+later, with the same `window_count`), and refusing it would mean either
+deferring evaluation on the observation path or having `observe` run
+`expire` first — the latter still lowers the count before the evaluation
+and merely moves the subtraction, so nothing is gained. Decision 6's
+sentence is rewritten, decision 8's `hot_to_cold_transitions` reason set
+gains `observation`, and decision 4's step 5 (which already counts "under
+`reason`") needs no change. The warm-up exemption is unaffected: decision 4
+already returns `None` for a HOT -> COLD of an inherited IP during
+warm-up "whatever the trigger", and an observation is a trigger.
+
+Assumptions:
+
+* **Label it `observation`, not `expiry`.** The count that was subtracted
+  was expired, so `expiry` is arguable; but the label names the *path*
+  that emitted the transition (decision 4 step 5 counts "under `reason`"
+  as passed by the caller), and the caller is the observation path.
+  Consistency of the label with the call site beats consistency with the
+  arithmetic.
+* **§37's pointer note is updated to match**, since it enumerates the
+  labels.
+
+Shipped code: none affected. `hammertime.core.state.machine.evaluate_ip_state`
+is pure over `(previous, count, config)` and does not know why it was
+called.
+
+### Follow-ups (not part of this amendment; for the top-level session to dispatch)
+
+* `test-author`: `test_lateness.py` lines 42-46 (module docstring) claim the
+  exact-horizon outcome is left unpinned; the tests pin it to
+  `EXPIRED_BUCKET` (A10). Correct the docstring to say so.
+* `test-author`, tests the rulings above call for that T4 did not write:
+  `is_live`/`observe` with a future `S` (A4); `IpCounter.observe` and
+  `ShardWindow.observe` with an unaligned `S` raising `ValueError` (A9);
+  `tracked_count`, `is_tracked`, `active_count` and the capacity slot with a
+  non-empty `inherited_hot`, and an inherited IP's retention deadline after
+  demotion (A5); `evict_due()` evicting without a preceding `expire_due()`
+  (A6); the `WindowChange` returned for a zero delta (A8); a
+  `total_after < total_before` `WindowChange` on `observe` into a stale
+  slot, and — in T5's scope — a `HotIpRemoved` emitted with
+  `reason="observation"` (A11); `window_evictions{shard,reason}` (A7).

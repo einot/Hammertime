@@ -246,8 +246,9 @@ is O(1) after bucket maintenance.
 
 > ADR-0011: the aggregator's ring holds exactly `window_seconds /
 > bucket_seconds` buckets. A bucket starting at `S` is live at time `now` iff
-> `bucket_start(now) - S < window_seconds`; it leaves the window at exactly
-> `now = S + window_seconds`. A delta for a bucket that is no longer live can
+> `0 <= bucket_start(now) - S < window_seconds` (a bucket that has not
+> started is not live; ADR-0011 Amendment 2); it leaves the window at exactly
+> `now = S + window_seconds`. A delta for a bucket that is not live can
 > never affect a future window count and is diverted to reconciliation
 > (Section 24) rather than applied. Counters are process-local, one store per
 > owned shard (Section 20).
@@ -1993,13 +1994,15 @@ active_ips
 hot_ips
 cold_to_hot_transitions
 hot_to_cold_transitions
-window_evictions           (ADR-0011; labelled retention | capacity)
+window_evictions           (ADR-0011; labelled shard and retention | capacity)
 shards_claimed             (ADR-0011)
 ```
 
 > ADR-0011: the aggregator labels the two transition counters by `shard`,
 > `config_version` and `reason` (`observation` | `config` for COLD -> HOT;
-> `expiry` | `warmup` | `config` for HOT -> COLD), and is the emitter of
+> `observation` | `expiry` | `warmup` | `config` for HOT -> COLD — an
+> observation can lower the running total by a count that had already
+> expired, Amendment 2 item A11), and is the emitter of
 > `late_messages` (labelled `late` | `future` | `expired_bucket`) and of an
 > aggregator-side `observations_rejected` (`window_too_long` | `malformed`),
 > since it — not ingest — judges lateness (Section 24). `tracked_ips` counts
