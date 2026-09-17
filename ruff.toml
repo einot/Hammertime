@@ -1,6 +1,15 @@
 line-length = 100
 target-version = "py312"
 
+[format]
+# Ruff formats Python code blocks embedded in Markdown. Our ADRs and spec
+# documents use illustrative sketches -- Protocol stubs written one per
+# line, elided bodies, inline commentary -- that are meant to be read, not
+# compiled. Reformatting them damages the prose without making any shipped
+# code safer, so the formatter governs real source only. Linting
+# (`ruff check`) is unaffected.
+exclude = ["*.md"]
+
 [lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ANN"]
 ignore = ["ANN401"]

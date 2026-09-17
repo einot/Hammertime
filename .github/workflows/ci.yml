@@ -2,22 +2,78 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
+
+# Nothing in this workflow writes to the repository, so drop the token to
+# read-only rather than inheriting the repo default.
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight run for the same ref. Not applied to
+# master: a run there records whether the default branch is actually green,
+# which is worth completing even if another push lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync --all-extras --dev
+      # uv.lock must already agree with pyproject.toml. Catches a dependency
+      # edited without re-locking, which otherwise only shows up as a
+      # mismatch between what CI resolves and what a contributor installed.
+      - run: uv lock --check
       - run: uv run ruff check .
+      # Part of the merge bar in CLAUDE.md but previously not run by CI, so
+      # a formatting regression could reach a branch with CI still green.
+      - run: uv run ruff format --check .
       - run: uv run mypy packages services
       - run: uv run pytest -q
+      # Tripwire for #26. The integration job below is disabled because
+      # tests/integration and tests/e2e contain no collectable tests, so
+      # pytest there exits 5. The moment real tests land in either
+      # directory this step fails and says what to turn back on, so the
+      # disable cannot quietly outlive its reason.
+      - name: Guard - re-enable the integration job once tests exist
+        run: |
+          set +e
+          uv run pytest tests/integration tests/e2e --collect-only -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 5 ]; then
+            echo "::error::tests/integration and/or tests/e2e now collect tests (pytest exit $rc, expected 5)."
+            echo "::error::Re-enable the 'integration' job in .github/workflows/ci.yml by removing 'if: false',"
+            echo "::error::add --wait to its 'docker compose up' step, then delete this guard. See issue #26."
+            exit 1
+          fi
 
+  # DISABLED pending #26 -- re-enable together with the guard step in
+  # 'check' above.
+  #
+  # This job cannot pass today, and disabling it hides no test coverage:
+  # tests/integration and tests/e2e contain zero collectable tests, so its
+  # pytest step exits 5 ("no tests collected"). Nothing is skipped or
+  # quarantined here -- there is nothing there to skip.
+  #
+  # Re-enable when ALL of the following hold (see #26):
+  #   1. aggregator, trie and detector are implemented and actually start
+  #      under docker compose. Today they contain no def or class outside
+  #      their tests/ directories and crash-loop on a missing main().
+  #   2. test-author has written real tests into tests/integration and
+  #      tests/e2e.
+  #   3. The 'docker compose up' step below gains --wait. Without it the
+  #      job proves nothing even when green: 'up -d' exits 0 for
+  #      containers that die immediately afterwards.
   integration:
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
