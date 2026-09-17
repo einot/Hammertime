@@ -9,13 +9,15 @@ labels). ADR-0002 (event time), ADR-0003 (at-least-once consumption),
 ADR-0004 (one single-entry message per IP, keyed and `subject`-tagged by it),
 ADR-0009 decisions 3, 7 and 9 (`run_maintenance()`, shutdown, the
 `hammertime-aggregator` group), ADR-0010 decision 6 (one bucket per
-observation, over-long windows), ADR-0011 decision 3 (the six outcomes and
+observation, over-long windows), ADR-0011 decision 3 (the seven outcomes and
 the worker's three steps), decision 6 (maintenance order, commit cadence,
 shutdown), decision 8 (metrics) and Amendment 2 items A9 (flooring) and A11
 (a demotion on the observation path).
 
 Decision 3 is the specification this file is written against. Per consumed
-message:
+message, once the lookup that precedes step 1 has found the partition's
+`ShardWindow` -- the case where it does not is Amendment 5 item A19's
+`UNCLAIMED`, which `test_sharding.py` owns:
 
 1. `codec.decode`; the payload MUST be a `RequestObservation` with exactly one
    entry whose IP text equals the envelope `subject` and the message key. Any

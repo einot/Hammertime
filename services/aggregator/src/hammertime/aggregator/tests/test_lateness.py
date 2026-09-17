@@ -15,6 +15,7 @@ The interface under test is ADR-0011 decision 3:
         EXPIRED_BUCKET = "expired_bucket"
         WINDOW_TOO_LONG = "window_too_long"
         MALFORMED = "malformed"
+        UNCLAIMED = "unclaimed"
 
     def classify_observation(
         *, window_start: int, window_seconds: int, now: int, config: DetectionConfig
@@ -31,8 +32,10 @@ and the checks it makes, **in this order**:
    config.window_seconds`, i.e. `IpCounter.is_live` is false
 5. otherwise `APPLIED`
 
-`MALFORMED` is a worker outcome (a message that fails the codec or ADR-0004's
-one-IP-per-message invariant) and is never returned here.
+`MALFORMED` (a message that fails the codec or ADR-0004's one-IP-per-message
+invariant) and `UNCLAIMED` (a message whose `partition` this member does not
+hold -- ADR-0011 Amendment 5 item A19) are both worker outcomes, and neither
+is ever returned here.
 
 `now` is the service clock at processing time, not the envelope timestamp,
 so every case below is expressed as an age relative to a fixed `NOW`.
@@ -126,14 +129,18 @@ def _classify(
 
 
 class TestObservationOutcomeEnum:
-    """ADR-0011 decision 3: six outcomes, on the wire as strings so they can
-    label `late_messages` / `observations_rejected` (section 37)."""
+    """ADR-0011 decision 3, as Amendment 5 item A19 leaves it: seven outcomes,
+    on the wire as strings so that the counted ones can label `late_messages` /
+    `observations_rejected` (section 37). `APPLIED` and `UNCLAIMED` are not
+    labels of either series -- A19 counts an unclaimed message under no series
+    at all, and leaves `observations_rejected{reason}` at `window_too_long |
+    malformed`."""
 
     def test_it_is_a_str_enum(self) -> None:
         assert issubclass(ObservationOutcome, StrEnum)
         assert isinstance(ObservationOutcome.APPLIED, str)
 
-    def test_it_has_exactly_the_six_documented_members(self) -> None:
+    def test_it_has_exactly_the_seven_documented_members(self) -> None:
         assert {member.name: member.value for member in ObservationOutcome} == {
             "APPLIED": "applied",
             "LATE": "late",
@@ -141,6 +148,7 @@ class TestObservationOutcomeEnum:
             "EXPIRED_BUCKET": "expired_bucket",
             "WINDOW_TOO_LONG": "window_too_long",
             "MALFORMED": "malformed",
+            "UNCLAIMED": "unclaimed",
         }
 
     def test_the_metric_labels_are_the_member_values(self) -> None:
@@ -316,16 +324,18 @@ def test_the_check_order_holds_for_every_input(
 
 @given(age=_AGES, window_seconds=_MESSAGE_WINDOWS, config=_CONFIGS)
 @settings(deadline=None, max_examples=400)
-def test_malformed_is_never_returned(
+def test_the_worker_outcomes_are_never_returned(
     age: int, window_seconds: int, config: DetectionConfig
 ) -> None:
-    """`MALFORMED` is a worker outcome (a message that fails the codec or
-    ADR-0004's invariant); the classifier cannot produce it."""
+    """`MALFORMED` (a message that fails the codec or ADR-0004's invariant) and
+    `UNCLAIMED` (a message on a partition this member does not hold, Amendment
+    5 item A19) are worker outcomes; the classifier cannot produce either."""
 
     outcome = classify_observation(
         window_start=NOW - age, window_seconds=window_seconds, now=NOW, config=config
     )
     assert outcome is not ObservationOutcome.MALFORMED
+    assert outcome is not ObservationOutcome.UNCLAIMED
     assert outcome in (
         ObservationOutcome.APPLIED,
         ObservationOutcome.LATE,

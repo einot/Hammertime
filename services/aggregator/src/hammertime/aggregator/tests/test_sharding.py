@@ -8,9 +8,11 @@ ADR-0011 decision 1 (a shard *is* a partition of
 set), Amendment 1 item A3 (a set-but-empty value is a configuration error),
 decision 5 (`ShardClaims`: claim, warm-up, revoke), Amendment 2 item A5
 (an inherited HOT IP is a tracked entry from construction) and item A7 (the
-two per-window eviction counters), and Amendment 3 item A13 (`window_evictions`
+two per-window eviction counters), Amendment 3 item A13 (`window_evictions`
 and `shards_claimed` are computed on read from the windows the worker binds
-to its `AggregatorMetrics`).
+to its `AggregatorMetrics`), and Amendment 5 item A19 (a message on a
+partition this member does not hold is `UNCLAIMED`: logged, counted under no
+series, neither decoded nor diverted, and the store untouched).
 
 Two interfaces are under test. The first is pinned exactly by decision 9:
 
@@ -56,9 +58,11 @@ NOT asserted here, and why:
   omitting its own lifecycle records. The observable half of A5's claim
   assertion (`inherited_hot=2`) is asserted on the window instead:
   `hot_count == 2`.
-* **The outcome `handle()` returns for a message on an unclaimed partition.**
-  Decision 3 enumerates six outcomes for a message the worker owns and says
-  nothing about one it does not; only the absence of any effect is asserted.
+* **The `unclaimed_partition` log record** of Amendment 5 item A19 and
+  decision 8 (`WARNING`, with the topic, partition and offset), for the same
+  reason the `shard_claimed` family is left out above. Its counterpart -- that
+  A19's record comes with no counter -- *is* asserted, on the metrics object:
+  see `test_a_message_for_a_revoked_partition_is_not_applied`.
 * **Real rebalance ordering.** `InMemoryBus` has one partition and no
   coordinator (ADR-0011 assumption 22), so `on_revoked` is only ever driven
   directly here, exactly as `packages/hammertime-bus/.../tests/test_assignment.py`
@@ -76,6 +80,7 @@ from typing import Any
 
 import pytest
 from hammertime.aggregator.config import parse_shard_ids
+from hammertime.aggregator.lateness import ObservationOutcome
 from hammertime.aggregator.metrics import AggregatorMetrics
 from hammertime.aggregator.sharding.assignment import ShardClaims
 from hammertime.aggregator.worker import AggregatorWorker
@@ -696,11 +701,14 @@ class TestTheWorkerClaimsShardZero:
         # Decision 1: the aggregator "learns an IP's shard from
         # `ConsumedMessage.partition`". Once that partition's window is gone
         # there is nothing to apply the delta to, and nothing may be emitted
-        # or diverted on its behalf. (What `handle()` *returns* here is not
-        # pinned by decision 3 -- see the module docstring.)
+        # or diverted on its behalf. Amendment 5 item A19 pins the rest: the
+        # outcome is `UNCLAIMED`, the seventh member -- the message is not
+        # this member's to judge, so it is neither decoded nor counted under
+        # any series, and in particular is *not* `MALFORMED`.
         clock = ManualClock(initial=BASE)
         bus = InMemoryBus()
-        worker = _worker(bus=bus, clock=clock)
+        metrics = AggregatorMetrics()
+        worker = _worker(bus=bus, clock=clock, metrics=metrics)
         await worker.start()
         reader = bus.consumer("test-reader")
         stream = await reader.subscribe(OBSERVATIONS_TOPIC)
@@ -713,11 +721,20 @@ class TestTheWorkerClaimsShardZero:
         )
         message = await _take_one(stream)
         assert message.partition == 0
-        await worker.handle(message)
+        outcome = await worker.handle(message)
 
         try:
+            assert outcome is ObservationOutcome.UNCLAIMED
             assert worker.window(0) is None
             assert _records(bus, HOT_IP_TOPIC) == []
             assert _records(bus, RECONCILIATION_TOPIC) == []
+            # A19: no counter increment under any series. The message is well
+            # formed, so `observations_rejected{reason=malformed}` -- a signal
+            # about producers -- must not tick on a rebalance; the series keeps
+            # its two reasons, and this message is neither of them.
+            assert metrics.get("observations_rejected", reason="malformed") == 0
+            assert metrics.get("observations_rejected", reason="window_too_long") == 0
+            for reason in ("late", "future", "expired_bucket"):
+                assert metrics.get("late_messages", reason=reason) == 0
         finally:
             await worker.stop()
