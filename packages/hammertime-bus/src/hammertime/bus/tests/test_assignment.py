@@ -24,8 +24,24 @@ What decision 1 pins, and is asserted below:
   `start()`, which is why it is asserted here in three ways: on an empty
   log, ahead of the first yielded message, and exactly once.
 * "`InMemoryBus` has one partition per topic: group-managed and static
-  `{0}` both assign `{(topic, 0)}` immediately; any other static set is a
-  `ValueError`."
+  `{0}` both assign `{(topic, 0)}` immediately; any other static set --
+  including the empty set, for every consumer implementation (Amendment 1,
+  item A3) -- is a `ValueError`."
+* An explicitly empty static set is refused, and refused early: ADR-0011
+  Amendment 1 item A3 rules that `Consumer.subscribe(topic,
+  partitions=<empty iterable>)` "raises `ValueError` for every
+  implementation ..., before contacting any broker and without calling the
+  listener. An empty static set is not a way of saying 'nothing';
+  `partitions=None` is the only way of saying 'let the group decide'."
+  Asserted below for `set()` and for `[]` (the parameter is an
+  `Iterable[int]`, so the refusal must not depend on the concrete type),
+  and for the listener never seeing a claim. The `partitions=None` half is
+  every listener test in
+  `TestInitialAssignmentIsDeliveredBeforeSubscribeReturns`, which subscribes
+  without `partitions` and is assigned `{(TOPIC, 0)}`; A3 leaves that path
+  and the group-managed empty *initial* assignment (ready, `WARNING
+  event=no_shards_assigned`) unchanged -- the latter is not observable
+  against the memory bus, see "NOT TESTABLE" below.
 * Static assignment still commits offsets under the group name.
 * `ConsumedMessage.partition` is the shard id the aggregator reads
   ownership from ("The aggregator never computes an IP hash of its own"),
@@ -49,20 +65,20 @@ settles them differently:
 4. A rejected static set must not invoke the listener at all: an assignment
    that was refused was never held, and ADR-0009 readiness must not be able
    to observe a claim the bus rejected. The ADR does not say this in words.
-5. `partitions=set()` (empty) is deliberately *not* tested: "any other
-   static set is a `ValueError`" reads as covering it, but an empty static
-   assignment is also arguably the group-managed "may be empty" case of the
-   same paragraph, and nothing in the ADR disambiguates. Flagged rather
-   than guessed.
-6. The signature says `Iterable[int]`, so a list `[0]` is accepted exactly
+5. The signature says `Iterable[int]`, so a list `[0]` is accepted exactly
    like `{0}`. The ADR only ever writes set literals.
-7. Whether a *second* `subscribe()` on the same consumer re-delivers
+6. Whether a *second* `subscribe()` on the same consumer re-delivers
    `on_assigned` is unstated, so no test subscribes twice with a listener;
    "exactly once" is asserted across one subscribe plus consumption and
    commit.
-8. `RecordingListener` below is this file's own test double; the ADR names
+7. `RecordingListener` below is this file's own test double; the ADR names
    no concrete implementation (the aggregator's is `ShardClaims`, out of
    scope here).
+
+(The empty static set used to be assumption 5 here -- "deliberately *not*
+tested ... nothing in the ADR disambiguates. Flagged rather than guessed."
+ADR-0011 Amendment 1 item A3 disambiguated it, so it is no longer an
+assumption of this file but one of the properties pinned above.)
 
 NOT TESTABLE against `InMemoryBus`, and not tested anywhere in this file:
 
@@ -214,7 +230,9 @@ class TestInitialAssignmentIsDeliveredBeforeSubscribeReturns:
 
 class TestStaticAssignment:
     """ADR-0011 decision 1: "group-managed and static `{0}` both assign
-    `{(topic, 0)}` immediately; any other static set is a `ValueError`"."""
+    `{(topic, 0)}` immediately; any other static set -- including the empty
+    set, for every consumer implementation (Amendment 1, item A3) -- is a
+    `ValueError`"."""
 
     async def test_static_partition_zero_assigns_the_same_single_partition(self) -> None:
         bus = InMemoryBus()
@@ -240,7 +258,7 @@ class TestStaticAssignment:
         assert listener.trace[0] == "on_assigned"
 
     async def test_static_partitions_accept_any_iterable_of_ints(self) -> None:
-        # ASSUMPTION 6: the signature says `Iterable[int]`, not `set[int]`.
+        # ASSUMPTION 5: the signature says `Iterable[int]`, not `set[int]`.
         bus = InMemoryBus()
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
@@ -286,6 +304,45 @@ class TestStaticAssignment:
 
         with pytest.raises(ValueError):
             await consumer.subscribe(TOPIC, partitions={1}, listener=listener)
+
+        assert listener.assigned == []
+        assert listener.revoked == []
+
+    async def test_an_empty_static_set_is_a_value_error(self) -> None:
+        # ADR-0011 Amendment 1 item A3: "An empty static set is not a way of
+        # saying 'nothing'; `partitions=None` is the only way of saying 'let
+        # the group decide'." A member that owned nothing for its whole life
+        # while /readyz reported it healthy is the silent misconfiguration
+        # A3 refuses. (`partitions=None` itself is unaffected -- see
+        # TestInitialAssignmentIsDeliveredBeforeSubscribeReturns, which
+        # subscribes without `partitions` throughout.)
+        bus = InMemoryBus()
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(ValueError):
+            await consumer.subscribe(TOPIC, partitions=set())
+
+    async def test_an_empty_static_list_is_a_value_error_too(self) -> None:
+        # ASSUMPTION 5: `partitions` is an `Iterable[int]`, so the refusal
+        # must not depend on the concrete type any more than the acceptance
+        # of `[0]` does. A3 refuses "an empty iterable", not an empty set.
+        bus = InMemoryBus()
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(ValueError):
+            await consumer.subscribe(TOPIC, partitions=[])
+
+    async def test_a_rejected_empty_static_set_never_reports_a_claim(self) -> None:
+        # A3: the refusal happens "before contacting any broker and without
+        # calling the listener" -- the same rule ASSUMPTION 4 states for any
+        # other rejected static set, and the reason the empty case cannot be
+        # read as a quiet, ready-but-idle claim.
+        bus = InMemoryBus()
+        listener = RecordingListener()
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(ValueError):
+            await consumer.subscribe(TOPIC, partitions=set(), listener=listener)
 
         assert listener.assigned == []
         assert listener.revoked == []
