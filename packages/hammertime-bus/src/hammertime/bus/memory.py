@@ -8,14 +8,12 @@ implement `hammertime.bus.interface.Producer`/`Consumer`, so tests can swap a
 real Kafka transport for this one without changing calling code.
 """
 
-from __future__ import annotations
-
 import asyncio
 from collections import defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
-from hammertime.bus.interface import ConsumedMessage
+from hammertime.bus.interface import AssignmentListener, ConsumedMessage
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,11 +42,11 @@ class InMemoryBus:
         self._committed: dict[tuple[str, str], int] = {}
         self._condition = asyncio.Condition()
 
-    def producer(self) -> MemoryProducer:
+    def producer(self) -> "MemoryProducer":
         """A new producer view onto this bus."""
         return MemoryProducer(self)
 
-    def consumer(self, group_id: str) -> MemoryConsumer:
+    def consumer(self, group_id: str) -> "MemoryConsumer":
         """A new consumer view onto this bus, resuming `group_id`'s committed position."""
         return MemoryConsumer(self, group_id)
 
@@ -106,8 +104,41 @@ class MemoryConsumer:
             self._positions[topic] = self._bus._committed_offset(topic, self._group_id)
         return self._positions[topic]
 
-    async def subscribe(self, topic: str) -> AsyncIterator[ConsumedMessage]:
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        """Claim `topic`'s single partition, tell `listener`, then yield messages.
+
+        Every `InMemoryBus` topic has exactly one partition, 0 (ADR-0011
+        decision 1, assumption 22), so both the group-managed default and a
+        static `{0}` claim `{(topic, 0)}`; any other static set names a
+        partition this bus does not have and is a `ValueError`.
+
+        The listener is awaited here, before the iterator is handed back, so
+        a caller that has finished `subscribe()` is holding its shard claims
+        -- a rejected static set never reports a claim at all.
+        """
+        assignment = self._assignment(topic, partitions)
+        if listener is not None:
+            await listener.on_assigned(assignment)
         return self._consume(topic)
+
+    @staticmethod
+    def _assignment(topic: str, partitions: Iterable[int] | None) -> frozenset[tuple[str, int]]:
+        """The `(topic, partition)` pairs this subscription claims."""
+        if partitions is None:
+            return frozenset({(topic, 0)})
+        requested = set(partitions)
+        if requested != {0}:
+            raise ValueError(
+                f"InMemoryBus has one partition per topic; cannot statically "
+                f"assign {sorted(requested)} of {topic!r}"
+            )
+        return frozenset({(topic, 0)})
 
     async def _consume(self, topic: str) -> AsyncIterator[ConsumedMessage]:
         while True:

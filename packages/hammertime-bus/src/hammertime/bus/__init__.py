@@ -7,13 +7,19 @@ package, so the log interface deliberately exposes offsets/sequences rather than
 hiding them.
 """
 
-from hammertime.bus.interface import ConsumedMessage, Consumer, Producer
+from hammertime.bus.interface import (
+    AssignmentListener,
+    ConsumedMessage,
+    Consumer,
+    Producer,
+)
 from hammertime.bus.kafka import KafkaConsumer, KafkaProducer
 from hammertime.bus.memory import InMemoryBus, MemoryConsumer, MemoryProducer
 from hammertime.bus.topics import TOPICS, TopicSpec, all_topics
 
 __all__ = [
     "TOPICS",
+    "AssignmentListener",
     "ConsumedMessage",
     "Consumer",
     "InMemoryBus",
