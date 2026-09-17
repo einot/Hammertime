@@ -301,7 +301,7 @@ Worked values the tests must reproduce (defaults `hot_threshold=1000`,
 `weight_max=1_000_000` unless stated): `threshold_ratio(1000) == 1000`,
 `(0) == 0`, `(1200) == 1200`, `(2500) == 2500`, `(1) == 1`
 (`(1000 + 500) // 1000`), `(1499) == 1499`; with `hot_threshold=500`:
-`(600) == 1200` (`(600000 + 250) // 500`); with `hot_threshold=3`: `(1) == 334`
+`(600) == 1200` (`(600000 + 250) // 500`); with `hot_threshold=3`: `(1) == 333`
 (`(1000 + 1) // 3`), `(2) == 667`; clamping: with `weight_max=5000`,
 `(10_000) == 5000`; `(10**9)` at the default clamps to `1_000_000`, which is
 exactly the schema's maximum, so a clamped weight is always encodable.
