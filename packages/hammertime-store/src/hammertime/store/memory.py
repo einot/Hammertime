@@ -143,7 +143,10 @@ class MemoryShardStateStore:
     `record_transition` contains no `await`, so it runs to completion
     without yielding to the event loop: atomic in practice for a
     single-process asyncio deployment, the same reasoning `MemoryDedupStore.
-    claim` documents.
+    claim` documents. That is what makes its read-then-clamp of the
+    sequence counter safe without any compare-and-set machinery -- the
+    Redis backend, which has no such guarantee, needs a WATCH loop for the
+    same three lines.
     """
 
     def __init__(self) -> None:
@@ -163,6 +166,9 @@ class MemoryShardStateStore:
         self, shard: int, ip: Address, state: IpState, sequence: int
     ) -> None:
         if sequence < 0:
+            # Write nothing: `schemas/hot_ip_event.v1.json` has
+            # `"minimum": 0`, and a negative sequence would drive the
+            # clamp's floor below zero.
             raise ValueError(f"sequence must be non-negative, got {sequence!r}")
         if state is IpState.HOT:
             self._hot_ips.setdefault(shard, set()).add(ip)
@@ -171,4 +177,10 @@ class MemoryShardStateStore:
             # no-op that still advances the sequence, and must not create
             # an empty set for a shard that has none.
             self._hot_ips.get(shard, set()).discard(ip)
-        self._next_sequence[shard] = sequence + 1
+        # ADR-0011 Amendment 1 item A2: raise the counter to
+        # `sequence + 1` only if that is higher, never lower it. The
+        # membership change above is applied either way. Decision 4's
+        # "never reproduces an earlier `event_id`" promise is made about
+        # this persisted counter, so a replayed or out-of-order transition
+        # must not hand an already-used sequence back to the next caller.
+        self._next_sequence[shard] = max(self._next_sequence.get(shard, 0), sequence + 1)

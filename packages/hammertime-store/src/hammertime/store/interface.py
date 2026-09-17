@@ -97,9 +97,11 @@ class ShardState:
     #: tell) the trie about and must eventually demote.
     hot_ips: frozenset[Address]
     #: The sequence the shard's next transition will use; `0` for a shard
-    #: that has never recorded one. Resuming from here is what keeps
-    #: decision 4's `event_id` identity -- derived from `(agent_id,
-    #: sequence, event_type)` -- from repeating across a restart.
+    #: that has never recorded one, and otherwise one past the highest
+    #: sequence ever recorded (it only ever moves forward -- ADR-0011
+    #: Amendment 1 item A2). Resuming from here is what keeps decision 4's
+    #: `event_id` identity -- derived from `(agent_id, sequence,
+    #: event_type)` -- from repeating across a restart.
     next_sequence: int
 
 
@@ -127,12 +129,36 @@ class ShardStateStore(Protocol):
     async def record_transition(
         self, shard: int, ip: Address, state: IpState, sequence: int
     ) -> None:
-        """Add (`HOT`) or remove (`COLD`) `ip`, and set next sequence to `sequence + 1`.
+        """Add (`HOT`) or remove (`COLD`) `ip`, and raise next sequence to `sequence + 1`.
 
         Atomic: the membership change and the sequence update either both
         land or neither does. A torn write would either leave an IP
         recorded as HOT under a sequence that a later transition reuses, or
         burn a sequence without recording the membership it belongs to.
+
+        The sequence is **clamped, never lowered** (ADR-0011 Amendment 1
+        item A2). The stored next sequence becomes `max(before, sequence +
+        1)`: it is raised to `sequence + 1` only if that is higher.
+        Membership is updated regardless of how `sequence` compares to the
+        stored value. The whole testable contract is::
+
+            load(shard).next_sequence == 1 + max(every sequence ever
+            recorded for that shard), or 0 if none
+
+        in any order and under any repetition -- so replaying an identical
+        call is a no-op the second time.
+
+        The clamp lives here, in the store, rather than in the caller
+        because decision 4's "never reproduces an earlier `event_id`"
+        promise is stated about the *persisted* counter, and this store is
+        the only party that outlives the process. The cases where an
+        unconditional assignment would bite -- a retry after a lost reply,
+        a second caller added later, a bug in the claim path -- are exactly
+        the ones nobody writes a test for on purpose.
+
+        `sequence` MUST be non-negative (`schemas/hot_ip_event.v1.json` has
+        `"minimum": 0`); a negative one raises `ValueError` and writes
+        nothing.
 
         `COLD` for an IP the shard does not hold is a membership no-op that
         still advances the sequence -- decision 4's recovery path reaches

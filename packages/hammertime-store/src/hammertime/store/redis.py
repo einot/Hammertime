@@ -66,6 +66,7 @@ from hammertime.core.state.enums import IpState
 from hammertime.store.dedup import SequenceKey
 from hammertime.store.interface import ShardState
 from redis.asyncio import Redis
+from redis.exceptions import WatchError
 
 #: Placeholder value stored at each dedup key. Only the key's existence and
 #: TTL matter; the value itself carries no information.
@@ -85,6 +86,13 @@ _KEY_PREFIX = "hammertime:dedup:"
 #: requirement is written against this prefix, so it is load-bearing beyond
 #: tidiness.
 _SHARD_KEY_PREFIX = "hammertime:agg:"
+
+#: How many times `RedisShardStateStore.record_transition` re-reads and
+#: retries its WATCH/MULTI/EXEC before giving up. Each attempt loses only
+#: to a concurrent writer on the *same shard's* sequence key, which spec
+#: section 20's one-owner-per-shard rule makes rare; this is a guard
+#: against livelock, not a throughput knob.
+_MAX_SEQUENCE_CAS_ATTEMPTS = 16
 
 
 def _hot_key(shard: int) -> str:
@@ -201,6 +209,12 @@ class RedisShardStateStore:
     and the sequence are a coherent snapshot of one instant) and never
     creates a key: `SMEMBERS` on a missing key returns an empty set and
     `GET` returns `None`, which is exactly `ShardState(frozenset(), 0)`.
+
+    `record_transition` is one atomic server-side step per call (ADR-0011
+    Amendment 1 item A2 relaxes decision 5's original "one MULTI/EXEC" to
+    that, precisely because the clamp it mandates is a compare-and-set and
+    MULTI/EXEC cannot express one). See its body for why that is a
+    WATCH-based optimistic transaction here.
     """
 
     def __init__(self, client: Redis) -> None:
@@ -220,31 +234,68 @@ class RedisShardStateStore:
         self, shard: int, ip: Address, state: IpState, sequence: int
     ) -> None:
         if sequence < 0:
+            # Write nothing: `schemas/hot_ip_event.v1.json` has
+            # `"minimum": 0`, and a negative sequence would drive the
+            # clamp's floor below zero.
             raise ValueError(f"sequence must be non-negative, got {sequence!r}")
-        # One MULTI/EXEC per call, per ADR-0011 decision 5: Redis runs the
-        # queued commands as a unit, so no reader ever sees the membership
-        # change without the matching sequence or vice versa. Note what is
-        # *not* transactional: SREM leaving the set empty deletes the `:hot`
-        # key (Redis drops empty collections), but `:seq` is a plain string
-        # and survives -- demoting a shard's last HOT IP must not restart
-        # its numbering, or a later transition could reproduce an earlier
-        # `event_id`.
+        hot_key = _hot_key(shard)
+        sequence_key = _sequence_key(shard)
+        candidate = sequence + 1
+        # ADR-0011 Amendment 1 item A2: the stored next sequence is RAISED
+        # to `sequence + 1` only if that is higher, never lowered, while
+        # the membership change is applied regardless -- both in one atomic
+        # step. A plain MULTI/EXEC cannot express that: its queued commands
+        # are sent before any of them run, so none of them can read `:seq`
+        # and decide whether to write it. Hence WATCH-based optimistic
+        # concurrency -- `EVAL` would do too, and A2 permits it, but it
+        # would cost a Lua runtime (`lupa`) in the test environment purely
+        # so the in-process fake can emulate server-side scripting.
         #
-        # This is a plain MULTI/EXEC, not a WATCH/optimistic-retry loop: no
-        # command here reads a value it then writes back (SADD/SREM/SET are
-        # each unconditional), so there is nothing for a concurrent writer
-        # to invalidate. If EXEC fails -- connection loss, a Redis error,
-        # OOM under `noeviction` -- `execute()` raises and neither key is
-        # modified; the exception propagates to the caller, which per
-        # decision 4 must then abandon the publish rather than announce a
-        # transition it did not durably record.
+        # The comparison stays in Python on exact `int`s, which is better
+        # than the Lua alternative rather than a concession: `sequence` is
+        # bounded by 2**63-1, and Lua numbers are doubles that silently
+        # lose integer precision above 2**53.
         async with self._client.pipeline(transaction=True) as pipe:
-            if state is IpState.HOT:
-                pipe.sadd(_hot_key(shard), str(ip))
-            else:
-                # SREM of an absent member is a no-op that still leaves the
-                # sequence update below to run: decision 4's recovery path
-                # demotes inherited IPs that may never have been recorded.
-                pipe.srem(_hot_key(shard), str(ip))
-            pipe.set(_sequence_key(shard), sequence + 1)
-            await pipe.execute()
+            for _ in range(_MAX_SEQUENCE_CAS_ATTEMPTS):
+                try:
+                    await pipe.watch(sequence_key)
+                    stored = await pipe.get(sequence_key)
+                    # redis-py leaves `multi()` unannotated, so strict
+                    # mypy calls it untyped; the narrow ignore is the
+                    # same shape the repo already uses for third-party
+                    # typing gaps.
+                    pipe.multi()  # type: ignore[no-untyped-call]
+                    if state is IpState.HOT:
+                        pipe.sadd(hot_key, str(ip))
+                    else:
+                        # SREM of an absent member is a no-op that still
+                        # leaves the clamp below to run: decision 4's
+                        # recovery path demotes inherited IPs that may
+                        # never have been recorded.
+                        pipe.srem(hot_key, str(ip))
+                    if stored is None or candidate > int(stored):
+                        pipe.set(sequence_key, candidate)
+                    # EXEC aborts if any other client touched `:seq` since
+                    # the WATCH, so the read above cannot go stale
+                    # underneath the write. Nothing is applied on abort --
+                    # not even the membership change, which is why it sits
+                    # inside the same MULTI.
+                    await pipe.execute()
+                    return
+                except WatchError:
+                    # Another writer won the race; re-read and re-decide.
+                    # Retrying is safe because SADD/SREM are idempotent and
+                    # an aborted EXEC applied nothing.
+                    continue
+        # Bounded, not `while True`: livelock here would hang the
+        # aggregator's transition path silently. Contention is expected to
+        # be nil in practice (spec section 20 gives a shard exactly one
+        # owner), so exhausting these attempts means something is wrong
+        # that a retry loop should not paper over. Raising aborts the
+        # caller's publish, which is the safe direction under decision 4:
+        # better an un-announced transition than one announced but not
+        # recorded.
+        raise WatchError(
+            f"could not record transition for shard {shard} after "
+            f"{_MAX_SEQUENCE_CAS_ATTEMPTS} attempts: {sequence_key} is under contention"
+        )
