@@ -26,7 +26,20 @@ Bind addresses: ingest `HAMMERTIME_INGEST_BIND` (8080), trie
 only the three endpoints above.
 
 Every domain endpoint below answers exactly like `GET /readyz` (503 with the
-same body) while the service is not ready.
+same body) while the service is not ready, and so does ingest's
+`POST /v1/observations` (`docs/protocol/observation-v1.md`). The JSON bodies
+in the table are byte-exact — compact, no whitespace, `Content-Type:
+application/json` — because every service renders the same
+`hammertime.core.runtime.AdminResponse` verbatim (ADR-0009 A4, A6). The
+readiness state is three-valued (`starting` from construction, `ready` from
+the end of startup, `stopping` from the moment shutdown is requested — before
+any connection is closed), so a 503 always says which side of `ready` the
+service is on.
+
+The aggregator's pure-ASGI admin app additionally answers
+`404 {"status":"not_found"}` for any other path and
+`405 {"status":"method_not_allowed"}` for a non-GET on the three above; the
+FastAPI services answer their frameworks' own 404/405 for the same cases.
 
 ## Trie — port 8081 (§29, §31, §46.7)
 

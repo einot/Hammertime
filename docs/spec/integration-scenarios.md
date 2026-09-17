@@ -20,8 +20,12 @@ one bucket per observation). Wire shapes: `docs/protocol/observation-v1.md`,
    — a job with no Docker, broker or Redis. Every test therefore runs all four
    services *in the test process* on one `InMemoryBus`, with in-memory stores,
    a `ManualClock`, and a `tmp_path` for the detection config and the trie's
-   snapshot directory. No sockets are opened: HTTP goes through
+   snapshot directory. No network is used: every HTTP request goes through
    `httpx.AsyncClient(transport=httpx.ASGITransport(app=service.app))`.
+   Each service's `run()` does bind its listening socket (ADR-0009 A8: the
+   service owns its own server), which is why §2.2 sets every bind address
+   to `127.0.0.1:0` — loopback, ephemeral port, no collision between
+   parallel test processes — and nothing ever connects to those sockets.
 2. **No skips, no gates.** No `pytest.mark.skip`/`skipif`, no environment
    variable that turns a test off, no `xfail`. A scenario that cannot be
    written from the documents above is a spec gap to report, not a test to
@@ -60,6 +64,16 @@ harness then awaits `start()` on all four in pipeline order (ingest,
 aggregator, trie, detector), asserts each `.ready` is `True`, and runs each
 `run()` as an `asyncio.Task` for the test's duration; teardown awaits `stop()`
 on each and then the tasks.
+
+`run()` is where the aggregator, trie and detector consume the bus, so it is
+mandatory for those three. For ingest it is optional: `start()`/`stop()` are
+complete without it, `app` is fully usable through `ASGITransport` once
+`start()` returns, and its `run()` only serves HTTP (unused here) and runs
+the configuration poller — which, with the interval in §2.2, never polls on
+its own anyway; `publish_config` drives `reload_config()` explicitly on all
+four services for exactly that reason. Run it regardless, so that teardown is
+uniform (`stop()` then await the task) and ingest's drain path is the
+production one (ADR-0009 A8).
 
 Suggested surface (names are the harness author's to choose; behaviour is
 not):
@@ -111,8 +125,9 @@ HAMMERTIME_AGGREGATOR_MAINTENANCE_INTERVAL_S=1000000
 HAMMERTIME_STARTUP_TIMEOUT_S=10  HAMMERTIME_SHUTDOWN_TIMEOUT_S=5
 ```
 
-Bind addresses are never listened on (ASGI transport); they only have to
-parse. The huge periodic intervals make every periodic action happen only
+Bind addresses are bound by each `run()` (§1) but never connected to — every
+request uses the ASGI transport — so port `0` is correct and the host must be
+loopback. The huge periodic intervals make every periodic action happen only
 when a test calls `advance`, `snapshot_now` or `publish_config` explicitly —
 so a wall-clock timer can never race a `ManualClock`-driven assertion. The
 rate limits are large so that none of these scenarios can touch a 429; the

@@ -2643,6 +2643,27 @@ A service MUST tolerate its dependencies (event log, state store) being
 unavailable at startup, retrying with backoff up to a startup deadline
 (`HAMMERTIME_STARTUP_TIMEOUT_S`, default 60) before failing with status 1.
 
+A dependency failure is *transient* — and therefore retried — iff it is an
+instance of a class the connecting code names as transient for that
+dependency, with `OSError` (connection refused/reset, timeout) as the floor
+every dependency shares; a client library's own connection-error classes are
+added per dependency (ingest: `redis.exceptions.ConnectionError`/`TimeoutError`
+for the store, `aiokafka.errors.KafkaConnectionError` for the bus).
+Connectivity is what is retried — a refused, reset or timed-out connection,
+a dependency still loading, and a hostname that does not resolve yet. A
+credential the dependency rejects MUST NOT be retried: it fails the start on
+the first attempt, with no `dependency_unavailable` record. Where a client
+library reports a rejected credential as a subclass of a class the service
+must list as transient (redis-py does), the connecting code MUST catch it
+inside the connect callable and re-raise a type outside the transient set,
+chaining the original and never including the connection URL in the message
+(ADR-0009 A1, "The credential rule"). Any failure of a type outside the
+transient set is non-transient and fails the start on the first attempt. The
+retry delay starts at 0.5 s and doubles to a cap of 5 s; a delay that would
+overrun the deadline is not started, and the last transient error is what is
+reported. Each failed attempt is logged as `dependency_unavailable` with the
+dependency name and a 1-based attempt number (ADR-0009 A1).
+
 A service is *ready* when it can answer correctly for everything published
 before it started:
 
@@ -2659,6 +2680,15 @@ aggregator's is `HAMMERTIME_AGGREGATOR_BIND` (default port 8083). Domain read
 endpoints (Section 29, `docs/protocol/read-api-v1.md`) and the ingestion
 endpoint MUST answer 503 while the service is not ready.
 
+Readiness has three states — `starting` (from construction), `ready` (from
+the end of `start()`), `stopping` (from the moment `stop()` is called, before
+anything is torn down) — carried by one `Readiness` object per service
+(`hammertime.core.runtime`). A service's `ready` is `True` iff that state is
+`ready`; `/readyz` answers `200 {"status":"ready"}` in that state and `503
+{"status":"<state>"}` otherwise; the ingestion endpoint and the domain read
+endpoints answer the identical 503 body (`docs/protocol/observation-v1.md`,
+`docs/protocol/read-api-v1.md`).
+
 ## 47.3 Configuration changes
 
 A service polls `HAMMERTIME_CONFIG_PATH` every `HAMMERTIME_CONFIG_POLL_INTERVAL_S`
@@ -2667,6 +2697,16 @@ strictly greater than the version in force. A document that fails validation
 is logged and ignored; the previous version stays in force. A new version
 becomes visible in emitted events and read responses only after the
 re-evaluation it triggers (Section 34) has been applied.
+
+A version is always in force: the document is loaded before the service is
+constructed (47.1 step 3), and polling begins one interval after the service's
+main loop starts — never during `start()`. The poller is
+`hammertime.core.runtime.ConfigPoller`, shared by every service (ADR-0009 A5);
+`reload_config()` is one poll of it, performed synchronously, returning the
+configuration in force afterwards. A rejected document is logged as
+`config_rejected`; an applied one as `config_applied`. If a service's own
+re-evaluation raises, the previous version stays in force, the failure is
+logged, and the next poll retries.
 
 ## 47.4 Shutdown
 
@@ -2695,3 +2735,26 @@ shared in-memory event log with a controlled clock (ADR-0009 decision 3). The
 maintenance coroutines a test drives directly (`run_maintenance`,
 `snapshot_now`, `reload_config`) MUST be the same ones the service's periodic
 loops call.
+
+The runtime's own timing is injectable rather than observed by sleeping: the
+dependency retry (`connect_with_retry`) takes `sleep=` and `monotonic=`
+(and `timeout_s=`, `transient=`, `logger=`), and the configuration poller
+takes `poll_interval_s=` and `logger=` (ADR-0009 A1, A2, A5). The `Service`
+protocol is `runtime_checkable`, so a conformance test may assert
+`isinstance(service, Service)` (ADR-0009 A3). A service's `run()` is what
+binds its listening socket; `start()` and `stop()` are complete without it,
+and a harness that skips `run()` gets no automatic configuration polling
+(ADR-0009 A8).
+
+## 47.7 Structured log records
+
+Every record a service emits is one JSON object per line on standard output,
+with sorted keys, carrying at least `event`, `level` (lowercase), `service`
+and `timestamp` (ISO 8601 UTC), and `exception` (a formatted traceback) only
+when the record was emitted with one. `HAMMERTIME_LOG_LEVEL` is the
+threshold. The lifecycle events and their fields are the table in ADR-0009
+A7; the ones every service MUST emit are `config_invalid`, `starting`,
+`dependency_unavailable`, `start_failed`, `ready`, `run_exited`, `stopping`,
+`shutdown_timeout`, `config_rejected` and `config_applied`. No record — of any
+event — may contain a credential: not the agent token key, not a bearer token,
+not the userinfo of a store URL.
