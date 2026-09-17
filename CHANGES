@@ -1,3 +1,6 @@
+Add GET /readyz to ingest, answering 200 once startup has completed and 503 with {"status":"starting"|"stopping"} otherwise; POST /v1/observations answers the same 503 while the service is not ready
+Ingest re-reads HAMMERTIME_CONFIG_PATH every HAMMERTIME_CONFIG_POLL_INTERVAL_S (default 1) and applies a document only when its config_version is strictly greater than the version in force; a document that fails to load or validate is logged and ignored, leaving the previous version in force
+Ingest exits 2 when its configuration is invalid, 1 on a runtime failure and 0 after a clean drain; it now retries an unavailable bus or store at startup up to HAMMERTIME_STARTUP_TIMEOUT_S (default 60) and drains within HAMMERTIME_SHUTDOWN_TIMEOUT_S (default 8) on SIGTERM/SIGINT, logging structured starting/ready records
 Return 401 with a uniform body for every failed agent authentication; 403 is now only a correct credential for a disabled agent
 Throttle failed agent authentication per source prefix and per attempted agent_id, answering 429 with Retry-After
 Charge the ingest rate limiter per distinct observed IP as well as per request; over-budget batches get 429 with Retry-After

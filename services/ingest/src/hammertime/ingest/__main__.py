@@ -1,36 +1,38 @@
-"""Entry point: build the app, wire bus/store, serve.
+"""Entry point: hand ingest's composition root to the shared runner.
 
-Spec: section 4; ADR-0007
+Spec: section 4, section 47; ADR-0007, ADR-0009
 
-Bus/store wiring is Epic #4's job; this currently just builds and serves
-the validation-only app from `app.py`.
+ADR-0009 decision 1: `main()` takes no arguments, reads no `argv`, and does
+nothing but turn `run_service`'s exit code into the process status --
+0 clean shutdown, 1 runtime failure, 2 configuration invalid. Everything
+else (structured logging, the `starting`/`ready` records, the startup
+deadline and its dependency backoff, SIGTERM/SIGINT, the drain) belongs to
+`hammertime.core.runtime`, and the object graph belongs to
+`hammertime.ingest.service.build_service`.
 
-`proxy_headers=False`: uvicorn defaults to `proxy_headers=True`, which
-installs its own `ProxyHeadersMiddleware` that can rewrite `scope["client"]`
-from `X-Forwarded-For`/`X-Real-IP` for any peer in `forwarded_allow_ips`
-(itself defaulting to `127.0.0.1,::1`, or `*` if a deployment sets
-`FORWARDED_ALLOW_IPS`). That would let uvicorn silently override the
-"trusted" client address behind `auth/middleware.py`'s back even when
-`HAMMERTIME_INGEST_TRUSTED_PROXY_HOPS=0` -- two independent, potentially
-disagreeing layers deciding whether to trust `X-Forwarded-For`. XFF
-interpretation must be owned solely by `middleware.py`'s
-`trusted_proxy_hops` logic (spec section 36.5), so uvicorn's own rewriting
-is disabled here.
+`load_settings()` runs inside the factory, so a malformed environment
+variable is reported as one `config_invalid` record and exit 2 rather than
+as a `ValueError` traceback.
+
+The HTTP server itself is built in `service.py`, which keeps uvicorn's own
+`X-Forwarded-For`/`X-Real-IP` rewriting disabled (`proxy_headers=False`):
+interpreting those headers is solely `auth/middleware.py`'s
+`trusted_proxy_hops` logic (spec section 36.5), never two layers that can
+disagree. The reasoning is recorded in full at the setting itself.
 """
 
-import uvicorn
-from hammertime.ingest.app import create_app
+from hammertime.core.runtime import run_service
 from hammertime.ingest.config import load_settings
+from hammertime.ingest.service import SERVICE_NAME, IngestService, build_service
+
+
+def _build_from_env() -> IngestService:
+    """`build_from_env`: the composition root partially applied to `os.environ`."""
+    return build_service(load_settings())
 
 
 def main() -> None:
-    settings = load_settings()
-    uvicorn.run(
-        create_app(settings),
-        host=settings.host,
-        port=settings.port,
-        proxy_headers=False,
-    )
+    raise SystemExit(run_service(SERVICE_NAME, _build_from_env))
 
 
 if __name__ == "__main__":

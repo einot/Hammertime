@@ -1,7 +1,7 @@
-"""POST /v1/observations, GET /healthz, GET /metrics.
+"""POST /v1/observations, GET /healthz, GET /readyz, GET /metrics.
 
-Spec: section 4, section 36, section 36.6, section 37;
-docs/protocol/observation-v1.md; ADR-0004, ADR-0008
+Spec: section 4, section 36, section 36.6, section 37, section 47;
+docs/protocol/observation-v1.md; ADR-0004, ADR-0008, ADR-0009
 
 Pipeline for `POST /v1/observations` (spec section 36.6's normative order):
 agent authentication (`Depends`, runs before the body is read) -> flat
@@ -21,8 +21,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from hammertime.core.errors import InvalidAddressError
 from hammertime.core.events.models import Observation, RequestObservation
+from hammertime.core.runtime import (
+    AdminResponse,
+    Readiness,
+    ServiceNotReady,
+    healthz_response,
+    metrics_response,
+    readyz_response,
+)
 from hammertime.ingest.api.schemas import (
-    HealthStatus,
     ObservationAccepted,
     ObservationDuplicate,
     ObservationRequest,
@@ -55,6 +62,45 @@ def _get_ingest_state(request: Request) -> "IngestState":
     # avoid a routes.py <-> app.py import cycle (app.py imports `router`
     # from this module at import time).
     return request.app.state.ingest  # type: ignore[no-any-return]
+
+
+def _get_readiness(request: Request) -> Readiness:
+    # Set by `create_app` (not by its lifespan): it has to answer /readyz
+    # before, during and after the lifespan, not only once it succeeded.
+    return request.app.state.readiness  # type: ignore[no-any-return]
+
+
+def _as_response(admin: AdminResponse) -> Response:
+    """Render one of `hammertime.core.runtime`'s admin responses.
+
+    The status codes and bodies of /healthz, /readyz and /metrics are
+    core's (ADR-0009 decision 4) so they cannot drift between the services;
+    this is only the FastAPI-shaped envelope around them.
+
+    The content type is set as a raw header rather than via `media_type=`:
+    Starlette appends `; charset=utf-8` to any `text/*` media type it is
+    given, which would make this service's `/metrics` announce a different
+    content type than core's own admin app for the identical body.
+    """
+    return Response(
+        content=admin.body,
+        status_code=admin.status_code,
+        headers={"content-type": admin.media_type},
+    )
+
+
+async def _require_ready(request: Request) -> None:
+    """Route dependency: 503 while the service is not ready (spec section 47.2).
+
+    Declared as a route-level `dependencies=[...]` entry, which FastAPI
+    solves *before* the handler's own `Depends` parameters, so a request
+    arriving mid-drain is turned away without touching the registry, the
+    rate limiters or the body. The protocol already reserves 503 for
+    "retry with the same sequence", so an agent needs no new behaviour for
+    it (docs/protocol/observation-v1.md).
+    """
+    if not _get_readiness(request).ready:
+        raise ServiceNotReady("ingest is not ready")
 
 
 async def _authenticate(request: Request) -> str:
@@ -163,7 +209,12 @@ def _to_request_observation(
     )
 
 
-@router.post("/v1/observations", status_code=202, response_model=ObservationAccepted)
+@router.post(
+    "/v1/observations",
+    status_code=202,
+    response_model=ObservationAccepted,
+    dependencies=[Depends(_require_ready)],
+)
 async def create_observation(
     request: Request, agent_id: str = Depends(_authenticate)
 ) -> ObservationAccepted | JSONResponse:
@@ -333,13 +384,19 @@ async def create_observation(
     return ObservationAccepted()
 
 
-@router.get("/healthz", response_model=HealthStatus)
-async def healthz() -> HealthStatus:
-    """Liveness check. No dependencies to probe yet (no bus/store wiring)."""
-    return HealthStatus()
+@router.get("/healthz")
+async def healthz() -> Response:
+    """Liveness: 200 as soon as the socket is open, whatever the readiness."""
+    return _as_response(healthz_response())
+
+
+@router.get("/readyz")
+async def readyz(request: Request) -> Response:
+    """Readiness: 200 once the lifespan has completed, 503 before and during the drain."""
+    return _as_response(readyz_response(_get_readiness(request)))
 
 
 @router.get("/metrics")
 async def metrics() -> Response:
     """Placeholder: `hammertime.core.telemetry.metrics` is itself unimplemented."""
-    return Response(content=b"", media_type="text/plain; version=0.0.4")
+    return _as_response(metrics_response())

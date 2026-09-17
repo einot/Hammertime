@@ -50,7 +50,6 @@ class ObservationDuplicate(BaseModel):
     status: Literal["duplicate"] = "duplicate"
 
 
-class HealthStatus(BaseModel):
-    """200 response body for `GET /healthz`."""
-
-    status: Literal["ok"] = "ok"
+# `/healthz`, `/readyz` and `/metrics` have no model here: their bodies and
+# status codes are `hammertime.core.runtime`'s, shared by all four services
+# so they cannot drift apart (ADR-0009 decision 4).

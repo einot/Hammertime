@@ -1,6 +1,6 @@
 """FastAPI application factory and lifespan (auth, rate limit, dedup, bus).
 
-Spec: section 4
+Spec: section 4, section 47
 
 The lifespan loads ingest settings and the detection config once at
 startup (not per request), and constructs every other process-lifetime
@@ -10,17 +10,32 @@ the `require_agent` dependency built from it, the `RateLimiter`, the
 `Producer` (memory or Kafka per `IngestSettings.bus_kind`) wrapped in an
 `ObservationPublisher`. Kafka's producer needs an explicit `start()`/
 `stop()`; the in-memory one needs neither.
+
+This lifespan *is* ingest's readiness (ADR-0009 decision 4): the app is
+ready exactly from the moment it has completed to the moment it starts
+unwinding, which is what `app.state.readiness` records and what
+`/readyz` -- and the 503 gate on the ingestion endpoint -- report. The two
+connections it makes (Redis, Kafka) are retried with backoff under the
+startup deadline, because `depends_on` in the compose file orders
+container start but not broker readiness (decision 5 step 5).
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from fastapi import FastAPI, Request
+from aiokafka.errors import KafkaConnectionError
+from fastapi import FastAPI, Request, Response
 from hammertime.bus.interface import Producer
 from hammertime.bus.kafka import KafkaProducer
 from hammertime.bus.memory import InMemoryBus
 from hammertime.core.config.loader import load as load_detection_config
+from hammertime.core.runtime import (
+    Readiness,
+    ServiceNotReady,
+    connect_with_retry,
+    not_ready_response,
+)
 from hammertime.core.time.clock import SystemClock
 from hammertime.ingest.api.routes import router
 from hammertime.ingest.auth.agents import (
@@ -38,6 +53,19 @@ from hammertime.store.interface import DedupStore
 from hammertime.store.memory import MemoryDedupStore
 from hammertime.store.redis import RedisDedupStore
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
+#: Failures that mean "the dependency is not up *yet*" and are worth
+#: retrying under the startup deadline (ADR-0009 decision 5). Anything else
+#: -- a bad URL, an auth failure, a protocol error -- is non-transient and
+#: fails the start immediately rather than being retried for 60 seconds.
+_TRANSIENT_STORE_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    RedisConnectionError,
+    RedisTimeoutError,
+)
+_TRANSIENT_BUS_ERRORS: tuple[type[BaseException], ...] = (OSError, KafkaConnectionError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +91,13 @@ class IngestState:
     observation_limiter: RateLimiter
     dedup: DedupService
     publisher: ObservationPublisher
+    #: The store and producer `dedup`/`publisher` above were built on.
+    #: Held so a configuration reload (ADR-0009 decision 6) can rebuild
+    #: those two -- whose settings are `allowed_lateness_seconds` and
+    #: `config_version` -- around the *same* connections instead of
+    #: reconnecting, which would drop the dedup window on the floor.
+    dedup_store: DedupStore
+    producer: Producer
 
 
 def create_app(
@@ -99,6 +134,8 @@ def create_app(
     driven by settings/environment -- production always gets `require_agent`'s
     own defaults (a fresh random per-process salt and the default slot count).
     """
+    # "starting" until the lifespan completes; ADR-0009 decision 4.
+    readiness = Readiness()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -135,6 +172,14 @@ def create_app(
             resolved_dedup_store = dedup_store
         elif resolved_settings.store_kind == "redis":
             redis_client = Redis.from_url(resolved_settings.redis_url)
+            client = redis_client
+
+            async def ping_store() -> None:
+                # `Redis.from_url` connects lazily, so this round trip is
+                # what "dedup store reachable" in decision 4 actually means.
+                await client.ping()
+
+            await connect_with_retry("store", ping_store, transient=_TRANSIENT_STORE_ERRORS)
             resolved_dedup_store = RedisDedupStore(redis_client)
         else:
             resolved_dedup_store = MemoryDedupStore()
@@ -145,7 +190,7 @@ def create_app(
             producer = bus.producer()
         elif resolved_settings.bus_kind == "kafka":
             kafka_producer = KafkaProducer(bootstrap_servers=resolved_settings.bus_brokers)
-            await kafka_producer.start()
+            await connect_with_retry("bus", kafka_producer.start, transient=_TRANSIENT_BUS_ERRORS)
             producer = kafka_producer
         else:
             producer = InMemoryBus().producer()
@@ -199,15 +244,39 @@ def create_app(
             publisher=ObservationPublisher(
                 producer, config_version=detection_config.config_version
             ),
+            dedup_store=resolved_dedup_store,
+            producer=producer,
         )
+        readiness.mark_ready()
         try:
             yield
         finally:
+            # Stop answering 200 on /readyz (and start answering 503 on the
+            # ingestion endpoint) *before* the connections those answers
+            # depend on are torn down.
+            readiness.mark_stopping()
             if kafka_producer is not None:
                 await kafka_producer.stop()
             if redis_client is not None:
                 await redis_client.aclose()
 
+    async def service_not_ready(request: Request, exc: Exception) -> Response:
+        """Render `ServiceNotReady` as decision 4's 503, not FastAPI's `detail` shape."""
+        response = not_ready_response(_readiness_of(request.app))
+        return Response(
+            content=response.body,
+            status_code=response.status_code,
+            headers={"content-type": response.media_type},
+        )
+
     app = FastAPI(title="hammertime-ingest", lifespan=lifespan)
+    app.state.readiness = readiness
+    app.add_exception_handler(ServiceNotReady, service_not_ready)
     app.include_router(router)
     return app
+
+
+def _readiness_of(app: FastAPI) -> Readiness:
+    # Set by `create_app` below, the same way `IngestState` is set by its
+    # lifespan and read back through `routes.py::_get_ingest_state`.
+    return app.state.readiness  # type: ignore[no-any-return]
