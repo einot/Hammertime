@@ -6,8 +6,10 @@ new thresholds), section 46.4 (`weight` is computed under the configuration
 in force at the transition), section 47.3 (the new version is visible only
 after the re-evaluation it triggered has been applied). ADR-0009 decision 6
 and Amendment item A5 (strictly greater version; rejected documents ignored),
-ADR-0011 decision 7 (the pass), decision 2's `apply_config` (geometry) and
-decision 5 (the warm-up exemption still applies).
+ADR-0011 decision 7 (the pass), decision 2's `apply_config` (geometry),
+decision 5 (the warm-up exemption still applies) and Amendment 3 item A12
+(the version gate lives in `ConfigPoller.poll_once()` alone; the worker's
+`apply_config` is unconditional).
 
 The interface under test is ADR-0011 decision 9, which pins one signature
 exactly:
@@ -22,17 +24,25 @@ snapshot of `window.tracked_ips()`, then adopt `v`.
 ASSUMPTIONS -- things decisions 7 and 9 do not pin. Adjust the helpers below,
 not the meaning of the assertions:
 
-1. `await worker.apply_config(candidate) -> DetectionConfig` takes an
-   already-validated `DetectionConfig` (the loader/`ConfigPoller` is what
-   turns a document into one, ADR-0009 A5) and returns the configuration in
-   force *after* the call -- so a rejected candidate returns the unchanged
-   one. The version gate itself (`candidate.config_version <=
-   current.config_version` is ignored) is asserted on `apply_config` because
-   section 47.3 states it of the service as a whole; ADR-0009 A5 also places
-   it in `ConfigPoller`, and the two agreeing is the point.
+1. Ruled rather than assumed since Amendment 3 item A12, and kept here
+   because the rest of the list is numbered against it:
+   `await worker.apply_config(config) -> None` takes an already-validated
+   `DetectionConfig` (the loader/`ConfigPoller` is what turns a document into
+   one, ADR-0009 A5) and applies it *unconditionally* -- it compares no
+   versions and returns nothing, so calling it with the version already in
+   force simply runs the pass again. The version gate (a `config_version`
+   that is not strictly greater is ignored, silently) belongs to
+   `ConfigPoller.poll_once()` and to nothing else, and `apply_config` is the
+   `Callable[[DetectionConfig], Awaitable[None]]` hook that poller calls.
+   `AggregatorService.reload_config()` is one `poll_once()` of that poller
+   and returns the poller's `current`, so the gate is asserted here through a
+   poller wired the way `reload_config()` wires one (`TestTheVersionGate`).
 2. `reevaluate_shard`'s `int` return is the number of transitions the pass
-   emitted -- the `transitions=N` field decision 8 gives the `config_applied`
-   log record.
+   emitted -- the `transitions` field of the worker's own
+   `config_reevaluated` log record (decision 8, renamed by A12). It is *not*
+   `config_applied`: after A12 that name is the poller's record, and
+   ADR-0009 A7 gives it `path`, `config_version` and
+   `previous_config_version` only.
 3. `AggregatorWorker(*, bus, state_store, clock, config, metrics,
    shard_ids=None, max_tracked_ips=...)`, `start()`/`stop()`,
    `worker.window(shard)`, `worker.config`. Same assumption as
@@ -52,8 +62,11 @@ section 2; the 32-IP scenario is that document's section 4 step 1-3.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 
 from hammertime.aggregator.metrics import AggregatorMetrics
 from hammertime.aggregator.reevaluate import reevaluate_shard
@@ -66,6 +79,7 @@ from hammertime.core.config.models import DetectionConfig
 from hammertime.core.events.codec import EventPayload, decode
 from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import HotIpAdded, HotIpRemoved
+from hammertime.core.runtime import ConfigPoller
 from hammertime.core.state.enums import IpState
 from hammertime.core.state.weight import threshold_ratio
 from hammertime.core.time.clock import ManualClock
@@ -116,6 +130,28 @@ V1 = _config()
 V2 = _config(config_version=2, hot_threshold=500, cold_threshold=400)
 # Section 4 step 3: v1's thresholds under a higher version.
 V3 = _config(config_version=3, hot_threshold=1000, cold_threshold=800)
+
+# The same configuration in document form: what an operator publishes and what
+# `ConfigPoller` reads (`schemas/detection_config.v1.json`,
+# `config/detection.v1.json`). The shape is the one
+# `packages/hammertime-core/.../tests/test_runtime.py::_write_config` writes.
+_DOCUMENT: dict[str, Any] = {
+    "config_version": 1,
+    "window_seconds": WINDOW_SECONDS,
+    "bucket_seconds": BUCKET_SECONDS,
+    "hot_threshold": 1000,
+    "cold_threshold": 800,
+    "minimum_hot_ips": 16,
+    "minimum_hot_ratio": 0.10,
+    "allowed_lateness_seconds": 30,
+    "state_retention_seconds": 600,
+    "weight_max": 1_000_000,
+}
+
+
+def _write_config(path: Path, **overrides: Any) -> Path:
+    path.write_text(json.dumps({**_DOCUMENT, **overrides}))
+    return path
 
 
 def _records(bus: InMemoryBus, topic: str = HOT_IP_TOPIC) -> list[tuple[bytes | None, bytes]]:
@@ -182,6 +218,21 @@ def _emitter(
         clock=clock,
         metrics=AggregatorMetrics(),
     )
+
+
+def _poller(path: Path, worker: AggregatorWorker) -> ConfigPoller:
+    """The wiring `AggregatorService.reload_config()` performs (A12).
+
+    `worker.apply_config` is the poller's unconditional `apply` hook, and this
+    line is also where A12's signature is checked statically: mypy runs strict
+    over these tests, and a hook returning anything but `None` is not
+    assignable to `Callable[[DetectionConfig], Awaitable[None]]` (`Awaitable`
+    is covariant), so an `apply_config` that still returned the configuration
+    in force would fail type-checking here. The version in force at the poller
+    is the one in force at the worker.
+    """
+
+    return ConfigPoller(path, current=worker.config, apply=worker.apply_config)
 
 
 class TestNoChangeUntilTheThresholdsMove:
@@ -275,10 +326,13 @@ class TestLoweringTheThresholdsPromotesEveryTrackedIp:
         async with _running(_worker(bus=bus, clock=clock)) as worker:
             _seed(_window_of(worker), IPS, 600)
 
-            returned = await worker.apply_config(V2)
+            # A12: `apply_config` returns nothing, so the version in force is
+            # read off the worker. The `-> None` half of that is checked
+            # statically instead of here -- binding the result of a call that
+            # returns `None` is itself a mypy error, and `_poller` pins the
+            # hook type (see the comment there).
+            await worker.apply_config(V2)
 
-            assert returned.config_version == 2
-            assert returned.hot_threshold == 500
             assert worker.config.config_version == 2
             assert worker.config.hot_threshold == 500
             assert _window_of(worker).config.hot_threshold == 500
@@ -319,41 +373,97 @@ class TestRaisingTheThresholdsDemotesEveryTrackedIp:
 
 
 class TestTheVersionGate:
-    """Section 47.3 / ADR-0009 decision 6: only a strictly greater
-    `config_version` is applied."""
+    """Section 47.3 / ADR-0009 decision 6 and A5: only a strictly greater
+    `config_version` is applied.
 
-    async def test_a_lower_version_is_ignored(self) -> None:
+    The gate is `ConfigPoller.poll_once()`'s and nobody else's (A12), so the
+    three tests that exercise it -- the lower version, the version already in
+    force, and the strictly greater one -- put the candidate on disk and poll
+    for it through `_poller`, which is the wiring
+    `AggregatorService.reload_config()` performs. `apply_config` appears in
+    those three only as setup (putting a version in force before the poll) and
+    as the hook the poller itself calls. The fourth test,
+    `test_a_descriptive_only_change_is_adopted_and_produces_no_transitions`,
+    is about what the pass does once the gate has let a document through, not
+    about the gate, so it calls `apply_config` directly.
+    """
+
+    async def test_a_lower_version_is_ignored(self, tmp_path: Path) -> None:
         clock = ManualClock(initial=BASE)
         bus = InMemoryBus()
         async with _running(_worker(bus=bus, clock=clock)) as worker:
             _seed(_window_of(worker), IPS, 600)
             await worker.apply_config(V3)
             before = len(_records(bus))
+            path = _write_config(
+                tmp_path / "detection.json",
+                config_version=2,
+                hot_threshold=500,
+                cold_threshold=400,
+            )
+            poller = _poller(path, worker)
 
-            returned = await worker.apply_config(V2)
+            current = await poller.poll_once()
 
-            assert returned.config_version == 3
+            assert current.config_version == 3
+            assert current.hot_threshold == 1000
             assert worker.config.config_version == 3
+            assert worker.config.hot_threshold == 1000
             assert len(_records(bus)) == before
+            assert _window_of(worker).hot_count == 0
 
-    async def test_the_version_in_force_is_ignored_even_with_different_thresholds(self) -> None:
+    async def test_the_version_in_force_is_ignored_even_with_different_thresholds(
+        self, tmp_path: Path
+    ) -> None:
         # Section 4 step 4 of the integration scenario: the same
         # `config_version` carrying thresholds that *would* promote every
-        # tracked IP must have no effect at all.
+        # tracked IP must have no effect at all. The scenario publishes it and
+        # calls `reload_config()`, which is the poll performed here.
         clock = ManualClock(initial=BASE)
         bus = InMemoryBus()
         async with _running(_worker(bus=bus, clock=clock)) as worker:
             _seed(_window_of(worker), IPS, 600)
-            restated = _config(config_version=1, hot_threshold=100, cold_threshold=50)
+            path = _write_config(
+                tmp_path / "detection.json",
+                config_version=1,
+                hot_threshold=100,
+                cold_threshold=50,
+            )
+            poller = _poller(path, worker)
 
-            returned = await worker.apply_config(restated)
+            current = await poller.poll_once()
 
-            assert returned.config_version == 1
-            assert returned.hot_threshold == 1000
+            assert current.config_version == 1
+            assert current.hot_threshold == 1000
             assert worker.config.config_version == 1
             assert worker.config.hot_threshold == 1000
             assert _records(bus) == []
             assert _window_of(worker).hot_count == 0
+
+    async def test_a_strictly_greater_version_reaches_the_worker(self, tmp_path: Path) -> None:
+        # The open side of the same gate: the poller calls the hook, the pass
+        # runs under the new thresholds, and both the poller's `current` and
+        # the worker's `config` move to the new document.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        async with _running(_worker(bus=bus, clock=clock)) as worker:
+            _seed(_window_of(worker), IPS, 600)
+            path = _write_config(
+                tmp_path / "detection.json",
+                config_version=2,
+                hot_threshold=500,
+                cold_threshold=400,
+            )
+            poller = _poller(path, worker)
+
+            current = await poller.poll_once()
+
+            assert current.config_version == 2
+            assert current.hot_threshold == 500
+            assert worker.config.config_version == 2
+            assert worker.config.hot_threshold == 500
+            assert len(_records(bus)) == 32
+            assert _window_of(worker).hot_count == 32
 
     async def test_a_descriptive_only_change_is_adopted_and_produces_no_transitions(self) -> None:
         # ADR-0011 decision 7 / assumption 19: a change confined to
@@ -367,10 +477,8 @@ class TestTheVersionGate:
             _seed(_window_of(worker), IPS, 600)
             v4 = _config(config_version=4, weight_max=5000)
 
-            returned = await worker.apply_config(v4)
+            await worker.apply_config(v4)
 
-            assert returned.config_version == 4
-            assert returned.weight_max == 5000
             assert worker.config.config_version == 4
             assert worker.config.weight_max == 5000
             assert _records(bus) == []

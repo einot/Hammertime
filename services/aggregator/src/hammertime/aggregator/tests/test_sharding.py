@@ -6,9 +6,11 @@ authoritative information), section 47.2 (readiness is "shard claims held").
 ADR-0011 decision 1 (a shard *is* a partition of
 `hammertime.observations.v1`; `HAMMERTIME_SHARD_IDS` is `auto` or an explicit
 set), Amendment 1 item A3 (a set-but-empty value is a configuration error),
-decision 5 (`ShardClaims`: claim, warm-up, revoke) and Amendment 2 item A5
+decision 5 (`ShardClaims`: claim, warm-up, revoke), Amendment 2 item A5
 (an inherited HOT IP is a tracked entry from construction) and item A7 (the
-two per-window eviction counters).
+two per-window eviction counters), and Amendment 3 item A13 (`window_evictions`
+and `shards_claimed` are computed on read from the windows the worker binds
+to its `AggregatorMetrics`).
 
 Two interfaces are under test. The first is pinned exactly by decision 9:
 
@@ -57,11 +59,6 @@ NOT asserted here, and why:
 * **The outcome `handle()` returns for a message on an unclaimed partition.**
   Decision 3 enumerates six outcomes for a message the worker owns and says
   nothing about one it does not; only the absence of any effect is asserted.
-* **`window_evictions{shard,reason}` as an exported series** (A7). A7 says it
-  is "read from `ShardWindow.retention_evictions` / `.capacity_evictions` of
-  each claimed shard ... at export time", and nothing pins the read path, so
-  what is asserted is the per-window counters of each claimed shard and that
-  a revoked shard's window -- and therefore its series -- goes away with it.
 * **Real rebalance ordering.** `InMemoryBus` has one partition and no
   coordinator (ADR-0011 assumption 22), so `on_revoked` is only ever driven
   directly here, exactly as `packages/hammertime-bus/.../tests/test_assignment.py`
@@ -593,8 +590,9 @@ class TestInheritedRetention:
 class TestEvictionCountersArePerClaimedShard:
     """Amendment 2 item A7: `window_evictions{shard,reason}` is read from the
     two counters of each claimed shard, so the series lives and dies with the
-    window (see the module docstring for why the export itself is not
-    asserted here)."""
+    window. Amendment 3 item A13 pins the read path A7 left open -- the series
+    is computed on each `metrics.get`, from the windows the worker bound --
+    so the last test here reads it through `AggregatorMetrics`."""
 
     async def test_each_claimed_shard_counts_its_own_evictions(self) -> None:
         clock = ManualClock(initial=BASE)
@@ -630,6 +628,32 @@ class TestEvictionCountersArePerClaimedShard:
         await claims.on_revoked(frozenset({(OBSERVATIONS_TOPIC, 0)}))
 
         assert claims.window(0) is None
+
+    async def test_a_claimed_shards_counters_are_readable_through_the_metrics(self) -> None:
+        # A13: `AggregatorWorker.__init__` binds the claimed windows as the
+        # source of the derived series, and `get` computes the answer from
+        # them on the call -- so an eviction needs no bookkeeping of its own to
+        # become readable, and `shards_claimed` is the number of windows the
+        # bound source yields.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        metrics = AggregatorMetrics()
+        worker = _worker(bus=bus, clock=clock, metrics=metrics)
+
+        await worker.start()
+        try:
+            window = worker.window(0)
+            assert window is not None
+            assert window.observe(IP_A, BASE, 5) is not None
+            clock.advance(STATE_RETENTION_SECONDS)
+            window.expire_due()
+            assert window.evict_due() == 1
+
+            assert metrics.get("window_evictions", shard=0, reason="retention") == 1
+            assert metrics.get("window_evictions", shard=0, reason="capacity") == 0
+            assert metrics.get("shards_claimed") == 1
+        finally:
+            await worker.stop()
 
 
 class TestTheWorkerClaimsShardZero:

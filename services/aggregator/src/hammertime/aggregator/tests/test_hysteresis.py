@@ -8,7 +8,10 @@ carries no attributes). ADR-0003 amendment and ADR-0004 (envelope identity:
 `agent_id`, `sequence`, `subject`), ADR-0005 (`attributes`), ADR-0011
 decisions 4 and 5 (persist before publish, warm-up exemption) and decision 8
 (the transition counters and their `reason` label sets, as amended by
-Amendment 2 item A11). Wire shape: `schemas/hot_ip_event.v1.json`.
+Amendment 2 item A11), Amendment 3 item A13 (the `AggregatorMetrics` surface:
+strict names and label names) and item A14 (`EmittedTransition.transition` is
+`hammertime.core.state.transitions.StateTransition`). Wire shape:
+`schemas/hot_ip_event.v1.json`.
 
 The interface under test is ADR-0011 decision 4, quoted here in full because
 the module does not exist yet and these tests are what it is written against:
@@ -46,13 +49,20 @@ differently:
    API for reading one back. Assumed: `AggregatorMetrics()` takes no required
    arguments and `metrics.get(name, **labels) -> int` returns the value of a
    series, `0` for one that was never touched. Only `_counter()` below and
-   the handful of call sites it has depend on that spelling.
-2. **`EmittedTransition.transition`'s type.** `StateTransition` is named by
-   decision 4's code block and defined nowhere in the spec, the ADRs or any
-   shipped test, so nothing below names a member of it. The direction of a
-   transition is asserted through the emitted `event_type` and through the
-   two directions comparing unequal, which holds for any enum/value type the
-   implementation picks.
+   the handful of call sites it has depend on that spelling. Amendment 3 item
+   A13 has since ratified both, and added that the name and the label names
+   are validated strictly (`TestTheMetricsRegistryIsStrict`), so this is now
+   a statement rather than an assumption.
+2. **`EmittedTransition.transition`'s type** -- no longer an assumption.
+   Amendment 3 item A14 found the type shipped, at
+   `hammertime.core.state.transitions.StateTransition`: a frozen dataclass
+   `(previous: IpState, current: IpState)` with `became_hot` / `became_cold`
+   properties. Decision 4 now builds it from the state read at the top of
+   `evaluate` and the result of `evaluate_ip_state`:
+   `StateTransition(previous=previous, current=new)`.
+   The direction is therefore asserted three ways below: the
+   emitted `event_type`, the two directions comparing unequal (frozen
+   dataclass equality), and those two properties.
 3. **The `shard_claimed`/`warmup_complete` log records of decision 8 are not
    asserted** here or in `test_sharding.py`: ADR-0009 decision 5 and section
    47.7 fix the event names and fields but not the record shape a unit test
@@ -283,8 +293,9 @@ class TestSectionSixTableThroughTheEmitter:
         assert envelope.event_type == "HotIpRemoved"
 
     async def test_the_two_directions_are_distinguishable_on_the_transition_field(self) -> None:
-        # ASSUMPTION 2: `StateTransition`'s members are not named anywhere, so
-        # only the inequality of the two directions is asserted.
+        # ASSUMPTION 2 / A14: `StateTransition` is a frozen dataclass carrying
+        # the edge, so the two directions compare unequal and each names
+        # itself.
         clock = ManualClock(initial=BASE)
         bus = InMemoryBus()
         emitter = _emitter(bus=bus, clock=clock)
@@ -298,6 +309,15 @@ class TestSectionSixTableThroughTheEmitter:
         assert promotion is not None
         assert demotion is not None
         assert promotion.transition != demotion.transition
+        assert promotion.transition.became_hot is True
+        assert promotion.transition.became_cold is False
+        assert demotion.transition.became_cold is True
+        assert demotion.transition.became_hot is False
+        # A14: the edge is (previous, current), read at the top of `evaluate`.
+        assert promotion.transition.previous is IpState.COLD
+        assert promotion.transition.current is IpState.HOT
+        assert demotion.transition.previous is IpState.HOT
+        assert demotion.transition.current is IpState.COLD
 
 
 class TestTheEmittedAddEvent:
@@ -804,3 +824,73 @@ class TestTransitionCounters:
             )
             == 0
         )
+
+
+class TestTheMetricsRegistryIsStrict:
+    """Amendment 3 item A13: a series is a declared name plus declared labels.
+
+    `name` must be one of decision 8's nine series, and the label names passed
+    must equal that series' own exactly; both `increment` and `get` raise
+    `ValueError` otherwise, so a typo cannot quietly become an empty series.
+    Label *values* are not validated, so nothing here asserts anything about
+    them. `increment` is only defined for the four event counters; what the
+    other five do when incremented is not pinned by A13 and is not asserted.
+    """
+
+    def test_incrementing_an_unknown_series_is_an_error(self) -> None:
+        metrics = AggregatorMetrics()
+
+        with pytest.raises(ValueError):
+            metrics.increment(
+                "cold_to_hot_transition",  # decision 8's name is plural
+                shard=SHARD,
+                config_version=1,
+                reason="observation",
+            )
+
+    def test_reading_an_unknown_series_is_an_error(self) -> None:
+        metrics = AggregatorMetrics()
+
+        with pytest.raises(ValueError):
+            metrics.get("hot_ip_count", shard=SHARD)
+
+    def test_incrementing_with_a_missing_label_is_an_error(self) -> None:
+        metrics = AggregatorMetrics()
+
+        with pytest.raises(ValueError):
+            metrics.increment("cold_to_hot_transitions", shard=SHARD, config_version=1)
+
+    def test_incrementing_with_an_extra_label_is_an_error(self) -> None:
+        # `late_messages` carries `reason` and nothing else.
+        metrics = AggregatorMetrics()
+
+        with pytest.raises(ValueError):
+            metrics.increment("late_messages", reason="too_late", shard=SHARD)
+
+    def test_reading_with_a_misspelled_label_is_an_error(self) -> None:
+        metrics = AggregatorMetrics()
+
+        with pytest.raises(ValueError):
+            metrics.get(
+                "hot_to_cold_transitions",
+                shard=SHARD,
+                config_version=1,
+                reasons="expiry",
+            )
+
+    def test_reading_a_label_free_series_with_a_label_is_an_error(self) -> None:
+        metrics = AggregatorMetrics()
+
+        with pytest.raises(ValueError):
+            metrics.get("shards_claimed", shard=SHARD)
+
+    def test_a_derived_series_reads_zero_before_any_window_is_bound(self) -> None:
+        # A13: "before `bind_windows` every derived series reads 0" -- an
+        # `AggregatorMetrics` the worker has not taken over is not an error to
+        # read, it is empty.
+        metrics = AggregatorMetrics()
+
+        assert metrics.get("shards_claimed") == 0
+        assert metrics.get("tracked_ips", shard=SHARD) == 0
+        assert metrics.get("hot_ips", shard=SHARD) == 0
+        assert metrics.get("window_evictions", shard=SHARD, reason="retention") == 0
