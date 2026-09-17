@@ -72,14 +72,14 @@ during reconciliation rather than guessing it here.
 
 ADR-0008 (issue #41) additions below (`TestObservationBudget*`,
 `TestOverCapacityBatchIs413NotA500`, `TestFlatRequestRateLimitNowHasRetryAfter`):
-`IngestState.observation_limiter` (ADR-0008's implementation notes) has no
-`create_app` override keyword of its own, unlike the flat per-request
-`rate_limiter=` above (which `_build_app` always wires to a frozen
-`ManualClock`) -- so, absent one, those tests rely on real wall-clock time
-between two back-to-back `TestClient` calls staying well under one second,
-using deliberately small `observation_rate_limit_eps`/`observation_burst`
-values to keep that margin generous. Reconcile onto an injected
-`ManualClock` if/when `app.py` exposes one for this limiter.
+`IngestState.observation_limiter` (ADR-0008's implementation notes) does
+have a `create_app` override keyword of its own (`observation_limiter=`),
+as do ADR-0007's two failed-authentication limiters
+(`auth_failure_source_limiter=`, `auth_failure_agent_limiter=`), so
+`_build_app` wires all four limiters -- not just the flat per-request
+`rate_limiter=` -- to the same frozen `ManualClock`. Nothing in this module
+refills against wall time; see `_build_app`'s own comment for why that
+matters.
 """
 
 from __future__ import annotations
@@ -134,11 +134,11 @@ def _agent(agent_id: str, token: str, *, rate_limit_rps: int, enabled: bool = Tr
 
 
 # ADR-0008 (issue #41): the observation budget is a *global* per-agent
-# limiter built once in app.py's lifespan from these two settings, with no
-# create_app() override of its own (unlike rate_limiter=/dedup_store=/bus=
-# above) -- so any test in this file that must trip or must not trip it
-# does so purely by choosing observation_rate_limit_eps/observation_burst
-# via _settings(), never by injecting a limiter instance directly.
+# limiter built once in app.py's lifespan from these two settings. Its
+# rate/capacity are still chosen per test via
+# observation_rate_limit_eps/observation_burst in _settings(); the limiter
+# *instance* is injected by _build_app (observation_limiter=) purely so it
+# shares the frozen ManualClock and never refills against wall time.
 _AMPLE_OBSERVATION_RATE_LIMIT_EPS = 1_000_000
 _AMPLE_OBSERVATION_BURST = 1_000_000
 
@@ -189,11 +189,13 @@ def _build_app(
 ) -> tuple[TestClient, InMemoryBus]:
     """A pipeline-ready app plus the `InMemoryBus` it publishes to.
 
-    Every dependency the pipeline needs (auth registry, rate limiter, dedup
-    store, bus) is explicit and freshly constructed per call, so tests
-    never share state with each other. `bus` defaults to a fresh
-    `InMemoryBus()`; pass e.g. a `_FailingBus()` to simulate a publish
-    failure.
+    Every dependency the pipeline needs (auth registry, all four rate
+    limiters, dedup store, bus) is explicit and freshly constructed per
+    call, so tests never share state with each other -- and every one of
+    those limiters, plus the dedup store, runs on one frozen `ManualClock`
+    so nothing in this module depends on wall time. `bus` defaults to a
+    fresh `InMemoryBus()`; pass e.g. a `_FailingBus()` to simulate a
+    publish failure.
     """
     default_agent = _agent(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN, rate_limit_rps=_AMPLE_RATE_LIMIT_RPS)
     registry = AgentRegistry.from_records(
@@ -201,10 +203,23 @@ def _build_app(
     )
     resolved_clock = clock if clock is not None else ManualClock(initial=0)
     resolved_bus = bus if bus is not None else InMemoryBus()
+    # EVERY limiter `create_app` accepts is wired to the same frozen
+    # `ManualClock` -- not just the flat per-request `rate_limiter=`. Any
+    # limiter left to `create_app`'s own fallback gets a bare `RateLimiter()`
+    # on the `SystemClock`, so its tokens refill with wall time; that makes
+    # any test proving a budget is *exhausted* timing-dependent, because a
+    # slow enough gap between two back-to-back `client.post(...)` calls hands
+    # the second request a token it should not have and turns an expected 429
+    # into a 202. With `observation_rate_limit_eps=5` that gap is only 200ms,
+    # and it fails only under load -- the worst way to find out. A frozen
+    # clock makes exhaustion exact: nothing refills mid-test.
     app = create_app(
         settings if settings is not None else _settings(),
         agent_registry=registry,
         rate_limiter=RateLimiter(clock=resolved_clock),
+        auth_failure_source_limiter=RateLimiter(clock=resolved_clock),
+        auth_failure_agent_limiter=RateLimiter(clock=resolved_clock),
+        observation_limiter=RateLimiter(clock=resolved_clock),
         dedup_store=MemoryDedupStore(clock=resolved_clock),
         bus=resolved_bus,
     )
@@ -724,14 +739,10 @@ class TestObservationBudgetChargesDistinctIpsNotEntryCount:
         # they had been charged nothing at all, a second, brand-new
         # distinct IP would still fit in the untouched budget. Charged
         # correctly (cost 1 of 1), the very next distinct IP must find the
-        # budget already spent.
-        #
-        # Real-clock note: `observation_limiter` has no clock-injection
-        # point through `create_app` (unlike `rate_limiter=` above, which
-        # `_build_app` always wires to a frozen `ManualClock`), so this
-        # relies on two back-to-back TestClient calls completing well
-        # under one second of real time -- true in practice, but revisit
-        # with an injected clock if `app.py` ever exposes one.
+        # budget already spent -- deterministically, since `_build_app`
+        # wires `observation_limiter` to the same frozen `ManualClock` as
+        # every other limiter, so no token can refill between the two
+        # calls below.
         client, bus = _build_app(
             settings=_settings(observation_rate_limit_eps=1, observation_burst=1)
         )
