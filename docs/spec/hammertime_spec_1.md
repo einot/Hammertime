@@ -1116,7 +1116,11 @@ Events older than the accepted lateness horizon MAY be dropped, corrected, or se
 > and never silently dropped. A message whose `window_seconds` exceeds the
 > configured window is diverted too (ADR-0010 decision 6). Only a message
 > that fails decoding or the ADR-0004 one-IP-per-message invariant is
-> dropped, with a log record.
+> dropped, with a log record. A message a member fetches for a partition it
+> does not hold — a rebalance can revoke one between fetch and handling — is
+> not applied, diverted, dropped or counted by that member: it is logged and
+> skipped as belonging to whichever member holds the partition (ADR-0011
+> Amendment 5, A19).
 
 ---
 

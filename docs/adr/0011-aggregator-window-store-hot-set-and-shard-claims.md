@@ -1,7 +1,10 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted; amended 2026-09-17 four times (see "Amendment 1",
-"Amendment 2", "Amendment 3" and "Amendment 4" at the end. Amendment 1 records the
+Status: accepted; amended 2026-09-17 five times (see "Amendment 1",
+"Amendment 2", "Amendment 3", "Amendment 4" and "Amendment 5" at the end.
+Amendment 5 pins `ShardClaims.adopt_config` — how a shard claimed after a
+configuration change gets the version in force — and gives a message on an
+unclaimed partition its own outcome, `UNCLAIMED`, uncounted. Amendment 1 records the
 partition count of `hammertime.observations.v1` changing from 32 to 128 and
 pins two edge cases decisions 1 and 5 left ambiguous. Amendment 2 pins eight
 edge cases of the window store, the counter and the lateness classifier that
@@ -334,7 +337,7 @@ distinct IPs a shard sees in any ten-minute period, and the cap bounds it
 absolutely. A HOT IP costs the same as any other tracked IP here; the
 per-HOT-IP cost that outlives the process is in decision 5.
 
-### 3. One observation, one of six outcomes; everything the hot path cannot use goes to reconciliation
+### 3. One observation, one of seven outcomes; everything the hot path cannot use goes to reconciliation
 
 ```python
 # hammertime.aggregator.lateness   (Spec: section 24; ADR-0002; ADR-0010 decision 6)
@@ -345,6 +348,8 @@ class ObservationOutcome(StrEnum):
     EXPIRED_BUCKET = "expired_bucket"    # inside the horizon, but the bucket has already left the window
     WINDOW_TOO_LONG = "window_too_long"  # payload.window_seconds > config.window_seconds
     MALFORMED = "malformed"              # never returned by classify_observation; a worker outcome
+    UNCLAIMED = "unclaimed"              # never returned by classify_observation; a worker outcome:
+                                         # message.partition is not a shard this member holds (A19)
 
 def classify_observation(
     *, window_start: int, window_seconds: int, now: int, config: DetectionConfig
@@ -390,7 +395,16 @@ test or implementation has to derive them (A9, A10):
   so a test that pins exact ages must pin `now` (the shipped tests use a
   bucket-aligned `now`).
 
-The worker (`hammertime.aggregator.worker`) handles one consumed message as:
+The worker (`hammertime.aggregator.worker`) handles one consumed message as
+follows. Before step 1 it looks up the `ShardWindow` of `message.partition`
+(`claims.window(p)`); if this member holds no claim for that partition —
+reachable in normal operation, because a rebalance can revoke a partition
+between a message being fetched and being handled — the outcome is
+`UNCLAIMED`: logged at `WARNING event=unclaimed_partition` with the topic,
+partition and offset, **not** counted under any series, not decoded, not
+diverted, and the store untouched; `handle()` returns it and the consumer
+carries on. The message belongs to whichever member holds the partition,
+not to this one (A19). Otherwise:
 
 1. `codec.decode`; the payload MUST be a `RequestObservation` with exactly
    one entry whose IP text equals the envelope `subject` and the message key
@@ -534,13 +548,49 @@ A2; no TTL) are interchangeable behind it, chosen by
 Claims (`hammertime.aggregator.sharding.assignment.ShardClaims`, the
 aggregator's `AssignmentListener`):
 
+```python
+# hammertime.aggregator.sharding.assignment   (Spec: section 20, section 26, section 32, section 47.2)
+class ShardClaims:                                   # satisfies AssignmentListener (decision 1)
+    def __init__(
+        self,
+        *,
+        state_store: ShardStateStore,
+        producer: Producer,
+        consumer: Consumer,
+        clock: Clock,
+        config: DetectionConfig,                     # what on_assigned builds windows with, until adopt_config
+        max_tracked_ips: int = 1_000_000,
+    ) -> None: ...
+    @property
+    def config(self) -> DetectionConfig: ...         # the config the next claim would build its window with
+    @property
+    def shards(self) -> frozenset[int]: ...          # the partitions claimed right now
+    def window(self, shard: int) -> ShardWindow | None: ...   # None once revoked / never claimed
+    def windows(self) -> tuple[ShardWindow, ...]: ...         # snapshot; what the worker binds (A13)
+    def adopt_config(self, config: DetectionConfig) -> None: ...   # A18
+    async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None: ...
+    async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None: ...
+```
+
 * **`on_assigned(p)`** for each new partition: `state = await
   state_store.load(p)`; construct `ShardWindow(shard=p, config=<in force>,
   clock, inherited_hot=state.hot_ips, next_sequence=state.next_sequence,
   max_tracked_ips)`; log `INFO event=shard_claimed shard=p inherited_hot=N`.
   The window counters start empty: they self-heal within one window,
   because every bucket older than the claim has expired by
-  `claim + window_seconds`.
+  `claim + window_seconds`. "The config in force" is `claims.config`: the
+  constructor's `config` until the first `adopt_config`, then the last one
+  adopted (A18).
+* **`adopt_config(v)`** replaces the config later claims build their windows
+  with, and does nothing else: it touches no window already claimed, emits
+  nothing, compares no versions (the gate is the poller's, A12) and is
+  idempotent. The worker calls it in decision 7 step 3, under the worker
+  lock, in the same pass that gave every already-claimed window the new
+  geometry (step 1, `window.apply_config(v)`) and re-evaluated it (step 2) —
+  so windows built before the change are brought onto `v` by the pass, and
+  windows built after it start on `v` because of this call. Without it a
+  shard claimed after a configuration change would be built on the config
+  this object was constructed with, i.e. a stale one (A18).
 * **Warm-up.** Until `claim + window_seconds` the new owner under-counts
   every inherited IP (observations that arrived before the claim are not
   in its ring), so demoting one would be a spurious `HotIpRemoved`.
@@ -636,9 +686,13 @@ mid-pass:
    otherwise rate-limited — the log between aggregator and trie is the
    back-pressure.
 3. Adopt `v` as the config in force at the worker (`worker.config` now
-   reports it) and log `INFO event=config_reevaluated config_version=<v>
-   transitions=<N>`, `N` being the sum of `reevaluate_shard`'s returns over
-   the claimed shards (decision 8). `apply_config` then returns; the poller
+   reports it) and at its `ShardClaims` (`claims.adopt_config(v)`, decision
+   5, so that a shard claimed after this pass builds its window on `v`;
+   both adoptions happen under the lock the assignment callbacks also take,
+   so no claim can interleave between them — A18) and log `INFO
+   event=config_reevaluated config_version=<v> transitions=<N>`, `N` being
+   the sum of `reevaluate_shard`'s returns over the claimed shards
+   (decision 8). `apply_config` then returns; the poller
    sets its own `current` to `v`, logs ADR-0009 A7's `config_applied`, and
    `reload_config()` returns the poller's `current` — which is `v` after a
    successful apply and the previous version otherwise (a rejected or
@@ -703,7 +757,9 @@ Structured log events (ADR-0009 decision 5 conventions): `shard_claimed`,
 `shard_revoked`, `no_shards_assigned`, `warmup_complete`,
 `config_reevaluated` (`config_version`, `transitions`; emitted by the worker
 at the end of `apply_config`, before the poller's own `config_applied` of
-ADR-0009 A7 — A12), `malformed_observation`, `store_over_capacity`.
+ADR-0009 A7 — A12), `malformed_observation`, `unclaimed_partition`
+(`topic`, `partition`, `offset`; `WARNING`, no counter — A19),
+`store_over_capacity`.
 
 ### 9. Settings and module layout
 
@@ -728,7 +784,8 @@ services/aggregator/src/hammertime/aggregator/
   lateness.py                                  ObservationOutcome, classify_observation
   window/counter.py                            IpCounter
   window/store.py                              ShardWindow, WindowChange (expiry, retention, capacity)
-  sharding/assignment.py                       ShardClaims (AssignmentListener; claim, warm-up, revoke)
+  sharding/assignment.py                       ShardClaims (AssignmentListener; claim, warm-up, revoke; adopt_config(config) -> None,
+                                               config (property), shards, window(p), windows())
   transitions.py                               TransitionEmitter, EmittedTransition (transition: core StateTransition)
   reevaluate.py                                reevaluate_shard(window, emitter, *, config, ips=None, batch_size=1000) -> int
   worker.py                                    AggregatorWorker: consume loop, handle(message) -> ObservationOutcome,
@@ -2322,3 +2379,350 @@ hypothesis strategies (`_LIVE_BUCKET`, `test_slot_reuse_needs_no_explicit_expire
 generate aligned buckets only. **No committed test is invalidated.** No
 follow-up test is called for: the T4b tests already demonstrate the
 ruled order, on both classes.
+
+## Amendment 5 (2026-09-17) — `ShardClaims.adopt_config`, and a message on an unclaimed partition is `UNCLAIMED`, not `MALFORMED`
+
+Why: a `supervisor` review of C5, the aggregator implementation (commit
+`e2b4b12`, read directly for this amendment in the worktree that holds it),
+raised two gaps in this ADR — not defects in C5. (1) C5 added a public
+method `ShardClaims.adopt_config(config)`, called at the end of
+`AggregatorWorker.apply_config`, which decision 5, decision 7 and decision
+9 do not name; it exists because decision 5's own wording (`on_assigned`
+builds `ShardWindow(shard=p, config=<in force>, ...)`) cannot be honoured
+after a configuration change without it. (2) C5 returns `MALFORMED` for a
+message whose partition this member does not hold, logs it, and — unlike
+every other `MALFORMED` — increments no counter; decision 3 step 1 says a
+`MALFORMED` message is "logged, counted, and skipped" and decision 8 gives
+it `observations_rejected{reason=malformed}`, so the returned outcome and
+the metric disagreed. Decision 3 did not cover the case, and
+`test_sharding.py`'s module docstring explicitly leaves the return value
+unpinned.
+
+This amendment rules on those two points and nothing else. Each item says
+whether the point was (a) already determined and missed, (b) genuinely
+unspecified and ruled now, or (c) left open with consequences, and what C5
+must change. Two open points are deliberately **not** reopened: A13 names
+no error for `increment` on a declared non-event series (C5 chose
+`ValueError`), and A12's first assumption (a direct caller of
+`apply_config` gets a lower or equal version applied); neither item below
+depends on either.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Decision 3, heading.** Was: "One observation, one of six outcomes;
+  everything the hot path cannot use goes to reconciliation". Now "one of
+  seven outcomes" (A19).
+* **Decision 3, the `ObservationOutcome` code block.** Gained one member
+  after `MALFORMED`: `UNCLAIMED = "unclaimed"`, with the comment "never
+  returned by classify_observation; a worker outcome: message.partition is
+  not a shard this member holds (A19)". The six existing lines are
+  unchanged.
+* **Decision 3, the sentence introducing the worker's steps.** Was: "The
+  worker (`hammertime.aggregator.worker`) handles one consumed message
+  as:". Now: "... handles one consumed message as follows. Before step 1
+  it looks up the `ShardWindow` of `message.partition` ..." — a paragraph
+  stating the `UNCLAIMED` rule (lookup before decoding; `WARNING
+  event=unclaimed_partition` with topic, partition and offset; not counted,
+  not decoded, not diverted, store untouched) and ending "Otherwise:" (A19).
+  Steps 1-3 keep their numbers and their text, so every existing
+  cross-reference to "decision 3 step 1/2/3" still resolves.
+* **Decision 5, the `ShardClaims` paragraph.** Was the sentence "Claims
+  (`hammertime.aggregator.sharding.assignment.ShardClaims`, the aggregator's
+  `AssignmentListener`):" followed directly by the `on_assigned` bullet.
+  Now a `ShardClaims` code block sits between them — constructor, `config`
+  property, `shards`, `window(p)`, `windows()`, `adopt_config`,
+  `on_assigned`, `on_revoked` (A18). The `on_assigned` bullet gained a
+  closing sentence defining "the config in force" as `claims.config`, and a
+  new `adopt_config(v)` bullet follows it (A18). The warm-up, `on_revoked`
+  and readiness bullets are unchanged.
+* **Decision 7, step 3.** Was: "Adopt `v` as the config in force at the
+  worker (`worker.config` now reports it) and log `INFO
+  event=config_reevaluated config_version=<v> transitions=<N>`, `N` being
+  the sum of `reevaluate_shard`'s returns over the claimed shards (decision
+  8)." Now inserts, after "reports it)", "and at its `ShardClaims`
+  (`claims.adopt_config(v)`, decision 5, so that a shard claimed after this
+  pass builds its window on `v`; both adoptions happen under the lock the
+  assignment callbacks also take, so no claim can interleave between them
+  — A18)" (A18). The rest of the step, and steps 1-2, are unchanged.
+* **Decision 8, the log events sentence.** Was: "... `malformed_observation`,
+  `store_over_capacity`." Now: "... `malformed_observation`,
+  `unclaimed_partition` (`topic`, `partition`, `offset`; `WARNING`, no
+  counter — A19), `store_over_capacity`." (A19). The series table is
+  unchanged: `observations_rejected`'s reasons stay `window_too_long |
+  malformed`.
+* **Decision 9, the module layout.** `sharding/assignment.py`'s line — was
+  "`ShardClaims (AssignmentListener; claim, warm-up, revoke)`" — now reads
+  "`ShardClaims (AssignmentListener; claim, warm-up, revoke;
+  adopt_config(config) -> None, config (property), shards, window(p),
+  windows())`" (A18). `lateness.py`'s and `worker.py`'s lines are unchanged
+  (`ObservationOutcome` and `handle(message) -> ObservationOutcome` are
+  still the names).
+* **Status line.** Marked amended five times, with a one-sentence summary
+  of this amendment.
+* **`docs/spec/hammertime_spec_1.md`, §24's ADR-0011 note.** Was, as its
+  last sentence: "Only a message that fails decoding or the ADR-0004
+  one-IP-per-message invariant is dropped, with a log record." Now
+  followed by: "A message a member fetches for a partition it does not hold
+  — a rebalance can revoke one between fetch and handling — is not applied,
+  diverted, dropped or counted by that member: it is logged and skipped as
+  belonging to whichever member holds the partition (ADR-0011 Amendment 5,
+  A19)." (A19). The rest of the note is unchanged.
+
+Decisions 1, 2, 4 and 6, the Assumptions list (assumption 10, "`MALFORMED`
+is dropped, not diverted", is untouched: it is about codec and invariant
+failures and says nothing about ownership), Consequences, Sources and
+Amendments 1-4 are untouched. Before closing this list, `docs/spec/`,
+`docs/adr/` and `docs/protocol/` were grepped for `ShardClaims`,
+`ObservationOutcome`, `observations_rejected`, `MALFORMED`/`malformed`,
+`adopt_config`, `unclaimed` and "six outcomes". Findings: outside this ADR,
+`ShardClaims` and `ObservationOutcome` appear nowhere in `docs/`; "six
+outcomes" appears only in this ADR's decision 3 heading (edited above);
+`observations_rejected` appears in the spec's §37 metric list and its
+ADR-0011 note ("`window_too_long` | `malformed`"), which this amendment
+leaves as it is because `UNCLAIMED` is not counted, and in
+`docs/spec/integration-scenarios.md` not at all; `malformed` outside this
+ADR is ingest's `400`/`401` vocabulary (`docs/protocol/observation-v1.md`,
+ADR-0006/0007/0008/0009, spec §36) and unrelated; the §24 note was the one
+restatement of what a non-applied message's fates are, and is edited
+above. `docs/spec/README.md`'s section index maps the same sections to the
+same modules and is untouched. No `CHANGES` entry: the aggregator has not
+shipped in any release, so its arrival entry (Consequences, *`CHANGES`*)
+covers the whole of its behaviour, and neither a Python enum member nor a
+private-to-the-process method is a wire format, schema, config key or
+default.
+
+### A18. `ShardClaims.adopt_config(config)`: how a claim made after a configuration change gets the version in force
+
+**Classification: (b), genuinely unspecified and ruled now — by
+ratifying C5's method.** Decision 5 says `on_assigned` constructs
+`ShardWindow(shard=p, config=<in force>, ...)`, and decision 7 step 3 says
+`apply_config` adopts `v` "as the config in force at the worker". Nothing
+said how the object that performs claims learns of `v`. `ShardClaims` is
+constructed once, by `AggregatorWorker.__init__`, with the worker's
+starting `config` (T5's ASSUMPTION 1, which C5 implements), and
+`on_assigned`'s signature is fixed by the `AssignmentListener` protocol
+(decision 1), so the config cannot be passed in per claim. Without a
+channel, every shard claimed after the first configuration change — which
+under `HAMMERTIME_SHARD_IDS=auto` is every rebalance for the rest of the
+process's life — would be built on the starting config: wrong geometry if
+`bucket_seconds`/`window_seconds` changed, and a `window.config` that
+disagrees with `worker.config`, which A9's "the target window's
+`bucket_seconds`" argument assumes never happens outside the locked pass.
+So the method is needed, and it is an interface question, which is why it
+is settled here rather than left as a `coder` choice.
+
+Ruling (decision 5 now says this, and decision 7 step 3 and decision 9
+name it):
+
+* `ShardClaims.adopt_config(config: DetectionConfig) -> None` replaces the
+  configuration that subsequent `on_assigned` calls build windows with,
+  observable as `claims.config`. It does nothing else: it does not touch,
+  re-bucket or re-evaluate any window already claimed, emits nothing,
+  compares no versions, and calling it twice with the same value is the
+  same as calling it once.
+* The worker calls it in decision 7 step 3 — after step 1
+  (`window.apply_config(v)` on every claimed window) and step 2 (the
+  re-evaluation pass), under the worker lock, alongside its own adoption
+  of `v`. Windows that exist at the time of the change are therefore
+  brought onto `v` by steps 1-2 and are *not* the concern of
+  `adopt_config`; windows built afterwards start on `v` because of it.
+  Because `AggregatorWorker.on_assigned` takes the same lock, no claim can
+  be built between the worker adopting `v` and the claims object adopting
+  it, so the relative order of the two assignments inside step 3 is
+  unobservable and is not pinned.
+* `claims.config` is the constructor's `config` until the first
+  `adopt_config`, then the last value adopted. It is what decision 5's
+  "`config=<in force>`" means.
+
+Assumptions (push back individually):
+
+* **A mutator on `ShardClaims`, rather than a callable or a back-reference
+  to the worker.** Constructing `ShardClaims` with `config:
+  Callable[[], DetectionConfig]` (reading `worker.config` at claim time)
+  would remove the second copy of the value, but changes the constructor
+  T5 pinned (`config=DEFAULTS` in `test_sharding.py`'s `_claims()`) and
+  that every claims test builds against, for no observable difference:
+  the two copies can only diverge inside step 3, under the lock, where no
+  claim can be built. Ratifying the shipped shape costs no test change; the
+  alternative costs a `test-author` pass.
+* **No version comparison.** Same reasoning as A12's first assumption: the
+  gate has one home, `ConfigPoller.poll_once()`. A direct caller that
+  adopts a lower version gets it adopted; the worker never does so in
+  production because the poller never calls `apply_config` with one.
+* **A failed pass leaves `claims.config` at the old version.** If step 2
+  raises, step 3 does not run, so neither `worker.config` nor
+  `claims.config` changes — the two stay equal, which is the property this
+  item cares about — while the windows re-bucketed in step 1 keep the new
+  geometry. That is exactly the partial-effects state A12's second
+  assumption already describes and leaves open (whether the pass should be
+  atomic); this item does not reopen it. A shard claimed in that state is
+  built on the old config, and the next poll's retry of the same document
+  (ADR-0009 A5) brings it onto `v` through steps 1-2 like any other
+  window.
+* **The rest of the code block is a restatement, not a new rule.** The
+  constructor is T5's ASSUMPTION 1 and `shards` / `window(p)` its
+  ASSUMPTION 2, both already implemented by C5; `windows()` is the
+  callable A13 said the worker binds "however it is spelled". They are
+  listed so that the block is the whole public surface — `adopt_config`'s
+  contract refers to the constructor's `config`, and a partial block would
+  invite the same "the surface is exactly this" reading that ASSUMPTION 1
+  got. Nothing about them changes; a reviewer who would rather the block
+  named only `adopt_config` and `config` should say so.
+
+Shipped code: C5's `sharding/assignment.py` (`adopt_config`, lines 89-97;
+`config`, lines 71-74) and `worker.py` (`apply_config`, line 260, calling
+it after `self._config = config` under the lock) do exactly this; **no
+behaviour changes.** `adopt_config`'s docstring should cite decision 5 and
+A18; that is a docstring edit for the `coder` landing C5, not a code
+change. Shipped tests: no committed test calls `adopt_config` or asserts
+which config a post-change claim is built on, and `test_sharding.py`'s
+ASSUMPTION 1 enumerates the *constructor*, which is unchanged — **no
+committed test is invalidated and none must change.** Follow-up
+(`test-author`, optional): after `apply_config(v2)` on a running worker,
+revoke and re-claim partition 0 (or claim a second partition on a
+`ShardClaims` built directly, calling `adopt_config(v2)` first) and assert
+`window.config is v2` — the case that motivated the method.
+
+### A19. A message on a partition this member does not hold is `UNCLAIMED` — a seventh outcome, logged, uncounted
+
+**Classification: (b), genuinely unspecified and ruled now.** Decision 3
+enumerated six outcomes and, in its worker steps, assumed "the
+`ShardWindow` of `message.partition`" exists; decision 1 says the aggregator
+"learns an IP's shard from `ConsumedMessage.partition`" and decision 5's
+`on_revoked` drops the window. Nothing said what `handle()` does when the
+lookup finds nothing. The case is reachable in normal operation, not only
+by a bug: under group management a rebalance can revoke a partition after
+a message from it has been fetched and before `handle()` takes the lock —
+`run()` awaits the next message *then* awaits the lock, and
+`on_revoked` runs under that lock (decision 5) — so the message arrives at
+`_handle` with no window to apply it to. T5 asserted the absence of every
+effect (`test_a_message_for_a_revoked_partition_is_not_applied`: no window,
+nothing on the hot-ip topic, nothing on the reconciliation topic) and
+explicitly left the return value unpinned. C5 chose `MALFORMED`, uncounted.
+
+Ruling (decision 3 now says this):
+
+* `ObservationOutcome` gains a seventh member, `UNCLAIMED = "unclaimed"`,
+  never returned by `classify_observation` (like `MALFORMED`, a worker
+  outcome).
+* The worker looks up `claims.window(message.partition)` **before** step 1
+  (decoding). If there is no window, the outcome is `UNCLAIMED`: a
+  `WARNING event=unclaimed_partition topic=... partition=... offset=...`
+  record, **no** counter increment under any series, no decode, no
+  diversion, no store access; `handle()` returns `UNCLAIMED` and the
+  consumer carries on. `MALFORMED` is unchanged and stays "logged, counted
+  and skipped" exactly as decision 3 step 1 and decision 8 say.
+* `observations_rejected{reason}` keeps its two reasons, `window_too_long
+  | malformed`. Decision 8's table and §37's note are unchanged.
+
+Why a new member rather than either of the two ways of keeping six.
+*Reusing `MALFORMED` and counting it* makes the metric agree with the
+return value at the cost of making `observations_rejected{reason=malformed}`
+— a signal about producers (assumption 10: a message that "cannot be
+trusted to name the IP it is keyed by") — tick on every rebalance, for
+messages that are perfectly well formed; anyone alerting on that series
+would be paged by a scale-out. *Reusing `MALFORMED` and documenting that
+this one case is uncounted* keeps the divergence and writes it down: a
+caller of `handle()` — the tests, a future tool — could not tell a poison
+message from a handover from the return value, and decision 3's "one
+observation, one outcome" would have one outcome meaning two things.
+The enum's purpose is to say what the hot path did with the message;
+"nothing, it is not mine" is a distinct answer from "nothing, it is
+garbage", and giving it its own name is what makes both the return value
+and the counter truthful. The cost is stated under *Shipped tests* below:
+one assertion and some docstring text.
+
+Why uncounted. What a counter would measure is "messages fetched by the
+old owner after revocation", which is (i) an ownership event, not a
+content or lateness event — none of the existing four event counters
+means that; (ii) bounded by the messages fetched but not yet handled at
+the moment of revocation, which under the worker's one-message-at-a-time
+loop is at most the message in hand per rebalance; and (iii) already
+observable in the `shard_revoked` record, in `shards_claimed` dropping,
+and in the `unclaimed_partition` record itself, which names the exact
+offset. A new series for it would also touch A13's closed list of nine
+names for a counter that fires roughly once per rebalance; not worth the
+surface. If a deployment ever shows the record more often than that, the
+right response is to look at the bus's fetch/revoke ordering, not to
+count it.
+
+Assumptions (push back individually):
+
+* **Lookup before decoding.** C5 already does this. A message this member
+  does not own is not this member's to judge, and the lookup is a dict
+  probe; so a malformed message on an unclaimed partition is `UNCLAIMED`,
+  not `MALFORMED`, and is not counted as malformed. The other order would
+  count the same poison message once per member that happened to fetch
+  it.
+* **`WARNING`, not `INFO`.** Ratifies C5. The record names an offset this
+  member fetched and did not process, which an operator tracing a
+  particular observation would want to find; a rebalance is normal, but a
+  message handled by nobody is worth a warning. If the record proves noisy
+  in practice, lowering it is a one-word change with no contract behind
+  it beyond decision 8's name and fields.
+* **The name `UNCLAIMED` and the value `"unclaimed"`.** Chosen to match
+  the shipped record name `unclaimed_partition` and decision 5's
+  vocabulary ("claim", "shard claims held"). `NOT_OWNED` was the
+  alternative; no test or spec text depends on the spelling.
+* **Nothing is said about whether the partition's new owner sees the
+  message.** This item pins what *this* member does. Whether the message
+  reaches the new owner is a property of the bus's commit and redelivery
+  semantics — decision 6's commit points and ADR-0003's at-least-once rule
+  — and is unchanged by this item; the wording "belongs to whichever
+  member holds the partition" is deliberately not "will be processed by".
+* **Scope: `handle()`'s return type is unchanged.** `handle(message) ->
+  ObservationOutcome` (decision 9) stands; the alternative of returning
+  `None` for "not mine" was rejected because it types the same fact as
+  "no outcome" rather than as one, and would ripple into every caller's
+  annotation.
+
+Shipped code — what C5 must change (a `coder` brief; behaviour is
+unchanged except for the returned value):
+
+* `lateness.py`: add `UNCLAIMED = "unclaimed"` after `MALFORMED`, with a
+  comment that it is a worker outcome for a message on a partition this
+  member does not hold, never returned by `classify_observation`. The
+  class docstring's "the value is the metric label" should say "for the
+  counted outcomes" or equivalent, since neither `APPLIED` nor `UNCLAIMED`
+  is a label.
+* `worker.py` `_handle`, the `window is None` branch (lines 277-291):
+  return `ObservationOutcome.UNCLAIMED` instead of `MALFORMED`; the
+  comment should cite A19 instead of saying decision 3 is silent. The
+  module docstring's and `handle()`'s "six outcomes" become "seven" (or
+  cite decision 3 without a number). The `WARNING unclaimed_partition`
+  record and the absence of any counter are already as ruled.
+* No change to `metrics.py`, `_malformed()`, `_divert()`,
+  `_LATE_OUTCOMES`, `sharding/assignment.py` or any other module.
+
+Shipped tests — what must change (a `test-author` brief):
+
+* `test_lateness.py`: `TestObservationOutcomeEnum::test_it_has_exactly_the_six_documented_members`
+  (lines 136-144) asserts the member set and **is invalidated**; it gains
+  `"UNCLAIMED": "unclaimed"` and a name that says seven. The class
+  docstring (lines 129-130, "six outcomes") and the module docstring's
+  enum listing (lines 11-18) and its `MALFORMED` sentence (lines 34-35)
+  should name the seventh member and say it, too, is never returned by
+  `classify_observation`. `test_malformed_is_never_returned` (lines
+  319-328) may add `assert outcome is not ObservationOutcome.UNCLAIMED`;
+  optional, since its closing `assert outcome in (...)` over the five
+  classifier outcomes already excludes it.
+* `test_sharding.py`: the module docstring's "NOT asserted" bullet (lines
+  59-61) and the comment in
+  `test_a_message_for_a_revoked_partition_is_not_applied` (lines 696-700)
+  say the return value is unpinned; both are now stale and should cite
+  A19. The test should assert `await worker.handle(message) is
+  ObservationOutcome.UNCLAIMED` and, with a metrics object passed in, that
+  `observations_rejected{reason=malformed}` reads 0 afterwards — the
+  divergence this item closes, demonstrated. That assertion is required,
+  not optional: it is the only place the ruling is observable.
+* `test_worker.py`: line 12's "the six outcomes" is docstring text only;
+  update for accuracy. No assertion in that file is invalidated: every
+  `MALFORMED` assertion there is for a codec or invariant failure on a
+  claimed partition, and line 386's loop over `("window_too_long",
+  "malformed")` still names every reason `observations_rejected` has.
+* `test_window.py` line 292 and `test_worker.py` line 570 say `MALFORMED`
+  is reserved for the codec and the ADR-0004 invariant; still true.
+
+Order: the `test-author` change and the `coder` change land together (the
+enum assertion fails against six members and the sharding assertion fails
+against `MALFORMED`); the C5 landing brief should carry both.
