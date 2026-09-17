@@ -244,6 +244,14 @@ window_count(IP)
 
 is O(1) after bucket maintenance.
 
+> ADR-0011 fixes the window's edges against the service clock: a bucket
+> starting at `S` is live while `S <= now < S + window_seconds`, so the window
+> is exactly `window_seconds` of aligned buckets including the current one and
+> a bucket expires at `S + window_seconds`. At most `window_seconds /
+> bucket_seconds` buckets are retained per IP, an observation may land in any
+> live bucket (Section 24), and `total` is maintained incrementally.
+> Implemented in `services/aggregator/window/`.
+
 ---
 
 ## 6. HOT/COLD State Transitions
@@ -1081,6 +1089,18 @@ allowed_lateness = 30 seconds
 
 Events older than the accepted lateness horizon MAY be dropped, corrected, or sent through a reconciliation path.
 
+> ADR-0011 defines the aggregator's disposition of every consumed
+> observation, judged against the service clock at arrival: `FUTURE`
+> (`window_start > now`), `LATE` (age beyond `window_seconds +
+> allowed_lateness_seconds`, ADR-0002), `EXPIRED` (inside that horizon but the
+> bucket has already left the window of Section 5), or `APPLY`. Anything not
+> applied is republished unchanged to
+> `hammertime.observations-reconciliation.v1` and counted (`late_messages`,
+> `future_messages`, `expired_on_arrival`); an observation is never both
+> applied and reconciled, and never neither. `allowed_lateness_seconds` does
+> not widen what is counted; its load-bearing role is ingest's dedup retention
+> (ADR-0003). Implemented in `services/aggregator/lateness.py`.
+
 ---
 
 # 25. Time Buckets
@@ -1130,6 +1150,16 @@ state retention = 10 minutes
 An IP with no observations beyond the retention period can be removed from the sliding-window store.
 
 The trie only needs currently hot IPs if the system's purpose is prefix-level hot detection.
+
+> ADR-0011: the aggregator's window store evicts an IP when it is `COLD` and
+> no observation has been applied to it for `state_retention_seconds`
+> (judged on arrival time). `HOT` entries are never evicted by retention —
+> their buckets expire first, a maintenance sweep re-evaluates them to `COLD`
+> and emits `HotIpRemoved`, and a later sweep evicts them. A hard cap
+> (`HAMMERTIME_AGGREGATOR_MAX_TRACKED_IPS`) bounds the store independently of
+> retention. `tracked_ips`, `active_ips` (non-empty window) and `hot_ips` are
+> the Section 37 gauges. Implemented in `services/aggregator/window/expiry.py`
+> and `window/store.py`.
 
 ---
 
@@ -1494,6 +1524,18 @@ The system SHOULD provide a controlled re-evaluation mechanism instead of silent
 > strictly increases, and visible in events and read responses only after the
 > re-evaluation has been applied. `test_config_change.py`
 > (`docs/spec/integration-scenarios.md`) is the executable form of this section.
+
+> ADR-0011 defines the aggregator's re-evaluation (`services/aggregator/
+> reevaluate.py`): under a strictly greater `config_version`, a change to
+> `window_seconds` or `bucket_seconds` re-buckets every retained count at
+> `bucket_start(S, new_bucket_seconds)` (dropping what is no longer live) and
+> a change to either threshold or to the geometry re-runs
+> `evaluate_ip_state` over every tracked IP in first-seen order, emitting the
+> resulting transitions tagged with the new version. Changes to the descriptive
+> fields above, to the prefix-predicate fields, or to
+> `allowed_lateness_seconds`/`state_retention_seconds` visit no IP. The
+> re-evaluation runs under the same lock as observation processing, so the
+> new version is visible in emitted events only once it is complete.
 
 ---
 
@@ -2506,6 +2548,13 @@ descriptive only.
 Prefix-level weight aggregates are out of scope for this version: maintaining one
 incrementally would introduce a second per-node aggregate that replay would have
 to reproduce exactly (ADR-0005).
+
+> `threshold_ratio` has one implementation, `hammertime.core.attributes`
+> (ADR-0011), so the aggregator that writes `weight` and any consumer that
+> verifies it compute the same integer. `build_attributes(window_count,
+> config)` in the same module produces the document the aggregator attaches
+> to `HotIpAdded`; a negative `window_count` is a programming error
+> (`ValueError`), never clamped.
 
 ## 46.5 Transport, storage, and lifecycle
 
