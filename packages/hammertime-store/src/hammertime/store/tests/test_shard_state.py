@@ -73,17 +73,31 @@ of them individually rather than bending the assertions:
 NOT tested here, deliberately:
 
 * **Atomicity of `record_transition`.** Decision 5 requires the membership
-  change and the sequence update to happen atomically (one MULTI/EXEC
-  transaction for Redis). A torn write is only observable if the process or
-  connection dies between the two commands, which an in-process fake cannot
-  produce. `test_concurrent_transitions_do_not_lose_updates` covers the
-  weaker, observable property (no lost update to the HOT set under
-  interleaved awaits) and says so; it is not a substitute.
-* **An out-of-order `sequence`.** "Sets the shard's next sequence to
-  `sequence + 1`" reads as an unconditional assignment, but decision 4's
-  only caller never goes backwards, so whether a lower `sequence` must
-  lower `next_sequence` or be clamped with `max()` is genuinely unpinned.
-  Left untested rather than guessed at; flagged for the architect.
+  change and the sequence update to happen atomically (for Redis, "one
+  atomic server-side step per call" -- Amendment 1 item A2 relaxed
+  decision 5's original "one MULTI/EXEC transaction per call" to that,
+  because MULTI/EXEC cannot express the compare-and-set the clamp needs;
+  the atomicity requirement itself is unchanged). A torn write is only
+  observable if the process or connection dies between the two commands,
+  which an in-process fake cannot produce.
+  `test_concurrent_transitions_do_not_lose_updates` covers the weaker,
+  observable property (no lost update to the HOT set under interleaved
+  awaits) and says so; it is not a substitute.
+
+Formerly listed here as unpinned, now tested: **an out-of-order
+`sequence`**. Whether a lower `sequence` lowers `next_sequence` was left
+untested and flagged for the architect; ADR-0011 Amendment 1 item A2 ruled
+it. `record_transition` MUST clamp -- the stored next sequence becomes
+`max(<value before the call>, sequence + 1)` and is never lowered, so
+`load(shard).next_sequence == 1 + max(every sequence ever recorded for
+shard)` (or `0` if none has been) whatever the call order and however often
+a call was repeated; the membership change is applied regardless of how
+`sequence` compares to the stored counter (A2's assumptions: a sequence
+fence here would be "a half-built split-brain guard"); and `sequence < 0`
+is a `ValueError` that writes nothing. Pinned in `ShardStateStoreContract`
+below, so both backends are held to it
+(`test_a_lower_sequence_does_not_lower_next_sequence` onwards), plus
+`TestRedisKeyspace.test_a_refused_negative_sequence_writes_no_keys`.
 """
 
 import asyncio
@@ -311,6 +325,148 @@ class ShardStateStoreContract:
         # range is pinned: some transition's sequence + 1.
         assert 1 <= state.next_sequence <= len(ips)
 
+    # --- ADR-0011 Amendment 1, item A2: `record_transition` never lowers
+    # `next_sequence`. "After `record_transition(shard, ip, state,
+    # sequence)` returns, the shard's stored next sequence is
+    # `max(<value before the call>, sequence + 1)`; it is never lowered."
+    # The store is the only party that outlives the process, so it is where
+    # decision 4's promise ("never reproduces an earlier `event_id`") is
+    # made unconditional.
+
+    async def test_a_lower_sequence_does_not_lower_next_sequence(self) -> None:
+        # max(10, 3) == 10. An unconditional assignment would hand the next
+        # claimant of the shard a `next_sequence` it had already used.
+        store = self.make_store()
+        await store.record_transition(0, IP_A, IpState.HOT, 9)
+
+        await store.record_transition(0, IP_B, IpState.HOT, 2)
+
+        assert (await store.load(0)).next_sequence == 10
+
+    async def test_a_stale_sequence_still_applies_the_hot_set_change(self) -> None:
+        # A2: "The membership update (add on HOT, remove on COLD) is applied
+        # regardless of how `sequence` compares to the stored counter." Its
+        # assumptions section says using the sequence as a fence here would
+        # be "a half-built split-brain guard" -- the store has no fencing
+        # token, so it must not behave as though it had one.
+        store = self.make_store()
+        await store.record_transition(0, IP_A, IpState.HOT, 9)
+
+        await store.record_transition(0, IP_B, IpState.HOT, 0)
+
+        state = await store.load(0)
+        assert state.hot_ips == frozenset({IP_A, IP_B})
+        assert state.next_sequence == 10
+
+    async def test_a_stale_cold_transition_still_removes_the_ip(self) -> None:
+        # The demotion half of the same rule: a stale sequence must not
+        # suppress the removal, or the shard would keep announcing an IP as
+        # inherited-HOT that its owner has already demoted.
+        store = self.make_store()
+        await store.record_transition(0, IP_A, IpState.HOT, 4)
+        await store.record_transition(0, IP_B, IpState.HOT, 9)
+
+        await store.record_transition(0, IP_A, IpState.COLD, 5)
+
+        state = await store.load(0)
+        assert state.hot_ips == frozenset({IP_B})
+        assert state.next_sequence == 10
+
+    async def test_next_sequence_is_one_past_the_highest_sequence_ever_recorded(self) -> None:
+        # A2's observable contract: "load(shard).next_sequence == 1 + max(
+        # every sequence ever recorded for shard) ... whatever order the
+        # calls came in and however many times any of them was repeated."
+        # (The "or 0 if none has been" half is
+        # `test_never_seen_shard_loads_as_empty_with_sequence_zero`.)
+        store = self.make_store()
+
+        for sequence in (3, 11, 0, 11, 7, 1, 11, 2):
+            await store.record_transition(0, IP_A, IpState.HOT, sequence)
+
+        assert (await store.load(0)).next_sequence == 12
+
+    async def test_the_high_water_mark_does_not_depend_on_call_order(self) -> None:
+        # Same multiset of recorded sequences, opposite orders, identical
+        # resulting state -- "whatever order the calls came in".
+        ascending = self.make_store()
+        descending = self.make_store()
+
+        for sequence in (0, 4, 9):
+            await ascending.record_transition(0, IP_A, IpState.HOT, sequence)
+        for sequence in (9, 4, 0):
+            await descending.record_transition(0, IP_A, IpState.HOT, sequence)
+
+        assert await ascending.load(0) == await descending.load(0)
+        assert await ascending.load(0) == ShardState(hot_ips=frozenset({IP_A}), next_sequence=10)
+
+    async def test_replaying_the_same_transition_leaves_the_store_unchanged(self) -> None:
+        # A2: "Recording the same (shard, ip, state, sequence) twice leaves
+        # the store exactly as one call would have (idempotent under
+        # replay)" -- the retried call whose first attempt the server
+        # applied but whose reply was lost. The clamp is what makes the
+        # replay a no-op instead of a regression.
+        once = self.make_store()
+        twice = self.make_store()
+        for store in (once, twice):
+            await store.record_transition(0, IP_A, IpState.HOT, 0)
+            await store.record_transition(0, IP_B, IpState.HOT, 5)
+
+        await twice.record_transition(0, IP_B, IpState.HOT, 5)
+
+        assert await twice.load(0) == await once.load(0)
+        assert await twice.load(0) == ShardState(hot_ips=frozenset({IP_A, IP_B}), next_sequence=6)
+
+    async def test_replaying_a_demotion_is_a_no_op(self) -> None:
+        # The COLD half of replay idempotence: re-applying an already
+        # applied removal neither resurrects the IP nor advances the
+        # counter past `sequence + 1`.
+        store = self.make_store()
+        await store.record_transition(0, IP_A, IpState.HOT, 0)
+        await store.record_transition(0, IP_A, IpState.COLD, 1)
+        before = await store.load(0)
+
+        await store.record_transition(0, IP_A, IpState.COLD, 1)
+
+        assert await store.load(0) == before
+        assert before == ShardState(hot_ips=frozenset(), next_sequence=2)
+
+    async def test_a_negative_sequence_is_a_value_error(self) -> None:
+        # A2: "`sequence < 0` is a ValueError and writes nothing."
+        # `schemas/hot_ip_event.v1.json` declares `sequence` as an integer
+        # with "minimum": 0, so a negative value could never be emitted and
+        # can only be a bug; the store is where it is cheapest to catch.
+        store = self.make_store()
+
+        with pytest.raises(ValueError):
+            await store.record_transition(0, IP_A, IpState.HOT, -1)
+
+    async def test_a_negative_sequence_writes_nothing(self) -> None:
+        # The other half of the same sentence, asserted on both the HOT set
+        # and the counter: the refused promotion must not add IP_B, the
+        # refused demotion must not remove IP_A, and neither may touch
+        # `next_sequence`.
+        store = self.make_store()
+        await store.record_transition(0, IP_A, IpState.HOT, 4)
+        before = await store.load(0)
+
+        with pytest.raises(ValueError):
+            await store.record_transition(0, IP_B, IpState.HOT, -1)
+        with pytest.raises(ValueError):
+            await store.record_transition(0, IP_A, IpState.COLD, -7)
+
+        assert await store.load(0) == before
+        assert before == ShardState(hot_ips=frozenset({IP_A}), next_sequence=5)
+
+    async def test_a_negative_sequence_does_not_create_a_never_seen_shard(self) -> None:
+        # "Writes nothing" includes not bringing the shard into existence:
+        # a refused call leaves the shard exactly as unclaimed as before.
+        store = self.make_store()
+
+        with pytest.raises(ValueError):
+            await store.record_transition(0, IP_A, IpState.HOT, -1)
+
+        assert await store.load(0) == ShardState(hot_ips=frozenset(), next_sequence=0)
+
 
 class TestMemoryShardStateStore(ShardStateStoreContract):
     def make_store(self) -> ShardStateStore:
@@ -452,6 +608,18 @@ class TestRedisKeyspace:
         store, client = self._store()
 
         await store.load(11)
+
+        assert await _key_names(client, "*") == set()
+
+    async def test_a_refused_negative_sequence_writes_no_keys(self) -> None:
+        # ADR-0011 Amendment 1 item A2: "`sequence < 0` is a ValueError and
+        # writes nothing". The contract tests above assert that through
+        # `load`; here it is asserted against the keyspace itself, so a
+        # backend that created the `:seq` key before validating would fail.
+        store, client = self._store()
+
+        with pytest.raises(ValueError):
+            await store.record_transition(0, IP_A, IpState.HOT, -1)
 
         assert await _key_names(client, "*") == set()
 
