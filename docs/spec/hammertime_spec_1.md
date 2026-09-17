@@ -1118,9 +1118,11 @@ Events older than the accepted lateness horizon MAY be dropped, corrected, or se
 > that fails decoding or the ADR-0004 one-IP-per-message invariant is
 > dropped, with a log record. A message a member fetches for a partition it
 > does not hold — a rebalance can revoke one between fetch and handling — is
-> not applied, diverted, dropped or counted by that member: it is logged and
-> skipped as belonging to whichever member holds the partition (ADR-0011
-> Amendment 5, A19).
+> not applied, diverted or counted by that member: it is logged and skipped,
+> and it is not lost, because a member only ever commits the position after
+> the last message it handled, never the position after the last message it
+> fetched; the partition's next owner therefore resumes at or before it and
+> handles it (ADR-0011 Amendment 5, A19; Amendment 6, A20).
 
 ---
 

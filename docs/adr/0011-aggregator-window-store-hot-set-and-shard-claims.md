@@ -1,10 +1,14 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted; amended 2026-09-17 five times (see "Amendment 1",
-"Amendment 2", "Amendment 3", "Amendment 4" and "Amendment 5" at the end.
-Amendment 5 pins `ShardClaims.adopt_config` — how a shard claimed after a
-configuration change gets the version in force — and gives a message on an
-unclaimed partition its own outcome, `UNCLAIMED`, uncounted. Amendment 1 records the
+Status: accepted; amended 2026-09-17 six times (see "Amendment 1" through
+"Amendment 6" at the end. Amendment 6 closes an at-least-once gap at
+revocation: every commit covers only messages the worker has handled, the
+bus `Consumer.commit` takes explicit offsets, and a message fetched under a
+claim that has since been revoked is left in the log for the partition's
+next owner. Amendment 5 pins `ShardClaims.adopt_config` — how a shard
+claimed after a configuration change gets the version in force — and gives
+a message on an unclaimed partition its own outcome, `UNCLAIMED`,
+uncounted. Amendment 1 records the
 partition count of `hammertime.observations.v1` changing from 32 to 128 and
 pins two edge cases decisions 1 and 5 left ambiguous. Amendment 2 pins eight
 edge cases of the window store, the counter and the lateness classifier that
@@ -14,7 +18,7 @@ configuration version gate lives and what `apply_config` returns, the Python
 surface of `AggregatorMetrics`, and what `EmittedTransition.transition` is —
 plus two smaller points raised alongside them. Amendment 4 pins the order of
 `observe`'s alignment and liveness checks and completes Amendment 3's
-follow-up list. All four amendments rewrite
+follow-up list. Every amendment rewrites
 decision bodies in place to state the rule now in force directly; each
 amendment's opening lists every such edit, and quotes the superseded
 wording, so the before/after is recoverable from this document alone)
@@ -108,7 +112,8 @@ class Consumer(Protocol):
         partitions: Iterable[int] | None = None,
         listener: AssignmentListener | None = None,
     ) -> AsyncIterator[ConsumedMessage]: ...
-    # seek(), commit() unchanged
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None: ...   # A20
+    # seek() unchanged
 ```
 
 * `partitions=None` (the default) is group-managed assignment: the broker
@@ -135,6 +140,15 @@ class Consumer(Protocol):
   path with `assign([TopicPartition(...)])`, synthesising the single
   `on_assigned` call itself in the static case (aiokafka does not invoke
   rebalance listeners for manual assignment). See Sources.
+* `commit(offsets)` commits exactly the `(topic, partition) -> next offset
+  to read` pairs given — for those partitions only, at those offsets, and
+  nothing else. `commit()` with no argument keeps its original meaning: the
+  consumed position of every partition this consumer holds. An empty
+  mapping is a no-op that returns normally without contacting the broker;
+  a partition this consumer does not hold is an error (`ValueError` from
+  `MemoryConsumer`; aiokafka's `IllegalStateError` from `KafkaConsumer`).
+  The aggregator never calls `commit()` without `offsets` (Amendment 6,
+  A20).
 
 `HAMMERTIME_SHARD_IDS` is the only sharding setting: `auto` (default,
 group-managed) or an explicit set (`0`, `0-3`, `0,2,5-7`; inclusive ranges;
@@ -399,12 +413,22 @@ The worker (`hammertime.aggregator.worker`) handles one consumed message as
 follows. Before step 1 it looks up the `ShardWindow` of `message.partition`
 (`claims.window(p)`); if this member holds no claim for that partition —
 reachable in normal operation, because a rebalance can revoke a partition
-between a message being fetched and being handled — the outcome is
+between a message being fetched and being handled — or if the claim it
+holds is not the one the message was fetched under (the partition was
+revoked and claimed again since the fetch; the consume loop records the
+`ShardWindow` of the message's partition in the same event-loop step in
+which the fetch completed, and the handler compares that object by
+identity with the current one — A20), the outcome is
 `UNCLAIMED`: logged at `WARNING event=unclaimed_partition` with the topic,
 partition and offset, **not** counted under any series, not decoded, not
-diverted, and the store untouched; `handle()` returns it and the consumer
-carries on. The message belongs to whichever member holds the partition,
-not to this one (A19). Otherwise:
+diverted, the store untouched, and the partition's handled position
+(decision 5, `mark_handled`) not advanced; `handle()` returns it and the
+consumer carries on. The message belongs to whichever member holds the
+partition next, and reaches it: no commit by this member ever covers a
+message it has not handled (decision 6, A20), so the next owner's first
+fetch starts at or before it (A19, A20). A message passed to `handle()`
+directly — by a test — was not fetched by the loop and is judged against
+the current claim alone. Otherwise:
 
 1. `codec.decode`; the payload MUST be a `RequestObservation` with exactly
    one entry whose IP text equals the envelope `subject` and the message key
@@ -432,7 +456,9 @@ not to this one (A19). Otherwise:
 Consumption is at-least-once (ADR-0003). Counters are process-local, so a
 redelivery after a crash rebuilds counters that died with the process
 rather than double-counting them, and a redelivery after a handover lands
-in a `ShardWindow` that never held the first copy. The only state that
+in a `ShardWindow` that never held the first copy — including a handover
+back to this same member, because the copy fetched under the old claim is
+`UNCLAIMED` rather than applied to the new window (A20). The only state that
 survives is the HOT set (decision 5), which is idempotent under
 redelivery: an IP the store already has as HOT is not re-announced.
 
@@ -566,8 +592,10 @@ class ShardClaims:                                   # satisfies AssignmentListe
     @property
     def shards(self) -> frozenset[int]: ...          # the partitions claimed right now
     def window(self, shard: int) -> ShardWindow | None: ...   # None once revoked / never claimed
-    def windows(self) -> tuple[ShardWindow, ...]: ...         # snapshot; what the worker binds (A13)
+    def windows(self) -> tuple[ShardWindow, ...]: ...         # snapshot; the callable the worker binds for A13 (pinned here, A18)
     def adopt_config(self, config: DetectionConfig) -> None: ...   # A18
+    def mark_handled(self, message: ConsumedMessage) -> None: ...  # A20: the claim's handled position becomes offset + 1
+    async def commit_handled(self, partitions: Iterable[tuple[str, int]] | None = None) -> None: ...  # A20: flush, then commit handled positions
     async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None: ...
     async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None: ...
 ```
@@ -591,6 +619,20 @@ class ShardClaims:                                   # satisfies AssignmentListe
   windows built after it start on `v` because of this call. Without it a
   shard claimed after a configuration change would be built on the config
   this object was constructed with, i.e. a stale one (A18).
+* **`mark_handled(message)`** records `message.offset + 1` as the
+  **handled position** of the claim on `(message.topic,
+  message.partition)` — the next offset a commit may name for it. The
+  worker calls it, under the lock, at the end of `handle()` for every
+  outcome except `UNCLAIMED` (decision 3). A claim starts with no handled
+  position (nothing has been handled under it) and loses it when revoked;
+  a partition this object does not hold is a `KeyError` (A20).
+* **`commit_handled(partitions=None)`**: `producer.flush()`, then
+  `consumer.commit({(topic, p): <handled position>, ...})` over the
+  partitions given (default: every held partition), omitting any that has
+  no handled position yet — the mapping may therefore be empty, and both
+  calls are made regardless. This is the only way the aggregator commits:
+  decision 6's three commit points all go through it, so a committed
+  position never covers a message that has not been handled (A20).
 * **Warm-up.** Until `claim + window_seconds` the new owner under-counts
   every inherited IP (observations that arrived before the claim are not
   in its ring), so demoting one would be a spurious `HotIpRemoved`.
@@ -601,10 +643,14 @@ class ShardClaims:                                   # satisfies AssignmentListe
   `reason="warmup"`; a quiet one is demoted then, a busy one stays. IPs
   this process itself promoted are evaluated normally throughout.
 * **`on_revoked(p)`**: under the worker lock (so never mid-message):
-  `producer.flush()`, `consumer.commit()`, drop the `ShardWindow`, log
-  `INFO event=shard_revoked shard=p`. Nothing is written to the state
-  store — it is already current — and nothing is emitted; the next owner
-  inherits the HOT set and warms up.
+  `commit_handled(<the revoked partitions>)` — flush, then commit each
+  revoked partition's handled position, which by construction excludes a
+  message fetched but not yet handled (A20) — then drop the `ShardWindow`
+  and the handled position, and log `INFO event=shard_revoked shard=p`.
+  Nothing is written to the state store — it is already current — and
+  nothing is emitted; the next owner inherits the HOT set, warms up, and
+  resumes the partition at the committed position, so a message this
+  member fetched and did not handle is delivered to it.
 * Readiness: `start()` returns once `subscribe()` has delivered the initial
   assignment. An empty assignment under `auto` is ready (the process is
   healthy, the group has more members than partitions) and logs
@@ -642,6 +688,15 @@ The consumer position is committed every
 checked after each message), on every `on_revoked`, and at shutdown —
 always after `producer.flush()`, so a committed position never precedes the
 transitions it produced (the same rule ADR-0010 decision 3 gives the trie).
+What is committed is the **handled** position of each held partition — the
+offset after the last message `handle()` finished for it under the current
+claim — passed explicitly as `Consumer.commit(offsets)`; never the bus's
+consumed position, which already sits past a message that has been fetched
+and not yet handled. All three points go through
+`ShardClaims.commit_handled()` (decision 5), so a message in hand at a
+commit — one a rebalance revoked between fetch and handling, or one fetched
+just before `stop()` took the lock — is never covered by it and is
+redelivered to whichever member next holds the partition (A20).
 The interval is an I/O cadence, not domain time: it is measured on the wall
 clock even when the service clock is a `ManualClock`.
 
@@ -785,7 +840,8 @@ services/aggregator/src/hammertime/aggregator/
   window/counter.py                            IpCounter
   window/store.py                              ShardWindow, WindowChange (expiry, retention, capacity)
   sharding/assignment.py                       ShardClaims (AssignmentListener; claim, warm-up, revoke; adopt_config(config) -> None,
-                                               config (property), shards, window(p), windows())
+                                               config (property), shards, window(p), windows(), mark_handled(message),
+                                               commit_handled(partitions=None) -> None)
   transitions.py                               TransitionEmitter, EmittedTransition (transition: core StateTransition)
   reevaluate.py                                reevaluate_shard(window, emitter, *, config, ips=None, batch_size=1000) -> int
   worker.py                                    AggregatorWorker: consume loop, handle(message) -> ObservationOutcome,
@@ -919,7 +975,9 @@ prior ADR. Push back on them individually.
 * **Bus package** (`hammertime-bus`): `AssignmentListener`, the widened
   `Consumer.subscribe`, `MemoryConsumer` calling the listener with `{(topic,
   0)}`, `KafkaConsumer` constructed without topics and subscribing with a
-  `ConsumerRebalanceListener` adapter or `assign()`.
+  `ConsumerRebalanceListener` adapter or `assign()`; `Consumer.commit`
+  gains an optional explicit `offsets` mapping on both implementations
+  (Amendment 6, A20).
 * **Store package** (`hammertime-store`): `ShardState`, `ShardStateStore`,
   `MemoryShardStateStore`, `RedisShardStateStore`. The Redis deployment
   warning in `redis.py`'s docstring applies with more force here: an
@@ -1000,6 +1058,59 @@ follows (Amendment 3, A13):
   series per `(name, label values)`, label values are strings, and a
   different label set is a different series — hence `str(value)` keying
   and the exact-label-names rule.
+
+Consulted for the commit and rebalance ordering Amendment 6 (A20) relies
+on. All four are the raw `master` source on GitHub, fetched 2026-09-17; the
+repository pins `aiokafka==0.14.0` (`uv.lock`) and the tagged source was
+not fetched, so a reviewer should check the readings against that tag.
+
+* aiokafka `GroupCoordinator._on_join_prepare` (source,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/group_coordinator.py`):
+  calls `self._subscription.begin_reassignment()`, then
+  `_maybe_do_last_autocommit(previous_assignment)` (which returns at once
+  when `enable_auto_commit` is false, as `KafkaConsumer` sets it), then
+  the listener's `on_partitions_revoked(previous_assignment.tps)`, awaiting
+  it if it is a coroutine, inside `try/except Exception:
+  log.exception(...)`. Taken from it: the revoke callback runs before the
+  join request; the eager protocol revokes *every* previously held
+  partition on every rebalance; and a listener that raises is logged and
+  swallowed, not propagated.
+* aiokafka `GroupCoordinator._on_join_complete` (same file): calls
+  `self._subscription.assign_from_subscribed(assignment.partitions())`
+  and only then the listener's `on_partitions_assigned(assigned)`. Taken
+  from it: the previous assignment is replaced — and, per the next item,
+  deactivated — *after* `on_partitions_revoked` has returned and *before*
+  `on_partitions_assigned` is called.
+* aiokafka `SubscriptionState` / `Subscription` / `Assignment` (source,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/subscription_state.py`):
+  `Subscription._begin_reassignment` only sets
+  `self._reassignment_in_progress = True`; `Subscription._assign` calls
+  `self._assignment._unassign()` on the old assignment and constructs the
+  new one; `Assignment.active` is `self.unassign_future.done() is False`;
+  `Assignment.all_consumed_offsets()` returns each partition's `position`;
+  `TopicPartitionState.consumed_to(position)` is what advances it. Taken
+  from it: during `on_partitions_revoked` the old assignment is still in
+  place and active, so both `commit()` and `commit(offsets)` for the
+  revoked partitions are accepted there; and the "consumed position"
+  `commit()` defaults to is the position after every record already
+  returned to the caller.
+* aiokafka `AIOKafkaConsumer.commit` and `FetchResult.getone` /
+  `check_assignment` (sources,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/consumer.py`,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/fetcher.py`):
+  `commit(offsets)` "When explicitly passing `offsets` use either offset
+  of next record, or tuple of offset and metadata:: `await
+  consumer.commit({tp: msg.offset + 1})`"; with explicit offsets it raises
+  `IllegalStateError(f"Partition {tp} is not assigned")` for a partition
+  outside the current assignment, and with `offsets=None` it commits
+  `assignment.all_consumed_offsets()`. `FetchResult.getone` returns a
+  buffered record only while `assignment.active` and advances the
+  position as it returns it. Taken from them: the next-offset convention
+  A20 adopts for `Consumer.commit(offsets)`; the constraint that an
+  explicit commit may name only held partitions; and that records of the
+  old assignment can still be returned to the consume loop after
+  `on_partitions_revoked` has run, until `_on_join_complete` replaces the
+  assignment.
 
 ## Amendment 1 (2026-09-17) — 128 partitions; `next_sequence` never moves backwards; an empty static shard set is refused
 
@@ -2039,9 +2150,10 @@ the reasons:
   (0 if never incremented), or a window-derived value computed on the call.
 * `bind_windows(windows: Callable[[], Iterable[ShardWindow]]) -> None` is
   how the derived series get their source. `AggregatorWorker.__init__`
-  binds a callable that yields the currently claimed windows (through
-  `ShardClaims.shards` / `window(p)`; how it is spelled is the
-  implementation's). On each `get` of a derived series the callable is
+  binds a callable that yields the currently claimed windows
+  (`ShardClaims.windows()`, pinned by Amendment 5, A18; as first written
+  this sentence left the spelling to the implementation). On each `get` of
+  a derived series the callable is
   invoked and the answer computed from the windows it yields:
   `tracked_ips{shard}` / `active_ips{shard}` / `hot_ips{shard}` are the
   named window's `tracked_count` / `active_count` / `hot_count`;
@@ -2491,6 +2603,60 @@ covers the whole of its behaviour, and neither a Python enum member nor a
 private-to-the-process method is a wire format, schema, config key or
 default.
 
+**Correction pass (same day).** A `supervisor` review of this amendment as
+first committed (commit `7884c2a`) made three findings. Two are corrected
+in place here; the third is the gap Amendment 6 rules. The superseded
+wording of each edit:
+
+* **Status line** (finding: misreported work). Was: "amended 2026-09-17
+  five times (see "Amendment 1", "Amendment 2", "Amendment 3", "Amendment
+  4" and "Amendment 5" at the end. ... All four amendments rewrite decision
+  bodies in place" — the count had been raised to five while the sentence
+  after it still said four. Now: "six times (see "Amendment 1" through
+  "Amendment 6" at the end. ...)" — the correction pass and Amendment 6
+  landed together — and "Every amendment rewrites decision bodies in
+  place".
+* **Amendment 3, A13, the `bind_windows` bullet** (finding: scope
+  expansion). Was: "`AggregatorWorker.__init__` binds a callable that
+  yields the currently claimed windows (through `ShardClaims.shards` /
+  `window(p)`; how it is spelled is the implementation's)." Now:
+  "... yields the currently claimed windows (`ShardClaims.windows()`,
+  pinned by Amendment 5, A18; as first written this sentence left the
+  spelling to the implementation)." The A18 code block had pinned
+  `windows() -> tuple[ShardWindow, ...]` while A18's justification called
+  it "the callable A13 said the worker binds 'however it is spelled'" —
+  presenting a new pin as an existing one, with no edit to A13 listed, so
+  A13 and decision 5 disagreed. Resolution: the pin is **kept** (C5
+  implements `windows()` and the worker's `run_maintenance`,
+  `apply_config` and `bind_windows` all use it, so the name is load-bearing
+  beyond A13's metrics source) and A13 now agrees with it. No committed
+  test calls `windows()`, so the pin costs no test change; the alternative
+  — dropping it from the block — would have cost the same number of edits
+  and left a public method the block's own "whole public surface" claim
+  omitted. The `windows()` comment in the block — was "`# snapshot; what
+  the worker binds (A13)`" — now reads "`# snapshot; the callable the
+  worker binds for A13 (pinned here, A18)`".
+* **A18, last assumption.** Was: "**The rest of the code block is a
+  restatement, not a new rule.** The constructor is T5's ASSUMPTION 1 and
+  `shards` / `window(p)` its ASSUMPTION 2, both already implemented by C5;
+  `windows()` is the callable A13 said the worker binds "however it is
+  spelled". They are listed so that the block is the whole public surface
+  — `adopt_config`'s contract refers to the constructor's `config`, and a
+  partial block would invite the same "the surface is exactly this"
+  reading that ASSUMPTION 1 got. Nothing about them changes; a reviewer
+  who would rather the block named only `adopt_config` and `config`
+  should say so." Now headed "**... a restatement, except `windows()`,
+  which it pins.**", says A13 was edited to match, records the finding,
+  and says unpinning would cost no test change.
+* **§24's ADR-0011 note** (finding: the sentence this amendment added
+  asserted the message is "not ... dropped" while the shipped revocation
+  commit, `consumer.commit()` of the consumed position, dropped it for
+  everyone). That is not a wording defect but the gap A19's last
+  assumption declined to rule. Amendment 6 rules it, re-edits the note,
+  and quotes this amendment's wording as the superseded text in its own
+  edit list; A19's last assumption is edited to point there (its
+  superseded wording is likewise quoted in Amendment 6's edit list).
+
 ### A18. `ShardClaims.adopt_config(config)`: how a claim made after a configuration change gets the version in force
 
 **Classification: (b), genuinely unspecified and ruled now — by
@@ -2559,15 +2725,22 @@ Assumptions (push back individually):
   built on the old config, and the next poll's retry of the same document
   (ADR-0009 A5) brings it onto `v` through steps 1-2 like any other
   window.
-* **The rest of the code block is a restatement, not a new rule.** The
-  constructor is T5's ASSUMPTION 1 and `shards` / `window(p)` its
-  ASSUMPTION 2, both already implemented by C5; `windows()` is the
-  callable A13 said the worker binds "however it is spelled". They are
-  listed so that the block is the whole public surface — `adopt_config`'s
-  contract refers to the constructor's `config`, and a partial block would
-  invite the same "the surface is exactly this" reading that ASSUMPTION 1
-  got. Nothing about them changes; a reviewer who would rather the block
-  named only `adopt_config` and `config` should say so.
+* **The rest of the code block is a restatement, except `windows()`, which
+  it pins.** The constructor is T5's ASSUMPTION 1 and `shards` /
+  `window(p)` its ASSUMPTION 2, both already implemented by C5.
+  `windows() -> tuple[ShardWindow, ...]` is C5's spelling of the callable
+  A13 had left to the implementation ("how it is spelled is the
+  implementation's"); listing it in the block makes it contract, and A13's
+  sentence was edited to say so. (As first committed this bullet called
+  `windows()` "the callable A13 said the worker binds 'however it is
+  spelled'", presenting the pin as an existing one with no edit to A13;
+  the correction pass recorded in this amendment's edit list fixed both
+  places.) They are listed so that the block is the whole public surface —
+  `adopt_config`'s contract refers to the constructor's `config`, and a
+  partial block would invite the same "the surface is exactly this"
+  reading that ASSUMPTION 1 got. A reviewer who would rather `windows()`
+  stay unpinned should say so: no committed test calls it, so unpinning
+  costs no test change.
 
 Shipped code: C5's `sharding/assignment.py` (`adopt_config`, lines 89-97;
 `config`, lines 71-74) and `worker.py` (`apply_config`, line 260, calling
@@ -2664,12 +2837,16 @@ Assumptions (push back individually):
   the shipped record name `unclaimed_partition` and decision 5's
   vocabulary ("claim", "shard claims held"). `NOT_OWNED` was the
   alternative; no test or spec text depends on the spelling.
-* **Nothing is said about whether the partition's new owner sees the
-  message.** This item pins what *this* member does. Whether the message
-  reaches the new owner is a property of the bus's commit and redelivery
-  semantics — decision 6's commit points and ADR-0003's at-least-once rule
-  — and is unchanged by this item; the wording "belongs to whichever
-  member holds the partition" is deliberately not "will be processed by".
+* **Whether the partition's new owner sees the message was left open here
+  and is ruled by A20 (Amendment 6).** This item pins what *this* member
+  does. As first written, this bullet said the message's fate at the new
+  owner was "a property of the bus's commit and redelivery semantics —
+  decision 6's commit points and ADR-0003's at-least-once rule" and chose
+  "belongs to whichever member holds the partition" over "will be
+  processed by" for that reason. A20 found that decision 5's revocation
+  commit, as then specified (`consumer.commit()`, the consumed position),
+  covered the message in hand, so *nobody* processed it, and closed the
+  gap: under A20 the message is delivered to the next owner.
 * **Scope: `handle()`'s return type is unchanged.** `handle(message) ->
   ObservationOutcome` (decision 9) stands; the alternative of returning
   `None` for "not mine" was rejected because it types the same fact as
@@ -2726,3 +2903,534 @@ Shipped tests — what must change (a `test-author` brief):
 Order: the `test-author` change and the `coder` change land together (the
 enum assertion fails against six members and the sharding assertion fails
 against `MALFORMED`); the C5 landing brief should carry both.
+
+## Amendment 6 (2026-09-17) — every commit covers only handled messages; `Consumer.commit` takes explicit offsets; a message fetched under a revoked claim is left for the next owner
+
+Why: Amendment 5's A19 pinned what a member does with a message fetched
+for a partition it no longer holds (`UNCLAIMED`, uncounted) and, in its
+last assumption, deliberately declined to say whether the partition's next
+owner sees that message. Reading C5 (`e2b4b12`) for that item exposed that
+the answer under the ADR as written was **no**: decision 5's `on_revoked`
+called `consumer.commit()` with no arguments, which on both bus
+implementations commits the *consumed* position — the offset after every
+message already returned to the consume loop (`MemoryConsumer._consume`
+sets `_positions[topic] = offset + 1` before it yields; aiokafka's
+`FetchResult.getone` calls `consumed_to` as it returns the record, and
+`commit()` defaults to `all_consumed_offsets()`; see Sources). So in the
+ordering A19 itself describes as reachable in normal operation — the loop
+fetches a message for partition `p`; a rebalance revokes `p` before
+`handle()` takes the lock; `on_revoked` commits; `handle()` returns
+`UNCLAIMED` — the committed offset was already past the message, the new
+owner started after it, and **nobody processed it**. The `supervisor`
+review of Amendment 5 raised the same point from the other side: the §24
+sentence that amendment added says the message is "not ... dropped", and
+the shipped code dropped it. §32 names the sliding-window state as *the
+authoritative information*, ADR-0003 and decision 3 promise at-least-once
+consumption, and this was silent observation loss on an ordinary
+rebalance. This amendment rules on that one gap (A20) and nothing else; the
+two `supervisor` findings on Amendment 5's text are corrected in place
+there, under "Correction pass".
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Recorded under Amendment 5's correction pass (the two
+  edits landed together).
+* **Decision 1, the bus interface code block.** Was: "`# seek(), commit()
+  unchanged`". Now shows `async def commit(self, offsets:
+  Mapping[tuple[str, int], int] | None = None) -> None: ...   # A20` and
+  "`# seek() unchanged`". A new bullet after the `KafkaConsumer` bullet
+  states `commit(offsets)`'s contract (A20); the four existing bullets are
+  unchanged.
+* **Decision 3, the `UNCLAIMED` paragraph.** Was: "... if this member
+  holds no claim for that partition — reachable in normal operation,
+  because a rebalance can revoke a partition between a message being
+  fetched and being handled — the outcome is `UNCLAIMED`: logged at
+  `WARNING event=unclaimed_partition` with the topic, partition and
+  offset, **not** counted under any series, not decoded, not diverted,
+  and the store untouched; `handle()` returns it and the consumer carries
+  on. The message belongs to whichever member holds the partition, not to
+  this one (A19). Otherwise:". Now adds the second `UNCLAIMED` condition
+  (the claim held is not the one the message was fetched under), says the
+  handled position is not advanced, replaces "belongs to whichever member
+  holds the partition, not to this one" with "belongs to whichever member
+  holds the partition next, and reaches it", and says a message passed to
+  `handle()` directly is judged against the current claim alone (A20).
+* **Decision 3, the at-least-once paragraph.** Was: "... and a redelivery
+  after a handover lands in a `ShardWindow` that never held the first
+  copy. The only state that survives ...". Now inserts "— including a
+  handover back to this same member, because the copy fetched under the
+  old claim is `UNCLAIMED` rather than applied to the new window (A20)"
+  (A20).
+* **Decision 5, the `ShardClaims` code block.** Gained two lines after
+  `adopt_config`: `mark_handled(message: ConsumedMessage) -> None` and
+  `commit_handled(partitions: Iterable[tuple[str, int]] | None = None) ->
+  None`, each with an A20 comment. (`windows()`'s comment changed under
+  Amendment 5's correction pass.) Two new bullets, `mark_handled` and
+  `commit_handled`, sit between the `adopt_config` bullet and the warm-up
+  bullet (A20).
+* **Decision 5, the `on_revoked` bullet.** Was: "**`on_revoked(p)`**:
+  under the worker lock (so never mid-message): `producer.flush()`,
+  `consumer.commit()`, drop the `ShardWindow`, log `INFO
+  event=shard_revoked shard=p`. Nothing is written to the state store — it
+  is already current — and nothing is emitted; the next owner inherits the
+  HOT set and warms up." Now: `commit_handled(<the revoked partitions>)`
+  in place of the two calls, the handled position dropped with the window,
+  and a closing clause that the next owner resumes at the committed
+  position and so receives a message this member fetched and did not
+  handle (A20).
+* **Decision 6, the commit paragraph.** Between "(the same rule ADR-0010
+  decision 3 gives the trie)." and "The interval is an I/O cadence ..." —
+  which were consecutive — a passage was inserted stating that what is
+  committed is the handled position, passed explicitly, at all three
+  points, through `ShardClaims.commit_handled()`, and that a message in
+  hand at a commit is never covered by it (A20). The sentences before and
+  after are unchanged; the flush-before-commit rule stands.
+* **Decision 9, the module layout.** `sharding/assignment.py`'s line —
+  was "`... config (property), shards, window(p), windows())`" — now
+  "`... config (property), shards, window(p), windows(),
+  mark_handled(message), commit_handled(partitions=None) -> None)`" (A20).
+* **Consequences, *Bus package*.** Was: "... subscribing with a
+  `ConsumerRebalanceListener` adapter or `assign()`." Now adds ";
+  `Consumer.commit` gains an optional explicit `offsets` mapping on both
+  implementations (Amendment 6, A20)".
+* **Sources.** Gained the four aiokafka citations A20 relies on
+  (`_on_join_prepare`, `_on_join_complete`, `subscription_state.py`,
+  `commit`/`getone`), with a note that `master` was fetched while the
+  repository pins 0.14.0.
+* **Amendment 5, A19, last assumption.** Was: "**Nothing is said about
+  whether the partition's new owner sees the message.** This item pins
+  what *this* member does. Whether the message reaches the new owner is a
+  property of the bus's commit and redelivery semantics — decision 6's
+  commit points and ADR-0003's at-least-once rule — and is unchanged by
+  this item; the wording "belongs to whichever member holds the partition"
+  is deliberately not "will be processed by"." Now headed "**Whether the
+  partition's new owner sees the message was left open here and is ruled
+  by A20 (Amendment 6).**", quotes its own original reasoning, and says
+  that under A20 the message is delivered to the next owner.
+* **`docs/spec/hammertime_spec_1.md`, §24's ADR-0011 note, last
+  sentence.** Was (Amendment 5's wording): "A message a member fetches for
+  a partition it does not hold — a rebalance can revoke one between fetch
+  and handling — is not applied, diverted, dropped or counted by that
+  member: it is logged and skipped as belonging to whichever member holds
+  the partition (ADR-0011 Amendment 5, A19)." Now: "... is not applied,
+  diverted or counted by that member: it is logged and skipped, and it is
+  not lost, because a member only ever commits the position after the last
+  message it handled, never the position after the last message it
+  fetched; the partition's next owner therefore resumes at or before it
+  and handles it (ADR-0011 Amendment 5, A19; Amendment 6, A20)." The rest
+  of the note is unchanged.
+
+Decisions 2, 4, 7 and 8, the Assumptions list (assumption 15, "Commit
+every 1 s of wall time", is untouched: it is about the cadence, and A20
+changes what is committed, not when), Amendments 1-4, and every item of
+Amendment 5 other than the A19 assumption above are untouched. Before
+closing this list, `docs/spec/`, `docs/adr/` and `docs/protocol/` were
+grepped for restatements of what A20 changes: `commit`, `committed
+position`, `committed offset`, `consumer position`, `revoke`/`revoked`/
+`revocation`, `on_revoked`, `at-least-once`, `redeliver`, `flush`, and the
+§24 sentence itself. Findings outside this ADR: `docs/spec/hammertime_spec_1.md`
+§24 (the note edited above); §33's ADR-0009 note ("On shutdown [the trie]
+writes a final snapshot after committing its consumer position") and §47.4
+("finish the message it is applying, commit its consumer position, flush
+its producer") restate the *shutdown order* for every service and say
+nothing about which position is committed — consistent with A20 and
+untouched; `docs/spec/integration-scenarios.md` mentions commit only in
+the `kill_trie()` harness row (the trie, unchanged); `docs/protocol/` has
+no restatement at all; ADR-0003's Consequences ("aggregator consumers are
+therefore at-least-once-safe only for idempotent operations and must not
+re-apply counters on redelivery — the consumer tracks committed offsets
+per shard") and ADR-0004's at-least-once sentence are the requirement A20
+enforces, unchanged; ADR-0009 decision 7 ("finishes the message it is
+currently applying, then commits its consumer position — never
+mid-message") is consistent with A20 and unchanged; ADR-0010 decision 3
+(the trie flushes before it commits) is unchanged, and the trie's bare
+`commit()` keeps its meaning. One pre-existing discrepancy was noticed and
+deliberately **not** touched, because it is not this amendment's question:
+§47.4 and ADR-0009 decision 7 list "commit, then flush" while decision 6
+of this ADR and ADR-0010 decision 3 require "flush, then commit"; it is
+named in the hand-off report for a separate ruling. `docs/spec/README.md`'s
+section index maps the same sections to the same modules and is untouched
+(§19's row already maps `packages/hammertime-bus`; §20/21's row already
+maps `sharding/assignment.py`). No `CHANGES` entry: the aggregator has
+not shipped in any release (its arrival entry under Consequences covers
+its behaviour), and `Consumer.commit(offsets)` is a backward-compatible
+Python API addition to an in-repo package — not a wire format, schema,
+config key or default.
+
+### A20. Every commit names the handled position explicitly; the bus `commit` takes offsets; a message fetched under a revoked claim is `UNCLAIMED` even if the same member re-claims the partition
+
+**Classification: (a) for the requirement, missed by decision 5's own
+wording; (b) for the mechanism, ruled now.** That the aggregator consumes
+at-least-once is not new: ADR-0003's Consequences require it, ADR-0009
+decision 7 restates it for shutdown ("never mid-message"), decision 3 of
+this ADR opens its last paragraph with "Consumption is at-least-once", and
+§32 makes the window state authoritative. What was missed is that
+decision 5's `on_revoked` — "`producer.flush()`, `consumer.commit()`" —
+specified a commit of the *consumed* position at the one moment the
+consumed position is guaranteed to be ahead of what has been handled. The
+requirement was already determined; the revocation rule contradicted it.
+How to satisfy it — which position, passed how, tracked where, and what
+happens to the message in hand when the same member gets the partition
+back — was never specified, and is ruled here.
+
+**The gap, traced in the shipped code** (`worker.py` and
+`sharding/assignment.py` at `e2b4b12`; the bus at the same commit):
+
+1. `AggregatorWorker.run()` awaits `_receive(stream)` in its own task,
+   then awaits `self.handle(message)`, which takes the lock. Between the
+   receive task completing and `run()` resuming there is at least one
+   event-loop step in which any other task may run.
+2. On `InMemoryBus`, `MemoryConsumer._consume` has already set
+   `_positions[topic] = offset + 1` before yielding the message. On
+   Kafka, `FetchResult.getone` has already advanced the partition's
+   position (Sources).
+3. A rebalance's `on_partitions_revoked` runs in the coordinator's task,
+   takes the worker lock through `AggregatorWorker.on_revoked`, and
+   `ShardClaims.on_revoked` calls `producer.flush()` then
+   `consumer.commit()` — the position from step 2, one past the message
+   in hand — and drops the window.
+4. `handle()` acquires the lock, finds no window, returns `UNCLAIMED`
+   (A19). The message is not applied, not diverted, not counted.
+5. The partition's next owner — another member, or this one after
+   `on_assigned` — starts from the committed offset, after the message.
+
+Under aiokafka's eager rebalance protocol *every* held partition is revoked
+and reassigned on *every* rebalance (`_on_join_prepare` passes
+`previous_assignment.tps` to the listener; Sources), so this is not a
+scale-down corner: any scale-out, any member restart, any session timeout
+puts every partition through steps 3-5, and whichever message is in hand
+at that moment is lost. The loss is silent (a `WARNING` that reads as
+routine), at most one observation per rebalance per member, and on the
+authoritative state: a `request_count` that never reaches any ring. That
+is exactly what decision 3's "everything the hot path cannot use goes to
+reconciliation" and §24's "never silently dropped" exist to prevent.
+
+**Ruling.** Four parts, stated in decisions 1, 3, 5 and 6:
+
+1. **The bus interface.** `Consumer.commit(offsets: Mapping[tuple[str,
+   int], int] | None = None) -> None`. With `offsets`, exactly the given
+   `(topic, partition) -> next offset to read` pairs are committed — those
+   partitions only, at those offsets, nothing else; the value is the
+   offset of the next message to read, i.e. the last handled `offset + 1`
+   (aiokafka's own convention for explicit commits, and already what
+   `InMemoryBus._committed` stores). An empty mapping is a no-op that
+   returns normally without contacting the broker. A partition this
+   consumer does not hold is an error: `ValueError` from `MemoryConsumer`
+   (partition not `0`, or a topic this consumer has not subscribed), and
+   aiokafka's `IllegalStateError` propagating from `KafkaConsumer`.
+   `commit()` with no argument keeps its current meaning on both
+   implementations — the trie (ADR-0010 decision 3) and the bus tests use
+   it and are unaffected.
+2. **The handled position.** `ShardClaims` keeps, per claim, a *handled
+   position*: `ShardClaims.mark_handled(message)` sets it to
+   `message.offset + 1` for `(message.topic, message.partition)`; a
+   partition not held is a `KeyError`. A claim starts with none and loses
+   it when revoked. The worker calls `mark_handled` under the lock at the
+   end of `handle()` for every outcome except `UNCLAIMED` — `APPLIED`,
+   the four diverted outcomes and `MALFORMED` all mean the worker is done
+   with the message. `ShardClaims.commit_handled(partitions=None)` is
+   `producer.flush()` followed by `consumer.commit(<the handled positions
+   of the given partitions, default all held, omitting those with
+   none>)`; both calls are made even when the mapping is empty. It is the
+   **only** commit path in the aggregator: the periodic commit and
+   `stop()` call `commit_handled()`, and `on_revoked(partitions)` calls
+   `commit_handled(partitions)` before dropping the windows. Decision 6's
+   flush-before-commit rule is untouched — `commit_handled` *is* that
+   rule with the right offsets — and the shipped
+   `test_a_revoke_flushes_before_it_commits` (`trace == ["flush",
+   "commit"]`) remains true.
+3. **The message in hand and a re-claim by the same member.** Committing
+   the handled position alone is not enough. Because every rebalance
+   revokes and reassigns every partition, the common outcome for a
+   healthy member is `on_revoked(p)` followed by `on_assigned(p)` for the
+   same `p`, with a fresh `ShardWindow`. If the message fetched under the
+   old claim were then handled against the new window it would be
+   applied there — and, because the committed position precedes it, the
+   broker redelivers it to the same new window: a double count in the
+   very case decision 3's "lands in a `ShardWindow` that never held the
+   first copy" argument assumed away. So the consume loop records the
+   `ShardWindow` of the message's partition **in the same event-loop step
+   in which the fetch completed** — immediately after `anext(stream)`
+   returns, with no `await` in between, which is the same step in which
+   the bus advanced the consumed position — and the handler treats the
+   message as `UNCLAIMED` when the partition's current window is `None`
+   **or is not that object**. `handle(message)`'s public signature is
+   unchanged; how the loop passes the recorded window to the handler is
+   the implementation's. A message a caller passes to `handle()` directly
+   has no fetch step and is judged against the current claim only, as
+   today. Object identity is the claim identity: a re-claim always builds
+   a new `ShardWindow` (decision 5), and no counter is needed.
+4. **§24.** The spec note now says the truth that follows: the message
+   is not applied, diverted or counted by this member, and it is not
+   lost, because the committed position is the handled position and the
+   next owner resumes at or before it.
+
+**Why this and not the alternatives the question listed.**
+
+* *Seek back on revocation.* Seeking moves *this* member's fetch position
+  for a partition it is about to lose; what the next owner reads is the
+  committed offset, so a seek changes nothing unless followed by a commit
+  of the seeked position — which is the handled-position commit by another
+  name, with the extra cost that the worker must know the in-hand offset
+  at revocation time and that aiokafka's `seek` requires an assigned
+  partition and is documented for use "on rebalance listeners or after
+  all pending messages are processed" (Sources). Rejected as the same fix
+  with more moving parts.
+* *Accept the loss and document it.* The blast radius is one
+  `RequestObservation` per member per rebalance, silently, from the
+  authoritative state, forever — a detection delayed or missed at the
+  threshold, unrecoverable because the reconciliation path never saw it
+  either. The fix costs one integer per held partition, one identity
+  comparison per message, and an optional argument on a two-implementation
+  protocol. Rejected: no proportionality argument survives that ratio.
+* *Commit only up to the offset before the message in hand, at
+  `on_revoked` only.* This is the chosen fix, generalised. Stating it for
+  `on_revoked` alone would leave the same in-hand exposure at `stop()`
+  (which takes the lock and commits while `run()` may hold a fetched,
+  unhandled message; the message is handled before `run()` returns, so
+  the loss there needs a crash during the drain, but the committed
+  position is still ahead of the handled one) and would give the worker
+  two commit semantics. One rule — a commit names handled positions —
+  closes both with one code path.
+* *Pause fetching around the lock, or fetch under the lock.* Would
+  serialise the coordinator against the consume loop and turn every
+  rebalance into a stall of the fetch; and aiokafka can still hand out a
+  record of the old assignment after `on_partitions_revoked` has returned
+  (Sources), so the in-hand case cannot be closed by scheduling alone.
+
+**Interaction with ADR-0011's at-least-once posture** (decision 3, last
+paragraph): unchanged in substance and now true in the re-claim case. A
+redelivery after a crash still rebuilds counters that died with the
+process; a redelivery after a handover still lands in a window that never
+held the first copy, because the first copy — fetched under the old claim
+— is `UNCLAIMED` rather than applied to the new window. The durable HOT
+set stays idempotent under redelivery. Nothing about warm-up (decision 5)
+changes: the new window warms up as before and the redelivered message is
+one of the observations it counts.
+
+**What Kafka does at the two points this relies on** (Sources): during
+`on_partitions_revoked` the previous assignment is still in place and
+active — `_begin_reassignment` only sets a flag — so `commit(offsets)` for
+the revoked partitions is accepted there, exactly as the bare `commit()`
+was; the assignment is replaced, and the old one deactivated, in
+`_on_join_complete` before `on_partitions_assigned`, after which the fetch
+position of every reassigned partition is taken from the committed offset.
+`commit(offsets)` for a partition outside the current assignment raises
+`IllegalStateError`; the aggregator never produces one because the handled
+positions it commits are those of partitions it holds — at revocation, of
+the partitions being revoked, which are held for the duration of the
+callback — and a revoked partition's position is dropped with its window.
+
+Assumptions (push back individually):
+
+* **An explicit-offsets argument on `commit`, rather than a "commit up to
+  this message" helper or a separate `commit_offsets` method.** It is the
+  shape aiokafka has, the memory bus already stores next-offset-to-read
+  per `(topic, group)`, and keeping one method with an optional argument
+  leaves the trie's and the bus tests' bare `commit()` untouched.
+* **Key shape `tuple[str, int]`**, matching `AssignmentListener`'s
+  `frozenset[tuple[str, int]]`, not a new `TopicPartition` type.
+* **Empty mapping is a no-op that still returns normally**, so that
+  `commit_handled` can call flush and commit unconditionally and the
+  flush-then-commit trace stays observable; `KafkaConsumer` short-circuits
+  before calling aiokafka rather than relying on what aiokafka does with
+  `{}`.
+* **The error for an unheld partition is not unified across
+  implementations** (`ValueError` versus aiokafka's `IllegalStateError`).
+  No caller catches it — it is a caller bug — and wrapping aiokafka's
+  exception would be code for a case the aggregator never reaches. The
+  interface docstring says both.
+* **The handled position lives on `ShardClaims`, not on `ShardWindow` or
+  the worker.** `ShardClaims` owns the consumer, the producer and the
+  per-partition claims, and is the object `on_revoked` runs on; `ShardWindow`
+  is the counter store (decision 2) and does not know the topic; the
+  worker would then need a second commit path for revocation. `next_sequence`
+  on the window is a precedent for per-claim bookkeeping on the window,
+  but `next_sequence` is loaded from the state store at claim, which the
+  handled position is not.
+* **`commit_handled` always flushes, even with nothing to commit.** A
+  flush with nothing pending is cheap on both implementations, and the
+  invariant "every commit is preceded by a flush" is easier to test than
+  "every non-empty commit is".
+* **`UNCLAIMED` does not advance the handled position** even when the
+  partition is held under a new claim: the message was not handled under
+  that claim, and advancing would commit past the redelivery the ruling
+  relies on.
+* **Identity by `ShardWindow` object, not a generation counter.** A
+  re-claim always constructs a new window (decision 5), so identity is
+  exactly claim identity; a counter would be a second thing to keep in
+  step. If a future change ever reuses a window across claims this
+  assumption must be revisited.
+* **The capture is in the same event-loop step as the fetch completing.**
+  This is an obligation on `coder`: no `await` between `anext(stream)`
+  returning and reading `claims.window(message.partition)`. It is what
+  makes the recorded window the claim under which the bus advanced the
+  consumed position, with no dependence on lock fairness or on how fast a
+  rebalance completes. (If `on_revoked` has already run when the fetch
+  completes, the capture is `None`, and the handler's `window is None`
+  test comes first — a `None` capture never counts as "the same claim".)
+* **A direct `handle()` caller is judged against the current claim.**
+  Tests are the only such caller; requiring them to state a fetched-under
+  window would change T5's `handle(message)` usage for no gain.
+* **`mark_handled` on an unheld partition is a `KeyError`**, as A15 chose
+  for `set_state` on an untracked IP: a missing claim is a missing key
+  and a caller bug (the worker only calls it after a non-`UNCLAIMED`
+  outcome, under the lock).
+* **The `stop()` in-hand case is covered by the general rule and not
+  given its own item.** It is the same mechanism (a commit of the consumed
+  position while a message is fetched and unhandled), differs only in
+  needing a crash during the drain to become a loss, and is closed by the
+  same sentence; it is named so that the reader knows it was seen, not
+  because it was asked about.
+* **No new metric or log record.** An identity-mismatch `UNCLAIMED` logs
+  the same `unclaimed_partition` record as A19's; the offset in it is
+  enough to correlate with the redelivery.
+* **aiokafka `master` was read, not the pinned 0.14.0.** The three
+  facts relied on (revoke callback before the join request; old
+  assignment live during it; explicit commits restricted to assigned
+  partitions) are long-standing behaviour, but the tag was not fetched;
+  see Sources.
+* **The trie is out of scope.** ADR-0010 decision 3's trie consumer has
+  no partition claims and no rebalance listener; its bare `commit()` is
+  unchanged and its own at-least-once analysis is that ADR's.
+
+Shipped code — what `coder` must change (behaviour changes: the committed
+position at every commit point, and the outcome of a message fetched under
+a since-replaced claim):
+
+* `packages/hammertime-bus/src/hammertime/bus/interface.py`:
+  `Consumer.commit(self, offsets: Mapping[tuple[str, int], int] | None =
+  None) -> None`, docstring stating decision 1's contract (explicit pairs
+  only; next-offset convention; empty mapping no-op; unheld partition is
+  an error; `None` unchanged). `Mapping` from `collections.abc`.
+* `packages/hammertime-bus/src/hammertime/bus/memory.py`
+  `MemoryConsumer.commit`: `offsets=None` keeps lines 164-166's behaviour;
+  a mapping validates each key (partition must be `0`; topic must be one
+  this consumer has a position for, i.e. has subscribed) and calls
+  `_set_committed_offset(topic, group, offset)` for each; it does **not**
+  touch `_positions` (the consumed position is the consumer's own; only a
+  new consumer for the group reads the committed one, as the interface
+  docstring already says).
+* `packages/hammertime-bus/src/hammertime/bus/kafka.py`
+  `KafkaConsumer.commit`: `offsets=None` keeps line 249; a mapping returns
+  at once if empty, else `await self._client.commit({TopicPartition(t, p):
+  o for (t, p), o in offsets.items()})`.
+* `services/aggregator/src/hammertime/aggregator/sharding/assignment.py`:
+  add the per-claim handled-position dict (keyed `(topic, partition)`),
+  `mark_handled(message)`, `commit_handled(partitions=None)`; `on_revoked`
+  (lines 122-133) becomes `await self.commit_handled(partitions)` then the
+  existing drop loop, also popping the handled position; module and
+  method docstrings cite decision 5, decision 6 and A20 (the module
+  docstring's "committing the consumer position" should say "committing
+  the handled position").
+* `services/aggregator/src/hammertime/aggregator/worker.py`: `_receive`
+  (lines 269-275) records `self._claims.window(message.partition)`
+  immediately after `anext` returns and passes it to the handler with the
+  message (a private two-argument `_handle`, or a small record — the
+  spelling is `coder`'s; `handle(message)` stays as it is and passes the
+  current window); `_handle` returns `UNCLAIMED` when `window is None or
+  window is not fetched_under` (the existing `window is None` branch,
+  lines 278-291, extended; the comment cites A19 and A20); every other
+  return path of `_handle` calls `self._claims.mark_handled(message)`
+  before returning; `_flush_and_commit` (lines 391-394) becomes `await
+  self._claims.commit_handled()` plus the `_last_commit` update. The
+  module docstring's at-least-once paragraph gains the re-claim sentence
+  decision 3 now has.
+* No change to `metrics.py`, `lateness.py`, `transitions.py`,
+  `reevaluate.py`, `service.py` (its `stop()` docstring's "commit the
+  consumer position" may say "the handled position"; docstring only) or
+  any store module.
+
+Shipped tests — what must change (`test-author`):
+
+* `services/aggregator/.../tests/test_sharding.py`, `_RecordingConsumer`
+  (lines 149-178): `commit(self)` must become `commit(self, offsets=None)`
+  forwarding `offsets` to the inner consumer — **invalidated as written**:
+  the wrapper no longer satisfies `Consumer` structurally (mypy) and
+  `ShardClaims.commit_handled` calls it with an argument (`TypeError` at
+  runtime). The trace assertion `["flush", "commit"]` in
+  `test_a_revoke_flushes_before_it_commits` (line 464) stays correct and
+  must not change. The module docstring's decision-5 summary (lines 27-28,
+  "calls `producer.flush()` then `consumer.commit()`") and
+  `TestRevokingAShard`'s docstring (lines 448-450) should say the commit
+  is of the handled positions; the "Real rebalance ordering" bullet (lines
+  62-65) stays true. `_claims()`'s docstring (lines 190-196) stays true.
+* `services/aggregator/.../tests/test_worker.py`
+  `TestOffsetsAreCommittedAtShutdown` (lines 830-879): still valid — both
+  messages were handled before `stop()`, so the handled and consumed
+  positions coincide — and must keep passing; its docstring may say
+  "handled" for precision.
+* `packages/hammertime-bus/.../tests/test_memory_bus.py`,
+  `test_assignment.py`: every bare `commit()` stays valid. Required new
+  tests, drawn from decision 1's `commit(offsets)` bullet: (i)
+  `commit({(topic, 0): n})` makes a fresh consumer for the group resume at
+  `n` even though the committing consumer had read further; (ii)
+  `commit({})` is a no-op — a fresh consumer resumes where the previous
+  commit left it; (iii) a partition other than `0`, and a topic the
+  consumer has not subscribed, raise `ValueError` and commit nothing;
+  (iv) `commit()` with no argument still commits the consumed position.
+  `KafkaConsumer` has no unit tests by design (its module docstring) and
+  gains none here.
+* Required new aggregator tests, drawn from decisions 3, 5 and 6 as now
+  written. **These are runnable today on `InMemoryBus`**: what cannot be
+  reproduced there is a *coordinator-driven* rebalance, but the
+  interleaving the gap needs — fetch completes, `on_revoked` runs,
+  `handle()` runs — can be scripted, and the committed position is
+  observable through a fresh consumer for the group, as
+  `TestOffsetsAreCommittedAtShutdown` already does.
+  1. `ShardClaims` level (with the `_claims()` fixture, whose inner
+     consumer is subscribed): publish one message; read it from the inner
+     consumer's stream so its consumed position moves past it; do **not**
+     call `mark_handled`; `on_revoked({(topic, 0)})`; a fresh
+     `bus.consumer("hammertime-aggregator")` subscribing to the topic
+     receives that same message first. Then the converse: same setup with
+     `mark_handled(message)` before the revoke; the fresh consumer resumes
+     after it. Together these demonstrate that the revocation commit is
+     the handled position and nothing else.
+  2. `AggregatorWorker` level — the exact ordering of the gap: a
+     `MessageBus` double whose `consumer(group)` returns a wrapper around
+     the real `MemoryConsumer` whose stream, for the first message,
+     schedules `asyncio.create_task(worker.on_revoked({(topic, 0)}))`
+     *before* yielding the message (so the revoke's first step runs
+     between the fetch completing and `run()` resuming, which is the real
+     ordering); run the worker; assert the message is not applied
+     (`worker.window(0) is None` after the revoke, nothing on the hot-ip
+     or reconciliation topics), then `stop()` the worker and assert a
+     fresh consumer for the group receives that message first (publish a
+     second message after `stop()` to prove the order). Against `e2b4b12`
+     this fails — the fresh consumer gets the second message — which is
+     the loss, demonstrated.
+  3. The re-claim variant of 2: the scheduled task does `await
+     worker.on_revoked(...)` then `await worker.on_assigned(...)` for
+     partition 0 before the loop handles the message; assert the new
+     window (`worker.window(0)` is a different object from the one before)
+     does not track the message's IP, nothing was emitted, and a fresh
+     group consumer still receives the message first. This pins ruling
+     part 3; a fix that committed handled positions without the identity
+     check would apply the message to the new window here.
+  Because `InMemoryBus` never resets a consumer's own position to the
+  committed offset (it has no rebalance), the *redelivery* itself — the
+  same worker receiving the message again after its re-claim — is not
+  observable in a unit test; only the committed position is. That half
+  needs a real broker.
+* What cannot be tested today, and where it would live: that aiokafka
+  accepts `commit(offsets)` inside `on_partitions_revoked`, that a
+  reassigned partition's fetch resumes from the committed offset, and the
+  end-to-end handover (member A fetches, rebalance, member B applies the
+  observation and the HOT transition is emitted exactly once) need a real
+  broker and a two-member `hammertime-aggregator` group. That is an
+  `integration` scenario for `docs/spec/integration-scenarios.md` under
+  issue #26, and the `integration` job is disabled pending #26 (recorded
+  in `CLAUDE.md`, "Disabled CI coverage"). The scenario is *not* written
+  by this amendment; it is a named follow-up for the architect once #26
+  is scheduled, and until then the unit tests above are the only
+  executable evidence.
+
+Order: the bus change (`interface.py`, `memory.py`, `kafka.py`, and its
+test-author pass) lands first, on its own branch, because the aggregator
+change imports the new signature; the aggregator `coder` and
+`test-author` changes land together on the C5 branch (the
+`_RecordingConsumer` signature fails against the new `ShardClaims` and the
+new worker tests fail against the old commit), rebased onto the bus
+change. Nothing in this amendment blocks A18's or A19's landing items,
+which remain as Amendment 5 lists them.
