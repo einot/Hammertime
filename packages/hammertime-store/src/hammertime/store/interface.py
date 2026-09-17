@@ -1,19 +1,25 @@
 """Store protocols: window counters, IP state, dedup high-water marks.
 
-Spec: section 20, section 23, section 26
+Spec: section 20, section 23, section 26, section 32
 
-Only the dedup protocol (spec section 23, ADR-0003) is defined here so far.
-Sliding-window counters and IP HOT/COLD state (spec section 20, section 26)
-belong to the aggregator epic and are not yet designed; add their `Protocol`s
-alongside `DedupStore` when that epic needs them, rather than speculatively
-shaping them now.
+Two protocols so far. `DedupStore` (spec section 23, ADR-0003) is ingest's
+per-agent duplicate detection. `ShardStateStore` (spec section 20, section
+26, section 32; ADR-0011 decision 5) is the aggregator's durable per-shard
+HOT set and transition sequence counter. Sliding-window *counters* (spec
+section 26) remain in-memory only and have no protocol here: ADR-0011
+decision 5 keeps only the HOT set beyond a process, because window buckets
+self-heal within one `window_seconds` of a claim.
 
-`DedupStore` mirrors `hammertime.bus.interface`'s `Producer`/`Consumer`
-convention: a `@runtime_checkable` async `Protocol` so `memory.py` (in-process)
-and `redis.py` (a real round-trip) are interchangeable behind it.
+Both mirror `hammertime.bus.interface`'s `Producer`/`Consumer` convention:
+`@runtime_checkable` async `Protocol`s so `memory.py` (in-process) and
+`redis.py` (a real round-trip) are interchangeable behind them.
 """
 
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+
+from hammertime.core.addressing.address import Address
+from hammertime.core.state.enums import IpState
 
 
 @runtime_checkable
@@ -69,5 +75,104 @@ class DedupStore(Protocol):
         call for a given `(agent_id, sequence)` ever returns `True`. Same
         `ttl_seconds` semantics as `mark_seen` (seen for at least
         `ttl_seconds`, never shortened by a later call).
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ShardState:
+    """What a shard's next owner inherits: its HOT set and sequence counter.
+
+    Spec section 32 makes the per-IP window state plus HOT/COLD state the
+    *authoritative* information; the trie is derived from the transitions
+    the aggregator publishes. The window counters self-heal within one
+    `window_seconds` of a claim and so are not persisted, but the HOT set
+    is not derivable from anything else: an owner that forgets an IP it
+    announced as HOT never emits the matching `HotIpRemoved`, and the trie
+    holds that IP forever (ADR-0011 context item 3).
+    """
+
+    #: IPs this shard currently has as HOT, i.e. the IPs it has told (or,
+    #: per ADR-0011 decision 4's persist-before-publish order, has tried to
+    #: tell) the trie about and must eventually demote.
+    hot_ips: frozenset[Address]
+    #: The sequence the shard's next transition will use; `0` for a shard
+    #: that has never recorded one, and otherwise one past the highest
+    #: sequence ever recorded (it only ever moves forward -- ADR-0011
+    #: Amendment 1 item A2). Resuming from here is what keeps decision 4's
+    #: `event_id` identity -- derived from `(agent_id, sequence,
+    #: event_type)` -- from repeating across a restart.
+    next_sequence: int
+
+
+@runtime_checkable
+class ShardStateStore(Protocol):
+    """Durable per-shard HOT set and transition sequence (ADR-0011 decision 5).
+
+    One logical record per shard (a Kafka partition of the observations
+    topic), keyed by the shard id: spec section 20 gives every IP exactly
+    one owner, so a shard's HOT set is never shared with another shard and
+    two shards never contend for the same entry.
+    """
+
+    async def load(self, shard: int) -> ShardState:
+        """Read `shard`'s current HOT set and next sequence.
+
+        A pure read: loading a shard that has never recorded a transition
+        returns `ShardState(frozenset(), 0)` and MUST NOT create or write
+        anything, so a diagnostic or a claim of an idle shard leaves no
+        trace. Loading does not consume the state either -- a re-claim
+        after a revoke loads the same shard again.
+        """
+        ...
+
+    async def record_transition(
+        self, shard: int, ip: Address, state: IpState, sequence: int
+    ) -> None:
+        """Add (`HOT`) or remove (`COLD`) `ip`, and raise next sequence to `sequence + 1`.
+
+        Atomic: the membership change and the sequence update either both
+        land or neither does. A torn write would either leave an IP
+        recorded as HOT under a sequence that a later transition reuses, or
+        burn a sequence without recording the membership it belongs to.
+
+        The sequence is **clamped, never lowered** (ADR-0011 Amendment 1
+        item A2). The stored next sequence becomes `max(before, sequence +
+        1)`: it is raised to `sequence + 1` only if that is higher.
+        Membership is updated regardless of how `sequence` compares to the
+        stored value. The whole testable contract is::
+
+            load(shard).next_sequence == 1 + max(every sequence ever
+            recorded for that shard), or 0 if none
+
+        in any order and under any repetition -- so replaying an identical
+        call is a no-op the second time.
+
+        The clamp lives here, in the store, rather than in the caller
+        because decision 4's "never reproduces an earlier `event_id`"
+        promise is stated about the *persisted* counter, and this store is
+        the only party that outlives the process. The cases where an
+        unconditional assignment would bite -- a retry after a lost reply,
+        a second caller added later, a bug in the claim path -- are exactly
+        the ones nobody writes a test for on purpose.
+
+        `sequence` MUST be non-negative (`schemas/hot_ip_event.v1.json` has
+        `"minimum": 0`); a negative one raises `ValueError` and writes
+        nothing.
+
+        `COLD` for an IP the shard does not hold is a membership no-op that
+        still advances the sequence -- decision 4's recovery path reaches
+        it whenever a new owner demotes an inherited IP the trie never
+        learned about.
+
+        The next sequence comes from the given `sequence`, not from a count
+        of calls: callers own sequence allocation (`ShardWindow`), and this
+        store only records where they have got to.
+
+        Callers MUST record the transition before publishing the
+        corresponding event (ADR-0011 decision 4): a failure here must
+        abort the publish, because the opposite order can leave the trie
+        holding an IP no owner knows about -- the permanent leak this store
+        exists to close.
         """
         ...

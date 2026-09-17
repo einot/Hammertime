@@ -1,3 +1,4 @@
+Add a durable per-shard aggregator HOT set and monotonic transition sequence in Redis keys hammertime:agg:{shard}:hot and hammertime:agg:{shard}:seq, which carry no TTL and require maxmemory-policy noeviction (an allkeys-* policy silently loses the HOT set); a recorded transition never moves the shard's sequence backwards
 BREAKING: hammertime.observations.v1 has 128 partitions instead of 32, raising the aggregator parallelism ceiling to 128 workers; an existing topic must be recreated at the new count, which remaps every IP to a different partition and invalidates any persisted per-shard state
 A dedup-store credential Redis rejects now fails ingest startup on the first attempt instead of being retried until HAMMERTIME_STARTUP_TIMEOUT_S expires
 Add GET /readyz to ingest, answering 200 once startup has completed and 503 with {"status":"starting"|"stopping"} otherwise; POST /v1/observations answers the same 503 while the service is not ready

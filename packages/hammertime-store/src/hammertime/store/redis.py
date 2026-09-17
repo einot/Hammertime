@@ -1,6 +1,14 @@
-"""Redis-backed store with TTLs matching state_retention_seconds.
+"""Redis-backed stores: dedup keys with TTLs, shard state without.
 
-Spec: section 26
+Spec: section 20, section 26, section 32
+
+Two backends, one Redis. `RedisDedupStore` (spec section 26) holds ingest's
+dedup records, where TTL-based expiry matching `state_retention_seconds` is
+the whole point. `RedisShardStateStore` (spec section 20, section 32;
+ADR-0011 decision 5) holds the aggregator's per-shard HOT set and sequence
+counter, which carry *no* TTL at all -- see that class's docstring for why
+the two opposite retention rules are both correct, and why the second one
+raises the stakes on the deployment's eviction policy.
 
 `RedisDedupStore` implements `hammertime.store.interface.DedupStore` against
 a real Redis (or Redis-compatible) backend -- the production counterpart to
@@ -53,20 +61,53 @@ key still existing with `gt` false, the retried `SET NX` correctly no-ops
 against the still-live, already-sufficient TTL.
 """
 
+from hammertime.core.addressing.address import Address
+from hammertime.core.state.enums import IpState
 from hammertime.store.dedup import SequenceKey
+from hammertime.store.interface import ShardState
 from redis.asyncio import Redis
+from redis.exceptions import WatchError
 
 #: Placeholder value stored at each dedup key. Only the key's existence and
 #: TTL matter; the value itself carries no information.
 _SEEN_VALUE = b"1"
 
-#: Namespaces every key this module writes. `SequenceKey.cache_key()` has no
+#: Namespaces every dedup key this module writes. `SequenceKey.cache_key()` has no
 #: prefix of its own, and this store is deployed against a shared Redis --
 #: `deploy/docker-compose.yml` points ingest and the (not yet implemented)
 #: aggregator Redis counter store at the same `redis://redis:6379/0` -- so an
 #: unprefixed key risks colliding with a future, unrelated key scheme in the
 #: same keyspace.
 _KEY_PREFIX = "hammertime:dedup:"
+
+#: Namespaces every key `RedisShardStateStore` writes, one pair per shard:
+#: `hammertime:agg:{shard}:hot` and `hammertime:agg:{shard}:seq`. ADR-0011
+#: names this keyspace explicitly -- the deploy epic's `noeviction`
+#: requirement is written against this prefix, so it is load-bearing beyond
+#: tidiness.
+_SHARD_KEY_PREFIX = "hammertime:agg:"
+
+#: How many times `RedisShardStateStore.record_transition` re-reads and
+#: retries its WATCH/MULTI/EXEC before giving up. Each attempt loses only
+#: to a concurrent writer on the *same shard's* sequence key, which spec
+#: section 20's one-owner-per-shard rule makes rare; this is a guard
+#: against livelock, not a throughput knob.
+_MAX_SEQUENCE_CAS_ATTEMPTS = 16
+
+
+def _hot_key(shard: int) -> str:
+    """The SET of IP text this shard currently has as HOT."""
+    return f"{_SHARD_KEY_PREFIX}{shard}:hot"
+
+
+def _sequence_key(shard: int) -> str:
+    """The sequence this shard's next transition will use."""
+    return f"{_SHARD_KEY_PREFIX}{shard}:seq"
+
+
+def _as_text(value: bytes | str) -> str:
+    """Decode a SET member, whichever `decode_responses` the client was built with."""
+    return value.decode() if isinstance(value, bytes) else value
 
 
 class RedisDedupStore:
@@ -134,3 +175,127 @@ class RedisDedupStore:
         key = _KEY_PREFIX + SequenceKey(agent_id, sequence).cache_key()
         created = await self._client.set(key, _SEEN_VALUE, ex=ttl_seconds, nx=True)
         return bool(created)
+
+
+class RedisShardStateStore:
+    """`ShardStateStore` backed by a real Redis: a SET plus a counter per shard.
+
+    Two keys per shard under `hammertime:agg:{shard}:` -- `:hot`, a SET of
+    IP text (`str(Address)`, the canonical form `Address.parse`
+    round-trips and the same form ADR-0011 decision 4 puts in an envelope's
+    `subject`), and `:seq`, the sequence the shard's next transition will
+    use. Takes an already-constructed client by injection, exactly as
+    `RedisDedupStore` does, for the same reason: connection lifecycle is
+    the caller's.
+
+    **No TTL, deliberately** (ADR-0011 decision 5): a shard's HOT set has
+    to outlive every process that touches it. That makes the deployment
+    warning in `RedisDedupStore`'s docstring apply here with more force. An
+    expiring or evicted dedup key costs a re-accepted duplicate; an
+    expiring or evicted `hammertime:agg:*` key costs the aggregator its
+    memory of which IPs it announced as HOT, so it never emits the matching
+    `HotIpRemoved` and the trie holds them forever -- silently recreating
+    the exact permanent divergence (spec section 12) this store exists to
+    close, with nothing to detect it. A deployment running this store MUST
+    either give the `hammertime:agg:` keyspace a dedicated, non-evicting
+    Redis instance/logical DB, or run `maxmemory-policy noeviction`, so
+    running out of memory surfaces as a loud write failure. An
+    `allkeys-lru`/`allkeys-lfu` policy is specifically unsafe here:
+    `volatile-*` would at least leave these (TTL-less) keys alone, but
+    `allkeys-*` will not. Tracked for the deploy/integration epic (#17),
+    not fixed at the application level here.
+
+    `load` is a pure read (two commands in one MULTI/EXEC, so the HOT set
+    and the sequence are a coherent snapshot of one instant) and never
+    creates a key: `SMEMBERS` on a missing key returns an empty set and
+    `GET` returns `None`, which is exactly `ShardState(frozenset(), 0)`.
+
+    `record_transition` is one atomic server-side step per call (ADR-0011
+    Amendment 1 item A2 relaxes decision 5's original "one MULTI/EXEC" to
+    that, precisely because the clamp it mandates is a compare-and-set and
+    MULTI/EXEC cannot express one). See its body for why that is a
+    WATCH-based optimistic transaction here.
+    """
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
+
+    async def load(self, shard: int) -> ShardState:
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.smembers(_hot_key(shard))
+            pipe.get(_sequence_key(shard))
+            members, sequence = await pipe.execute()
+        return ShardState(
+            hot_ips=frozenset(Address.parse(_as_text(member)) for member in members),
+            next_sequence=int(sequence) if sequence is not None else 0,
+        )
+
+    async def record_transition(
+        self, shard: int, ip: Address, state: IpState, sequence: int
+    ) -> None:
+        if sequence < 0:
+            # Write nothing: `schemas/hot_ip_event.v1.json` has
+            # `"minimum": 0`, and a negative sequence would drive the
+            # clamp's floor below zero.
+            raise ValueError(f"sequence must be non-negative, got {sequence!r}")
+        hot_key = _hot_key(shard)
+        sequence_key = _sequence_key(shard)
+        candidate = sequence + 1
+        # ADR-0011 Amendment 1 item A2: the stored next sequence is RAISED
+        # to `sequence + 1` only if that is higher, never lowered, while
+        # the membership change is applied regardless -- both in one atomic
+        # step. A plain MULTI/EXEC cannot express that: its queued commands
+        # are sent before any of them run, so none of them can read `:seq`
+        # and decide whether to write it. Hence WATCH-based optimistic
+        # concurrency -- `EVAL` would do too, and A2 permits it, but it
+        # would cost a Lua runtime (`lupa`) in the test environment purely
+        # so the in-process fake can emulate server-side scripting.
+        #
+        # The comparison stays in Python on exact `int`s, which is better
+        # than the Lua alternative rather than a concession: `sequence` is
+        # bounded by 2**63-1, and Lua numbers are doubles that silently
+        # lose integer precision above 2**53.
+        async with self._client.pipeline(transaction=True) as pipe:
+            for _ in range(_MAX_SEQUENCE_CAS_ATTEMPTS):
+                try:
+                    await pipe.watch(sequence_key)
+                    stored = await pipe.get(sequence_key)
+                    # redis-py leaves `multi()` unannotated, so strict
+                    # mypy calls it untyped; the narrow ignore is the
+                    # same shape the repo already uses for third-party
+                    # typing gaps.
+                    pipe.multi()  # type: ignore[no-untyped-call]
+                    if state is IpState.HOT:
+                        pipe.sadd(hot_key, str(ip))
+                    else:
+                        # SREM of an absent member is a no-op that still
+                        # leaves the clamp below to run: decision 4's
+                        # recovery path demotes inherited IPs that may
+                        # never have been recorded.
+                        pipe.srem(hot_key, str(ip))
+                    if stored is None or candidate > int(stored):
+                        pipe.set(sequence_key, candidate)
+                    # EXEC aborts if any other client touched `:seq` since
+                    # the WATCH, so the read above cannot go stale
+                    # underneath the write. Nothing is applied on abort --
+                    # not even the membership change, which is why it sits
+                    # inside the same MULTI.
+                    await pipe.execute()
+                    return
+                except WatchError:
+                    # Another writer won the race; re-read and re-decide.
+                    # Retrying is safe because SADD/SREM are idempotent and
+                    # an aborted EXEC applied nothing.
+                    continue
+        # Bounded, not `while True`: livelock here would hang the
+        # aggregator's transition path silently. Contention is expected to
+        # be nil in practice (spec section 20 gives a shard exactly one
+        # owner), so exhausting these attempts means something is wrong
+        # that a retry loop should not paper over. Raising aborts the
+        # caller's publish, which is the safe direction under decision 4:
+        # better an un-announced transition than one announced but not
+        # recorded.
+        raise WatchError(
+            f"could not record transition for shard {shard} after "
+            f"{_MAX_SEQUENCE_CAS_ATTEMPTS} attempts: {sequence_key} is under contention"
+        )

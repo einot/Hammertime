@@ -1,6 +1,13 @@
-"""In-memory store; the reference implementation the others must match.
+"""In-memory stores; the reference implementations the others must match.
 
-Spec: section 26
+Spec: section 20, section 26, section 32
+
+Two of them: `MemoryDedupStore` (ingest's dedup records, spec section 26)
+and `MemoryShardStateStore` (the aggregator's per-shard HOT set and
+sequence counter, spec section 20, section 32; ADR-0011 decision 5). They
+share only this module and the reference-implementation role; their
+retention rules are opposites -- dedup entries expire, shard state never
+does.
 
 `MemoryDedupStore` implements `hammertime.store.interface.DedupStore`
 in-process, the way `hammertime.bus.memory.InMemoryBus` implements
@@ -36,8 +43,11 @@ one, same as a TTL expiry would have done to it eventually anyway.
 import heapq
 from collections import OrderedDict
 
+from hammertime.core.addressing.address import Address
+from hammertime.core.state.enums import IpState
 from hammertime.core.time.clock import Clock, SystemClock
 from hammertime.store.dedup import SequenceWindow
+from hammertime.store.interface import ShardState
 
 _DEFAULT_MAX_AGENTS = 100_000
 
@@ -110,3 +120,67 @@ class MemoryDedupStore:
                 # superseded by a later mark_seen -- actually expired.
                 del self._windows[agent_id]
                 del self._expires_at[agent_id]
+
+
+class MemoryShardStateStore:
+    """In-process `ShardStateStore`: a set of HOT IPs and a counter per shard.
+
+    The reference implementation `RedisShardStateStore` must match, exactly
+    as `MemoryDedupStore` is for `DedupStore`. Nothing here expires: ADR-0011
+    decision 5 gives this state no TTL, because a shard's HOT set has to
+    outlive the process that wrote it. Memory is therefore bounded by the
+    HOT sets of the shards this process has claimed, which
+    `ShardWindow`'s own `max_tracked_ips` cap bounds upstream -- there is no
+    `max_agents`-style eviction here, because evicting an entry would
+    reintroduce the very leak the store closes (a forgotten HOT IP the trie
+    is never told to drop).
+
+    Being in-process, this backend loses everything on restart. That is
+    fine for tests and a single-process development run (a restarted
+    process also loses the trie it published to), but a deployment that
+    must survive a restart needs `RedisShardStateStore`.
+
+    `record_transition` contains no `await`, so it runs to completion
+    without yielding to the event loop: atomic in practice for a
+    single-process asyncio deployment, the same reasoning `MemoryDedupStore.
+    claim` documents. That is what makes its read-then-clamp of the
+    sequence counter safe without any compare-and-set machinery -- the
+    Redis backend, which has no such guarantee, needs a WATCH loop for the
+    same three lines.
+    """
+
+    def __init__(self) -> None:
+        self._hot_ips: dict[int, set[Address]] = {}
+        self._next_sequence: dict[int, int] = {}
+
+    async def load(self, shard: int) -> ShardState:
+        # `.get`, not `setdefault`: loading a never-seen shard must not
+        # create it (interface.py's `load` contract).
+        hot_ips = self._hot_ips.get(shard)
+        return ShardState(
+            hot_ips=frozenset(hot_ips) if hot_ips else frozenset(),
+            next_sequence=self._next_sequence.get(shard, 0),
+        )
+
+    async def record_transition(
+        self, shard: int, ip: Address, state: IpState, sequence: int
+    ) -> None:
+        if sequence < 0:
+            # Write nothing: `schemas/hot_ip_event.v1.json` has
+            # `"minimum": 0`, and a negative sequence would drive the
+            # clamp's floor below zero.
+            raise ValueError(f"sequence must be non-negative, got {sequence!r}")
+        if state is IpState.HOT:
+            self._hot_ips.setdefault(shard, set()).add(ip)
+        else:
+            # A demotion of an IP this shard does not hold is a membership
+            # no-op that still advances the sequence, and must not create
+            # an empty set for a shard that has none.
+            self._hot_ips.get(shard, set()).discard(ip)
+        # ADR-0011 Amendment 1 item A2: raise the counter to
+        # `sequence + 1` only if that is higher, never lower it. The
+        # membership change above is applied either way. Decision 4's
+        # "never reproduces an earlier `event_id`" promise is made about
+        # this persisted counter, so a replayed or out-of-order transition
+        # must not hand an already-used sequence back to the next caller.
+        self._next_sequence[shard] = max(self._next_sequence.get(shard, 0), sequence + 1)
