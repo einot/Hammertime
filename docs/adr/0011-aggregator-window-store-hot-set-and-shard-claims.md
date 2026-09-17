@@ -1,6 +1,12 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted
+Status: accepted; amended 2026-09-17 (see "Amendment 1" at the end. The
+amendment records the partition count of `hammertime.observations.v1`
+changing from 32 to 128 and pins two edge cases decisions 1 and 5 left
+ambiguous. Decisions 1 and 5 were rewritten in place to state the new
+rules directly; the amendment's opening lists every such edit, and quotes
+the superseded wording, so the before/after is recoverable from this
+document alone)
 
 Scope note: this ADR settles the interfaces milestone M3 (epics #5, #6, #7
 and issue #48) implements against — what the aggregator keeps per IP, how
@@ -32,8 +38,11 @@ settled before anyone can write a test or a module:
    so the bus partitions the stream by IP. ADR-0009 fixes the consumer group
    name and readiness ("shard claims held") and explicitly leaves "how
    [`HAMMERTIME_SHARD_IDS`] maps onto partitions" to this epic.
-   `.env.example` says `HAMMERTIME_SHARD_COUNT=64`; `topics.py` provisions
-   32 partitions; `deploy/k8s/README.md` scales the aggregator with an HPA on
+   `.env.example` says `HAMMERTIME_SHARD_COUNT=64` and
+   `HAMMERTIME_SHARD_IDS=0-63`; `topics.py` provisioned 32 partitions when
+   this ADR was accepted (raised to 128 by the change Amendment 1, item A1
+   records);
+   `deploy/k8s/README.md` scales the aggregator with an HPA on
    consumer-group lag, i.e. identical replicas that cannot each carry a
    distinct static shard list.
 3. **State that must not be lost.** §32 names "IP sliding-window state +
@@ -105,10 +114,11 @@ class Consumer(Protocol):
   rule ("shard claims held") observable: `start()` returns after
   `subscribe()`.
 * `InMemoryBus` has one partition per topic: group-managed and static
-  `{0}` both assign `{(topic, 0)}` immediately; any other static set is a
-  `ValueError`. `InMemoryBus` supports at most one live member per group per
-  topic; a second `MemoryConsumer` for the same group would re-read the same
-  log, which no test relies on.
+  `{0}` both assign `{(topic, 0)}` immediately; any other static set —
+  including the empty set, for every consumer implementation (Amendment 1,
+  item A3) — is a `ValueError`. `InMemoryBus` supports at most one live
+  member per group per topic; a second `MemoryConsumer` for the same group
+  would re-read the same log, which no test relies on.
 * `KafkaConsumer` implements the group-managed path with aiokafka's
   `subscribe(topics, listener=ConsumerRebalanceListener)` and the static
   path with `assign([TopicPartition(...)])`, synthesising the single
@@ -117,12 +127,22 @@ class Consumer(Protocol):
 
 `HAMMERTIME_SHARD_IDS` is the only sharding setting: `auto` (default,
 group-managed) or an explicit set (`0`, `0-3`, `0,2,5-7`; inclusive ranges;
-static assignment). `HAMMERTIME_SHARD_COUNT` is retired: with ownership
-decided by the partitioner there is nothing for the aggregator to do with a
-declared count, and the value in `.env.example` (64) already disagreed with
-`topics.py` (32). Both variables were never read by any shipped build, so
-retiring one and redefining the other is not a breaking change for a
-running deployment.
+static assignment; a set-but-empty value is a configuration error, Amendment
+1 item A3). `HAMMERTIME_SHARD_COUNT` is retired: with ownership decided by
+the partitioner there is nothing for the aggregator to do with a declared
+count, and the value in `.env.example` (64) never matched `topics.py` (32
+when this ADR was accepted; 128 by the change Amendment 1, item A1
+records). Both variables
+were never read by any shipped build, so retiring one and redefining the
+other is not a breaking change for a running deployment. Until the
+aggregator change described under Consequences (*Environment*) lands,
+`.env.example` still carries `HAMMERTIME_SHARD_COUNT=64` and
+`HAMMERTIME_SHARD_IDS=0-63`; both lines are dead text that no build reads,
+and that change — not this ADR — replaces them.
+
+The partition count of `hammertime.observations.v1` is the number of shards
+and therefore the hard ceiling on aggregator parallelism; it is a deployment
+constant, not a tunable, for the reasons given in Amendment 1, item A1.
 
 ADR-0009 decision 9 stands: one fixed group, `hammertime-aggregator`; what
 distinguishes members is the set of partitions they hold — chosen by the
@@ -406,11 +426,13 @@ class ShardStateStore(Protocol):
 ```
 
 `record_transition` adds `ip` to the shard's HOT set when `state` is `HOT`,
-removes it when `COLD`, and sets the shard's next sequence to
-`sequence + 1` — atomically. `MemoryShardStateStore` (reference; dicts,
-no TTL) and `RedisShardStateStore` (keys `hammertime:agg:{shard}:hot`, a
-SET of IP text, and `hammertime:agg:{shard}:seq`; one MULTI/EXEC
-transaction per call; no TTL) are interchangeable behind it, chosen by
+removes it when `COLD`, and raises the shard's next sequence to
+`sequence + 1` if that is higher than the value already stored — never
+lowering it (Amendment 1, item A2) — atomically. `MemoryShardStateStore`
+(reference; dicts, no TTL) and `RedisShardStateStore` (keys
+`hammertime:agg:{shard}:hot`, a SET of IP text, and
+`hammertime:agg:{shard}:seq`; one atomic server-side step per call, see
+A2; no TTL) are interchangeable behind it, chosen by
 `HAMMERTIME_STORE_KIND` exactly as ingest chooses its `DedupStore`.
 
 Claims (`hammertime.aggregator.sharding.assignment.ShardClaims`, the
@@ -579,8 +601,9 @@ prior ADR. Push back on them individually.
    hot shard while debugging. Both because ADR-0009 decision 9 names the
    variable.
 3. **`HAMMERTIME_SHARD_COUNT` retired.** No reader, no role once ownership
-   is the partitioner's, and its `.env.example` value contradicted
-   `topics.py`.
+   is the partitioner's, and its `.env.example` value (64) contradicts
+   `topics.py` both at 32 (when this ADR was accepted) and at 128 (the
+   change Amendment 1, item A1 records).
 4. **Counters process-local; only the HOT set durable.** Redis-backed
    counters would cost a round trip per observation to avoid, at most, one
    window of under-counting after a restart or handover. The warm-up rule
@@ -660,7 +683,9 @@ prior ADR. Push back on them individually.
     need a policy nobody asked for. The trie epic decides what it does with
     them.
 21. **Empty assignment is ready.** The alternative (not ready) would make
-    scaling past the partition count roll back a deployment.
+    scaling past the partition count roll back a deployment. This covers a
+    group-managed empty assignment only; an explicitly empty static set is
+    refused before the process starts (Amendment 1, item A3).
 22. **`InMemoryBus` stays single-partition, single-member-per-group.** No
     scenario needs more; documenting the limit is cheaper than building a
     partitioned memory bus nobody consumes.
@@ -740,3 +765,253 @@ reading can be checked against the original.
   `DefaultPartitioner` — the hook assumption 1 chose not to use.
 * The readthedocs rendering of the same API was not reachable from this
   environment; the raw source above is the primary reference.
+
+## Amendment 1 (2026-09-17) — 128 partitions; `next_sequence` never moves backwards; an empty static shard set is refused
+
+Why: three things surfaced after this ADR merged. The user ruled that
+`hammertime.observations.v1` gets 128 partitions instead of 32 while the
+topic is still empty (A1). Two `test-author`s working from decisions 5 and 1
+each found an edge case the text left open and, correctly, wrote no test
+either way rather than guess: whether `record_transition` may move a shard's
+`next_sequence` backwards (A2), and whether an explicitly empty static
+partition set is a `ValueError` (A3). Each item below says whether it changes
+any shipped code. None does — at the time of writing no `ShardStateStore`,
+no `parse_shard_ids` and no `subscribe(partitions=...)` exists in the tree
+(`packages/hammertime-store` and `packages/hammertime-bus` were read to
+confirm this) — so all three are binding on the implementing briefs, not
+corrections to code. The `topics.py` edit A1 records is a separate `coder`
+change on its own branch, which merges *before* this amendment (see A1 for
+the fixed order).
+
+Unlike ADR-0009's Amendment 1, this amendment does not leave the decision
+bodies untouched and append corrections; two decisions were rewritten in
+place so that a reader of decision 1 or 5 sees the rule now in force rather
+than a superseded rule plus a footnote. Every edit outside this section,
+and what changed in each:
+
+* **Decision 5, rewritten in substance.** "sets the shard's next sequence
+  to `sequence + 1`" became "raises the shard's next sequence to
+  `sequence + 1` if that is higher than the value already stored — never
+  lowering it", and the Redis implementation note "one MULTI/EXEC
+  transaction per call" became "one atomic server-side step per call".
+  Both are A2's ruling; A2 quotes the original wording.
+* **Decision 1, rewritten in substance, in three places.** (i) The
+  `InMemoryBus` bullet's "any other static set is a `ValueError`" became
+  "any other static set — including the empty set, for every consumer
+  implementation — is a `ValueError`" (A3's ruling; A3 quotes the original
+  sentence). (ii) The `HAMMERTIME_SHARD_IDS`/`HAMMERTIME_SHARD_COUNT`
+  paragraph was rewritten: the grammar sentence now says a set-but-empty
+  value is a configuration error (A3), "`topics.py` (32)" now gives both
+  the historical and the new count (A1), and two sentences were added
+  stating what `.env.example` carries today and that the aggregator change
+  under Consequences (*Environment*), not this ADR, replaces those lines.
+  (iii) A new closing paragraph was added: the partition count is the
+  number of shards, the hard ceiling on aggregator parallelism, and a
+  deployment constant rather than a tunable — normative text that did not
+  exist before, justified in A1.
+* **Context item 2.** The partition-count statement now gives both counts,
+  and `HAMMERTIME_SHARD_IDS=0-63` is mentioned alongside
+  `HAMMERTIME_SHARD_COUNT=64` (it was omitted before).
+* **Assumption 3.** Now gives both counts.
+* **Assumption 21.** Gained a sentence scoping it to group-managed empty
+  assignment, with a pointer to A3.
+* **Status line.** Marked amended.
+
+Decisions 2, 3, 4, 6, 7, 8 and 9 are untouched.
+
+### A1. `hammertime.observations.v1` goes from 32 to 128 partitions, and the count is a deployment constant
+
+The user ruled that `hammertime.observations.v1` gets **128** partitions,
+up from the 32 this ADR was accepted against. The edit itself — `topics.py`,
+`OBSERVATIONS.partitions` from `32` to `128` — is a separate `coder` change
+on its own branch, not part of this amendment, and the merge order is fixed
+as: that change, then this amendment, then the store and bus branches that
+cite A2 and A3. So at no point does `master` carry a count in this ADR that
+`topics.py` does not have; on a branch holding this amendment alone,
+`topics.py` still reads `32` until it is rebased onto that change. Every
+statement of a partition count in this ADR outside this item (Context item
+2, decision 1, assumption 3) is worded as "32 when accepted, 128 by the
+change A1 records" for that reason; the consequences this item derives
+below are stated against the ruled count and are true once that change is
+in. No statement of a maximum shard or worker count was ever made in
+numbers before this item — decision 1 and assumption 21 speak of "the
+partition count", which they still do, and once the change is in mean 128.
+
+What the number means under decision 1, spelled out because it is what made
+the change worth doing now rather than later:
+
+* **It is the hard ceiling on aggregator parallelism.** A shard is a
+  partition, so once the change is in at most 128 members of
+  `hammertime-aggregator` hold a shard; the 129th gets an empty
+  assignment, which is ready and logs `no_shards_assigned` (decision 5,
+  assumption 21). A static `HAMMERTIME_SHARD_IDS` set is then drawn from
+  `0..127` (from `0..31` against the 32 this ADR was accepted with).
+* **Changing it once the topic carries data is a migration, not a
+  setting.** The partitioner maps an IP's key to a partition as a function
+  of the partition count, so a new count sends an IP's subsequent
+  observations to a different shard while its earlier ones stay in the old
+  one. During the overlap the IP has two owners, each emitting transitions
+  under its own `agent_id`; the persisted HOT sets
+  (`hammertime:agg:{shard}:hot`) describe a mapping that no longer holds;
+  and the old shard's owner will demote the IP after one window because it
+  no longer sees it, regardless of what the new owner is counting. Nothing
+  in this ADR reconciles that — it would take a coordinated drain, re-key
+  and HOT-set rewrite that this ADR does not design. Hence: the count is
+  changed now, while the topic is empty and no shard has a persisted HOT
+  set, and is treated as a deployment constant thereafter. `topics.py`'s
+  docstring calls partition counts "operational defaults ... expected to be
+  tuned per deployment"; for this one topic that is true only *before* the
+  deployment first carries data.
+
+Assumptions:
+
+* **128 itself is the user's figure**, not derived here. It is ruled, not
+  argued for; this amendment records what it implies.
+* **Only the observations topic's count is stated.** Shard identity comes
+  from `hammertime.observations.v1` alone (decision 1); the partition
+  counts of the hot-ip, reconciliation and prefix-stats topics are
+  throughput settings for their own consumers and this ADR says nothing
+  about them, before or after the change. Whether the accompanying
+  `topics.py` edit touches them is not something this ADR constrains.
+* **A static id outside `0..127` is not ruled on here.** Decision 1 never
+  said what `subscribe(partitions={200})` does against a 128-partition
+  topic; that is unchanged by this amendment and is flagged in the
+  hand-off notes rather than pinned without reading how aiokafka's
+  `assign()` behaves for an unknown partition.
+
+### A2. `record_transition` never lowers `next_sequence` — a store-side guarantee
+
+Decision 5 said `record_transition` "sets the shard's next sequence to
+`sequence + 1`". Read literally that is an unconditional assignment, so a
+call carrying a lower `sequence` than one already recorded would move the
+counter backwards, and the next claimant of the shard would load a
+`next_sequence` it had already used — reproducing an earlier `event_id`,
+which is exactly what decision 4 says the persisted counter prevents.
+
+Ruling: the store **MUST clamp**. After `record_transition(shard, ip,
+state, sequence)` returns, the shard's stored next sequence is
+`max(<value before the call>, sequence + 1)`; it is never lowered. The
+membership update (add on `HOT`, remove on `COLD`) is applied regardless of
+how `sequence` compares to the stored counter, and the two happen in one
+atomic step as before. `sequence < 0` is a `ValueError` and writes nothing.
+The observable contract for a test, for either store:
+
+* `load(shard).next_sequence == 1 + max(every sequence ever recorded for
+  shard)`, or `0` if none has been — whatever order the calls came in and
+  however many times any of them was repeated.
+* Recording the same `(shard, ip, state, sequence)` twice leaves the store
+  exactly as one call would have (idempotent under replay).
+
+Why store-side rather than trusting the caller: decision 4's only caller
+today (the `TransitionEmitter`, one per process, drawing from the in-memory
+`window.next_sequence` loaded at claim) never goes backwards, so this can
+look like a non-issue. But the promise "never reproduces an earlier
+`event_id`" is stated about the persisted counter, and the store is the only
+party that outlives the process — the cheapest place to make the promise
+unconditional is the one place that survives. The situations where an
+unconditional assignment would bite are precisely the ones nobody tests on
+purpose: a retried call whose first attempt was applied by the server but
+whose reply was lost (the clamp makes the replay a no-op instead of a
+regression), a future second caller, or a plain bug in a claim path. A
+clamp costs one comparison; an unconditional write saves nothing.
+
+Redis: `MULTI`/`EXEC` cannot express a compare-and-set, so decision 5's "one
+MULTI/EXEC transaction per call" is relaxed to **one atomic server-side step
+per call** — a Lua script via `EVAL`/`EVALSHA` doing the `SADD`/`SREM` and
+the compare-and-`SET` of `hammertime:agg:{shard}:seq` together, or an
+equivalent `WATCH`-based optimistic transaction. The keys, their shapes and
+the no-TTL rule are unchanged. `MemoryShardStateStore` is a `max` on a dict
+entry.
+
+What the clamp does **not** do: it is not a fence between two processes
+that both believe they own a shard. If a zombie owner and a new claimant
+both loaded the same `next_sequence` and both record transitions, they can
+still produce the same `event_id` for different transitions; the clamp only
+guarantees that whichever value ends up stored is the highest seen. Keeping
+a shard single-owner is the consumer group protocol's job and decision 1's
+"never mix static and group-managed members" rule, not the store's.
+
+Assumptions:
+
+* **Clamp, not reject.** A lower `sequence` could instead raise, forcing a
+  caller bug to surface. Rejected because the store cannot tell a replayed
+  call (harmless, must succeed) from a stale one (a bug), and failing the
+  replay would fail a transition that already happened.
+* **Membership is applied even for a stale `sequence`.** Using the sequence
+  as a fence for the HOT-set update would be a half-built split-brain
+  guard; the store has no fencing token and this ADR does not add one.
+* **`sequence < 0` is refused.** `schemas/hot_ip_event.v1.json` declares
+  `sequence` as an integer with `"minimum": 0`, so a negative value could
+  never be emitted and can only be a bug; `ValueError` at the store is
+  where it is cheapest to catch.
+* **The in-memory counter is unchanged.** Decision 4 step 1 stays a plain
+  `window.next_sequence += 1`; the clamp is only about what the store does
+  with the value it is handed.
+
+This item requires no change to shipped code (there is no store yet); it is
+binding on the `hammertime-store` brief and gives its `test-author` a
+testable statement for both implementations.
+
+### A3. `HAMMERTIME_SHARD_IDS=` (set but empty) is a configuration error; an empty static partition set is a `ValueError` at the bus
+
+Decision 1's `InMemoryBus` bullet originally read, in its first sentence
+(the rest of the bullet, about one live member per group, is unchanged):
+"`InMemoryBus` has one partition per topic: group-managed and static `{0}`
+both assign `{(topic, 0)}` immediately; any other static set is a
+`ValueError`." The bullet before it said, of group management, that the
+initial assignment "may be empty". Nothing said what an explicitly empty
+*static* set is — and
+the sentence quoted above was about `InMemoryBus` only, leaving
+`KafkaConsumer` with no rule at all. The two
+outcomes an implementer could pick are very different: a worker that
+silently claims nothing and reports ready, or one that refuses to start.
+
+Ruling: **refuse, at the earliest point.**
+
+* `parse_shard_ids("")` and `parse_shard_ids("   ")` raise `ValueError`;
+  `load_settings` lets that propagate naming `HAMMERTIME_SHARD_IDS`, so the
+  process exits 2 before any bus, store or socket is opened (ADR-0009
+  decision 2). An *unset* `HAMMERTIME_SHARD_IDS` still means `auto`; set
+  but empty does not. This is the pattern ingest's `load_settings` already
+  follows — `env.get(key, default)` hands a set-but-empty value to the
+  parser, which rejects it — so no new convention is introduced.
+* `Consumer.subscribe(topic, partitions=<empty iterable>)` raises
+  `ValueError` for every implementation (`MemoryConsumer`, `KafkaConsumer`),
+  before contacting any broker and without calling the listener. Decision
+  1's `InMemoryBus` sentence now says so explicitly; for `KafkaConsumer` it
+  means `assign([])` is never issued. An empty static set is not a way of
+  saying "nothing"; `partitions=None` is the only way of saying "let the
+  group decide".
+* A group-managed empty initial assignment is unchanged: ready, with
+  `WARNING event=no_shards_assigned` (decision 5, assumption 21).
+
+Why: the two empties are not the same thing. A group-managed empty
+assignment is a runtime outcome the operator did not write — the group has
+more members than partitions — and the next rebalance can change it, so a
+ready-but-idle member is the correct steady state. A static empty set is
+written configuration that no rebalance will ever change: the member would
+be idle for its whole life while `/readyz` reports it healthy, which is a
+silent misconfiguration of exactly the kind ADR-0009 decision 2 exists to
+refuse. It is also far more likely to be a templating accident (an unset
+variable interpolated into a compose or Kubernetes env block as `""`) than
+an intent, and static mode's purpose (assumption 2: pin a member to
+partitions) has no meaningful zero case.
+
+Assumptions:
+
+* **Whitespace-only counts as empty.** `strip()` before parsing; a value of
+  spaces is the same accident as an empty one.
+* **The rest of decision 1's grammar is untouched.** Tokens are `n` or
+  `lo-hi` (inclusive, `lo <= hi`), comma-separated; this amendment pins
+  only the empty case. Duplicates and overlapping ranges collapse into the
+  set and are not errors — that follows from the return type being a set,
+  not from a new rule.
+* **Refusal at the bus is defence in depth, not the operator-facing
+  check.** The settings parser is what an operator hits; the `subscribe`
+  rule exists so that no caller — a test, a future tool — can construct a
+  member that owns nothing by the static path.
+
+This item requires no change to shipped code (`MemoryConsumer.subscribe`
+and `KafkaConsumer.subscribe` do not yet take `partitions`; there is no
+`parse_shard_ids`); it is binding on the bus and aggregator briefs and on
+their `test-author`s.
