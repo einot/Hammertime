@@ -89,11 +89,14 @@ class ShardWindow:
         # a scan of the store.
         self._expiry_heap: list[tuple[int, int, Address]] = []
         self._expiry_scheduled: dict[Address, int] = {}
-        # Retention/capacity schedule, ordered by `last_seen`. An entry whose
-        # key no longer matches `entry.last_seen` is re-pushed with the current
-        # value when it surfaces, so each tracked IP keeps exactly one pending
-        # heap entry however often it is observed.
+        # Retention/capacity schedule, ordered by `last_seen`.
+        # `_last_seen_scheduled[ip]` is the key of that IP's one pending heap
+        # entry, so a tracked IP sits on the heap exactly once however often it
+        # is observed or re-evaluated. `last_seen` only grows, so a pending key
+        # can be stale; an entry whose key no longer matches `entry.last_seen`
+        # is re-pushed with the current value when it surfaces.
         self._last_seen_heap: list[tuple[int, int, Address]] = []
+        self._last_seen_scheduled: dict[Address, int] = {}
         now = clock.now()
         for ip in frozenset(inherited_hot):
             # Item A5: an inherited HOT IP is a tracked entry from
@@ -215,9 +218,11 @@ class ShardWindow:
         entry.state = state
         if state is IpState.COLD:
             entry.inherited = False
-            # A demoted IP is a retention candidate again, and its schedule
-            # entry may have been discarded while it was HOT.
-            self._push_last_seen(ip, entry)
+            # A demoted IP is a retention candidate again. Both sweepers set a
+            # HOT entry aside and push it back, so its pending schedule entry
+            # outlived the promotion; this only has to cover the case where it
+            # did not, and never adds a second entry for the same IP.
+            self._schedule_last_seen(ip, entry)
 
     def expire_due(self) -> list[WindowChange]:
         """Expire the buckets that left the window; one change per IP whose total dropped."""
@@ -264,9 +269,11 @@ class ShardWindow:
             entry = self._entries.get(ip)
             if entry is None:
                 heapq.heappop(self._last_seen_heap)
+                self._last_seen_scheduled.pop(ip, None)
                 continue
             if last_seen != entry.last_seen:
                 heapq.heapreplace(self._last_seen_heap, (entry.last_seen, tie_break, ip))
+                self._last_seen_scheduled[ip] = entry.last_seen
                 continue
             if last_seen > deadline:
                 break  # ordered by last_seen: nothing behind this one is due
@@ -329,15 +336,26 @@ class ShardWindow:
             inherited=inherited,
         )
         self._entries[ip] = entry
-        self._push_last_seen(ip, entry)
+        self._schedule_last_seen(ip, entry)
         return entry
 
     def _drop(self, ip: Address) -> None:
         """Remove an entry; its stale schedule entries are ignored lazily."""
         del self._entries[ip]
         self._expiry_scheduled.pop(ip, None)
+        self._last_seen_scheduled.pop(ip, None)
 
-    def _push_last_seen(self, ip: Address, entry: _Entry) -> None:
+    def _schedule_last_seen(self, ip: Address, entry: _Entry) -> None:
+        """Keep exactly one pending retention/capacity entry for `ip` on the heap.
+
+        `last_seen` only ever grows, so an already pending key is at or below
+        the entry's current value: it surfaces at or before the real deadline
+        and the sweepers re-push it with the current value. A second push would
+        buy nothing and could never be reclaimed while the IP stays tracked.
+        """
+        if ip in self._last_seen_scheduled:
+            return
+        self._last_seen_scheduled[ip] = entry.last_seen
         heapq.heappush(self._last_seen_heap, (entry.last_seen, next(self._tie_break), ip))
 
     def _schedule_expiry(self, ip: Address, entry: _Entry) -> None:
@@ -365,9 +383,11 @@ class ShardWindow:
             last_seen, tie_break, ip = heapq.heappop(self._last_seen_heap)
             entry = self._entries.get(ip)
             if entry is None:
+                self._last_seen_scheduled.pop(ip, None)
                 continue
             if last_seen != entry.last_seen:
                 heapq.heappush(self._last_seen_heap, (entry.last_seen, tie_break, ip))
+                self._last_seen_scheduled[ip] = entry.last_seen
                 continue
             if entry.state is IpState.HOT:
                 deferred.append((last_seen, tie_break, ip))
