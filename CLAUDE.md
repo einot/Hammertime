@@ -111,10 +111,11 @@ session may finish and merge PRs itself — resolving merge conflicts
 hand), pushing the resolution, and merging — without delegating that work.
 This does not extend to designing the change being merged, only to landing
 it. Before merging, the full suite must pass (`uv run pytest -q`, `ruff
-check`, `ruff format --check`, `mypy`); the known pre-existing `integration`
-CI gap (empty `tests/integration`/`tests/e2e`, tracked in #26) is the one
-standing exception until it's fixed — once it starts passing, hold every
-merge to that bar too.
+check`, `ruff format --check`, `mypy`). There is no longer a standing
+exception to that bar — the `integration` CI gap that used to be one is now
+handled as recorded under "Disabled CI coverage" below. Run those four
+commands so a failing one is actually visible: piping each to `tail` hides
+its exit status and will report a red gate as green.
 
 ## Branch protection
 
@@ -128,3 +129,33 @@ covers finishing/merging a PR, not committing straight to `master`.
 Branch-per-issue (or per-design-doc) is the established convention here —
 keep it that way even as issues get split, reconciled, or stacked on each
 other.
+
+## Disabled CI coverage
+
+Anything switched off in CI is recorded here together with the condition
+for switching it back on. Nothing gets disabled without an entry, and no
+entry is deleted until the thing is genuinely running again.
+
+**`integration` job — disabled, pending #26.** `.github/workflows/ci.yml`
+carries `if: false` on that job. It could never pass:
+`tests/integration` and `tests/e2e` contain no collectable tests (pytest
+exits 5), and three of the four services — aggregator, trie, detector —
+have no `def` or `class` outside their own test directories, so they
+crash-loop under `docker compose`. **No test is skipped or quarantined by
+this**: there are none in those directories to skip. A disabled job shows
+as skipped rather than green, so nothing claims to pass that does not.
+
+Re-enable when all three of these hold:
+
+1. aggregator, trie and detector are implemented and actually start under
+   `docker compose`.
+2. `test-author` has written real tests into `tests/integration` and
+   `tests/e2e`.
+3. The job's `docker compose up` step gains `--wait`. Without it the job
+   passes even when every container dies on startup, so restoring the job
+   unchanged would buy a green check that proves nothing.
+
+A guard step in the `check` job fails the build the moment either
+directory starts collecting tests, printing exactly what to turn back on.
+That tripwire, not this paragraph, is what makes the disable impossible to
+forget — so if you re-enable the job, delete the guard in the same change.
