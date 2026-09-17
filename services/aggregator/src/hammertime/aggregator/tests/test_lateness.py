@@ -41,9 +41,16 @@ Notes on what is and is not pinned:
 
 * At an age of exactly `window_seconds + allowed_lateness_seconds` (330 s
   with the shipped defaults) the observation is inside the horizon -- the
-  `LATE` test is strictly `>` -- so it falls through to the bucket check.
-  Whether it lands on `EXPIRED_BUCKET` or `APPLIED` depends on the bucket
-  arithmetic alone, and the tests below assert only that it is not `LATE`.
+  `LATE` test is strictly `>` -- so it falls through to the bucket check,
+  which it always fails. ADR-0011 Amendment 2 item A10 ratifies and
+  generalises that: for every config and every `now`, an age `>=
+  window_seconds` is `LATE` or `EXPIRED_BUCKET` and never `APPLIED`, and the
+  exact horizon is always `EXPIRED_BUCKET`. The tests below pin the exact
+  horizon to `EXPIRED_BUCKET` -- `TestExpiredBucket` parametrises `age` over
+  `[300, 301, 305, 310, 329, 330]`, and the `_expected` mirror the property
+  tests compare against returns `EXPIRED_BUCKET` at 330 for every sampled
+  config. (`TestLate.test_exactly_at_the_horizon_is_not_late` makes only the
+  weaker statement its name gives, which A10 subsumes.)
 * `_bucket_start` restates section 25's formula locally rather than
   importing a helper, so these tests depend on the arithmetic the spec fixes
   and not on a particular helper signature.
@@ -139,10 +146,10 @@ class TestObservationOutcomeEnum:
     def test_the_metric_labels_are_the_member_values(self) -> None:
         # Section 37: `late_messages{reason=late|future|expired_bucket}` and
         # `observations_rejected{reason=window_too_long|malformed}`.
-        assert ObservationOutcome.LATE == "late"
-        assert ObservationOutcome.FUTURE == "future"
-        assert ObservationOutcome.EXPIRED_BUCKET == "expired_bucket"
-        assert ObservationOutcome.WINDOW_TOO_LONG == "window_too_long"
+        assert ObservationOutcome.LATE.value == "late"
+        assert ObservationOutcome.FUTURE.value == "future"
+        assert ObservationOutcome.EXPIRED_BUCKET.value == "expired_bucket"
+        assert ObservationOutcome.WINDOW_TOO_LONG.value == "window_too_long"
 
 
 class TestApplied:

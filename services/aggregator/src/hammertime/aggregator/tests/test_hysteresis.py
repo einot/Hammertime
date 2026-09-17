@@ -200,9 +200,7 @@ def _counter(metrics: AggregatorMetrics, name: str, **labels: object) -> int:
     return metrics.get(name, **labels)
 
 
-def _seed(
-    window: ShardWindow, ip: Address, *, count: int, state: IpState, at: int = BASE
-) -> None:
+def _seed(window: ShardWindow, ip: Address, *, count: int, state: IpState, at: int = BASE) -> None:
     """Give `ip` a window total of `count` and a previous state of `state`."""
 
     assert window.observe(ip, at, count) is not None
@@ -324,7 +322,7 @@ class TestTheEmittedAddEvent:
         return bus, window, result
 
     async def test_exactly_one_record_keyed_by_the_ip(self) -> None:
-        bus, _window_, _result = await self._promote()
+        bus, _, _result = await self._promote()
 
         key, envelope = _only(bus)
 
@@ -333,7 +331,7 @@ class TestTheEmittedAddEvent:
         assert envelope.subject == str(IP_A)
 
     async def test_the_envelope_names_the_producing_shard_not_an_agent(self) -> None:
-        bus, _window_, _result = await self._promote()
+        bus, _, _result = await self._promote()
 
         _key, envelope = _only(bus)
 
@@ -346,7 +344,7 @@ class TestTheEmittedAddEvent:
         # Decision 4 step 3: `timestamp` is
         # `datetime.fromtimestamp(clock.now(), tz=UTC)`, and step 4 reuses
         # "the same timestamp" on the envelope.
-        bus, _window_, _result = await self._promote()
+        bus, _, _result = await self._promote()
 
         _key, envelope = _only(bus)
         payload = envelope.payload
@@ -357,7 +355,7 @@ class TestTheEmittedAddEvent:
         assert payload.timestamp == expected
 
     async def test_the_payload_carries_the_window_count_and_config_version(self) -> None:
-        bus, _window_, _result = await self._promote(count=1200)
+        bus, _, _result = await self._promote(count=1200)
 
         _key, envelope = _only(bus)
         payload = envelope.payload
@@ -372,7 +370,7 @@ class TestTheEmittedAddEvent:
         # Issue #48 / section 46.4: `weight` is `threshold_ratio(count,
         # config)`; 1200 requests against `hot_threshold` 1000 is 1200
         # thousandths of the threshold.
-        bus, _window_, _result = await self._promote(count=1200)
+        bus, _, _result = await self._promote(count=1200)
 
         _key, envelope = _only(bus)
         payload = envelope.payload
@@ -387,7 +385,7 @@ class TestTheEmittedAddEvent:
         # The same 600 requests are 1200 thousandths of a `hot_threshold` of
         # 500 -- the unit is thousandths *of the threshold*, not of 1000.
         config = _config(config_version=2, hot_threshold=500, cold_threshold=400)
-        bus, _window_, _result = await self._promote(count=600, config=config)
+        bus, _, _result = await self._promote(count=600, config=config)
 
         _key, envelope = _only(bus)
         payload = envelope.payload

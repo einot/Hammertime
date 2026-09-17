@@ -502,7 +502,7 @@ class TestMalformedObservations:
     async def test_a_subject_that_disagrees_with_the_entry_is_malformed(self) -> None:
         value = _observation(IP_A, 1200, subject=str(IP_B), window_start=BASE)
 
-        bus, metrics, outcome, window = await self._handle(key=str(IP_B), value=value)
+        bus, _, outcome, window = await self._handle(key=str(IP_B), value=value)
 
         assert outcome is ObservationOutcome.MALFORMED
         assert _records(bus, RECONCILIATION_TOPIC) == []

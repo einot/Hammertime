@@ -15,8 +15,10 @@ from the modules themselves.
 The two rules everything else follows from:
 
 * A bucket starting at `S` (a multiple of `bucket_seconds`) is live at `now`
-  iff `bucket_start(now) - S < window_seconds`; it leaves the window at
-  exactly `now = S + window_seconds` (section 5's ADR-0011 note).
+  iff `0 <= bucket_start(now) - S < window_seconds` -- a bucket that has not
+  started is not live (section 5's ADR-0011 note as amended by ADR-0011
+  Amendment 2, item A4); it leaves the window at exactly
+  `now = S + window_seconds`.
 * The total is a running total, maintained on every write and on every
   expiry, never recomputed by summing the ring (section 5).
 
@@ -33,11 +35,12 @@ spec:
 * `_bucket_start` is a local restatement of section 25's formula rather than
   an import, so these tests depend on the arithmetic the spec fixes and not
   on a particular helper signature.
-* Nothing here asserts whether an *inherited* HOT IP is also `is_tracked`
-  or counted by `tracked_count` at construction time: ADR-0011 decision 2
-  says an inherited IP has a state and an `inherited` flag, but never says
-  whether it occupies a store entry (and therefore a capacity slot) before
-  its first observation. That gap is reported rather than guessed at.
+* Whether an *inherited* HOT IP is also `is_tracked` and counted by
+  `tracked_count` at construction time was a gap in ADR-0011 decision 2 when
+  these tests were first written, and was reported rather than guessed at.
+  ADR-0011 Amendment 2, item A5 closed it: an inherited IP is a tracked entry
+  from construction, with `last_seen = clock.now()` at construction. That is
+  what `TestShardWindowWarmup` now pins.
 """
 
 from __future__ import annotations
@@ -199,8 +202,10 @@ class TestIpCounterObserve:
 
 
 class TestIpCounterLiveness:
-    """The boundary: live iff `bucket_start(now) - S < window_seconds`, so a
-    bucket leaves the window at exactly `now = S + window_seconds`."""
+    """The upper boundary: live iff `0 <= bucket_start(now) - S <
+    window_seconds` (ADR-0011 Amendment 2, item A4), so a bucket leaves the
+    window at exactly `now = S + window_seconds`. The lower bound -- a bucket
+    that has not started -- is `TestIpCounterFutureBucket` below."""
 
     def test_a_bucket_is_live_one_second_before_its_window_ends(self) -> None:
         assert _counter().is_live(BASE, BASE + WINDOW_SECONDS - 1) is True
@@ -229,6 +234,86 @@ class TestIpCounterLiveness:
     @pytest.mark.parametrize("age", [300, 301, 310, 1_000])
     def test_every_age_at_or_beyond_the_window_is_gone(self, age: int) -> None:
         assert _counter().is_live(BASE, BASE + age) is False
+
+
+class TestIpCounterFutureBucket:
+    """ADR-0011 Amendment 2, item A4: a bucket that has not started is not
+    live, and `observe` refuses it exactly as it refuses an expired one.
+
+    Why the lower bound exists: the slot of a future bucket
+    `S = bucket_start(now) + kB` (`1 <= k < N`) is the slot of `S - W`, which
+    *is* live, so admitting the write would evict a live bucket from the ring.
+    """
+
+    @pytest.mark.parametrize(
+        "ahead", [BUCKET_SECONDS, 2 * BUCKET_SECONDS, 150, WINDOW_SECONDS, 10_000]
+    )
+    def test_a_bucket_that_has_not_started_is_not_live(self, ahead: int) -> None:
+        assert _counter().is_live(BASE + ahead, BASE) is False
+
+    def test_the_bucket_before_a_bucket_starts_is_not_live_either(self) -> None:
+        # `bucket_start(BASE - 1) = BASE - BUCKET_SECONDS`, one bucket short of
+        # `BASE`, so `bucket_start(now) - S` is negative.
+        assert _counter().is_live(BASE, BASE - 1) is False
+        assert _counter().is_live(BASE, BASE) is True
+
+    def test_observe_refuses_a_future_bucket_and_changes_nothing(self) -> None:
+        counter = _counter()
+        counter.observe(BASE, 4, BASE)
+        assert counter.observe(BASE + BUCKET_SECONDS, 99, BASE) is False
+        assert counter.total == 4
+        assert counter.live_buckets(BASE) == ((BASE, 4),)
+        assert counter.next_expiry() == BASE + WINDOW_SECONDS
+
+    def test_a_refused_future_write_into_an_empty_counter_creates_nothing(self) -> None:
+        counter = _counter()
+        assert counter.observe(BASE + BUCKET_SECONDS, 99, BASE) is False
+        assert counter.total == 0
+        assert counter.live_buckets(BASE) == ()
+        assert counter.next_expiry() is None
+
+    def test_a_refused_future_write_leaves_the_live_bucket_sharing_its_slot(self) -> None:
+        # `BASE + BUCKET_SECONDS` shares its slot with `BASE + 10 - 300 =
+        # BASE - 290`, which is still live at `BASE`.
+        counter = _counter()
+        assert counter.observe(BASE - 290, 7, BASE) is True
+        assert counter.observe(BASE + BUCKET_SECONDS, 99, BASE) is False
+        assert counter.total == 7
+        assert counter.live_buckets(BASE) == ((BASE - 290, 7),)
+
+
+class TestIpCounterAlignment:
+    """ADR-0011 Amendment 2, item A9: `S % bucket_seconds != 0` is a
+    `ValueError` and changes nothing.
+
+    The caller floors (decision 3's worker step 3 floors with the target
+    window's own `bucket_seconds`), so an unaligned bucket start reaching the
+    counter is an in-process caller bug, not a property of a message --
+    `MALFORMED` stays reserved for the codec and ADR-0004's invariant.
+    """
+
+    @pytest.mark.parametrize("offset", [1, 5, 9])
+    def test_an_unaligned_bucket_start_is_a_value_error(self, offset: int) -> None:
+        counter = _counter()
+        with pytest.raises(ValueError):
+            counter.observe(BASE + offset, 5, BASE)
+
+    def test_an_unaligned_write_leaves_the_counter_untouched(self) -> None:
+        counter = _counter()
+        counter.observe(BASE, 4, BASE)
+        with pytest.raises(ValueError):
+            counter.observe(BASE + 1, 99, BASE)
+        assert counter.total == 4
+        assert counter.live_buckets(BASE) == ((BASE, 4),)
+        assert counter.next_expiry() == BASE + WINDOW_SECONDS
+
+    def test_an_unaligned_write_into_an_empty_counter_creates_nothing(self) -> None:
+        counter = _counter()
+        with pytest.raises(ValueError):
+            counter.observe(BASE + 1, 5, BASE)
+        assert counter.total == 0
+        assert counter.live_buckets(BASE) == ()
+        assert counter.next_expiry() is None
 
 
 class TestIpCounterOutOfOrder:
@@ -492,6 +577,82 @@ class TestShardWindowObserve:
         assert window.observe(IP_A, BASE, 99) is None
         assert window.total(IP_A) == 5
 
+    def test_an_observation_into_a_future_bucket_is_refused(self) -> None:
+        # Amendment 2, item A4: "not live (past or future)" -> `None`, with no
+        # entry created and no `last_seen` refresh.
+        window = _window(clock=ManualClock(initial=BASE))
+        assert window.observe(IP_A, BASE + BUCKET_SECONDS, 5) is None
+        assert window.is_tracked(IP_A) is False
+        assert window.tracked_count == 0
+        assert window.total(IP_A) == 0
+
+    def test_a_refused_future_observation_does_not_refresh_last_seen(self) -> None:
+        # Amendment 2, item A4. `last_seen` is only observable through
+        # retention, so the deadline is what pins it: it stays `BASE`, not the
+        # future bucket start the store refused.
+        clock = ManualClock(initial=BASE)
+        window = _window(clock=clock)
+        window.observe(IP_A, BASE, 5)
+        assert window.observe(IP_A, BASE + BUCKET_SECONDS, 99) is None
+        assert window.total(IP_A) == 5
+        clock.advance(600)
+        window.expire_due()
+        assert window.evict_due() == 1
+        assert window.is_tracked(IP_A) is False
+
+    def test_an_unaligned_bucket_start_is_a_value_error(self) -> None:
+        # Amendment 2, item A9: the worker floors with the target window's own
+        # `bucket_seconds`, so the store always receives an aligned bucket;
+        # anything else is a caller bug.
+        window = _window(clock=ManualClock(initial=BASE))
+        with pytest.raises(ValueError):
+            window.observe(IP_A, BASE + 1, 5)
+        assert window.is_tracked(IP_A) is False
+        assert window.tracked_count == 0
+        assert window.total(IP_A) == 0
+
+    def test_an_unaligned_observation_leaves_an_existing_entry_untouched(self) -> None:
+        # Amendment 2, item A9.
+        window = _window(clock=ManualClock(initial=BASE))
+        window.observe(IP_A, BASE, 5)
+        with pytest.raises(ValueError):
+            window.observe(IP_A, BASE + 1, 99)
+        assert window.total(IP_A) == 5
+        assert window.tracked_count == 1
+        assert window.state(IP_A) is IpState.COLD
+
+    def test_a_zero_delta_on_an_untracked_ip_returns_a_change(self) -> None:
+        # Amendment 2, item A8: a zero delta is an ordinary applied
+        # observation. It creates the entry and returns a `WindowChange` --
+        # `None` is reserved for "the bucket is not live".
+        window = _window(clock=ManualClock(initial=BASE))
+        change = window.observe(IP_A, BASE, 0)
+        assert change == WindowChange(ip=IP_A, state=IpState.COLD, total_before=0, total_after=0)
+        assert window.is_tracked(IP_A) is True
+        assert window.tracked_count == 1
+        assert window.total(IP_A) == 0
+
+    def test_an_observation_into_a_stale_slot_lowers_the_total(self) -> None:
+        # Amendment 2, item A11: `observe` subtracts the slot's previous
+        # occupant -- always a bucket that has already left the window -- so
+        # `total_after < total_before` is reachable with a non-negative delta,
+        # without any sweep having run. `BASE + WINDOW_SECONDS` shares `BASE`'s
+        # slot: `(S // B) % N` is unchanged by one whole window.
+        clock = ManualClock(initial=BASE)
+        window = _window(clock=clock)
+        window.observe(IP_A, BASE, 5)
+        clock.advance(WINDOW_SECONDS)
+
+        change = window.observe(IP_A, BASE + WINDOW_SECONDS, 1)
+
+        assert change is not None
+        assert change.ip == IP_A
+        assert change.state is IpState.COLD
+        assert change.total_before == 5
+        assert change.total_after == 1
+        assert change.total_after < change.total_before
+        assert window.total(IP_A) == 1
+
 
 class TestShardWindowExpiry:
     """`expire_due()` -- one `WindowChange` per IP whose total dropped."""
@@ -549,8 +710,9 @@ class TestShardWindowExpiry:
 
 
 class TestShardWindowRetention:
-    """Section 26: a COLD IP with an empty window is evicted once
-    `last_seen + state_retention_seconds <= now`; a HOT IP never is."""
+    """Section 26: a COLD IP is evicted once `last_seen +
+    state_retention_seconds <= now`, whatever its running total says (ADR-0011
+    Amendment 2, item A6); a HOT IP never is."""
 
     def test_a_cold_idle_ip_survives_until_the_retention_deadline(self) -> None:
         clock = ManualClock(initial=BASE)
@@ -594,6 +756,24 @@ class TestShardWindowRetention:
         assert window.is_tracked(IP_A) is False
         assert window.is_tracked(IP_B) is True
         assert window.hot_ips() == frozenset({IP_B})
+
+    def test_eviction_needs_no_preceding_expiry_sweep(self) -> None:
+        # Amendment 2, item A6: `evict_due()` is self-sufficient. The running
+        # total is not part of the retention test, so an IP whose buckets have
+        # left the window but whose sweep has not run is still evicted at the
+        # deadline. (Decision 6's order -- expire, warm-up, evict -- stays
+        # normative for a different reason: a HOT IP must be expired *and*
+        # evaluated in the sweep that empties it.)
+        clock = ManualClock(initial=BASE)
+        window = _window(clock=clock)
+        window.observe(IP_A, BASE, 5)
+        clock.advance(600)
+
+        assert window.evict_due() == 1
+
+        assert window.is_tracked(IP_A) is False
+        assert window.tracked_count == 0
+        assert window.total(IP_A) == 0
 
     def test_a_fresh_observation_postpones_the_deadline(self) -> None:
         clock = ManualClock(initial=BASE)
@@ -671,6 +851,37 @@ class TestShardWindowWarmup:
         assert window.is_inherited(IP_A) is True
         assert window.hot_ips() == frozenset({IP_A, IP_B})
         assert window.total(IP_A) == 0
+
+    def test_an_inherited_ip_is_a_tracked_entry_from_construction(self) -> None:
+        # Amendment 2, item A5: an inherited IP occupies a store entry (and so
+        # a `max_tracked_ips` slot) from construction, but its total is 0 until
+        # its first applied observation, so it is tracked and not active.
+        clock = ManualClock(initial=BASE)
+        window = _window(clock=clock, inherited_hot=(IP_A, IP_B))
+        assert window.tracked_count == 2
+        assert window.is_tracked(IP_A) is True
+        assert window.is_tracked(IP_B) is True
+        assert window.tracked_ips() == frozenset({IP_A, IP_B})
+        assert window.active_count == 0
+
+    def test_an_inherited_ips_retention_runs_from_the_claim(self) -> None:
+        # Amendment 2, item A5: `last_seen` is `clock.now()` at construction --
+        # the moment the process last knew the IP mattered -- and `set_state`
+        # does not touch it. A demoted inherited IP is therefore evictable
+        # `state_retention_seconds` after the claim, the same deadline an IP
+        # observed at claim time would get.
+        clock = ManualClock(initial=BASE)
+        window = _window(clock=clock, inherited_hot=(IP_A,))
+        clock.advance(WINDOW_SECONDS)
+        window.set_state(IP_A, IpState.COLD)
+
+        clock.advance(299)  # BASE + 599
+        assert window.evict_due() == 0
+        assert window.is_tracked(IP_A) is True
+
+        clock.advance(1)  # BASE + 600
+        assert window.evict_due() == 1
+        assert window.is_tracked(IP_A) is False
 
     def test_warm_until_is_one_window_after_the_claim(self) -> None:
         clock = ManualClock(initial=BASE)
