@@ -117,7 +117,7 @@ HAMMERTIME_DETECTOR_BIND=127.0.0.1:0    HAMMERTIME_AGGREGATOR_BIND=127.0.0.1:0
 HAMMERTIME_INGEST_RATE_LIMIT_RPS=100000
 HAMMERTIME_INGEST_OBSERVATION_RATE_LIMIT_EPS=1000000
 HAMMERTIME_INGEST_OBSERVATION_BURST=1000000
-HAMMERTIME_SHARD_COUNT=1       HAMMERTIME_SHARD_IDS=0
+HAMMERTIME_SHARD_IDS=0         (static: the memory bus's only partition, ADR-0011)
 HAMMERTIME_TRIE_SNAPSHOT_DIR=<tmp_path>/snapshots
 HAMMERTIME_TRIE_SNAPSHOT_INTERVAL_S=1000000
 HAMMERTIME_CONFIG_POLL_INTERVAL_S=1000000
@@ -154,10 +154,14 @@ strings.
 * An observation's whole `request_count` lands in the bucket containing its
   `window_start` (ADR-0010 decision 6). `window_start` must be a multiple of
   `bucket_seconds` (protocol).
-* The aggregator judges lateness against the shared clock: an observation is
-  counted iff `0 <= now - window_start <= window_seconds + allowed_lateness_seconds`
-  (= 330 s); otherwise it is published to
-  `hammertime.observations-reconciliation.v1` and not counted (ADR-0002).
+* The aggregator judges lateness against the shared clock (ADR-0002,
+  ADR-0011): an observation is counted iff
+  `0 <= now - window_start <= window_seconds + allowed_lateness_seconds`
+  (= 330 s) *and* its bucket is still live (`bucket_start(now) -
+  window_start < window_seconds`); otherwise it is published to
+  `hammertime.observations-reconciliation.v1` and not counted. Scenarios only
+  ever post observations that are either current or far past the horizon,
+  never in the 300-330 s band where the two conditions differ.
 * A bucket starting at `S` has certainly left the window once
   `now >= S + window_seconds + bucket_seconds`. Scenarios advance by at least
   310 s past the newest relevant `window_start` and never probe the exact
