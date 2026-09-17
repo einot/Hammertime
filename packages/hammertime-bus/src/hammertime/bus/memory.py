@@ -10,7 +10,7 @@ real Kafka transport for this one without changing calling code.
 
 import asyncio
 from collections import defaultdict
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 
 from hammertime.bus.interface import AssignmentListener, ConsumedMessage, static_partitions
@@ -98,6 +98,7 @@ class MemoryConsumer:
         self._bus = bus
         self._group_id = group_id
         self._positions: dict[str, int] = {}
+        self._subscribed: set[str] = set()
 
     def _position(self, topic: str) -> int:
         if topic not in self._positions:
@@ -125,6 +126,7 @@ class MemoryConsumer:
         -- a rejected static set never reports a claim at all.
         """
         assignment = self._assignment(topic, partitions)
+        self._subscribed.add(topic)
         if listener is not None:
             await listener.on_assigned(assignment)
         return self._consume(topic)
@@ -161,6 +163,38 @@ class MemoryConsumer:
         del partition
         self._positions[topic] = offset
 
-    async def commit(self) -> None:
-        for topic, offset in self._positions.items():
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None:
+        """Write read positions back to the bus for this consumer's group.
+
+        With no argument every topic this consumer has read from is committed
+        at its *consumed* position -- unchanged behaviour.
+
+        With `offsets` exactly the given `(topic, partition) -> next offset to
+        read` pairs are committed, and nothing else: the consumed positions in
+        `_positions` are neither written nor disturbed, so a caller may commit
+        a handled position that lags the message it already holds (ADR-0011
+        amendment 6, item A20). An empty mapping commits nothing.
+
+        A partition this consumer does not hold is a `ValueError`: every
+        `InMemoryBus` topic has the single partition 0, and a topic that was
+        never subscribed was never claimed. The whole mapping is checked
+        before any of it is written, so a rejected call commits none of it.
+        """
+        if offsets is None:
+            for topic, offset in self._positions.items():
+                self._bus._set_committed_offset(topic, self._group_id, offset)
+            return
+        for topic, partition in offsets:
+            self._require_held(topic, partition)
+        for (topic, _partition), offset in offsets.items():
             self._bus._set_committed_offset(topic, self._group_id, offset)
+
+    def _require_held(self, topic: str, partition: int) -> None:
+        """Reject a `(topic, partition)` this consumer has not claimed."""
+        if partition != 0:
+            raise ValueError(
+                f"InMemoryBus has one partition per topic; cannot commit "
+                f"partition {partition} of {topic!r}"
+            )
+        if topic not in self._subscribed:
+            raise ValueError(f"cannot commit {topic!r}: this consumer is not subscribed to it")

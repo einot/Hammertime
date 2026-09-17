@@ -8,7 +8,7 @@ there are no unit tests here by design.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
@@ -243,7 +243,33 @@ class KafkaConsumer:
             raise RuntimeError("KafkaConsumer.seek() requires an active subscription")
         self._client.seek(TopicPartition(topic, partition), offset)
 
-    async def commit(self) -> None:
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None:
+        """Commit this group's offsets, either the consumed ones or `offsets`.
+
+        With no argument aiokafka commits the consumed position of every
+        assigned partition -- unchanged behaviour.
+
+        With `offsets` exactly the given `(topic, partition) -> next offset to
+        read` pairs are committed. aiokafka's explicit-commit convention is
+        the same one: the value is the offset of the next record to read, the
+        last handled `offset + 1` (ADR-0011 amendment 6, item A20). A
+        partition this consumer is not assigned raises aiokafka's
+        `IllegalStateError`, which is left to propagate.
+
+        An empty mapping returns before the client is touched at all, so no
+        commit request reaches the broker and an unstarted consumer is not an
+        error -- there is nothing to commit and nothing to fail on.
+        """
+        if offsets is not None and not offsets:
+            return
         if self._client is None:
             raise RuntimeError("KafkaConsumer.commit() requires an active subscription")
-        await self._client.commit()
+        if offsets is None:
+            await self._client.commit()
+            return
+        await self._client.commit(
+            {
+                TopicPartition(topic, partition): offset
+                for (topic, partition), offset in offsets.items()
+            }
+        )
