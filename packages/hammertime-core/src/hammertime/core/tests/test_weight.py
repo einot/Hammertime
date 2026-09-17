@@ -57,8 +57,8 @@ REGISTRY_WEIGHT_MAX = 1_000_000
 class TestSpecAnchorValues:
     """Section 46.4's own worked equivalences:
 
-        weight = 1000   <=>   window count exactly at hot_threshold
-        weight = 2500   <=>   window count 2.5x hot_threshold
+    weight = 1000   <=>   window count exactly at hot_threshold
+    weight = 2500   <=>   window count 2.5x hot_threshold
     """
 
     def test_count_exactly_at_the_default_hot_threshold_is_one_thousand(self) -> None:
