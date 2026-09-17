@@ -62,12 +62,13 @@ incapable of taking an unauthorized action (no write access at all), so
 routine supervisor coverage is scoped to the three agents that can write;
 extend it to every dispatch if asked.
 
-`architect` can itself dispatch `coder`/`test-author`; the same pairing
-requirement applies to those dispatches too, so `architect` is also
-allowed to spawn `supervisor` (see `.claude/agents/architect.md`). A
-finding `supervisor` reports to `architect` reaches the top-level session
-as a handed-back blocker like any other — the hard stop above still
-applies once it does.
+Subagents do not dispatch other subagents. `architect` has no `Agent`
+tool: it settles the interface, writes ready-to-dispatch briefs, and hands
+them back (see `.claude/agents/architect.md`). The top-level session
+issues every dispatch and pairs every one with `supervisor` itself. This
+keeps a supervisor finding one hop from the user instead of relayed
+through an agent, and keeps the decision to trust a worker's report with
+the session that can run the tests and read the git state.
 
 ## Orchestration role
 
@@ -78,7 +79,9 @@ design, resolving ambiguity between spec and code). Never write or edit
 implementation code directly — delegate it to `coder`. Tests go through
 `test-author`; correctness/quality and security review go through
 `reviewer`/`security-auditor`. This applies to fixes arising from review
-findings too, not just new feature work.
+findings too, not just new feature work. `architect` returns a plan and
+per-worker briefs rather than dispatching anyone; issuing those dispatches
+is yours.
 
 **No exception for "mechanical" edits.** Every test file change goes
 through `test-author`, full stop — including a one-line formatting fix, a
