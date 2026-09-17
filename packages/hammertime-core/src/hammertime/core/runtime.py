@@ -59,6 +59,7 @@ RETRY_MAX_DELAY_S = 5.0
 # --- the service contract (decision 3) --------------------------------------
 
 
+@runtime_checkable
 class Service(Protocol):
     """What `run_service` needs from a service, and nothing more."""
 

@@ -17,7 +17,8 @@ unwinding, which is what `app.state.readiness` records and what
 `/readyz` -- and the 503 gate on the ingestion endpoint -- report. The two
 connections it makes (Redis, Kafka) are retried with backoff under the
 startup deadline, because `depends_on` in the compose file orders
-container start but not broker readiness (decision 5 step 5).
+container start but not broker readiness (decision 5 step 5). A rejected
+credential is not that kind of failure and fails the start at once.
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -53,19 +54,53 @@ from hammertime.store.interface import DedupStore
 from hammertime.store.memory import MemoryDedupStore
 from hammertime.store.redis import RedisDedupStore
 from redis.asyncio import Redis
+from redis.exceptions import AuthenticationError as RedisAuthenticationError
+from redis.exceptions import AuthorizationError as RedisAuthorizationError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 #: Failures that mean "the dependency is not up *yet*" and are worth
-#: retrying under the startup deadline (ADR-0009 decision 5). Anything else
-#: -- a bad URL, an auth failure, a protocol error -- is non-transient and
+#: retrying under the startup deadline (ADR-0009 decision 5). A failure of
+#: any other type -- a bad URL, a protocol error -- is non-transient and
 #: fails the start immediately rather than being retried for 60 seconds.
 _TRANSIENT_STORE_ERRORS: tuple[type[BaseException], ...] = (
     OSError,
     RedisConnectionError,
     RedisTimeoutError,
 )
+
+#: The bus needs no counterpart to `_PERMANENT_STORE_ERRORS` below:
+#: aiokafka raises its authentication failures (`AuthenticationFailedError`,
+#: `UnsupportedSaslMechanismError`, ...) as plain `KafkaError`s, none of
+#: which is or subclasses `KafkaConnectionError`.
 _TRANSIENT_BUS_ERRORS: tuple[type[BaseException], ...] = (OSError, KafkaConnectionError)
+
+#: Type alone is not enough on the store side: redis-py reports a rejected
+#: credential as `AuthenticationError`/`AuthorizationError`, both
+#: *subclasses* of `redis.exceptions.ConnectionError`, so listing
+#: `RedisConnectionError` above as transient sweeps them in too.
+#: `connect_with_retry` classifies strictly by `isinstance` against its
+#: `transient` tuple and offers no exclusions (ADR-0009 Amendment 1 item
+#: A1), so the distinction is drawn here instead, in the callable passed to
+#: it: `ping_store` re-raises these as `DependencyAuthenticationError`,
+#: which matches no transient tuple and so propagates on the first attempt.
+#: Everything else redis-py raises keeps its existing classification -- a
+#: store that is still starting is still retried on the usual schedule.
+_PERMANENT_STORE_ERRORS: tuple[type[BaseException], ...] = (
+    RedisAuthenticationError,
+    RedisAuthorizationError,
+)
+
+
+class DependencyAuthenticationError(Exception):
+    """A dependency rejected the credentials this process was configured with.
+
+    Raised in place of the driver's own authentication error when that error
+    is indistinguishable by type from "not up yet" (see
+    `_PERMANENT_STORE_ERRORS`). Presenting a wrong password once a second
+    for the whole startup deadline helps no operator, so this is not
+    retried; the driver's own exception is kept as the `__cause__`.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +212,13 @@ def create_app(
             async def ping_store() -> None:
                 # `Redis.from_url` connects lazily, so this round trip is
                 # what "dedup store reachable" in decision 4 actually means.
-                await client.ping()
+                try:
+                    await client.ping()
+                except _PERMANENT_STORE_ERRORS as exc:
+                    # Never include the URL: it carries the password.
+                    raise DependencyAuthenticationError(
+                        f"store rejected the configured credentials: {exc}"
+                    ) from exc
 
             await connect_with_retry("store", ping_store, transient=_TRANSIENT_STORE_ERRORS)
             resolved_dedup_store = RedisDedupStore(redis_client)
