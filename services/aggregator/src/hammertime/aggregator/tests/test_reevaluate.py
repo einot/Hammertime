@@ -36,7 +36,10 @@ not the meaning of the assertions:
    `Callable[[DetectionConfig], Awaitable[None]]` hook that poller calls.
    `AggregatorService.reload_config()` is one `poll_once()` of that poller
    and returns the poller's `current`, so the gate is asserted here through a
-   poller wired the way `reload_config()` wires one (`TestTheVersionGate`).
+   poller wired the way `reload_config()` wires one (`TestTheVersionGate`),
+   and the absence of a second gate inside `apply_config` is asserted by
+   calling the worker's method directly with a version that is equal to, and
+   then lower than, the one in force (`TestApplyConfigComparesNoVersions`).
 2. `reevaluate_shard`'s `int` return is the number of transitions the pass
    emitted -- the `transitions` field of the worker's own
    `config_reevaluated` log record (decision 8, renamed by A12). It is *not*
@@ -483,6 +486,128 @@ class TestTheVersionGate:
             assert worker.config.weight_max == 5000
             assert _records(bus) == []
             assert _window_of(worker).total(IP_A) == 600
+
+
+class TestApplyConfigComparesNoVersions:
+    """A12, the other half: `AggregatorWorker.apply_config` is *unconditional*.
+
+    `TestTheVersionGate` above covers the gate where A12 puts it --
+    `ConfigPoller.poll_once()`. These tests cover the seam A12 says has no gate
+    at all: the worker's own method "compares no versions", so a direct caller
+    (a test, a tool) passing the version already in force, or a strictly lower
+    one, gets it applied -- thresholds adopted at the worker and the
+    re-evaluation pass run. Nothing here goes through a poller.
+
+    Each test would fail against an `apply_config` that kept a version
+    comparison of its own: a gated implementation would skip the pass, leaving
+    the bus empty and `worker.config` where it was, and every assertion below
+    about emitted transitions and about the version/thresholds in force
+    afterwards is written to catch exactly that.
+    """
+
+    async def test_reapplying_the_version_in_force_runs_the_pass_again(self) -> None:
+        # A12's assumption: "a direct caller re-applying the version in force is
+        # a useful way to force a full re-evaluation pass (nothing else exposes
+        # one)". `observe` moves counts without evaluating hysteresis, so 1200
+        # against v1's `hot_threshold` of 1000 is a promotion that only the
+        # forced pass can make.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        async with _running(_worker(bus=bus, clock=clock, state_store=state_store)) as worker:
+            window = _window_of(worker)
+            assert window.observe(IP_A, BASE, 1200) is not None
+            assert window.hot_count == 0
+            assert _records(bus) == []
+            assert worker.config.config_version == 1
+
+            # The exact `DetectionConfig` already in force, applied again.
+            await worker.apply_config(V1)
+
+            decoded = _decoded(bus)
+            assert [envelope.event_type for _key, envelope in decoded] == ["HotIpAdded"]
+            assert decoded[0][1].subject == str(IP_A)
+            assert decoded[0][1].config_version == 1
+            assert window.hot_count == 1
+            assert (await state_store.load(0)).hot_ips == frozenset({IP_A})
+            assert worker.config.config_version == 1
+
+    async def test_reapplying_the_version_in_force_demotes_drifted_state(self) -> None:
+        # The other direction of the same forced pass: `set_state` marks IP_B
+        # HOT without emitting anything, and 600 is below v1's `cold_threshold`
+        # of 800, so re-applying v1 demotes it.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        async with _running(_worker(bus=bus, clock=clock)) as worker:
+            window = _window_of(worker)
+            assert window.observe(IP_B, BASE, 600) is not None
+            window.set_state(IP_B, IpState.HOT)
+            assert window.hot_count == 1
+            assert _records(bus) == []
+
+            await worker.apply_config(V1)
+
+            decoded = _decoded(bus)
+            assert [envelope.event_type for _key, envelope in decoded] == ["HotIpRemoved"]
+            assert decoded[0][1].subject == str(IP_B)
+            assert decoded[0][1].config_version == 1
+            assert window.hot_count == 0
+            assert worker.config.config_version == 1
+
+    async def test_a_strictly_lower_version_is_applied_at_the_worker(self) -> None:
+        # The inverse of `test_a_lower_version_is_ignored` above: the same
+        # v3 -> v2 step, handed to the worker instead of published for the
+        # poller. The gate is the poller's, so here v2 takes effect -- its
+        # thresholds become the ones in force and the pass promotes under them.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        async with _running(_worker(bus=bus, clock=clock, state_store=state_store)) as worker:
+            window = _window_of(worker)
+            _seed(window, IPS, 600)
+            await worker.apply_config(V3)
+            assert worker.config.config_version == 3
+            # v3 restates v1's thresholds, so putting it in force emits nothing.
+            assert _records(bus) == []
+
+            await worker.apply_config(V2)
+
+            assert worker.config.config_version == 2
+            assert worker.config.hot_threshold == 500
+            assert window.config.hot_threshold == 500
+            decoded = _decoded(bus)
+            assert len(decoded) == 32
+            assert {envelope.subject for _key, envelope in decoded} == {str(ip) for ip in IPS}
+            for _key, envelope in decoded:
+                assert envelope.event_type == "HotIpAdded"
+                assert envelope.config_version == 2
+            assert window.hot_count == 32
+            assert (await state_store.load(0)).hot_ips == frozenset(IPS)
+
+    async def test_the_same_version_with_new_thresholds_is_applied_at_the_worker(self) -> None:
+        # The worker-level inverse of the equal-version test above: through the
+        # poller that document is dropped, but handed straight to
+        # `apply_config` its thresholds become the ones in force and the pass
+        # runs under them.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        async with _running(_worker(bus=bus, clock=clock)) as worker:
+            window = _window_of(worker)
+            _seed(window, IPS, 600)
+
+            await worker.apply_config(
+                _config(config_version=1, hot_threshold=100, cold_threshold=50)
+            )
+
+            assert worker.config.config_version == 1
+            assert worker.config.hot_threshold == 100
+            assert window.config.hot_threshold == 100
+            decoded = _decoded(bus)
+            assert len(decoded) == 32
+            for _key, envelope in decoded:
+                assert envelope.event_type == "HotIpAdded"
+                assert envelope.config_version == 1
+            assert window.hot_count == 32
 
 
 class TestGeometryChanges:
