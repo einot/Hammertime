@@ -16,6 +16,20 @@ log per topic, with each consumer group tracking its own read position;
 `commit()` persists that position so a fresh `Consumer` for the same group
 resumes rather than re-reading from the start of the log.
 
+`Consumer.commit` also takes an optional explicit mapping (ADR-0011
+decision 1, as Amendment 6 item A20 rewrote it):
+
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None
+
+With `offsets`, exactly the given `(topic, partition) -> next offset to
+read` pairs are committed -- those partitions only, at those offsets,
+nothing else; an empty mapping is a no-op that returns normally; a
+partition this consumer does not hold is a `ValueError` from
+`MemoryConsumer` (a partition other than `0`, or a topic it has not
+subscribed). `commit()` with no argument keeps its original meaning, the
+*consumed* position, which is what every other test in this file uses.
+`TestCommitWithExplicitOffsets` below is written from that bullet alone.
+
 Since a live `subscribe()` iterator blocks waiting for the next message
 (matching real broker semantics), these tests only ever read exactly as
 many messages as were published, then stop -- they never iterate past the
@@ -24,10 +38,14 @@ end of a bounded publish burst.
 
 from __future__ import annotations
 
-from hammertime.bus.interface import ConsumedMessage
+import pytest
+from hammertime.bus.interface import ConsumedMessage, Consumer
 from hammertime.bus.memory import InMemoryBus
 
 TOPIC = "test.topic.v1"
+# A topic no consumer below ever subscribes to: the second half of A20's
+# "a partition this consumer does not hold is an error".
+OTHER_TOPIC = "test.other.v1"
 
 
 async def _read_n(bus: InMemoryBus, group_id: str, topic: str, n: int) -> list[ConsumedMessage]:
@@ -179,3 +197,117 @@ class TestCommitAndReconnect:
             break
 
         assert resumed[0].value == b"first"  # crash before commit -> redelivered from the start
+
+
+class TestCommitWithExplicitOffsets:
+    """ADR-0011 decision 1's `commit(offsets)` bullet, added by Amendment 6
+    item A20.
+
+    A commit may now name the position it commits, so a consumer can commit
+    the position after the last message it *handled* instead of the one after
+    the last message it *fetched*. The aggregator needs exactly that: a
+    message fetched and not yet handled when a claim is revoked must stay in
+    the log for the partition's next owner (A20). Offsets are the "next offset
+    to read", i.e. the last handled `offset + 1`.
+
+    Offsets are learned by reading the log rather than assumed to be 0-based,
+    the way `TestSeek` above already does.
+    """
+
+    async def _publish_three(self, bus: InMemoryBus) -> None:
+        producer = bus.producer()
+        await producer.publish(TOPIC, key="k1", value=b"first")
+        await producer.publish(TOPIC, key="k2", value=b"second")
+        await producer.publish(TOPIC, key="k3", value=b"third")
+
+    async def _drain(self, consumer: Consumer, topic: str, n: int) -> list[ConsumedMessage]:
+        """Read exactly `n` messages on an *existing* consumer, then stop."""
+
+        read: list[ConsumedMessage] = []
+        async for message in await consumer.subscribe(topic):
+            read.append(message)
+            if len(read) == n:
+                break
+        return read
+
+    async def test_an_explicit_offset_is_what_a_fresh_consumer_resumes_at(self) -> None:
+        # "exactly the pairs given -- those partitions only, at those offsets":
+        # the committing consumer had read the whole log, and the commit still
+        # names only the position after the first message.
+        bus = InMemoryBus()
+        await self._publish_three(bus)
+        group = "explicit-offset"
+        consumer = bus.consumer(group)
+        read = await self._drain(consumer, TOPIC, 3)
+
+        await consumer.commit({(TOPIC, read[0].partition): read[0].offset + 1})
+
+        resumed = await _read_n(bus, group, TOPIC, 1)
+        assert resumed[0].value == b"second"
+
+    async def test_an_empty_mapping_commits_nothing(self) -> None:
+        # "An empty mapping is a no-op that returns normally": the position
+        # the previous commit left stands, even though the consumer has read
+        # further since.
+        bus = InMemoryBus()
+        await self._publish_three(bus)
+        group = "empty-mapping"
+        consumer = bus.consumer(group)
+        await self._drain(consumer, TOPIC, 1)
+        await consumer.commit()  # committed: after "first"
+        await self._drain(consumer, TOPIC, 2)  # read "second" and "third"
+
+        await consumer.commit({})
+
+        resumed = await _read_n(bus, group, TOPIC, 1)
+        assert resumed[0].value == b"second"
+
+    async def test_a_partition_other_than_zero_is_a_value_error(self) -> None:
+        # `InMemoryBus` has one partition per topic, so partition 1 is a
+        # partition this consumer does not hold.
+        bus = InMemoryBus()
+        await self._publish_three(bus)
+        consumer = bus.consumer("bad-partition")
+        read = await self._drain(consumer, TOPIC, 1)
+
+        with pytest.raises(ValueError):
+            await consumer.commit({(TOPIC, 1): read[0].offset + 1})
+
+    async def test_a_topic_this_consumer_has_not_subscribed_is_a_value_error(self) -> None:
+        bus = InMemoryBus()
+        await self._publish_three(bus)
+        consumer = bus.consumer("bad-topic")
+        read = await self._drain(consumer, TOPIC, 1)
+
+        with pytest.raises(ValueError):
+            await consumer.commit({(OTHER_TOPIC, 0): read[0].offset + 1})
+
+    async def test_a_rejected_commit_commits_nothing(self) -> None:
+        # "raise `ValueError` and commit nothing": the group's committed
+        # position is the one the last accepted commit left.
+        bus = InMemoryBus()
+        await self._publish_three(bus)
+        group = "rejected-commit"
+        consumer = bus.consumer(group)
+        read = await self._drain(consumer, TOPIC, 2)
+        await consumer.commit({(TOPIC, read[0].partition): read[0].offset + 1})
+
+        with pytest.raises(ValueError):
+            await consumer.commit({(TOPIC, 1): read[1].offset + 1})
+
+        resumed = await _read_n(bus, group, TOPIC, 1)
+        assert resumed[0].value == b"second"
+
+    async def test_commit_with_no_argument_still_commits_the_consumed_position(self) -> None:
+        # The `None` half of the same bullet: unchanged, and still the
+        # position after every message this consumer has been handed.
+        bus = InMemoryBus()
+        await self._publish_three(bus)
+        group = "bare-commit"
+        consumer = bus.consumer(group)
+        await self._drain(consumer, TOPIC, 2)
+
+        await consumer.commit()
+
+        resumed = await _read_n(bus, group, TOPIC, 1)
+        assert resumed[0].value == b"third"

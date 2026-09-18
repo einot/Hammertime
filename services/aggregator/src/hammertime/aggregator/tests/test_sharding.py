@@ -192,6 +192,43 @@ class _RecordingConsumer:
         return getattr(self._inner, name)
 
 
+async def _claims_and_stream(
+    *,
+    clock: ManualClock,
+    bus: InMemoryBus | None = None,
+    state_store: MemoryShardStateStore | None = None,
+    config: DetectionConfig | None = None,
+    trace: list[str] | None = None,
+    max_tracked_ips: int = 1_000_000,
+) -> tuple[ShardClaims, AsyncIterator[ConsumedMessage]]:
+    """ASSUMPTION 1 (see the module docstring), with the claim's own stream.
+
+    The inner consumer is subscribed first, the way the worker's own consumer
+    is by the time any assignment callback can run -- `on_revoked` commits on
+    it, and committing a position that was never taken is not a scenario
+    decision 5 describes.
+
+    Its subscription is handed back because Amendment 6 item A20's revocation
+    tests have to read on *that* consumer: reading is what moves its consumed
+    position past a message the claim has not handled, which is the position
+    a bare `consumer.commit()` would have committed.
+    """
+
+    resolved_bus = bus if bus is not None else InMemoryBus()
+    resolved_trace = trace if trace is not None else []
+    inner = resolved_bus.consumer("hammertime-aggregator")
+    stream = await inner.subscribe(OBSERVATIONS_TOPIC)
+    claims = ShardClaims(
+        state_store=state_store if state_store is not None else MemoryShardStateStore(),
+        producer=_RecordingProducer(resolved_bus, resolved_trace),
+        consumer=_RecordingConsumer(inner, resolved_trace),
+        clock=clock,
+        config=config if config is not None else DEFAULTS,
+        max_tracked_ips=max_tracked_ips,
+    )
+    return claims, stream
+
+
 async def _claims(
     *,
     clock: ManualClock,
@@ -201,26 +238,18 @@ async def _claims(
     trace: list[str] | None = None,
     max_tracked_ips: int = 1_000_000,
 ) -> ShardClaims:
-    """ASSUMPTION 1 (see the module docstring).
+    """ASSUMPTION 1 (see the module docstring); `_claims_and_stream` without
+    the stream, for the tests that never read a message."""
 
-    The inner consumer is subscribed first, the way the worker's own consumer
-    is by the time any assignment callback can run -- `on_revoked` commits on
-    it, and committing a position that was never taken is not a scenario
-    decision 5 describes.
-    """
-
-    resolved_bus = bus if bus is not None else InMemoryBus()
-    resolved_trace = trace if trace is not None else []
-    inner = resolved_bus.consumer("hammertime-aggregator")
-    await inner.subscribe(OBSERVATIONS_TOPIC)
-    return ShardClaims(
-        state_store=state_store if state_store is not None else MemoryShardStateStore(),
-        producer=_RecordingProducer(resolved_bus, resolved_trace),
-        consumer=_RecordingConsumer(inner, resolved_trace),
+    claims, _stream = await _claims_and_stream(
         clock=clock,
-        config=config if config is not None else DEFAULTS,
+        bus=bus,
+        state_store=state_store,
+        config=config,
+        trace=trace,
         max_tracked_ips=max_tracked_ips,
     )
+    return claims
 
 
 def _worker(
@@ -544,6 +573,102 @@ class TestRevokingAShard:
         assert window.hot_ips() == frozenset({IP_A})
         assert window.next_sequence == 3
         assert window.warm_until == BASE + 50 + WINDOW_SECONDS
+
+
+class TestTheRevocationCommitIsTheHandledPosition:
+    """Amendment 6 item A20, and decision 5's `mark_handled` /
+    `commit_handled` bullets: what a revocation commits is the claim's
+    *handled* position -- `message.offset + 1` for the last message the
+    worker finished under this claim -- and nothing else.
+
+    Each test below reads one message on the claim's *own* consumer, which is
+    what advances that consumer's consumed position past it (A20's "the gap,
+    traced in the shipped code", step 2: the memory bus sets
+    `_positions[topic] = offset + 1` before it yields). The observable
+    difference is what a fresh consumer for the `hammertime-aggregator` group
+    is handed afterwards -- the same way
+    `test_worker.py::TestOffsetsAreCommittedAtShutdown` observes a commit.
+    """
+
+    async def _publish_two(self, bus: InMemoryBus) -> None:
+        producer = bus.producer()
+        await producer.publish(
+            OBSERVATIONS_TOPIC, key=str(IP_A), value=_observation(IP_A, 1200, window_start=BASE)
+        )
+        await producer.publish(
+            OBSERVATIONS_TOPIC, key=str(IP_B), value=_observation(IP_B, 1200, window_start=BASE)
+        )
+
+    async def test_an_unhandled_message_is_left_for_the_next_owner(self) -> None:
+        # The loss A20 closes: the claim fetched the message and never marked
+        # it handled, so the revocation commit names no position for the
+        # partition and the next owner starts at or before it. A bare
+        # `consumer.commit()` here would commit `offset + 1` and nobody would
+        # ever process this observation.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        claims, stream = await _claims_and_stream(clock=clock, bus=bus)
+        await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        await self._publish_two(bus)
+        fetched = await _take_one(stream)
+        assert fetched.key == str(IP_A).encode()
+
+        await claims.on_revoked(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        next_owner = bus.consumer("hammertime-aggregator")
+        received = await _take_one(await next_owner.subscribe(OBSERVATIONS_TOPIC))
+        assert received.offset == fetched.offset
+        assert received.key == str(IP_A).encode()
+
+    async def test_a_handled_message_moves_the_next_owner_past_it(self) -> None:
+        # The converse, and what keeps the commit a commit: once
+        # `mark_handled` has recorded `offset + 1`, the revocation commits
+        # exactly that and the next owner resumes after the message.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        claims, stream = await _claims_and_stream(clock=clock, bus=bus)
+        await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        await self._publish_two(bus)
+        fetched = await _take_one(stream)
+        claims.mark_handled(fetched)
+
+        await claims.on_revoked(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        next_owner = bus.consumer("hammertime-aggregator")
+        received = await _take_one(await next_owner.subscribe(OBSERVATIONS_TOPIC))
+        assert received.offset == fetched.offset + 1
+        assert received.key == str(IP_B).encode()
+
+    async def test_commit_handled_flushes_and_commits_even_with_nothing_handled(self) -> None:
+        # A20: `commit_handled` is "`producer.flush()` followed by
+        # `consumer.commit(...)`", and "both calls are made even when the
+        # mapping is empty" -- so decision 6's "every commit is preceded by a
+        # flush" holds without a "every non-empty commit" qualifier.
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        claims = await _claims(clock=clock, trace=trace)
+        await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        trace.clear()
+
+        await claims.commit_handled()
+
+        assert trace == ["flush", "commit"]
+
+    async def test_mark_handled_for_an_unheld_partition_is_a_key_error(self) -> None:
+        # A20: "a partition this object does not hold is a `KeyError`" -- the
+        # choice Amendment 2 item A15 made for `set_state` on an untracked IP.
+        # A claim also "loses it when revoked", which is why the message
+        # fetched under the old claim cannot be marked handled after the fact.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        claims, stream = await _claims_and_stream(clock=clock, bus=bus)
+        await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        await self._publish_two(bus)
+        fetched = await _take_one(stream)
+        await claims.on_revoked(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        with pytest.raises(KeyError):
+            claims.mark_handled(fetched)
 
 
 class TestInheritedRetention:

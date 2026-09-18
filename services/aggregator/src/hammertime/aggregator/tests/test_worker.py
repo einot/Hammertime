@@ -11,13 +11,20 @@ ADR-0009 decisions 3, 7 and 9 (`run_maintenance()`, shutdown, the
 `hammertime-aggregator` group), ADR-0010 decision 6 (one bucket per
 observation, over-long windows), ADR-0011 decision 3 (the seven outcomes and
 the worker's three steps), decision 6 (maintenance order, commit cadence,
-shutdown), decision 8 (metrics) and Amendment 2 items A9 (flooring) and A11
-(a demotion on the observation path).
+shutdown), decision 8 (metrics), Amendment 2 items A9 (flooring) and A11
+(a demotion on the observation path), and Amendment 6 item A20 (a commit
+covers only messages the worker has handled, and a message fetched under a
+claim that has since been revoked -- or replaced by a re-claim of the same
+partition -- is `UNCLAIMED` and stays in the log for the partition's next
+owner).
 
 Decision 3 is the specification this file is written against. Per consumed
 message, once the lookup that precedes step 1 has found the partition's
 `ShardWindow` -- the case where it does not is Amendment 5 item A19's
-`UNCLAIMED`, which `test_sharding.py` owns:
+`UNCLAIMED`, which `test_sharding.py` owns for a message handed to
+`handle()` directly, and `TestAMessageFetchedUnderARevokedClaim` below owns
+for a message the *consume loop* fetched, which is the only place A20's
+fetch-then-revoke ordering exists:
 
 1. `codec.decode`; the payload MUST be a `RequestObservation` with exactly one
    entry whose IP text equals the envelope `subject` and the message key. Any
@@ -80,7 +87,8 @@ NOT asserted here, and why:
 * **The 1 s commit cadence itself.** Decision 6 measures it on the *wall*
   clock ("an I/O cadence, not domain time"), and nothing here may sleep for
   wall time, so what is asserted is the other two commit points decision 6
-  names: `on_revoked` (`test_sharding.py`) and shutdown (below).
+  names: `on_revoked` (`test_sharding.py`, and through the worker in
+  `TestAMessageFetchedUnderARevokedClaim` below) and shutdown (below).
 
 `BASE` is `1_800_000_000`, the `T0` of `docs/spec/integration-scenarios.md`
 section 2 -- a multiple of 300, so every bucket boundary below is exact.
@@ -91,15 +99,16 @@ the event loop with `asyncio.sleep(0)`.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from typing import Any
 
 from hammertime.aggregator.lateness import ObservationOutcome
 from hammertime.aggregator.metrics import AggregatorMetrics
 from hammertime.aggregator.window.store import ShardWindow
 from hammertime.aggregator.worker import AggregatorWorker
-from hammertime.bus.interface import ConsumedMessage
+from hammertime.bus.interface import AssignmentListener, ConsumedMessage, Consumer
 from hammertime.bus.memory import InMemoryBus
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.core.addressing.address import Address
@@ -312,6 +321,149 @@ class _Feed:
         await self._producer.publish(OBSERVATIONS_TOPIC, key=key, value=value)
         message = await self._next()
         return await worker.handle(message)
+
+
+class _FetchGap:
+    """Scripts Amendment 6 item A20's rebalance into the first fetch.
+
+    A20's gap is an ordering: the consume loop fetches a message (the bus has
+    already advanced its consumed position past it), a rebalance revokes the
+    partition, and only then does the handler take the worker lock. The
+    memory bus has no coordinator, so the rebalance is driven from inside the
+    consumer's own stream -- the one place a test can act *between* the bus
+    advancing its position and the worker resuming.
+
+    Two modes, both of which A20 describes:
+
+    * `inline=False` -- the revoke (and, with `reclaim=True`, the re-claim)
+      is an `asyncio` task created immediately before the message is yielded.
+      `asyncio.create_task` never runs the coroutine synchronously, so the
+      task's first step cannot precede the loop's capture of
+      `claims.window(message.partition)`, which A20 requires to happen "in the
+      same event-loop step in which the fetch completed", with no `await` in
+      between. The capture is therefore the claim being revoked, and the
+      revoke runs before the handler: exactly A20's ordering.
+    * `inline=True` -- the revoke is awaited before the message is yielded at
+      all. The consumed position moved when the *inner* stream yielded, so
+      the gap is the same one; this is A20's parenthetical case, "if
+      `on_revoked` has already run when the fetch completes, the capture is
+      `None`".
+
+    `uninterrupted` is how the scheduled mode proves its ordering instead of
+    assuming it: `arm()` queues a do-nothing marker task immediately behind
+    the revoke task, so if the marker has still not run when the revoke (and
+    re-claim) finishes, nothing else ran in between -- in particular the
+    worker cannot have handled the message in hand part-way through. The
+    tests assert it.
+    """
+
+    def __init__(self, *, inline: bool, reclaim: bool = False) -> None:
+        self.inline = inline
+        self.reclaim = reclaim
+        self.worker: AggregatorWorker | None = None
+        # The window the partition had at the instant the message was handed
+        # to the worker -- the claim the message was fetched under.
+        self.window_at_yield: ShardWindow | None = None
+        # Set when the loop asks for the *next* message, i.e. once it has
+        # finished handling the first one.
+        self.refetched = False
+        self.uninterrupted: bool | None = None
+        self.hook_task: asyncio.Task[None] | None = None
+        self._marker_task: asyncio.Task[None] | None = None
+        self._marker_ran = False
+
+    def _target(self) -> AggregatorWorker:
+        worker = self.worker
+        assert worker is not None, "the double must be told whose claim to revoke"
+        return worker
+
+    async def _marker(self) -> None:
+        self._marker_ran = True
+
+    async def _rebalance(self) -> None:
+        await self._target().on_revoked(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        if self.reclaim:
+            await self._target().on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        self.uninterrupted = not self._marker_ran
+
+    async def arm(self) -> None:
+        """Run in the event-loop step in which the first fetch completes."""
+
+        if self.inline:
+            await self._rebalance()
+        else:
+            self.hook_task = asyncio.create_task(self._rebalance())
+            self._marker_task = asyncio.create_task(self._marker())
+        self.window_at_yield = self._target().window(0)
+
+
+class _GapConsumer:
+    """A `Consumer` that runs `_FetchGap.arm()` around the first message.
+
+    Delegates everything else to a real `MemoryConsumer`, so nothing here
+    depends on that class's constructor -- the same wrapper shape
+    `test_sharding.py::_RecordingConsumer` uses.
+    """
+
+    def __init__(self, inner: Consumer, gap: _FetchGap) -> None:
+        self._inner = inner
+        self._gap = gap
+
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        inner = await self._inner.subscribe(topic, partitions=partitions, listener=listener)
+        return self._scripted(inner)
+
+    async def _scripted(
+        self, inner: AsyncIterator[ConsumedMessage]
+    ) -> AsyncIterator[ConsumedMessage]:
+        first = True
+        async for message in inner:
+            if first:
+                first = False
+                await self._gap.arm()
+                yield message
+                self._gap.refetched = True
+                continue
+            yield message
+
+    async def seek(self, topic: str, partition: int, offset: int) -> None:
+        await self._inner.seek(topic, partition, offset)
+
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None:
+        await self._inner.commit(offsets)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _GapBus(InMemoryBus):
+    """An `InMemoryBus` whose *first* consumer is wrapped in a `_GapConsumer`.
+
+    The first one is the worker's own (nothing else takes a consumer before
+    `start()` does); the fresh member of the group each test builds after
+    `stop()` gets a plain `MemoryConsumer`, so what it reads is decided by
+    the committed offset alone. `InMemoryBus` is subclassed rather than
+    duck-typed because the worker takes a whole bus (ASSUMPTION 1), the same
+    way `services/ingest/.../tests/test_pipeline.py::_FailingBus` does.
+    """
+
+    def __init__(self, gap: _FetchGap) -> None:
+        super().__init__()
+        self._gap_script = gap
+        self._gap_wrapped = False
+
+    def consumer(self, *args: Any, **kwargs: Any) -> Any:
+        inner = super().consumer(*args, **kwargs)
+        if self._gap_wrapped:
+            return inner
+        self._gap_wrapped = True
+        return _GapConsumer(inner, self._gap_script)
 
 
 class TestAnAppliedObservation:
@@ -879,3 +1031,156 @@ class TestOffsetsAreCommittedAtShutdown:
         message = await _take_one(await resumed.subscribe(OBSERVATIONS_TOPIC))
 
         assert message.key == str(IP_C).encode()
+
+
+class TestAMessageFetchedUnderARevokedClaim:
+    """Amendment 6 item A20: the message in hand at a rebalance is left in the
+    log for the partition's next owner.
+
+    The ordering A20 traces -- the loop fetches a message for partition 0 (the
+    bus advances its consumed position past it), the partition is revoked
+    before the handler takes the worker lock, the handler returns `UNCLAIMED`
+    -- is scripted by `_FetchGap` above, which also records the evidence that
+    the ordering actually held rather than merely tending to.
+
+    What is asserted per test: the observation is not applied (no window
+    tracks the IP, nothing on the hot-ip or reconciliation topics, nothing in
+    the state store) and, after `stop()`, a fresh consumer for the
+    `hammertime-aggregator` group is handed *that* message first -- a second
+    observation is published after `stop()` so that "first" is an order and
+    not an accident. Against a member that commits the consumed position on
+    revocation the fresh consumer gets the second message instead, and
+    nobody ever processes the first: the silent loss A20 exists to close.
+
+    Not observable here, per A20: the *redelivery* itself. `InMemoryBus` never
+    resets a live consumer's own position to the committed offset, so only the
+    committed position can be read back; the handover needs a real broker and
+    is an `integration` scenario (issue #26).
+    """
+
+    async def _publish(self, bus: InMemoryBus, ip: Address) -> None:
+        await bus.producer().publish(
+            OBSERVATIONS_TOPIC, key=str(ip), value=_observation(ip, 1200, window_start=BASE)
+        )
+
+    async def _drain(self, worker: AggregatorWorker, task: asyncio.Task[None]) -> None:
+        """`stop()` (which commits), then let `run()` return. Never sleeps."""
+
+        await worker.stop()
+        for _ in range(1_000):
+            if task.done():
+                break
+            await asyncio.sleep(0)
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _first_message_of_the_group(self, bus: InMemoryBus) -> ConsumedMessage:
+        resumed = bus.consumer(GROUP)
+        return await _take_one(await resumed.subscribe(OBSERVATIONS_TOPIC))
+
+    async def test_a_revoke_between_the_fetch_and_the_handling_does_not_apply_it(self) -> None:
+        clock = ManualClock(initial=BASE)
+        metrics = AggregatorMetrics()
+        state_store = MemoryShardStateStore()
+        gap = _FetchGap(inline=False)
+        bus = _GapBus(gap)
+        await self._publish(bus, IP_A)
+        worker = _worker(bus=bus, clock=clock, metrics=metrics, state_store=state_store)
+        gap.worker = worker
+        await worker.start()
+        claimed = _window_of(worker)
+
+        task = asyncio.create_task(worker.run())
+        await _yield_until(lambda: gap.refetched)
+
+        # The ordering, evidenced rather than assumed: the claim was still
+        # held when the message was handed to the loop (so the loop's capture
+        # is that window), and the whole revoke then ran in one uninterrupted
+        # event-loop step, before the loop could handle the message.
+        assert gap.window_at_yield is claimed
+        assert gap.uninterrupted is True
+        assert worker.window(0) is None
+
+        # `UNCLAIMED`: not applied, not diverted, not counted, store untouched.
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        assert (await state_store.load(0)).hot_ips == frozenset()
+        assert _counter(metrics, "observations_rejected", reason="malformed") == 0
+
+        await self._drain(worker, task)
+        await self._publish(bus, IP_B)
+
+        assert (await self._first_message_of_the_group(bus)).key == str(IP_A).encode()
+
+    async def test_a_revoke_that_completes_before_the_message_is_handed_over(self) -> None:
+        # A20's other half of the same instant: the revoke wins the race to
+        # the fetch, so the loop's capture is `None`. The consumed position
+        # had already moved when the bus yielded the message, so the
+        # committed position is still the one that decides whether anybody
+        # ever sees this observation.
+        clock = ManualClock(initial=BASE)
+        metrics = AggregatorMetrics()
+        state_store = MemoryShardStateStore()
+        gap = _FetchGap(inline=True)
+        bus = _GapBus(gap)
+        await self._publish(bus, IP_A)
+        worker = _worker(bus=bus, clock=clock, metrics=metrics, state_store=state_store)
+        gap.worker = worker
+        await worker.start()
+
+        task = asyncio.create_task(worker.run())
+        await _yield_until(lambda: gap.refetched)
+
+        assert gap.window_at_yield is None
+        assert worker.window(0) is None
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        assert (await state_store.load(0)).hot_ips == frozenset()
+
+        await self._drain(worker, task)
+        await self._publish(bus, IP_B)
+
+        assert (await self._first_message_of_the_group(bus)).key == str(IP_A).encode()
+
+    async def test_a_reclaim_before_the_handling_is_still_unclaimed(self) -> None:
+        # A20 ruling part 3, the common case on an eager rebalance: every
+        # partition is revoked and reassigned, so the same member holds
+        # partition 0 again -- with a *new* `ShardWindow` -- by the time the
+        # handler runs. Identity is claim identity: the message was fetched
+        # under the old window, so it is `UNCLAIMED` and is left for the next
+        # fetch. Applying it to the new window here would both count it and
+        # have it redelivered, because the committed position precedes it.
+        clock = ManualClock(initial=BASE)
+        metrics = AggregatorMetrics()
+        state_store = MemoryShardStateStore()
+        gap = _FetchGap(inline=False, reclaim=True)
+        bus = _GapBus(gap)
+        await self._publish(bus, IP_A)
+        worker = _worker(bus=bus, clock=clock, metrics=metrics, state_store=state_store)
+        gap.worker = worker
+        await worker.start()
+        claimed = _window_of(worker)
+
+        task = asyncio.create_task(worker.run())
+        await _yield_until(lambda: gap.refetched)
+
+        # Revoke *and* re-claim ran in one uninterrupted event-loop step, so
+        # the window in force when the handler ran is the new one.
+        assert gap.window_at_yield is claimed
+        assert gap.uninterrupted is True
+        reclaimed = worker.window(0)
+        assert reclaimed is not None
+        assert reclaimed is not claimed
+
+        assert reclaimed.is_tracked(IP_A) is False
+        assert reclaimed.tracked_count == 0
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        assert (await state_store.load(0)).hot_ips == frozenset()
+
+        await self._drain(worker, task)
+        await self._publish(bus, IP_B)
+
+        assert (await self._first_message_of_the_group(bus)).key == str(IP_A).encode()
