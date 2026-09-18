@@ -5,7 +5,12 @@ decisions above it are unchanged in substance, the amendment pins the
 *surface* through which each one is observed and tested); amended
 2026-09-18 (see "Amendment 2" — decision 7's drain order is corrected in
 place: a service flushes its producer *before* it commits its consumer
-position, and that order binds every commit point of every service)
+position, and that order binds every commit point of every service);
+amended 2026-09-18 (see "Amendment 3" — decision 2's "before any bus,
+store or socket is opened" guarantee is corrected in place to cover a
+connection URL the client library would refuse at construction:
+`HAMMERTIME_REDIS_URL` is validated in `load_settings`, through
+`hammertime.store.validate_redis_url`, whenever the store kind is `redis`)
 
 Scope note: this ADR defines what a Hammertime service *process* is — how it
 starts, becomes ready, is observed, stops, and what it exits with — and the
@@ -98,6 +103,28 @@ A `ValueError`/`ConfigurationError` from `load_settings`, from the detection
 config loader, or from the registry loader terminates the process with exit
 code 2 (decision 8) *before* any bus, store or socket is opened. A service must
 never half-start on a bad configuration.
+
+That guarantee covers the *construction* of a client, not only the
+connection it later makes. A value that a client library would refuse when
+the client is built from it is invalid configuration, and `load_settings`
+MUST refuse it first — otherwise the refusal happens inside `start()`, after
+`starting` has been logged, and is reported as `start_failed` and exit 1,
+which tells an orchestrator to keep retrying something that cannot come
+right. Concretely, `HAMMERTIME_REDIS_URL` is meaningful only when
+`store_kind == "redis"`, and in that case `load_settings` MUST validate it by
+calling `hammertime.store.validate_redis_url(value)` — a helper in the
+`hammertime-store` package that accepts exactly what
+`redis.asyncio.Redis.from_url` accepts and raises `ValueError` naming the
+variable without repeating any part of the value — before it returns. When
+`store_kind == "memory"` the value is stored untouched and never parsed, so a
+set-but-malformed URL is ignored, not rejected. The settings dataclass itself
+does not validate: `load_settings` is the boundary, and an object built
+directly (as the tests do) is a plain carrier. See A12.
+
+> Amended 2026-09-18: the paragraph above was added by Amendment 3, which
+> corrects the guarantee the previous paragraph states — it was violated by
+> a malformed `HAMMERTIME_REDIS_URL` in both services that had one — and
+> settles where and how the URL is validated (A12).
 
 ### 3. Every service exposes a composition root that accepts injected transports
 
@@ -514,9 +541,10 @@ swallows `OSError` per host and raises a bare `KafkaConnectionError`
 (`aiokafka/client.py` lines 215-217, 241-242), so an unresolvable host
 reaches `connect_with_retry` as a listed transient type on both
 dependencies. A *malformed* URL is a different case and never reaches the
-retry at all: `Redis.from_url` rejects it with `ValueError` at construction
-(`redis/asyncio/connection.py::parse_url`, line 1817), before `connect()` is
-first called.
+retry — nor, since Amendment 3, `start()` — at all: `load_settings` rejects
+it with `ValueError` through `hammertime.store.validate_redis_url`, which
+runs `Redis.from_url`'s own parser (`redis/asyncio/connection.py::parse_url`)
+before any client exists, so it is `config_invalid` and exit 2 (A12).
 
 **The credential rule (the correction).** A credential the dependency
 actively rejects will never become valid by waiting, so it MUST fail the
@@ -1224,3 +1252,325 @@ Assumptions (push back individually):
   hand-off report.
 * *The 2026-09-18 date and the "A11" numbering* continue Amendment 1's
   sequence; nothing else in this ADR's numbering moves.
+
+## Amendment 3 (2026-09-18) — a connection URL the client would refuse is invalid configuration
+
+Why: decision 2 and spec §47.1 step 3 promise that an invalid configuration
+is rejected before any bus, store or socket is opened and exits 2. A
+malformed `HAMMERTIME_REDIS_URL` did not behave that way (issue #73).
+Neither `services/ingest/src/hammertime/ingest/config.py` (line 192) nor
+`services/aggregator/src/hammertime/aggregator/config.py` (line 146) parses
+the value; each `load_settings` stores it as an opaque string, and the first
+thing to interpret it is `Redis.from_url(...)` — inside ingest's lifespan
+(`app.py` line 209, entered by `start()`) and inside the aggregator's
+`build_service` (`service.py` line 357). `Redis.from_url` parses the URL at
+construction (`redis/asyncio/client.py` line 206 ->
+`ConnectionPool.from_url`, `redis/asyncio/connection.py` line 2613 ->
+`parse_url`, line 1768; redis-py 8.1.0 per `uv.lock`), raising `ValueError`
+for an unsupported scheme (lines 1815-1819) or an ill-typed query parameter
+(lines 1780-1783). For ingest that `ValueError` escapes `start()` after
+`starting` has been logged and is reported as `start_failed` and exit 1 —
+the code that means "the dependency was unreachable, retry". For the
+aggregator it escapes the factory and is caught as `config_invalid`/exit 2
+by accident of where `build_service` happens to construct the client, not
+by any rule; a later reordering of that function would silently move it.
+The issue left one question to this ADR: whether the check belongs in each
+service's `load_settings` or in a shared helper, given that the trie and
+detector will need it too. Between filing and this amendment the aggregator
+gained store configuration, so the defect exists in two services and the
+"will need it" is no longer hypothetical.
+
+This amendment follows Amendment 1's convention: the decision is corrected
+in place with a dated blockquote pointing here, and every edit made outside
+this section is listed below with the superseded wording quoted. Like
+Amendment 2 it changes contract — it adds a validation `load_settings` did
+not previously perform — so the status line's "unchanged in substance"
+applies to Amendment 1 only.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended "; amended 2026-09-18 (see "Amendment 3" —
+  decision 2's "before any bus, store or socket is opened" guarantee is
+  corrected in place to cover a connection URL the client library would
+  refuse at construction: `HAMMERTIME_REDIS_URL` is validated in
+  `load_settings`, through `hammertime.store.validate_redis_url`, whenever
+  the store kind is `redis`)" after Amendment 2's clause.
+* **Decision 2, new paragraph and blockquote.** Between the paragraph
+  ending "A service must never half-start on a bad configuration." and the
+  heading of decision 3 — which were consecutive — the paragraph beginning
+  "That guarantee covers the *construction* of a client" and a dated
+  "Amended 2026-09-18" blockquote were inserted. No existing sentence of
+  decision 2 was changed.
+* **A1, the "malformed URL" sentence.** Was: "A *malformed* URL is a
+  different case and never reaches the retry at all: `Redis.from_url`
+  rejects it with `ValueError` at construction
+  (`redis/asyncio/connection.py::parse_url`, line 1817), before `connect()`
+  is first called." Now: "A *malformed* URL is a different case and never
+  reaches the retry — nor, since Amendment 3, `start()` — at all:
+  `load_settings` rejects it with `ValueError` through
+  `hammertime.store.validate_redis_url`, which runs `Redis.from_url`'s own
+  parser (`redis/asyncio/connection.py::parse_url`) before any client
+  exists, so it is `config_invalid` and exit 2 (A12)." The old sentence was
+  literally true and is what made the defect invisible: it described the
+  driver rejecting the URL without saying that, for ingest, this happened
+  inside `start()`.
+* **`docs/spec/hammertime_spec_1.md`, §47.1, step 3.** Was: "reject an
+  invalid configuration before opening any network connection, exiting
+  with status 2;". Now: "reject an invalid configuration before opening
+  any network connection, exiting with status 2 — where "invalid" includes
+  a connection URL the client library would refuse to build a client from
+  (`HAMMERTIME_REDIS_URL` is validated when `HAMMERTIME_STORE_KIND` is
+  `redis` and ignored when it is `memory`; ADR-0009 A12);". §47.5 is
+  unchanged: its "2 configuration invalid, detected before any connection
+  was made" is what the correction restores.
+* **`docs/spec/README.md`, the §47 row.** `packages/hammertime-store`
+  (`validate_redis_url`) is added to the "Implemented in" column, because
+  the helper's module docstring cites §47.
+
+Touched nowhere else, and why — before closing this list `docs/` was
+grepped for `before any (bus|store|socket|network)`, `exit code`, `exit 2`,
+`exit 1`, `status 2`, `status 1`, `config_invalid`, `start_failed`,
+`half-start`, `malformed`, `invalid configuration`, `HAMMERTIME_REDIS_URL`
+and `redis_url`:
+
+* ADR-0009 decision 5 step 2 ("Any `ValueError`/`ConfigurationError` ->
+  one `ERROR` record `event=config_invalid` with the message -> exit 2"),
+  decision 8's table and A7's `config_invalid` row describe the path the
+  corrected behaviour takes; they were already right and are untouched.
+  Decision 5 step 3 and A7's `starting` row (the `store_endpoint`
+  reduction of `HAMMERTIME_REDIS_URL`) are about logging a URL that has
+  been accepted, unchanged. The first Assumptions bullet's "exit 1 (a
+  `ValueError` traceback) instead of 2 on a bad setting" is history about
+  ingest's pre-runner `main()`; untouched.
+* ADR-0011 decision 9 lists `HAMMERTIME_REDIS_URL` among the keys the
+  aggregator's `load_settings` reads without saying how; the new rule
+  applies to it through decision 2 and needs no restatement there. ADR-0011
+  A3 (line 1319: `parse_shard_ids` lets `load_settings` "exit 2 before any
+  bus, store or socket is opened") is an instance of the guarantee, not a
+  restatement of its scope; untouched. ADR-0011 A20 (`startup_fields`) is
+  about the `starting` record; untouched.
+* `docs/protocol/`, `docs/runbook.md` and `docs/spec/integration-scenarios.md`
+  contain no statement of the exit codes or of configuration validation.
+  `deploy/k8s/README.md` (outside `docs/`, read only) likewise.
+* `.env.example` line 26 documents the key with its default and no
+  grammar; the default is valid under the rule and nothing there is wrong.
+  It is not the architect's file; whether to add a comment naming the
+  accepted schemes is left to the coder brief.
+
+### A12. `HAMMERTIME_REDIS_URL` is validated in `load_settings`, by the driver's parser, through one helper in `hammertime-store` — requires an implementation change
+
+**Classification of the defect: (a) already determined and missed.**
+Decision 2 and §47.1 step 3 fixed the guarantee; A1 even named the exact
+call that rejects a malformed URL; what nobody wrote down is that for
+ingest that call sits inside `start()`. The five questions the issue and
+the dispatch left open are classified individually below.
+
+**1. Where the validation lives — (b) genuinely unspecified, now ruled: a
+shared helper in `hammertime-store`, called from each service's
+`load_settings`.**
+
+```python
+# packages/hammertime-store/src/hammertime/store/url.py   (new; docstring `Spec: section 47`)
+REDIS_URL_ENV = "HAMMERTIME_REDIS_URL"
+
+def validate_redis_url(value: str, *, name: str = REDIS_URL_ENV) -> None:
+    """Raise `ValueError` naming `name` iff `redis.asyncio.Redis.from_url(value)`
+    would raise `ValueError` while building the client. Returns nothing and
+    never alters `value`."""
+```
+
+Re-exported from `hammertime.store` (`__init__.py`, alongside the store
+classes) so a service imports it from the same place it imports its store.
+Each `load_settings` calls it after `store_kind` has been parsed:
+
+```python
+redis_url = source.get("HAMMERTIME_REDIS_URL", _DEFAULT_REDIS_URL)
+if store_kind == "redis":
+    validate_redis_url(redis_url)
+```
+
+and stores the identical string in `redis_url: str`, which `Redis.from_url`
+later receives unchanged. Nothing about the settings dataclasses, `app.py`
+or `service.py` changes.
+
+Why the store package and not `hammertime-core` or per-service copies: the
+issue's own trade-off is decisive. The property that matters is "accepts
+exactly what `Redis.from_url` will accept", which only the driver's parser
+can promise, and `hammertime-core` does not depend on `redis`
+(`packages/hammertime-core/pyproject.toml`: `pydantic`, `prometheus-client`,
+`structlog`); adding it there would pull a driver into `hammertime-bus`,
+`hammertime-testkit` and every consumer of core for one function.
+`hammertime-store` already depends on `redis>=5.0`, already owns the Redis
+backends the URL is for, and is already a dependency of both services that
+have the setting (`services/ingest/pyproject.toml`,
+`services/aggregator/pyproject.toml`) and of any future service that gains
+one — a service cannot have a Redis store without it. Per-service copies
+were rejected for the reason the issue gave: four `load_settings` would
+hold four answers to "what is a valid URL", and the two that exist today
+already diverged from the guarantee in the same way.
+
+Why it returns `None` rather than the parsed form: the URL stays the single
+representation the client is built from. Returning `parse_url`'s kwargs
+would invite a caller to construct the client from them instead of from
+the string, creating a second construction path that can drift from the
+first, and would change the settings field's type for no consumer that
+needs it. The check is validate-and-discard by design.
+
+**2. What counts as valid — (b) now ruled: exactly what the driver
+accepts.** `validate_redis_url` calls `redis.asyncio.connection.parse_url`
+and translates its `ValueError` into its own (item 4). It performs no check
+of its own beyond that call — no scheme list, no host requirement, no
+`urllib.parse` pre-check — because any rule the helper adds is a second
+definition of validity that the driver does not share. The consequences of
+that choice are stated so nobody mistakes the check for more than it is:
+
+* Accepted: `redis://`, `rediss://` and `unix://` URLs, with or without
+  userinfo, host, port, path-db and query parameters — including
+  `redis://` alone (the pool defaults host and port) and `redis://h/abc`
+  (a non-integer path db is silently ignored, `connection.py` lines
+  1806-1810). Validity means "the driver will build a client from this",
+  not "this is well-formed by any RFC" and not "a server answers there".
+* Rejected: the empty string and whitespace-only (no scheme); a bare
+  `host:port` (no scheme); any other scheme (`http://`, `redis+sentinel://`,
+  ...); a typed query parameter the driver cannot cast (`?db=abc`,
+  `?socket_timeout=x`); and whatever `urllib.parse.urlparse` itself refuses
+  (an unbalanced IPv6 bracket, a non-numeric or out-of-range port, which
+  `parsed.port` raises `ValueError` for).
+* Set-but-empty `HAMMERTIME_REDIS_URL=` with `store_kind == "redis"` is
+  rejected, consistent with ADR-0011 A3's rule that a set-but-empty value
+  is an error, not the default; an *unset* variable takes the default
+  `redis://localhost:6379/0`, which is valid.
+* The helper is given the exact string that will later be passed to
+  `from_url`, and neither it nor `load_settings` strips or normalises it.
+  That is what makes "accepted here iff accepted there" hold; a caller that
+  transforms the value between the two calls breaks it.
+* `parse_url` is a module-level, unprefixed function of
+  `redis.asyncio.connection` (and of `redis.connection`), not exported from
+  any `redis` `__init__`. The asyncio one is chosen because both services
+  build `redis.asyncio.Redis`. Isolating the import in one helper is also
+  the mitigation: if a later redis-py moves or renames it, one line changes.
+
+**3. When it applies — (a) for the scope, (b) for the edge: only when
+`store_kind == "redis"`; under `"memory"` a set-but-malformed URL is
+ignored.** The scope was already determined: both settings dataclasses
+document the field as "meaningful only when store_kind == redis", the
+`bus_brokers` field carries the parallel "meaningful only when bus_kind ==
+kafka" and is not validated under `memory`, and the three ingest tests that
+build `IngestSettings` directly do so with `store_kind="memory",
+redis_url=""` (`test_routes.py` line 56, `test_pipeline.py` line 170,
+`test_auth_throttle.py` line 148), which is also what an operator does when
+flipping a local stack to `memory` without clearing the URL. What was not
+determined is the set-but-malformed case under `memory`, ruled *ignored*: a
+value that is never interpreted cannot cause a half-start, so rejecting it
+would refuse a configuration that works. The check is placed in
+`load_settings` after `store_kind` is parsed, and the dataclasses gain no
+`__post_init__`: direct construction stays unchecked, as it is for every
+other field (`port` is not range-checked there either).
+
+**4. The error's shape — (a) for the requirements, (b) for two details.**
+Required by decision 2 ("raises `ValueError` naming the variable") and by
+A7's no-credential rule and #71 (the URL carries the password):
+`ValueError`; the message contains the variable name (`name`, default
+`HAMMERTIME_REDIS_URL`) and states the accepted grammar; and it contains no
+part of the value — not the whole URL, not its userinfo, host, port, path or
+query, and not a redacted form either. Recommended text, not pinned
+byte-for-byte: `HAMMERTIME_REDIS_URL must be a Redis URL (redis://, rediss://
+or unix://) with well-formed query parameters; the value is not repeated here
+because it may carry a password`. Two details are this amendment's ruling:
+
+* *The driver's exception is not chained* (`raise ... from None`). A1's
+  credential rule chains the driver's error because the server's `AUTH`
+  text never echoes the password. Here the parser can: for
+  `redis://user:secret/0` (an `@` forgotten) `urlparse` reads `secret` as
+  the port and `parsed.port` raises `Port could not be cast to integer
+  value as 'secret'`. `config_invalid` renders `str(exc)` only
+  (`runtime.py` line 603, no `exc_info`), so a chained cause would not reach
+  the log today, but a traceback anywhere else — a test failure, a future
+  `exception` field on the record — would. Suppressing the context closes
+  that path at the cost of not telling the operator *which* part was bad;
+  the grammar in the message is the substitute.
+* *The `startup_fields` redaction is paralleled, not reused.* Both services
+  reduce the URL to `hostname:port/path` with `urlsplit` for the `starting`
+  record (ingest `service.py` lines 193-196, aggregator lines 275-278).
+  That runs only on a URL `load_settings` has already accepted, and it is
+  the right tool there. It is the wrong tool for the error path: a
+  malformed URL is precisely the input on which a redaction cannot be
+  trusted (the example above puts the password where `urlsplit` reports
+  the port). So the error carries nothing derived from the value, and the
+  two code paths stay separate on purpose.
+
+**5. The trie and detector — (b) now ruled: bound when they gain the
+setting; nothing now.** `services/trie/src/hammertime/trie/config.py` and
+`services/detector/src/hammertime/detector/config.py` are `TODO` stubs with
+no store setting. The corrected decision 2 is general — any `load_settings`
+that reads `HAMMERTIME_REDIS_URL` MUST call `validate_redis_url` when its
+store kind is `redis` — so their epics inherit the rule and the helper
+without a further amendment. No code changes for them here.
+
+**Shipped code — what changes.** All carried by the coder brief, none by
+this amendment: the new `hammertime.store.url` module and its re-export;
+one `validate_redis_url(redis_url)` call under `store_kind == "redis"` in
+each of ingest's and the aggregator's `load_settings`; and a `CHANGES`
+entry, because the exit status and log record an operator sees for a
+malformed URL change (not `BREAKING`: a deployment with a malformed URL was
+not running). `app.py` line 209 and `service.py` line 357 keep calling
+`Redis.from_url(settings.redis_url)`; after the fix that call cannot raise
+`ValueError` for a settings object that came through `load_settings`.
+
+**Existing tests — none must change.** No test calls `load_settings` with
+`HAMMERTIME_REDIS_URL` set (grepped `services/`, `packages/`, `tests/`);
+the three direct constructions with `redis_url=""` use `store_kind="memory"`
+and are unaffected because the dataclass does not validate;
+`test_runtime.py::TestExitCodeTwoOnInvalidConfiguration` (lines 434-472)
+tests the runner with a fake factory and stays valid. The new tests are the
+test-author brief's.
+
+Assumptions (push back individually):
+
+* *`hammertime-store` rather than a new `hammertime-config` package or the
+  service layer.* Chosen for the dependency reasons above; the cost is that
+  a URL-validation function lives in a package whose docstring is about
+  stores. Judged acceptable because "what URL can this backend be built
+  from" is the backend's knowledge.
+* *Module name `hammertime.store.url` and function name
+  `validate_redis_url`.* No precedent in the repo for a validator module;
+  named for what it validates. A `name=` keyword with the env-key default
+  is provided so a tool or a differently named future variable gets a
+  correct message; nothing today passes it.
+* *Returns `None`.* Reasoned above; push back if a consumer for the parsed
+  form appears (none exists).
+* *No validation beyond the driver's.* The permissive cases listed under
+  item 2 (`redis://` alone, ignored non-integer path db) are accepted on
+  purpose. A stricter rule — require a host, require an integer db — would
+  reject values the driver serves happily and would be Hammertime's own
+  grammar to maintain; nothing asked for one.
+* *Only `ValueError` is translated.* Anything else `parse_url` raises
+  propagates unchanged; none was found in redis-py 8.1.0's code path
+  (`urlparse`, `parse_qs`, `unquote`, the typed casts, all `ValueError`),
+  and hiding an unexpected exception type behind a configuration message
+  would mask a driver bug.
+* *`from None`.* Reasoned under item 4; the alternative (`from exc`,
+  matching A1) was rejected for the port-echo case. Push back if the loss
+  of the driver's "Invalid value for 'db'" detail is judged worse.
+* *The message text is recommended, not pinned.* Tests assert the
+  variable name is present and no component of a distinctive test value
+  is; the exact wording is the coder's, as it is for every other
+  `load_settings` message.
+* *Ignored, not rejected, under `memory`.* Reasoned under item 3; the
+  alternative would be consistent with "refuse the silent
+  misconfiguration" but would refuse a working one.
+* *Error precedence when several settings are invalid is first-in-load-
+  order, as today.* `store_kind` is parsed before the URL, so an invalid
+  kind is reported and the URL never checked; unchanged behaviour, stated
+  so nobody tests for the URL error in that case.
+* *Nothing is ruled about `HAMMERTIME_BUS_BROKERS`.* It is likewise stored
+  unparsed, but aiokafka does not parse it at construction, so the same
+  defect does not arise in the same way; whether a malformed broker list
+  should be rejected by `load_settings` is a separate question, named in
+  the hand-off report and not settled here.
+* *Nothing is ruled about the `startup_fields` redaction itself.* Its
+  `hostname:port/path` rendering (`None` for a URL with no port, no
+  hostname for `unix://`) and its duplication across two services are
+  observations for a separate ticket, not this amendment.
+* *The 2026-09-18 date and the "A12" numbering* continue the sequence;
+  ADR-0011 has its own "A12" and the two are unrelated.

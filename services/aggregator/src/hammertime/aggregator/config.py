@@ -20,6 +20,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from hammertime.store import validate_redis_url
+
 _DEFAULT_CONFIG_PATH = "./config/detection.v1.json"
 _DEFAULT_BUS_KIND = "kafka"
 _DEFAULT_BUS_BROKERS = "localhost:19092"
@@ -61,7 +63,10 @@ class AggregatorSettings:
     bus_brokers: str
     #: HAMMERTIME_STORE_KIND: "redis" | "memory".
     store_kind: str
-    #: HAMMERTIME_REDIS_URL: meaningful only when store_kind == "redis".
+    #: HAMMERTIME_REDIS_URL: meaningful only when store_kind == "redis", and
+    #: validated by `load_settings` in that case (ADR-0009 A12) -- the
+    #: dataclass itself does not validate, so a directly built object is a
+    #: plain carrier.
     redis_url: str
     #: HAMMERTIME_SHARD_IDS: None for `auto` (group-managed assignment), or
     #: the partitions this member owns statically (ADR-0011 decision 1).
@@ -128,6 +133,18 @@ def load_settings(env: Mapping[str, str] | None = None) -> AggregatorSettings:
     """Load aggregator settings from the environment (see `.env.example`)."""
     source = env if env is not None else os.environ
     host, port = _parse_bind(source.get("HAMMERTIME_AGGREGATOR_BIND", _DEFAULT_BIND))
+    store_kind = _parse_choice(
+        "HAMMERTIME_STORE_KIND",
+        source.get("HAMMERTIME_STORE_KIND", _DEFAULT_STORE_KIND),
+        allowed=_ALLOWED_STORE_KINDS,
+    )
+    redis_url = source.get("HAMMERTIME_REDIS_URL", _DEFAULT_REDIS_URL)
+    if store_kind == "redis":
+        # ADR-0009 decision 2 / A12: a URL `Redis.from_url` would refuse is
+        # invalid configuration, so it must fail here (config_invalid, exit
+        # 2) rather than inside start(). Under "memory" the value is never
+        # interpreted, so a set-but-malformed one is ignored, not rejected.
+        validate_redis_url(redis_url)
     return AggregatorSettings(
         host=host,
         port=port,
@@ -138,12 +155,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> AggregatorSettings:
             allowed=_ALLOWED_BUS_KINDS,
         ),
         bus_brokers=source.get("HAMMERTIME_BUS_BROKERS", _DEFAULT_BUS_BROKERS),
-        store_kind=_parse_choice(
-            "HAMMERTIME_STORE_KIND",
-            source.get("HAMMERTIME_STORE_KIND", _DEFAULT_STORE_KIND),
-            allowed=_ALLOWED_STORE_KINDS,
-        ),
-        redis_url=source.get("HAMMERTIME_REDIS_URL", _DEFAULT_REDIS_URL),
+        store_kind=store_kind,
+        redis_url=redis_url,
         # `env.get(key, default)` hands a set-but-empty value to the parser,
         # which rejects it -- ingest's `load_settings` pattern (item A3).
         shard_ids=parse_shard_ids(source.get(_SHARD_IDS_KEY, _SHARD_IDS_AUTO)),
