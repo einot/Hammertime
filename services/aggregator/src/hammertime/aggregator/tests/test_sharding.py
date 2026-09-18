@@ -10,9 +10,16 @@ decision 5 (`ShardClaims`: claim, warm-up, revoke), Amendment 2 item A5
 (an inherited HOT IP is a tracked entry from construction) and item A7 (the
 two per-window eviction counters), Amendment 3 item A13 (`window_evictions`
 and `shards_claimed` are computed on read from the windows the worker binds
-to its `AggregatorMetrics`), and Amendment 5 item A19 (a message on a
+to its `AggregatorMetrics`), Amendment 5 item A19 (a message on a
 partition this member does not hold is `UNCLAIMED`: logged, counted under no
-series, neither decoded nor diverted, and the store untouched).
+series, neither decoded nor diverted, and the store untouched), and
+Amendment 6 item A20 (`Consumer.commit` takes an explicit
+`Mapping[tuple[str, int], int]` of next offsets to read; a claim keeps a
+handled position set by `ShardClaims.mark_handled(message)` to
+`message.offset + 1`, and `ShardClaims.commit_handled(partitions=None)` --
+flush, then commit those handled positions -- is the aggregator's only
+commit path, so a committed position never covers a message that has not
+been handled).
 
 Two interfaces are under test. The first is pinned exactly by decision 9:
 
@@ -26,8 +33,10 @@ described by decision 5 in prose only -- "the aggregator's
 `AssignmentListener`" that, per assigned partition, loads the shard's state
 and constructs `ShardWindow(shard=p, config=<in force>, clock,
 inherited_hot=state.hot_ips, next_sequence=state.next_sequence,
-max_tracked_ips)`, and on revocation calls `producer.flush()` then
-`consumer.commit()` and drops the window.
+max_tracked_ips)`, and on revocation calls
+`commit_handled(<the revoked partitions>)` -- `producer.flush()` then
+`consumer.commit(<those partitions' handled positions>)`, Amendment 6 item
+A20 -- and drops the window.
 
 ASSUMPTIONS -- constructor and accessor details decision 5 does not pin.
 Adjust `_claims`/`_worker` below, not the meaning of the assertions:
@@ -74,7 +83,7 @@ section 2.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -175,9 +184,9 @@ class _RecordingConsumer:
     async def seek(self, topic: str, partition: int, offset: int) -> None:
         await self._inner.seek(topic, partition, offset)
 
-    async def commit(self) -> None:
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None:
         self._trace.append("commit")
-        await self._inner.commit()
+        await self._inner.commit(offsets)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -450,9 +459,11 @@ class TestClaimingAShard:
 
 
 class TestRevokingAShard:
-    """Decision 5, `on_revoked`: `producer.flush()`, `consumer.commit()`, drop
-    the window. Nothing is written to the state store -- it is already
-    current -- and nothing is emitted."""
+    """Decision 5, `on_revoked`: `commit_handled(<the revoked partitions>)` --
+    `producer.flush()`, then `consumer.commit()` of each revoked partition's
+    handled position (Amendment 6 item A20) -- then drop the window. Nothing is
+    written to the state store -- it is already current -- and nothing is
+    emitted."""
 
     async def test_a_revoke_flushes_before_it_commits(self) -> None:
         # The ordering rule decision 6 states for every commit: "always after
