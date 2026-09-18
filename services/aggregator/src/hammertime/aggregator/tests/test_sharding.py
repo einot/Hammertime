@@ -21,12 +21,13 @@ flush, then commit those handled positions -- is the aggregator's only
 commit path, so a committed position never covers a message that has not
 been handled). ADR-0001 Amendment 1 (the consistency model: clause 1, the
 owner is a shard and not a process; clause 2, a shard's transition stream is
-totally ordered and continuous across owners under one `agent_id` and one
-persisted `sequence`; clause 5, what a handover does to the stream; clause
-6, no double count and no loss at a rebalance) and ADR-0003 Amendment 2
-(points 1-3: a redelivery lands in a window that never counted it, the HOT
-set is idempotent, and "committed offsets" means the handled position) are
-what `TestHandoverBetweenTwoMembers` is written against.
+totally ordered and its identity -- one `agent_id`, one persisted `sequence`
+-- is continued, not restarted, across owners, the sequence being strictly
+increasing but not promised dense; clause 5, what a handover does to the
+stream; clause 6, no double count and no loss at a rebalance) and ADR-0003
+Amendment 2 (points 1-3: a redelivery lands in a window that never counted
+it, the HOT set is idempotent, and "committed offsets" means the handled
+position) are what `TestHandoverBetweenTwoMembers` is written against.
 
 Two interfaces are under test. The first is pinned exactly by decision 9:
 
@@ -356,9 +357,10 @@ def _identities(bus: InMemoryBus) -> list[tuple[str, str, str, int]]:
 
     ADR-0003 (amended): `event_id` derives from `(agent_id, sequence,
     event_type, subject)`, so these four are the identity a handover has to
-    keep continuous (ADR-0001 Amendment 1 clause 2). The envelope's `subject`
-    is optional in general (ADR-0004 decision 4), but decision 4 step 4 sets
-    `subject=str(ip)` on every transition, so a missing one is a failure here.
+    continue rather than restart (ADR-0001 Amendment 1 clause 2). The
+    envelope's `subject` is optional in general (ADR-0004 decision 4), but
+    decision 4 step 4 sets `subject=str(ip)` on every transition, so a
+    missing one is a failure here.
     """
 
     identities: list[tuple[str, str, str, int]] = []
@@ -370,9 +372,17 @@ def _identities(bus: InMemoryBus) -> list[tuple[str, str, str, int]]:
     return identities
 
 
-def _tracks(worker: AggregatorWorker, ip: Address) -> bool:
+def _is_hot(worker: AggregatorWorker, ip: Address) -> bool:
+    """The predicate a consume-loop test waits on.
+
+    Decision 4 orders one transition as `record_transition` -> publish ->
+    `set_state`, so an IP reading HOT means the store write and the hot-ip
+    record it asserts on already exist; `is_tracked` would become true at
+    `observe`, before any of them.
+    """
+
     window = worker.window(0)
-    return window is not None and window.is_tracked(ip)
+    return window is not None and window.state(ip) is IpState.HOT
 
 
 async def _yield_until(predicate: Callable[[], bool], *, steps: int = 10_000) -> None:
@@ -1132,8 +1142,12 @@ class TestHandoverBetweenTwoMembers:
         # commits its *handled* position -- `offset + 1` of m1, i.e. 1 -- so
         # B's consume loop starts at m2, which A never fetched. ADR-0001
         # Amendment 1 clause 2: B continues shard 0's `agent_id` and
-        # `sequence` where A left them, so the stream `HotIpAdded IP_A #0`,
-        # `HotIpAdded IP_B #1` is gap-free across the two workers; clause 6:
+        # `sequence` where A left them -- continued, not restarted; strictly
+        # increasing, not promised dense -- so no `event_id` is reused across
+        # the handover. The exact values, #0 then #1, follow from decision 4
+        # step 1 (`sequence = window.next_sequence`, then `+= 1`), decision 5
+        # (`next_sequence=state.next_sequence` at B's claim) and Amendment 1
+        # item A2 (the store holds `sequence + 1` after A's record). Clause 6:
         # m1 is not counted again (B's ring for IP_A stays empty) and m2 is
         # not lost.
         clock = ManualClock(initial=BASE)
@@ -1150,7 +1164,7 @@ class TestHandoverBetweenTwoMembers:
 
             b = await members.start()
             members.run(b)
-            await _yield_until(lambda: _tracks(b, IP_B))
+            await _yield_until(lambda: _is_hot(b, IP_B))
 
             window = b.window(0)
             assert window is not None
@@ -1215,30 +1229,51 @@ class TestHandoverBetweenTwoMembers:
         self,
     ) -> None:
         # Decision 5, warm-up: "Inherited IPs are therefore exempt from
-        # HOT -> COLD until `warm_until`, whatever the trigger." One second
-        # before B's `warm_until`, a sweep finds IP_A quiet (total 0) and
-        # still may not demote it -- the under-count is B's, not the IP's.
+        # HOT -> COLD until `warm_until`, whatever the trigger." Two triggers
+        # that would each demote IP_A outside warm-up are fired inside it.
+        # First an observation of 5 -- well below `cold_threshold` -- on the
+        # observation path, Amendment 2 item A11's HOT -> COLD with
+        # `reason="observation"`. Then, one second before `warm_until`, a
+        # sweep in which that bucket has left the window (BASE + 339: bucket
+        # age 330 >= 300), so `expire_due()` reports IP_A's total dropping to
+        # 0 and decision 6 step 1 evaluates it with `reason="expiry"`. Neither
+        # may demote: the under-count is B's, not the IP's. (A bare sweep with
+        # an empty ring would evaluate nothing and prove nothing.)
         clock = ManualClock(initial=BASE)
         bus = InMemoryBus()
         state_store = MemoryShardStateStore()
         feed = _Feed(bus)
+        b_metrics = AggregatorMetrics()
         members = _Members(bus=bus, clock=clock, state_store=state_store)
         try:
             a = await members.start()
             await self._first_owner_records_ip_a(a, feed, bus)
             await members.hand_over(a)
             clock.advance(HANDOVER_SECONDS)
-            b = await members.start()
-
-            clock.advance(WINDOW_SECONDS - 1)
-            await b.run_maintenance()
-
+            b = await members.start(metrics=b_metrics)
             window = b.window(0)
             assert window is not None
+
+            outcome = await feed.deliver(b, IP_A, 5)
+
+            assert outcome is ObservationOutcome.APPLIED
+            assert window.total(IP_A) == 5
+            assert window.state(IP_A) is IpState.HOT
+            assert window.is_inherited(IP_A) is True
+
+            clock.advance(WINDOW_SECONDS - 1)  # BASE + 339: the bucket at BASE has expired
+            await b.run_maintenance()
+
+            assert window.total(IP_A) == 0
             assert [envelope.event_type for envelope in _hot_ip_events(bus)] == ["HotIpAdded"]
             assert window.state(IP_A) is IpState.HOT
             assert window.is_inherited(IP_A) is True
             assert window.in_warmup is True
+            for reason in ("observation", "expiry", "warmup"):
+                demotions = b_metrics.get(
+                    "hot_to_cold_transitions", shard=0, config_version=1, reason=reason
+                )
+                assert demotions == 0
             assert await state_store.load(0) == ShardState(
                 hot_ips=frozenset({IP_A}), next_sequence=1
             )

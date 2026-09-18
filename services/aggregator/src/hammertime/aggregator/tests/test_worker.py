@@ -1242,7 +1242,10 @@ class TestTheMessageInHandReachesTheNextMember:
         await b.start()
         b_task = asyncio.create_task(b.run())
         try:
-            await _yield_until(lambda: _window_of(b).is_tracked(IP_A))
+            # HOT is set after the store write and the publish (decision 4
+            # steps 2, 4, 5), so waiting on it covers everything asserted
+            # below; `is_tracked` would already hold at `observe`.
+            await _yield_until(lambda: _window_of(b).state(IP_A) is IpState.HOT)
 
             window = _window_of(b)
             assert window.total(IP_A) == 1200
