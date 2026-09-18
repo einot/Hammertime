@@ -19,7 +19,14 @@ handled position set by `ShardClaims.mark_handled(message)` to
 `message.offset + 1`, and `ShardClaims.commit_handled(partitions=None)` --
 flush, then commit those handled positions -- is the aggregator's only
 commit path, so a committed position never covers a message that has not
-been handled).
+been handled). ADR-0001 Amendment 1 (the consistency model: clause 1, the
+owner is a shard and not a process; clause 2, a shard's transition stream is
+totally ordered and continuous across owners under one `agent_id` and one
+persisted `sequence`; clause 5, what a handover does to the stream; clause
+6, no double count and no loss at a rebalance) and ADR-0003 Amendment 2
+(points 1-3: a redelivery lands in a window that never counted it, the HOT
+set is idempotent, and "committed offsets" means the handled position) are
+what `TestHandoverBetweenTwoMembers` is written against.
 
 Two interfaces are under test. The first is pinned exactly by decision 9:
 
@@ -54,8 +61,18 @@ Adjust `_claims`/`_worker` below, not the meaning of the assertions:
 3. `AggregatorWorker(*, bus, state_store, clock, config, metrics,
    shard_ids=None, max_tracked_ips=1_000_000)` and
    `await worker.start()` / `await worker.handle(message)` /
+   `await worker.run()` / `await worker.run_maintenance()` /
    `await worker.stop()`; `shard_ids=None` is decision 1's `auto`. See
    `test_worker.py`, which states the same assumption.
+4. `await worker.on_revoked(partitions)` and `await worker.on_assigned(
+   partitions)` are the worker's own `AssignmentListener` methods, forwarding
+   to its `ShardClaims` under the worker lock -- the path Amendment 6 item
+   A20's trace of the shipped code names ("takes the worker lock through
+   `AggregatorWorker.on_revoked`") and the one `test_worker.py::_FetchGap`
+   drives. `TestHandoverBetweenTwoMembers` revokes through it so that the
+   revoke holds the same lock `handle()` does, which is what decision 5's
+   "`on_revoked(p)`: under the worker lock (so never mid-message)" requires
+   of a revoke driven from outside the bus.
 
 NOT asserted here, and why:
 
@@ -75,15 +92,24 @@ NOT asserted here, and why:
 * **Real rebalance ordering.** `InMemoryBus` has one partition and no
   coordinator (ADR-0011 assumption 22), so `on_revoked` is only ever driven
   directly here, exactly as `packages/hammertime-bus/.../tests/test_assignment.py`
-  notes.
+  notes. `TestHandoverBetweenTwoMembers` does exercise two (and once three)
+  members of the `hammertime-aggregator` group over one bus and one state
+  store -- but *sequentially*: member A is revoked and stopped before member
+  B is constructed, which is inside the memory bus's contract ("at most one
+  live member per group per topic", decision 1's `InMemoryBus` bullet). Two
+  members holding claims concurrently, and the coordinator's revoke-then-
+  assign across them, need a real broker (issue #26).
 
 `BASE` is `1_800_000_000`, the `T0` of `docs/spec/integration-scenarios.md`
-section 2.
+section 2. Nothing in this module sleeps for wall time: `_yield_until` and
+`_Members.stop_all` only yield to the event loop with `asyncio.sleep(0)`.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable, Mapping
+import asyncio
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
@@ -98,11 +124,12 @@ from hammertime.bus.memory import InMemoryBus, MemoryProducer
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.core.addressing.address import Address
 from hammertime.core.config.models import DetectionConfig
-from hammertime.core.events.codec import encode
+from hammertime.core.events.codec import EventPayload, decode, encode
 from hammertime.core.events.envelope import EventEnvelope
-from hammertime.core.events.models import Observation, RequestObservation
+from hammertime.core.events.models import HotIpRemoved, Observation, RequestObservation
 from hammertime.core.state.enums import IpState
 from hammertime.core.time.clock import ManualClock
+from hammertime.store.interface import ShardState
 from hammertime.store.memory import MemoryShardStateStore
 
 HOT_IP_TOPIC = "hammertime.hot-ip.v1"
@@ -116,10 +143,19 @@ BUCKET_SECONDS = 10
 STATE_RETENTION_SECONDS = 600
 
 BASE = 1_800_000_000
+# How long the shard sits unowned between member A's revoke and member B's
+# claim in `TestHandoverBetweenTwoMembers`: ADR-0001 Amendment 1 clause 5's
+# "rebalance time". Non-zero so that B's `warm_until` is visibly B's claim
+# time and not A's start.
+HANDOVER_SECONDS = 40
 
 IP_A = Address.parse("198.51.100.1")
 IP_B = Address.parse("198.51.100.2")
 IP_C = Address.parse("198.51.100.3")
+
+# ADR-0011 decision 4 step 4 / ADR-0003 Amendment 2: the envelope `agent_id`
+# of every transition shard 0 emits, whichever worker holds the shard.
+SHARD_AGENT_ID = "aggregator-shard-0"
 
 
 def _config(
@@ -307,6 +343,144 @@ async def _take_one(stream: AsyncIterator[ConsumedMessage]) -> ConsumedMessage:
 
 def _records(bus: InMemoryBus, topic: str) -> list[tuple[bytes | None, bytes]]:
     return [(record.key, record.value) for record in bus._logs.get(topic, [])]
+
+
+def _hot_ip_events(bus: InMemoryBus) -> list[EventEnvelope[EventPayload]]:
+    """Every transition on `hammertime.hot-ip.v1`, decoded, in log order."""
+
+    return [decode(value) for _key, value in _records(bus, HOT_IP_TOPIC)]
+
+
+def _identities(bus: InMemoryBus) -> list[tuple[str, str, str, int]]:
+    """`(event_type, subject, agent_id, sequence)` per emitted transition.
+
+    ADR-0003 (amended): `event_id` derives from `(agent_id, sequence,
+    event_type, subject)`, so these four are the identity a handover has to
+    keep continuous (ADR-0001 Amendment 1 clause 2). The envelope's `subject`
+    is optional in general (ADR-0004 decision 4), but decision 4 step 4 sets
+    `subject=str(ip)` on every transition, so a missing one is a failure here.
+    """
+
+    identities: list[tuple[str, str, str, int]] = []
+    for envelope in _hot_ip_events(bus):
+        assert envelope.subject is not None, "a hot-ip event always carries its IP as subject"
+        identities.append(
+            (envelope.event_type, envelope.subject, envelope.agent_id, envelope.sequence)
+        )
+    return identities
+
+
+def _tracks(worker: AggregatorWorker, ip: Address) -> bool:
+    window = worker.window(0)
+    return window is not None and window.is_tracked(ip)
+
+
+async def _yield_until(predicate: Callable[[], bool], *, steps: int = 10_000) -> None:
+    """Yield to the event loop until `predicate` holds. Never waits on the wall clock."""
+
+    for _ in range(steps):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the condition was never reached")
+
+
+class _Feed:
+    """Publishes observations and hands each consumed message to a worker.
+
+    Reads on its own consumer group (`test-reader`), as
+    `test_worker.py::_Feed` does, so the `hammertime-aggregator` group's
+    committed position is decided by the workers alone -- which is the thing
+    a handover test observes. `publish` without `deliver` leaves a message
+    in the log that no member has fetched.
+    """
+
+    def __init__(self, bus: InMemoryBus) -> None:
+        self._producer = bus.producer()
+        self._consumer = bus.consumer("test-reader")
+        self._stream: AsyncIterator[ConsumedMessage] | None = None
+
+    async def publish(self, ip: Address, count: int) -> None:
+        await self._producer.publish(
+            OBSERVATIONS_TOPIC, key=str(ip), value=_observation(ip, count, window_start=BASE)
+        )
+
+    async def deliver(
+        self, worker: AggregatorWorker, ip: Address, count: int
+    ) -> ObservationOutcome:
+        await self.publish(ip, count)
+        if self._stream is None:
+            self._stream = await self._consumer.subscribe(OBSERVATIONS_TOPIC)
+        message = await _take_one(self._stream)
+        return await worker.handle(message)
+
+
+class _Members:
+    """The successive members of one `hammertime-aggregator` group.
+
+    One bus, one state store, one clock; a fresh `AggregatorMetrics` per
+    member, so a transition can be attributed to the worker that emitted it.
+    Members are strictly sequential (see the module docstring): `hand_over`
+    revokes and stops a member, and only then may the next be started.
+    `stop_all` is the `finally` -- it stops exactly the members still
+    running and lets their consume loops return, never sleeping for wall
+    time.
+    """
+
+    def __init__(
+        self, *, bus: InMemoryBus, clock: ManualClock, state_store: MemoryShardStateStore
+    ) -> None:
+        self._bus = bus
+        self._clock = clock
+        self._state_store = state_store
+        self._running: list[AggregatorWorker] = []
+        self._tasks: list[asyncio.Task[None]] = []
+
+    async def start(self, *, metrics: AggregatorMetrics | None = None) -> AggregatorWorker:
+        """ASSUMPTION 3: construct and `start()` the next member."""
+
+        worker = _worker(
+            bus=self._bus,
+            clock=self._clock,
+            state_store=self._state_store,
+            metrics=metrics if metrics is not None else AggregatorMetrics(),
+        )
+        await worker.start()
+        self._running.append(worker)
+        return worker
+
+    def run(self, worker: AggregatorWorker) -> None:
+        """ASSUMPTION 3: the member's consume loop, as a task `stop_all` drains."""
+
+        self._tasks.append(asyncio.create_task(worker.run()))
+
+    async def hand_over(self, worker: AggregatorWorker) -> None:
+        """Decision 5's `on_revoked` for shard 0 (ASSUMPTION 4), then `stop()`.
+
+        The revoke is what commits the handled position and drops the
+        window; `stop()` afterwards is ADR-0009 decision 7's shutdown of a
+        member that now holds nothing. The next owner may be started once
+        this returns.
+        """
+
+        await worker.on_revoked(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        await worker.stop()
+        self._running = [member for member in self._running if member is not worker]
+
+    async def stop_all(self) -> None:
+        for worker in self._running:
+            await worker.stop()
+        self._running = []
+        for _ in range(1_000):
+            if all(task.done() for task in self._tasks):
+                break
+            await asyncio.sleep(0)
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self._tasks = []
 
 
 class TestParseShardIds:
@@ -874,3 +1048,303 @@ class TestTheWorkerClaimsShardZero:
                 assert metrics.get("late_messages", reason=reason) == 0
         finally:
             await worker.stop()
+
+
+class TestHandoverBetweenTwoMembers:
+    """Shard 0 changes hands from worker A to worker B over one bus and one
+    state store: ADR-0011 decision 1 (a shard is a partition; keys never
+    move, workers move between shards via claim/revoke) made observable end
+    to end, and the handover clauses of ADR-0001 Amendment 1 (1, 2, 5, 6)
+    and ADR-0003 Amendment 2 (points 1-3) checked against what B actually
+    inherits, applies and emits.
+
+    The two members are sequential -- A is revoked (through the worker, so
+    the lock is held) and stopped before B is constructed -- which is the
+    only shape the memory bus supports (module docstring, "Real rebalance
+    ordering"). The clock is advanced by `HANDOVER_SECONDS` between the two
+    so that B's claim time is distinguishable from A's.
+
+    Deliberately not asserted anywhere in this class: what `handle()` does
+    when given the same message twice under one live claim. ADR-0003
+    Amendment 2 says a byte-identical message handed to `handle()` twice
+    within one claim "is not a supported input" and that "no test should pin
+    what happens if a caller does it directly". Every redelivery below
+    crosses a claim boundary.
+    """
+
+    async def _first_owner_records_ip_a(
+        self, a: AggregatorWorker, feed: _Feed, bus: InMemoryBus
+    ) -> None:
+        """Member A handles m1 -- `IP_A`, 1200 requests at `BASE` -- and, per
+        decision 4, records `IP_A` HOT in the store (`sequence` 0) and
+        announces it once. Every test in this class starts from here."""
+
+        outcome = await feed.deliver(a, IP_A, 1200)
+        assert outcome is ObservationOutcome.APPLIED
+        window = a.window(0)
+        assert window is not None
+        assert window.state(IP_A) is IpState.HOT
+        assert _identities(bus) == [("HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0)]
+
+    async def test_the_next_owner_inherits_the_hot_set_the_first_owner_recorded(self) -> None:
+        # ADR-0011 decision 5 `on_assigned`: B loads shard 0's `ShardState`
+        # and builds its window with `inherited_hot=state.hot_ips`,
+        # `next_sequence=state.next_sequence`; Amendment 2 item A5 makes the
+        # inherited IP a tracked HOT entry with an empty ring; `warm_until`
+        # is `clock.now() + window_seconds` at *B's* construction. ADR-0001
+        # Amendment 1 clause 5: "the new owner inherits the shard's durable
+        # HOT set, exempts inherited IPs from demotion for `window_seconds`".
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        feed = _Feed(bus)
+        members = _Members(bus=bus, clock=clock, state_store=state_store)
+        try:
+            a = await members.start()
+            await self._first_owner_records_ip_a(a, feed, bus)
+            await members.hand_over(a)
+            clock.advance(HANDOVER_SECONDS)
+
+            b = await members.start()
+
+            assert a.window(0) is None
+            window = b.window(0)
+            assert window is not None
+            assert window.hot_ips() == frozenset({IP_A})
+            assert window.next_sequence == 1
+            assert window.is_inherited(IP_A) is True
+            assert window.in_warmup is True
+            assert window.warm_until == BASE + HANDOVER_SECONDS + WINDOW_SECONDS
+            # A5: inherited means an empty ring -- A's 1200 did not travel.
+            assert window.total(IP_A) == 0
+            assert window.state(IP_A) is IpState.HOT
+            # Decision 5 `on_revoked` / assumption 6: the handover itself
+            # emitted nothing -- no demotion on the way out, no re-announce
+            # on the way in.
+            assert _identities(bus) == [("HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0)]
+        finally:
+            await members.stop_all()
+
+    async def test_the_next_owner_resumes_at_the_first_owners_handled_position_and_applies_what_follows(  # noqa: E501
+        self,
+    ) -> None:
+        # Amendment 6 item A20 / ADR-0003 Amendment 2 point 3: A's revoke
+        # commits its *handled* position -- `offset + 1` of m1, i.e. 1 -- so
+        # B's consume loop starts at m2, which A never fetched. ADR-0001
+        # Amendment 1 clause 2: B continues shard 0's `agent_id` and
+        # `sequence` where A left them, so the stream `HotIpAdded IP_A #0`,
+        # `HotIpAdded IP_B #1` is gap-free across the two workers; clause 6:
+        # m1 is not counted again (B's ring for IP_A stays empty) and m2 is
+        # not lost.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        feed = _Feed(bus)
+        members = _Members(bus=bus, clock=clock, state_store=state_store)
+        try:
+            a = await members.start()
+            await self._first_owner_records_ip_a(a, feed, bus)  # m1, offset 0, handled
+            await feed.publish(IP_B, 1200)  # m2, offset 1; A never fetches it
+            await members.hand_over(a)  # commits {(topic, 0): 1}
+            clock.advance(HANDOVER_SECONDS)
+
+            b = await members.start()
+            members.run(b)
+            await _yield_until(lambda: _tracks(b, IP_B))
+
+            window = b.window(0)
+            assert window is not None
+            assert window.total(IP_B) == 1200
+            assert window.state(IP_B) is IpState.HOT
+            # B resumed *at* position 1, not before it: m1 was not re-read
+            # into B's window, whose entry for IP_A is still the inherited
+            # one with an empty ring.
+            assert window.total(IP_A) == 0
+            assert window.is_inherited(IP_A) is True
+            assert _identities(bus) == [
+                ("HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0),
+                ("HotIpAdded", str(IP_B), SHARD_AGENT_ID, 1),
+            ]
+            assert len({envelope.event_id for envelope in _hot_ip_events(bus)}) == 2
+            assert await state_store.load(0) == ShardState(
+                hot_ips=frozenset({IP_A, IP_B}), next_sequence=2
+            )
+        finally:
+            await members.stop_all()
+
+    async def test_an_ip_that_stays_busy_across_a_handover_is_announced_exactly_once(self) -> None:
+        # ADR-0011 decision 3, last paragraph: the HOT set "is idempotent
+        # under redelivery: an IP the store already has as HOT is not
+        # re-announced"; ADR-0003 Amendment 2 point 2 says the same of the
+        # durable set. B counts IP_A from scratch (A5: the ring starts empty)
+        # and reaches `hot_threshold` again, but IP_A is already HOT in the
+        # window it inherited, so there is no COLD -> HOT edge to emit.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        feed = _Feed(bus)
+        members = _Members(bus=bus, clock=clock, state_store=state_store)
+        try:
+            a = await members.start()
+            await self._first_owner_records_ip_a(a, feed, bus)
+            await members.hand_over(a)
+            clock.advance(HANDOVER_SECONDS)
+            b = await members.start()
+
+            outcome = await feed.deliver(b, IP_A, 1200)
+
+            assert outcome is ObservationOutcome.APPLIED
+            window = b.window(0)
+            assert window is not None
+            assert window.total(IP_A) == 1200
+            assert window.state(IP_A) is IpState.HOT
+            for_ip_a = [
+                envelope.event_type
+                for envelope in _hot_ip_events(bus)
+                if envelope.subject == str(IP_A)
+            ]
+            assert for_ip_a == ["HotIpAdded"]
+            assert len(_records(bus, HOT_IP_TOPIC)) == 1
+            assert await state_store.load(0) == ShardState(
+                hot_ips=frozenset({IP_A}), next_sequence=1
+            )
+        finally:
+            await members.stop_all()
+
+    async def test_the_next_owner_does_not_demote_an_inherited_ip_before_its_warm_up_ends(
+        self,
+    ) -> None:
+        # Decision 5, warm-up: "Inherited IPs are therefore exempt from
+        # HOT -> COLD until `warm_until`, whatever the trigger." One second
+        # before B's `warm_until`, a sweep finds IP_A quiet (total 0) and
+        # still may not demote it -- the under-count is B's, not the IP's.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        feed = _Feed(bus)
+        members = _Members(bus=bus, clock=clock, state_store=state_store)
+        try:
+            a = await members.start()
+            await self._first_owner_records_ip_a(a, feed, bus)
+            await members.hand_over(a)
+            clock.advance(HANDOVER_SECONDS)
+            b = await members.start()
+
+            clock.advance(WINDOW_SECONDS - 1)
+            await b.run_maintenance()
+
+            window = b.window(0)
+            assert window is not None
+            assert [envelope.event_type for envelope in _hot_ip_events(bus)] == ["HotIpAdded"]
+            assert window.state(IP_A) is IpState.HOT
+            assert window.is_inherited(IP_A) is True
+            assert window.in_warmup is True
+            assert await state_store.load(0) == ShardState(
+                hot_ips=frozenset({IP_A}), next_sequence=1
+            )
+        finally:
+            await members.stop_all()
+
+    async def test_the_next_owner_demotes_a_quiet_inherited_ip_after_warm_up_with_the_shards_next_sequence(  # noqa: E501
+        self,
+    ) -> None:
+        # Decision 5: at `warm_until` the sweep's `finish_warmup_if_due()`
+        # yields the inherited IPs still HOT and each is evaluated once with
+        # `reason="warmup"`; decision 6 orders that step inside
+        # `run_maintenance()`; decision 8 labels the counter
+        # `hot_to_cold_transitions{shard,config_version,reason="warmup"}`.
+        # ADR-0001 Amendment 1 clause 2: the `HotIpRemoved` carries shard 0's
+        # `agent_id` and the *next* sequence after A's `HotIpAdded` -- the
+        # counter B loaded from the store -- so the two events, from two
+        # workers, have distinct `event_id`s and form one ordered stream;
+        # clause 5: the demotion arrives `window_seconds` plus the rebalance
+        # time after A last counted the IP, and no earlier.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        feed = _Feed(bus)
+        a_metrics = AggregatorMetrics()
+        b_metrics = AggregatorMetrics()
+        members = _Members(bus=bus, clock=clock, state_store=state_store)
+        try:
+            a = await members.start(metrics=a_metrics)
+            await self._first_owner_records_ip_a(a, feed, bus)
+            await members.hand_over(a)
+            clock.advance(HANDOVER_SECONDS)
+            b = await members.start(metrics=b_metrics)
+
+            clock.advance(WINDOW_SECONDS)
+            await b.run_maintenance()
+
+            assert _identities(bus) == [
+                ("HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0),
+                ("HotIpRemoved", str(IP_A), SHARD_AGENT_ID, 1),
+            ]
+            events = _hot_ip_events(bus)
+            assert len({envelope.event_id for envelope in events}) == 2
+            removed = events[1].payload
+            assert isinstance(removed, HotIpRemoved)
+            assert removed.ip == IP_A
+            assert removed.sequence == 1
+            assert removed.window_count == 0  # B never counted IP_A
+            assert removed.attributes is None  # decision 4 step 3
+            assert await state_store.load(0) == ShardState(hot_ips=frozenset(), next_sequence=2)
+            window = b.window(0)
+            assert window is not None
+            assert window.state(IP_A) is IpState.COLD
+            assert window.is_inherited(IP_A) is False
+            assert window.in_warmup is False
+            assert (
+                b_metrics.get("hot_to_cold_transitions", shard=0, config_version=1, reason="warmup")
+                == 1
+            )
+            # The demotion is B's: A's counters never saw it.
+            assert (
+                a_metrics.get("hot_to_cold_transitions", shard=0, config_version=1, reason="warmup")
+                == 0
+            )
+        finally:
+            await members.stop_all()
+
+    async def test_a_third_owner_continues_the_sequence(self) -> None:
+        # After B's warm-up demotion the store holds no HOT IP and
+        # `next_sequence == 2`. Decision 5: C inherits exactly that -- an
+        # empty set, so "`warm_until` is `clock.now() + window_seconds` at
+        # construction iff `inherited_hot` is non-empty" gives no warm-up --
+        # and the shard's next transition, whoever emits it, would be #2
+        # (ADR-0001 Amendment 1 clause 2; ADR-0011 Amendment 1 item A2: the
+        # persisted counter never moves backwards).
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        feed = _Feed(bus)
+        members = _Members(bus=bus, clock=clock, state_store=state_store)
+        try:
+            a = await members.start()
+            await self._first_owner_records_ip_a(a, feed, bus)
+            await members.hand_over(a)
+            clock.advance(HANDOVER_SECONDS)
+            b = await members.start()
+            clock.advance(WINDOW_SECONDS)
+            await b.run_maintenance()
+            assert await state_store.load(0) == ShardState(hot_ips=frozenset(), next_sequence=2)
+            await members.hand_over(b)
+            clock.advance(HANDOVER_SECONDS)
+
+            c = await members.start()
+
+            assert b.window(0) is None
+            window = c.window(0)
+            assert window is not None
+            assert window.next_sequence == 2
+            assert window.hot_ips() == frozenset()
+            assert window.tracked_count == 0
+            assert window.warm_until is None
+            assert window.in_warmup is False
+            # Two handovers, two workers' worth of transitions, one stream.
+            assert _identities(bus) == [
+                ("HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0),
+                ("HotIpRemoved", str(IP_A), SHARD_AGENT_ID, 1),
+            ]
+        finally:
+            await members.stop_all()
