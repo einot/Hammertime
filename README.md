@@ -47,7 +47,7 @@ log. The trie is a *derived* index: it can always be rebuilt by replaying
 ```bash
 make setup         # uv sync the workspace
 make test          # unit + property tests
-make up            # docker compose: redpanda, redis, all four services
+make up            # docker compose: kafka, valkey, prometheus, all four services
 make load          # run the agent simulator against the local stack
 ```
 

@@ -1,6 +1,11 @@
 # ADR 0012 — Free and open-source components only, with a named drop-in for every single-vendor dependency
 
-Status: accepted 2026-09-18.
+Status: accepted 2026-09-18; amended 2026-09-18 (see "Amendment 1" at the
+end — the Class 1 inventory and the Class 4 pinning summary are brought to
+the state of the compose change brief C1 produced, decision 9's description
+of the override file is corrected in place, and the Context and
+Consequences statements that the two breaches are live gain dated notes.
+No decision changes in substance).
 
 Scope note: this ADR records a policy the repository owner gave verbatim
 and turns it into a rule that can be checked in review: which licences
@@ -50,6 +55,12 @@ third-party images `deploy/docker-compose.yml` runs today:
   set free. Hammertime uses no Bitnami image, but the pattern — a
   third-party repackaging whose free tier ends — is the image-level form
   of the same risk.
+
+> Amended 2026-09-18: the two breaches above are fixed by the compose change
+> that accompanies Amendment 1 — `apache/kafka:4.3.1` is the reference
+> broker, `valkey/valkey:9.1.2-alpine` the reference store, Redpanda is
+> the pinned override `deploy/docker-compose.redpanda.yml`; see the
+> inventory below for the post-change rows.
 
 The rest of the inventory is in good shape: every Python dependency is
 under an OSI-approved permissive or weak-copyleft licence (verified per
@@ -269,9 +280,13 @@ is the same under every broker.
 
 Redpanda is kept as a **documented substitute**, not removed: an override
 file `deploy/docker-compose.redpanda.yml` redefines only the `broker`
-service (image `redpandadata/redpanda`, pinned; its `redpanda start`
-command; its own healthcheck). Starting the stack with both files is the
-drop-in demonstration — the diff between the two brokers is confined to
+service (image `redpandadata/redpanda:v26.2.3`; `environment: !reset {}`
+so that none of the reference's `KAFKA_*` variables reach it; its
+`redpanda start` command; no healthcheck today, because healthchecks are
+ADR-0009 decision 10's and #17's — when #17 adds a broker healthcheck the
+override must carry a Redpanda-appropriate one of its own, since `!reset`
+covers only `environment` and the Kafka probe would otherwise be inherited).
+Starting the stack with both files is the drop-in demonstration — the diff between the two brokers is confined to
 that file, and nothing under `packages/`, `services/`, `tools/` or `.env*`
 differs. The broker-backed integration suite (#52) runs against the
 reference (Kafka). Running it against the override is not required by
@@ -287,6 +302,11 @@ citation and the deployment then agree. ADR-0009 decision 10 names `rpk
 cluster health` as the broker healthcheck; under Kafka that becomes the
 Kafka CLI's own probe (e.g. `kafka-broker-api-versions.sh
 --bootstrap-server localhost:9092`). Neither ADR is edited here.
+
+> Amended 2026-09-18: the override paragraph above originally said the
+> override carried "its own healthcheck", which contradicted brief C1's
+> "Do not: add healthchecks" and the file as landed. Corrected in place;
+> see Amendment 1.
 
 ### 10. Reference store: Valkey; Redis 8 (AGPLv3) and Redis 7.2 as alternatives
 
@@ -338,15 +358,26 @@ licence, drop-in named); `exception` (decision 2 item 4);
 read from the source named under Sources for the version shown; anything
 else is marked as an assumption.
 
-### Class 1 — runtime infrastructure (`deploy/docker-compose.yml`)
+The Class 1 and Class 4 tables were rewritten by Amendment 1 (2026-09-18)
+to the state of the compose change brief C1 produced; the superseded rows
+are quoted there. "Runtime" in the Verified column records whether the
+pinned image has actually been started: none has, because Docker's layer
+registry is unreachable from the environment the compose change was made
+in, so both compose variants were validated by `docker compose config`
+only. The first `make up` on a host with registry access is the real
+runtime proof, and the broker-backed integration suite (#52) is what will
+exercise the reference images in CI. Until then the Status column's
+`compliant` is a licence-and-pin statement, not a "has run" statement.
+
+### Class 1 — runtime infrastructure (`deploy/docker-compose.yml` and the `deploy/docker-compose.redpanda.yml` override)
 
 | Component | Image as deployed | Licence | Single-vendor, paid tier | Drop-in | Status | Pin | Verified |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Redpanda | `redpandadata/redpanda:latest` (line 5; `latest` = v26.2.3 today) | BUSL-1.1, change to Apache-2.0 four years after each release; enterprise features separately licensed | yes (Redpanda Data: Enterprise, Cloud) | Apache Kafka | **non-compliant** (not OSI; unpinned) — becomes the documented substitute under decision 9 | none | yes (`licenses/bsl.md`) |
-| Apache Kafka (reference after decision 9) | `apache/kafka:<4.x>` (to be added) | Apache-2.0 | no (ASF) | n/a; Redpanda is the substitute | compliant once pinned and landed | to be pinned | yes (`LICENSE`; Docker Hub publisher = The Apache Software Foundation) |
-| Redis | `redis:7-alpine` (line 15; resolves to 7.4.11-alpine today) | RSALv2 OR SSPLv1 (7.4.x–7.8.x); BSD-3-Clause up to 7.2.x; RSALv2 OR SSPLv1 OR AGPLv3 from 8.0 | yes (Redis Ltd: Enterprise, Cloud) | Valkey | **non-compliant** (7.4 is not OSI; floating tag) | major only | yes (branch `LICENSE.txt`/`COPYING`; Docker Hub tag map) |
-| Valkey (reference after decision 10) | `valkey/valkey:<9.x-alpine>` (to be added) | BSD-3-Clause | no (Linux Foundation) | Redis 8.x under AGPLv3; Redis 7.2 | compliant once landed | to be pinned | yes (`COPYING`; Docker Hub publisher = Valkey community) |
-| Prometheus | `prom/prometheus:latest` (line 53) | Apache-2.0 | no (CNCF) | n/a | compliant once pinned (**pin missing**) | none | yes (`LICENSE`) |
+| Redpanda | `redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml` line 4; override only, applied with a second `-f`) | BUSL-1.1, change to Apache-2.0 four years after each release; enterprise features separately licensed | yes (Redpanda Data: Enterprise, Cloud) | Apache Kafka (the reference) | substitute (decision 9): not OSI, so never the reference; kept as a pinned, deployment-only override | `major.minor.patch` | licence: `licenses/bsl.md` on the `dev` branch — the source repository returns 404 for every path at tag `v26.2.3`, so the licence is **not** verified at the pinned tag; tag: yes (Docker Hub, newest `vXX.Y.Z`); runtime: not exercised (`docker compose config` only) |
+| Apache Kafka (reference, decision 9) | `apache/kafka:4.3.1` (`deploy/docker-compose.yml` line 8; single-node KRaft combined mode) | Apache-2.0 | no (ASF) | n/a; Redpanda is the substitute | compliant | `major.minor.patch` | licence: yes (`LICENSE` at tag `4.3.1`; Docker Hub publisher = The Apache Software Foundation); tag: yes (newest non-rc 4.x on Docker Hub); runtime: not exercised — `docker compose config` plus a match of the `KAFKA_*` set against the ASF's own single-node example for 4.3.1; pending first `make up` / #52 |
+| Redis | not deployed since 2026-09-18 (was `redis:7-alpine`, resolving to 7.4.11-alpine; replaced by Valkey under decision 10) | RSALv2 OR SSPLv1 (7.4.x–7.8.x); BSD-3-Clause up to 7.2.x; RSALv2 OR SSPLv1 OR AGPLv3 from 8.0 | yes (Redis Ltd: Enterprise, Cloud) | Valkey | replaced (decision 10); Redis 8.x under AGPLv3 remains the recorded drop-in for Valkey in the other direction | n/a (not deployed) | licence: yes (branch `LICENSE.txt`/`COPYING`; Docker Hub tag map), kept for the record |
+| Valkey (reference, decision 10) | `valkey/valkey:9.1.2-alpine` (`deploy/docker-compose.yml` line 30; `--maxmemory-policy noeviction`) | BSD-3-Clause | no (Linux Foundation) | Redis 8.x under AGPLv3; Redis 7.2 | compliant | `major.minor.patch` | licence: yes (`COPYING` at tag `9.1.2`; Docker Hub publisher = Valkey community); tag: yes (newest stable on Docker Hub); runtime: not exercised (`docker compose config` only; pending first `make up` / #52) |
+| Prometheus | `prom/prometheus:v3.14.0` (`deploy/docker-compose.yml` line 69) | Apache-2.0 | no (CNCF) | n/a | compliant | `major.minor.patch` | licence: yes (`LICENSE` at tag `v3.14.0`); tag: yes (newest non-rc on Docker Hub); runtime: not exercised (`docker compose config` only) |
 | Grafana OSS | not deployed (`deploy/grafana/README.md` only) | AGPL-3.0-only | yes (Grafana Labs: Enterprise, Cloud) | none true; Perses (Apache-2.0, CNCF sandbox) nearest | exception (decision 8) | n/a | yes (`LICENSE`); Enterprise/Cloud tiers from recall |
 | CPython base image | `python:3.12-slim` (four `Dockerfile`s) | PSF-2.0 (+ Debian) | no (PSF) | n/a | compliant | `major.minor` | assumption: licence not fetched |
 
@@ -389,12 +420,16 @@ not itemised here; decision 3 item 4 audits them at release time.
 
 ### Class 4 — image pinning summary
 
+As of Amendment 1 every image reference in `deploy/` and every `Dockerfile`
+`FROM` line is pinned; no action remains open under decision 5 item 2.
+
 | Reference | Pinned? | Action |
 | --- | --- | --- |
-| `redpandadata/redpanda:latest` | no | replaced as reference (decision 9); the substitute override pins it |
-| `redis:7-alpine` | major only | replaced (decision 10) |
-| `prom/prometheus:latest` | no | pin to a `v3.x` release |
-| `python:3.12-slim` × 4 | `major.minor` | none |
+| `apache/kafka:4.3.1` (`deploy/docker-compose.yml`) | `major.minor.patch` | done — replaced `redpandadata/redpanda:latest` as the reference (decision 9) |
+| `redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml`) | `major.minor.patch` | done — substitute override (decision 9) |
+| `valkey/valkey:9.1.2-alpine` (`deploy/docker-compose.yml`) | `major.minor.patch` | done — replaced `redis:7-alpine` (decision 10) |
+| `prom/prometheus:v3.14.0` (`deploy/docker-compose.yml`) | `major.minor.patch` | done |
+| `python:3.12-slim` × 4 (`services/*/Dockerfile`) | `major.minor` | none |
 
 ## Assumptions
 
@@ -498,6 +533,13 @@ earlier ADRs do not make. Push back on them individually.
 
 ## Consequences
 
+> Amended 2026-09-18: the compose change that accompanies Amendment 1 has
+> made the swaps below (Kafka reference, Valkey reference, Prometheus
+> pinned, Redpanda override) and changed the `README.md` `make up` line;
+> the "today" and "with the compose PR" statements in this section
+> describe the pre-change state. Runtime is still unexercised (see the
+> inventory preamble).
+
 * **Apache Kafka is heavier than Redpanda.** A JVM broker image several
   times Redpanda's size and a slower cold start, paid on every `make up`
   and every broker-backed CI run. Accepted: it is the cost of the reference
@@ -535,7 +577,9 @@ earlier ADRs do not make. Push back on them individually.
 
 ## Follow-through (briefs for the top-level session to dispatch)
 
-Nothing below has been dispatched; the architect has no `Agent` tool. Order:
+Nothing below has been dispatched; the architect has no `Agent` tool.
+(Amended 2026-09-18: C1 has since been carried out and its diff reviewed;
+the inventory above records its result. R1's text is unchanged.) Order:
 the coder brief first; the reviewer brief on its diff; the test-author
 constraint is for #52's brief, not a dispatch of its own.
 
@@ -730,3 +774,195 @@ project's own licence file on GitHub was read instead, and that is noted.
   features used); `packages/hammertime-store/src/hammertime/store/redis.py`
   (`noeviction` requirement; commands used); `uv.lock` (versions);
   `.github/workflows/ci.yml`; `LICENSE` (MIT).
+
+Read on 2026-09-18 for Amendment 1 (licences at the pinned tags, re-fetched
+by the architect rather than taken from the C1 report):
+
+* `https://raw.githubusercontent.com/apache/kafka/4.3.1/LICENSE` — "Apache
+  License / Version 2.0, January 2004".
+* `https://raw.githubusercontent.com/valkey-io/valkey/9.1.2/COPYING` — "BSD
+  3-Clause License", "Copyright (c) 2024-present, Valkey contributors" and
+  "Copyright (c) 2006-2020, Redis Ltd.".
+* `https://raw.githubusercontent.com/prometheus/prometheus/v3.14.0/LICENSE`
+  — "Apache License / Version 2.0, January 2004".
+* `https://raw.githubusercontent.com/redpanda-data/redpanda/v26.2.3/licenses/bsl.md`
+  — HTTP 404; the source repository does not expose that tag under that
+  name, so the Redpanda citation remains the `dev` branch file above and
+  the inventory says so.
+* `https://raw.githubusercontent.com/apache/kafka/4.3.1/docker/examples/docker-compose-files/single-node/plaintext/docker-compose.yml`
+  — the ASF's own single-node KRaft combined-mode example for 4.3.1. C1's
+  `KAFKA_*` set matches it, with the `PLAINTEXT`/`PLAINTEXT_HOST` listener
+  ports mirrored (the example advertises `broker:19092` internally and
+  `localhost:9092` on the host; the repository keeps its existing
+  `broker:9092` / `localhost:19092`) and without the example's
+  `KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0`, which the broker defaults to
+  3000 ms — a first-rebalance latency, not a correctness setting.
+* Tag confirmations (`apache/kafka` 4.3.1 newest non-rc 4.x;
+  `valkey/valkey` 9.1.2-alpine newest stable; `prom/prometheus` v3.14.0
+  newest non-rc; `redpandadata/redpanda` v26.2.3 newest `vXX.Y.Z`) are the
+  C1 report's Docker Hub reads, not re-fetched here.
+* `deploy/docker-compose.yml` lines 8, 30, 69 and
+  `deploy/docker-compose.redpanda.yml` line 4 (image references as landed).
+
+## Amendment 1 (2026-09-18) — inventory brought to the post-C1 state; decision 9's override description corrected
+
+Why: decision 6 makes this ADR's inventory the living record and requires
+it to be updated in the same change set as any dependency change. Brief C1
+has now produced that change — `deploy/docker-compose.yml` runs
+`apache/kafka:4.3.1` as `broker`, `valkey/valkey:9.1.2-alpine` as `valkey`
+and `prom/prometheus:v3.14.0`; the new `deploy/docker-compose.redpanda.yml`
+overrides only `broker` with `redpandadata/redpanda:v26.2.3` — and the
+inventory still described the pre-change state (`latest` tags, "to be
+added", `non-compliant`). Separately, the review of C1's diff found that
+decision 9 said the override carried "its own healthcheck" while brief C1
+in the same ADR forbids adding healthchecks (ADR-0009 decision 10 / #17)
+and the file as landed has none. This amendment follows ADR-0009
+Amendment 1's convention: text is corrected in place with a dated
+blockquote or note pointing here, and every edit made outside this section
+is listed below with the superseded wording quoted. No decision changes in
+substance; the ADR gets no `CHANGES` entry (assumption 16) and the compose
+change already carries its one line.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Was: "Status: accepted 2026-09-18." Now: "Status:
+  accepted 2026-09-18; amended 2026-09-18 (see "Amendment 1" at the end —
+  ...)." with the summary clause.
+* **Context, new blockquote.** After the three-bullet list ending "is the
+  image-level form of the same risk." and before "The rest of the
+  inventory is in good shape", a dated blockquote was inserted saying the
+  two breaches are fixed by the compose change accompanying this amendment
+  and naming the three images. No existing sentence of Context was changed;
+  its "runs today" / "today resolves to" statements now describe the
+  pre-change state, as the note says.
+* **Decision 9, override paragraph, corrected in substance of description
+  (not of rule).** Was: "(image `redpandadata/redpanda`, pinned; its
+  `redpanda start` command; its own healthcheck)". Now: "(image
+  `redpandadata/redpanda:v26.2.3`; `environment: !reset {}` so that none
+  of the reference's `KAFKA_*` variables reach it; its `redpanda start`
+  command; no healthcheck today, because healthchecks are ADR-0009
+  decision 10's and #17's — when #17 adds a broker healthcheck the override
+  must carry a Redpanda-appropriate one of its own, since `!reset` covers
+  only `environment` and the Kafka probe would otherwise be inherited)". A
+  dated blockquote was added after the paragraph ending "Neither ADR is
+  edited here." The rule — Redpanda is a documented substitute confined to
+  the override file — is unchanged; only the description of the file's
+  contents was wrong.
+* **Inventory, new preamble paragraph.** Between "anything else is marked
+  as an assumption." and the Class 1 heading, a paragraph was inserted
+  stating that the Class 1 and Class 4 tables were rewritten here and
+  defining the "runtime" component of the Verified column (nothing has been
+  started; `docker compose config` only; first `make up` / #52 is the
+  proof).
+* **Class 1 heading.** Was: "### Class 1 — runtime infrastructure
+  (`deploy/docker-compose.yml`)". Now adds "and the
+  `deploy/docker-compose.redpanda.yml` override".
+* **Class 1 table, five rows rewritten** (Grafana OSS and CPython rows
+  untouched). Superseded rows:
+  * Redpanda — "`redpandadata/redpanda:latest` (line 5; `latest` = v26.2.3
+    today) | ... | Apache Kafka | **non-compliant** (not OSI; unpinned) —
+    becomes the documented substitute under decision 9 | none | yes
+    (`licenses/bsl.md`)". Now: image `redpandadata/redpanda:v26.2.3` in the
+    override file; status "substitute (decision 9)"; pin
+    `major.minor.patch`; Verified says the licence is read from the `dev`
+    branch and is **not** verified at the pinned tag (404 at
+    `v26.2.3`), tag confirmed, runtime not exercised.
+  * Apache Kafka — "`apache/kafka:<4.x>` (to be added) | ... | compliant
+    once pinned and landed | to be pinned | yes (`LICENSE`; Docker Hub
+    publisher = The Apache Software Foundation)". Now: `apache/kafka:4.3.1`
+    at `deploy/docker-compose.yml` line 8; `compliant`; `major.minor.patch`;
+    licence verified at tag `4.3.1`; runtime not exercised (config
+    validation plus match against the ASF single-node example).
+  * Redis — "`redis:7-alpine` (line 15; resolves to 7.4.11-alpine today) |
+    ... | **non-compliant** (7.4 is not OSI; floating tag) | major only |
+    ...". Now: "not deployed since 2026-09-18 (was `redis:7-alpine` ...)";
+    status "replaced (decision 10)"; pin "n/a (not deployed)"; licence
+    facts kept verbatim for the record.
+  * Valkey — "`valkey/valkey:<9.x-alpine>` (to be added) | ... | compliant
+    once landed | to be pinned | yes (`COPYING`; ...)". Now:
+    `valkey/valkey:9.1.2-alpine` at line 30 with `noeviction` noted;
+    `compliant`; `major.minor.patch`; licence verified at tag `9.1.2`;
+    runtime not exercised.
+  * Prometheus — "`prom/prometheus:latest` (line 53) | ... | compliant once
+    pinned (**pin missing**) | none | yes (`LICENSE`)". Now:
+    `prom/prometheus:v3.14.0` at line 69; `compliant`; `major.minor.patch`;
+    licence verified at tag `v3.14.0`; runtime not exercised.
+* **Class 4 table, rewritten, plus one sentence before it.** Was four
+  rows: "`redpandadata/redpanda:latest` | no | replaced as reference
+  (decision 9); the substitute override pins it", "`redis:7-alpine` |
+  major only | replaced (decision 10)", "`prom/prometheus:latest` | no |
+  pin to a `v3.x` release", "`python:3.12-slim` × 4 | `major.minor` |
+  none". Now five rows, one per image reference as landed, each
+  `major.minor.patch` except the Python base image (`major.minor`), action
+  "done" for the four compose images and "none" for Python; the sentence
+  before the table states that every reference in `deploy/` and every
+  `FROM` line is pinned and no decision 5 item 2 action remains.
+* **Consequences, new blockquote** at the top of the section, saying the
+  swaps and the `README.md` `make up` line change have been made and that
+  the section's "today" / "with the compose PR" statements describe the
+  pre-change state. No bullet was changed.
+* **Follow-through preamble, one parenthetical added.** After "Nothing
+  below has been dispatched; the architect has no `Agent` tool." the
+  sentence "(Amended 2026-09-18: C1 has since been carried out and its diff
+  reviewed; the inventory above records its result. R1's text is
+  unchanged.)" was inserted. This is beyond the strict list of what the
+  amendment was asked to update; it is there because the preamble was the
+  one remaining sentence a reader would take as current and would be
+  misled by. Strike it if the session prefers the preamble frozen.
+* **Sources, new dated block** listing the five URLs re-fetched for this
+  amendment, the tag confirmations taken from the C1 report, and the
+  compose line numbers as landed.
+
+Decision 7 item 1 still says "The two current cases are the broker image
+and the store image (decisions 9 and 10) and their fix is briefed under
+Follow-through." That sentence is left as written: it is the remediation
+rule's worked example, its "current" is anchored by the ADR's acceptance
+date, and the inventory rows it refers to now read `compliant` /
+`replaced` as the rule says they should once the fix merges.
+
+Assumptions made by this amendment (none is required by the task, the
+spec or an earlier ADR; push back individually):
+
+1. **Status wording "substitute (decision 9)" for Redpanda.** The Status
+   value list at the head of the inventory does not include it; the five
+   defined values (`compliant`, `compliant-with-drop-in`, `exception`,
+   `non-compliant`, `needs verification`) all describe components in the
+   reference deployment, and Redpanda is now in none of them — it is not
+   compliant (BUSL-1.1), but it is also no longer a breach, because
+   decision 2 item 3 permits exactly this documented-substitute status. A
+   sixth value was used rather than forcing the row into
+   `non-compliant`, which would wrongly imply a decision 7 remediation is
+   still owed.
+2. **"Verified" split into licence / tag / runtime.** The column's
+   definition ("the licence was read from the source named under Sources
+   for the version shown") covers only the licence; the task asked for a
+   runtime note wherever Status or Verified would otherwise overstate, and
+   the tag confirmation is a third, separate fact. The three are written
+   out in each row rather than adding columns, to keep the table's shape.
+3. **The Redpanda licence is recorded as read from `dev`, not at the
+   tag.** The 404 was reproduced by the architect. Whether the `v26.2.3`
+   release corresponds to a differently named tag in the source repository
+   was not investigated; BSL 1.1 at `dev` and at any 26.x release is
+   assumed to be the same text, which is consistent with the licence being
+   applied "four years from release date" per release rather than being
+   re-drafted. If the pinned tag's licence ever needs to be proven, the
+   Redpanda release archive rather than the GitHub tag is the place to
+   look.
+4. **`major.minor.patch` written in the Pin column** rather than the
+   definition's floor `major.minor`, because all four compose images now
+   carry a full patch tag and decision 5 recommends it; the floor is
+   unchanged.
+5. **The ASF example's `KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0` is not
+   treated as a gap.** C1 omitted it; the broker default (3000 ms) delays
+   only the first consumer-group rebalance after a group is created. It is
+   recorded under Sources as an observed difference so that #52, which will
+   measure startup against ADR-0009's 60 s deadline, knows it is there; it
+   is not raised as a finding and no follow-up brief is written for it.
+6. **The tag confirmations are taken from the C1 report.** Docker Hub tag
+   pages were not re-fetched by the architect; the licence files were. The
+   Sources block says which is which.
+7. **Runtime unexercised is a note, not a `needs verification` status.**
+   `needs verification` in the Status legend refers to licence verification.
+   The images' licences are verified; what is unverified is that the
+   compose files start. That belongs to #52 and the first `make up`, and is
+   recorded per row rather than by demoting `compliant`.

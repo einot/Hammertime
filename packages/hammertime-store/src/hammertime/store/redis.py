@@ -73,11 +73,12 @@ from redis.exceptions import WatchError
 _SEEN_VALUE = b"1"
 
 #: Namespaces every dedup key this module writes. `SequenceKey.cache_key()` has no
-#: prefix of its own, and this store is deployed against a shared Redis --
-#: `deploy/docker-compose.yml` points ingest and the (not yet implemented)
-#: aggregator Redis counter store at the same `redis://redis:6379/0` -- so an
-#: unprefixed key risks colliding with a future, unrelated key scheme in the
-#: same keyspace.
+#: prefix of its own, and this store is deployed against a shared Redis-protocol
+#: keyspace (Valkey in the reference deployment, ADR-0012) --
+#: `deploy/docker-compose.yml` points both ingest and the aggregator at the same
+#: `redis://valkey:6379/0`, and the aggregator's `hammertime:agg:*` shard-state
+#: keys (ADR-0011) live alongside -- so an unprefixed key would collide with an
+#: unrelated key scheme in the same keyspace.
 _KEY_PREFIX = "hammertime:dedup:"
 
 #: Namespaces every key `RedisShardStateStore` writes, one pair per shard:

@@ -1,56 +1,72 @@
 name: hammertime
 
 services:
-  redpanda:
-    image: redpandadata/redpanda:latest
-    command:
-      - redpanda start
-      - --smp 1
-      - --overprovisioned
-      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+  # Reference broker (ADR-0012 decision 9): Apache Kafka, single-node KRaft
+  # combined mode. Redpanda is the documented substitute; see
+  # docker-compose.redpanda.yml.
+  broker:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: CONTROLLER://:29093,PLAINTEXT://:9092,PLAINTEXT_HOST://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: SDU4XwcQSUW58J1LCtxq_w
     ports: ["19092:19092"]
 
-  redis:
-    image: redis:7-alpine
+  # Reference store (ADR-0012 decision 10): Valkey. noeviction is required by
+  # ADR-0011 for the hammertime:agg:* and hammertime:dedup:* keyspaces.
+  valkey:
+    image: valkey/valkey:9.1.2-alpine
+    command: ["valkey-server", "--maxmemory-policy", "noeviction"]
     ports: ["6379:6379"]
 
   ingest:
     build: { context: .., dockerfile: services/ingest/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: redpanda:9092
-      HAMMERTIME_REDIS_URL: redis://redis:6379/0
+      HAMMERTIME_BUS_BROKERS: broker:9092
+      HAMMERTIME_REDIS_URL: redis://valkey:6379/0
     ports: ["8080:8080"]
-    depends_on: [redpanda, redis]
+    depends_on: [broker, valkey]
 
   aggregator:
     build: { context: .., dockerfile: services/aggregator/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: redpanda:9092
-      HAMMERTIME_REDIS_URL: redis://redis:6379/0
-    depends_on: [redpanda, redis]
+      HAMMERTIME_BUS_BROKERS: broker:9092
+      HAMMERTIME_REDIS_URL: redis://valkey:6379/0
+    depends_on: [broker, valkey]
 
   trie:
     build: { context: .., dockerfile: services/trie/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: redpanda:9092
+      HAMMERTIME_BUS_BROKERS: broker:9092
     ports: ["8081:8081"]
     volumes: ["trie-snapshots:/snapshots"]
-    depends_on: [redpanda]
+    depends_on: [broker]
 
   detector:
     build: { context: .., dockerfile: services/detector/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: redpanda:9092
+      HAMMERTIME_BUS_BROKERS: broker:9092
     ports: ["8082:8082"]
-    depends_on: [redpanda]
+    depends_on: [broker]
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.14.0
     volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
     ports: ["9090:9090"]
 
