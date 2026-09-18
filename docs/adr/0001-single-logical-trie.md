@@ -193,5 +193,11 @@ Assumptions (each a judgment call, push back individually):
 * **The address-family split (one writer per family) does not change the
   model.** Each family's trie has its own `event_sequence`; nothing above is
   cross-family.
+  > Superseded 2026-09-18 by ADR-0012 decision 1 on the counter only: the
+  > one trie process is the writer for both families and keeps **one**
+  > `event_sequence` (ADR-0010 decision 3's service-wide counter), so the
+  > detector's `event_sequence` is well defined. The clauses above remain
+  > per IP and are still not cross-family — nothing orders one family's
+  > transitions against the other's.
 * **No CHANGES entry.** This amendment states shipped and already-decided
   behaviour; it changes nothing observable.

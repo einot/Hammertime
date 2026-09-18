@@ -9,7 +9,15 @@ services and expose no write operations).
 All timestamps are RFC 3339 UTC with a `Z` suffix, as in every event schema.
 `event_sequence` is the responding service's own counter (§22, ADR-0003
 amendment): for the trie, the number of hot-IP events applied so far; for the
-detector, the `sequence` of the newest `PrefixStatsChanged` applied.
+detector, the `sequence` of the newest `PrefixStatsChanged` applied. A
+hot-IP event is *applied* iff it changed the trie's state (ADR-0012 decision
+7): a transition that moved `hot_count`, or a `HotIpAdded` for an address
+already HOT, which replaces its record (§46.5) and so changes
+`request_count`/`attributes` below. A `HotIpRemoved` for an address the trie
+does not hold changes nothing and is not counted. The counter is one for the
+whole service, both address families included, and is strictly increasing
+but not dense on the prefix-stats topic (a replaced record advances it and
+publishes nothing).
 
 ## Admin endpoints — every service (§47)
 
@@ -45,8 +53,22 @@ FastAPI services answer their frameworks' own 404/405 for the same cases.
 
 ### `GET /prefix/{cidr}`
 
-`{cidr}` is `address/length`, e.g. `/prefix/10.20.30.0/24`. Host bits set, an
-invalid address, or a length outside `[0, bit_length]` -> `400 {"detail": ...}`.
+`{cidr}` is `address/length`, e.g. `/prefix/10.20.30.0/24` (the route is
+declared with Starlette's `path` convertor so the embedded `/` matches;
+ADR-0012 decision 9). The `/length` part is required and the length must be
+one to three decimal digits. Parsing failures are `400 {"detail": <reason>}`
+with one of four fixed reasons, never echoing the input:
+
+| Input | `detail` |
+| --- | --- |
+| no `/`, or a length that is not `[0-9]{1,3}` | `prefix must be address/length` |
+| the address does not parse, or carries an IPv6 scope id (`fe80::1%eth0`) | `invalid address` |
+| length outside `[0, bit_length]` for the address's family | `prefix length out of range` |
+| a bit set below `length` | `host bits set` |
+
+Accepted text is whatever `ipaddress` accepts (so `10.020.030.0/24` is
+rejected — leading zeros — and `::FFFF:10.0.0.0/104` is IPv6); the response
+echoes the canonical form (`2001:DB8::/32` is answered as `2001:db8::/32`).
 
 ```json
 {
@@ -76,7 +98,7 @@ invalid address, or a length outside `[0, bit_length]` -> `400 {"detail": ...}`.
 
 ### `GET /ip/{addr}`
 
-Malformed address -> `400`.
+Malformed address (including an IPv6 scope id) -> `400 {"detail": "invalid address"}`.
 
 ```json
 {
@@ -105,6 +127,13 @@ Malformed address -> `400`.
   stored, and returned, as `{"attributes_version": 1}`.
 * `matched_prefixes` — the ancestors at lengths 8, 16 and 24 (IPv4), in that
   order, each shaped like a `GET /prefix` body minus the envelope fields.
+  For an IPv6 address the lengths are 104, 112 and 120 — the lengths whose
+  capacities (2^24, 2^16, 2^8) equal those of the IPv4 ones (ADR-0012
+  assumption 6).
+* `request_count` and `attributes` come from the record the most recent
+  `HotIpAdded` stored; a redelivered or replayed `HotIpAdded` for an
+  already-HOT address replaces that record (§46.5), so both may change while
+  `state` stays `"HOT"`.
 
 ### `GET /prefixes/hot[?minimal=true]`
 
@@ -115,9 +144,20 @@ Malformed address -> `400`.
 }
 ```
 
-Every node whose `state` is `HOT_PREFIX`, ordered by prefix length descending
-then address ascending. With `minimal=true`, only those with no qualifying
-descendant (§31: the most specific qualifying prefixes).
+Every prefix whose `state` is `HOT_PREFIX`, over both address families,
+among the prefixes the trie reports to the detector — lengths from the
+family's minimum reported length (`HAMMERTIME_TRIE_MIN_PREFIX_LENGTH`,
+default 8 for IPv4; `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_V6`, default 104 for
+IPv6) to the host route — ordered by prefix length descending, then IPv4
+before IPv6, then network address ascending. "Every prefix" means every
+prefix of the *logical* binary trie (§27): a prefix the Patricia
+representation compresses away still appears here when it qualifies
+(ADR-0012 decision 3). With `minimal=true`, only those with no qualifying
+descendant (§31: the most specific qualifying prefixes); a compressed-away
+prefix is never minimal, so the minimal list is a subset of the
+materialized nodes. A `minimal` value that is not a boolean
+(`true`/`false`/`1`/`0`/`yes`/`no`, case-insensitive) is FastAPI's default
+`422`.
 
 ## Detector — port 8082 (§22, §31, ADR-0010)
 
@@ -159,6 +199,9 @@ descendant (§31: the most specific qualifying prefixes).
 
 ## Errors
 
-`400` bodies are `{"detail": "<message>"}` (FastAPI's default). No endpoint
-returns `404` for an unknown prefix or address — see the zero-valued answers
-above. `503` is reserved for not-ready.
+`400` bodies are `{"detail": "<message>"}` (FastAPI's default); the trie's
+messages are the fixed reasons listed under `GET /prefix/{cidr}` and never
+contain the request's own text (ADR-0012 assumption 18). A malformed query
+parameter (`minimal`) is FastAPI's default `422`. No endpoint returns `404`
+for an unknown prefix or address — see the zero-valued answers above. `503`
+is reserved for not-ready.

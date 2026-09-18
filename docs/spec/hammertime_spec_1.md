@@ -548,6 +548,15 @@ However, frequent HOT/COLD oscillation can cause allocation churn.
 
 Implementations SHOULD consider retaining structural nodes or using an arena/slab allocation strategy.
 
+> ADR-0012 decision 2: the production trie prunes a node the moment its
+> `hot_count` reaches 0 — unless it carries prefix metadata (Section 16),
+> which pins it — and returns the slot to an arena free list that is reused
+> before the arena grows, so oscillation costs no allocation after the first
+> cycle and live nodes are bounded by `2 * hot_ip_count + pinned + 1`. A
+> `HotIpRemoved` for an address the trie does not hold changes nothing
+> (outcome `noop`), which is how `hot_count >= 0` survives a redelivery or a
+> gap in an IP's stream (ADR-0001 Amendment 1 clause 5).
+
 ---
 
 # 12. Trie Invariants
@@ -584,6 +593,16 @@ assuming both children are represented and the node has no separate `/32` semant
 > instead: `len(records) == hot_count(root)` per address family.
 
 This invariant is more important than cached `prefix_state`.
+
+> ADR-0012 decision 3 states the invariants the implementation checks
+> (`services/trie/structure/invariants.py::check_invariants`, mirrored by
+> `hammertime.testkit.invariants`): this section's sum rule and leaf rule,
+> `hot_count >= 0`, `hot_count(root) == number of HOT addresses`, and for the
+> Patricia representation that every non-root node has `hot_count > 0` or
+> prefix metadata, every single-child node has prefix metadata, and no
+> arena slot is unreachable. `prefix_state` is not cached at all in v1: it is
+> computed at read time from `hot_count`, `prefix_length` and the
+> configuration in force, exactly as below.
 
 Prefix state can always be recomputed from:
 
@@ -784,6 +803,16 @@ The trie SHOULD NOT assume that all metadata is mergeable by simple union.
 > **ADR-0005:** this section governs prefix-scoped metadata only. Per-IP
 > attributes (Section 46) are not inherited and are not combined along the path;
 > the two mechanisms share no namespace.
+
+> ADR-0012 decision 5: `combine()` is a per-name `Combiner` registered in
+> `services/trie/metadata/combine.py` (`SetUnion`, `BitmaskOr`,
+> `PriorityOverride`; only the first two are commutative, all three are
+> associative), folded root-first over the path by `effective_metadata`. On
+> the Patricia trie a prefix that gains metadata is materialized and
+> *pinned*: never pruned or compressed away while it carries any, because
+> prefix metadata's lifetime is independent of hot state (Section 46.6).
+> Nothing in v1 declares prefix metadata; the mechanism exists so the
+> structure honours this section from the start.
 
 ---
 
@@ -1261,6 +1290,18 @@ can be represented as a compressed edge rather than 32 individual nodes.
 
 However, the logical model MUST remain equivalent to the binary trie described above.
 
+> ADR-0012 decisions 2-4: `services/trie/structure/patricia.py` is the
+> production representation (integer node ids in an arena, compressed
+> edges, immediate pruning) and `binary_trie.py` the bit-by-bit oracle; the
+> two are differentially tested over one public API and a Hypothesis state
+> machine. Equivalence is over the *logical* trie: every prefix a compressed
+> edge skips exists with the `hot_count` of the node below it, and can be
+> `HOT_PREFIX` without being materialized — the read path and the publisher
+> answer over those logical prefixes, never over materialized nodes alone. A
+> compressed-away prefix is never the *most specific* qualifying one
+> (Section 31), because its single logical child has the same count and half
+> the capacity.
+
 ---
 
 # 28. Atomicity
@@ -1295,6 +1336,18 @@ The preferred mechanism depends on the runtime and persistence requirements.
 
 A single-writer model is strongly recommended where practical because trie updates are small and deterministic.
 
+> ADR-0012 decision 7: single writer, on one asyncio event loop. The whole
+> update — the `hot_count` path of the address's family trie and the per-IP
+> attribute record (Section 46.5) — is one synchronous call,
+> `TrieState.apply`, with no `await` inside, and every read-API response is
+> built inside one synchronous section by an `async def` handler on the same
+> loop; a reader therefore cannot observe a partially updated path. The
+> outcome of an event is one of `added`, `removed`, `replaced` (a
+> `HotIpAdded` for an address already HOT — the record is replaced, no count
+> moves) or `noop` (a `HotIpRemoved` for an address not held). The first
+> three are *applied* and advance the trie's `event_sequence`; only the first
+> two publish `PrefixStatsChanged`.
+
 ---
 
 # 29. Read Path
@@ -1322,6 +1375,15 @@ should directly locate the `/16` trie node and return:
 > `GET /detections`; zero-valued answers for unknown prefixes) are specified in
 > `docs/protocol/read-api-v1.md` (ADR-0010). `state` here is the Section 13
 > predicate evaluated against the trie's current configuration.
+
+> ADR-0012 decision 9: the read path is `services/trie/query/views.py`
+> (`ReadModel`) behind a FastAPI app; it answers over the logical trie of
+> Section 27 for both address families, locates a prefix in
+> O(`bit_length`), computes `state` at read time through
+> `hammertime.core.state.prefix.evaluate_prefix_state`, and returns
+> `request_count` and `attributes` from the per-IP record the most recent
+> `HotIpAdded` stored. Parsing rules and the IPv6 `matched_prefixes` lengths
+> are in `docs/protocol/read-api-v1.md`.
 
 An IP query — which since ADR-0005 also returns the IP's attributes while it is
 HOT (Section 46.7):
@@ -1478,6 +1540,14 @@ A query MAY request the most specific qualifying prefixes rather than every ance
 
 This prevents an alert system from generating hundreds of redundant nested alerts.
 
+> ADR-0012 decision 9: the trie's `GET /prefixes/hot?minimal=true` is this
+> query — every `HOT_PREFIX` prefix with no `HOT_PREFIX` descendant, ranging
+> over the same prefix lengths the trie reports to the detector (from the
+> family's minimum reported length down to the host route), so it and the
+> detector's `GET /detections?minimal=true` agree by construction (ADR-0010
+> decision 1). Only a materialized trie node can be minimal (Section 27
+> note).
+
 ---
 
 # 32. Persistence
@@ -1559,6 +1629,23 @@ After loading a snapshot, events after its sequence number are replayed.
 > its read API — until that replay has reached the end of the log as it stood
 > when the process started. On shutdown it writes a final snapshot after
 > committing its consumer position (Section 47.4).
+
+> ADR-0012 decisions 8 and 11 (milestone M5, before snapshots exist): with
+> no snapshot the trie seeks every partition of `hammertime.hot-ip.v1` to
+> its beginning and replays the whole log to the end captured at start,
+> then becomes ready; the consumer group's committed offsets are maintained
+> (flushed first) for lag observability but are never the position it
+> resumes from. Replayed transitions re-publish their `PrefixStatsChanged`
+> with the same `sequence` and `event_id`, which consumers absorb. The
+> snapshot of M6 records, per partition, the worker's handled position
+> (`TrieWorker.handled_positions`) — this section's "event sequence number"
+> is not a single Kafka offset — plus every hot address's record including
+> its transition-time `window_count`, every pinned node's prefix metadata,
+> the trie's `event_sequence` and the `config_version`; it is taken only
+> after a flush-then-commit so it never covers an event whose stats have not
+> reached the log. `HAMMERTIME_TRIE_SNAPSHOT_DIR` and
+> `HAMMERTIME_TRIE_SNAPSHOT_INTERVAL_S` are parsed and validated from M5 on
+> and acted upon from M6 on.
 
 ---
 
@@ -1652,6 +1739,16 @@ IPv6 trie
 ```
 
 The implementation SHOULD preferably maintain separate roots because IPv4 and IPv6 have different address spaces.
+
+> ADR-0012 decision 1: one trie service process holds one `PatriciaTrie`
+> per `AddressFamily` (separate roots, separate arenas) and is the single
+> writer for both, consuming both families' transitions from the one
+> hot-ip topic under one `event_sequence`. The minimum reported prefix
+> length is per family: `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` (IPv4, default
+> 8) and `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_V6` (IPv6, default 104 — the
+> length whose capacity, 2^24, equals IPv4's /8, so both families report
+> the same 25 capacity levels per transition); `GET /ip`'s
+> `matched_prefixes` mirror 8/16/24 as 104/112/120 for IPv6.
 
 ---
 
@@ -2077,6 +2174,16 @@ ip_attribute_records   (ADR-0005, Section 46.8)
 ip_attribute_bytes
 attributes_rejected
 ```
+
+> ADR-0012 decision 11: the trie labels `trie_updates` by `family`
+> (`ipv4` | `ipv6` | `unknown`, the last only for a malformed record) and
+> `outcome` (`added` | `removed` | `replaced` | `noop` | `malformed`),
+> `trie_nodes` and `hot_ip_count` by `family`, and `prefix_queries` by
+> `endpoint` (`prefix` | `ip` | `prefixes_hot`); `ip_attribute_records` MUST
+> equal the sum of `hot_ip_count` over families. It additionally records
+> `trie_recovery_seconds` (ADR-0009 decision 5 step 6; the time `start()`
+> spent replaying) and the processing-latency series
+> `hot_transition_to_prefix_update_latency` below as a sum and a count.
 
 ### Detection metrics
 

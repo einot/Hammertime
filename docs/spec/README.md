@@ -6,9 +6,10 @@ Prefix Detection Service*, 47 sections (1-45 as originally written; §46 added b
 ADR-0005, which also adds pointer notes to §9, §12, §16, §29, §33, §34, §37;
 §47 added by ADR-0009, which adds pointer notes to §33 and §34, ADR-0010
 adds pointer notes to §13 and §29, ADR-0011 adds pointer notes to §5, §20,
-§24, §26, §30, §34 and §37, and ADR-0001 Amendment 1 — the consistency model
+§24, §26, §30, §34 and §37, ADR-0001 Amendment 1 — the consistency model
 for many aggregator shards feeding one trie — adds pointer notes to §21 and
-§22).
+§22, and ADR-0012 — the trie service — adds pointer notes to §11, §12, §16,
+§27, §28, §29, §31, §33, §35 and §37).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -38,26 +39,26 @@ Section index used throughout the code:
 | 4 | Agent ingestion protocol | `services/ingest` |
 | 5 | Sliding window / buckets | `services/aggregator/window/counter.py`, `services/aggregator/window/store.py`, `core/time`, `docs/adr/0011` |
 | 6, 7, 38 | HOT/COLD hysteresis | `core/state/machine.py`, `tests/property/test_state_machine.py` |
-| 8-12 | Binary IP trie & invariants | `services/trie/structure` |
+| 8-12 | Binary IP trie & invariants | `services/trie/structure`, `services/trie/state.py`, `tests/property/test_trie_properties.py`, `packages/hammertime-testkit` (`invariants.py`, `generators.py`), `docs/adr/0012` |
 | 13, 38 | `HOT_PREFIX` predicate (single implementation) | `core/state/prefix.py`, `services/detector/rules/baseline.py`, `services/trie/query`, `docs/adr/0010` |
-| 13, 14, 31 | Prefix classification & scoring | `services/detector` |
-| 16, 17 | Prefix metadata inheritance | `services/trie/metadata` |
+| 13, 14, 31 | Prefix classification & scoring | `services/detector`, `services/trie/query/views.py` (`GET /prefixes/hot?minimal=true`, §31), `docs/adr/0012` |
+| 16, 17 | Prefix metadata inheritance | `services/trie/metadata` (`local.py`, `combine.py`), `services/trie/structure/patricia.py` (pinned nodes), `docs/adr/0012` |
 | 19 | Event-driven internals | `core/events`, `packages/hammertime-bus`, `docs/adr/0004` |
 | 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py`), `packages/hammertime-store` (`ShardStateStore`), `services/ingest/publisher.py`, `docs/adr/0001` (Amendment 1), `docs/adr/0004`, `docs/adr/0011` |
 | 22 | Consistency model | `docs/adr/0001` (Amendment 1), `docs/adr/0003` (Amendment 2), `docs/adr/0011` (decisions 4, 5; A20), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
 | 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `services/aggregator/worker.py`, `core/time/buckets.py`, `docs/adr/0002` (Amendment 1), `docs/adr/0011` |
 | 26 | Memory / retention | `services/aggregator/window/store.py`, `packages/hammertime-store` (`ShardStateStore`), `docs/adr/0011` |
-| 27 | Trie representation | `services/trie/structure/patricia.py` |
-| 28 | Atomicity | `services/trie/worker.py` |
-| 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010` |
+| 27 | Trie representation | `services/trie/structure/patricia.py`, `services/trie/structure/arena.py`, `services/trie/structure/binary_trie.py` (oracle), `services/trie/tests/test_patricia_equivalence.py`, `docs/adr/0012` |
+| 28 | Atomicity | `services/trie/state.py`, `services/trie/worker.py`, `docs/adr/0012` |
+| 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010`, `docs/adr/0012` |
 | 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `core/state/transitions.py`, `docs/adr/0011` |
-| 32, 33 | Persistence & snapshots | `services/trie/snapshot` |
+| 32, 33 | Persistence & snapshots | `services/trie/snapshot` (M6), `services/trie/worker.py` (replay from the log beginning until snapshots exist), `docs/adr/0012` (decisions 8, 11) |
 | 34 | Versioned configuration | `core/config`, `services/aggregator/reevaluate.py`, `docs/adr/0011` |
-| 35 | IPv6 readiness | `core/addressing` |
+| 35 | IPv6 readiness | `core/addressing`, `services/trie/config.py` (per-family minimum reported length), `docs/adr/0012` |
 | 36 | Security | `services/ingest/auth` |
 | 36.1-36.4 | Agent credentials (hashed tokens, rotation, provisioning) | `services/ingest/auth/agents.py`, `core/auth/tokens.py`, `tools/agent-token`, `schemas/agent_registry.v2.json`, `docs/adr/0006` |
 | 36.5-36.7 | Auth throttling, request cost, throttled responses | `services/ingest/auth`, `services/ingest/ratelimit`, `services/ingest/api/routes.py`, `docs/adr/0007`, `docs/adr/0008` |
-| 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `deploy/grafana` |
-| 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events`, `core/config`, `docs/adr/0005`, `docs/adr/0011` |
+| 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `services/trie/metrics.py`, `deploy/grafana` |
+| 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/trie/state.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events`, `core/config`, `docs/adr/0005`, `docs/adr/0011`, `docs/adr/0012` |
 | 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `docs/adr/0009`, `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |
