@@ -11,6 +11,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from hammertime.store import validate_redis_url
+
 _DEFAULT_BIND = "0.0.0.0:8080"
 _DEFAULT_MAX_BODY_BYTES = 1_048_576
 _DEFAULT_MAX_OBSERVATIONS = 10_000
@@ -68,7 +70,10 @@ class IngestSettings:
     bus_brokers: str
     #: HAMMERTIME_STORE_KIND: "redis" | "memory".
     store_kind: str
-    #: HAMMERTIME_REDIS_URL: meaningful only when store_kind == "redis".
+    #: HAMMERTIME_REDIS_URL: meaningful only when store_kind == "redis", and
+    #: validated by `load_settings` in that case (ADR-0009 A12) -- the
+    #: dataclass itself does not validate, so a directly built object is a
+    #: plain carrier.
     redis_url: str
     #: HAMMERTIME_INGEST_AUTH_FAILURE_RATE_PER_MIN: failed-auth source-bucket
     #: refill rate, failures/min (ADR-0007, spec section 36.5).
@@ -164,6 +169,18 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
             f"({observation_burst}) must be >= HAMMERTIME_INGEST_MAX_OBSERVATIONS "
             f"({max_observations})"
         )
+    store_kind = _parse_choice(
+        "HAMMERTIME_STORE_KIND",
+        source.get("HAMMERTIME_STORE_KIND", _DEFAULT_STORE_KIND),
+        allowed=_ALLOWED_STORE_KINDS,
+    )
+    redis_url = source.get("HAMMERTIME_REDIS_URL", _DEFAULT_REDIS_URL)
+    if store_kind == "redis":
+        # ADR-0009 decision 2 / A12: a URL `Redis.from_url` would refuse is
+        # invalid configuration, so it must fail here (config_invalid, exit
+        # 2) rather than inside start(). Under "memory" the value is never
+        # interpreted, so a set-but-malformed one is ignored, not rejected.
+        validate_redis_url(redis_url)
     return IngestSettings(
         host=host,
         port=port,
@@ -184,12 +201,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
             allowed=_ALLOWED_BUS_KINDS,
         ),
         bus_brokers=source.get("HAMMERTIME_BUS_BROKERS", _DEFAULT_BUS_BROKERS),
-        store_kind=_parse_choice(
-            "HAMMERTIME_STORE_KIND",
-            source.get("HAMMERTIME_STORE_KIND", _DEFAULT_STORE_KIND),
-            allowed=_ALLOWED_STORE_KINDS,
-        ),
-        redis_url=source.get("HAMMERTIME_REDIS_URL", _DEFAULT_REDIS_URL),
+        store_kind=store_kind,
+        redis_url=redis_url,
         auth_failure_rate_per_min=_parse_positive_number(
             "HAMMERTIME_INGEST_AUTH_FAILURE_RATE_PER_MIN",
             source.get(

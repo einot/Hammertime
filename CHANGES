@@ -1,3 +1,4 @@
+Reject a malformed HAMMERTIME_REDIS_URL at startup as invalid configuration (config_invalid, exit 2) instead of failing inside start() with exit 1; checked only when HAMMERTIME_STORE_KIND=redis
 Add aggregator service: consumes hammertime.observations.v1 per shard, maintains per-IP sliding windows, and emits HotIpAdded/HotIpRemoved with weight in attributes
 Aggregator diverts late, future, expired-bucket and over-long-window observations to hammertime.observations-reconciliation.v1 and counts them in late_messages/observations_rejected
 Aggregator persists each shard's HOT IP set (memory or Redis under hammertime:agg:*) and inherits it on restart or shard handover with a one-window warm-up
