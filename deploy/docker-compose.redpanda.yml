@@ -1,0 +1,12 @@
+# ADR-0012 decision 9 substitute broker (Redpanda): docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.redpanda.yml up
+services:
+  broker:
+    image: redpandadata/redpanda:v26.2.3
+    environment: !reset {}
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://broker:9092,external://localhost:19092
+    ports: ["19092:19092"]
