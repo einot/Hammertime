@@ -4,15 +4,22 @@ Spec: section 20, section 26, section 32, section 47.2
 
 ADR-0011 decision 1 (a shard *is* a partition of
 `hammertime.observations.v1`, so ownership is the consumer group's
-assignment and there is no in-repo IP hash) and decision 5 (the shard's HOT
-set is durable; a claim inherits it and warms up).
+assignment and there is no in-repo IP hash) and decision 5 as amended by
+Amendment 6 item A20 (the shard's HOT set is durable; a claim inherits it
+and warms up, and carries the handled position a commit may name for it).
 
 `ShardClaims` is the aggregator's `AssignmentListener`. Claiming a partition
 means loading that shard's `ShardState` and building its `ShardWindow` from
-it; revoking one means flushing the producer, committing the consumer
+it; revoking one means flushing the producer, committing the handled
 position and dropping the window -- nothing is written to the state store,
 which is already current, and nothing is emitted, because the next owner
 inherits the HOT set and warms up.
+
+`commit_handled` (decision 6, A20) is the aggregator's only commit path: the
+periodic commit, `stop()` and every revocation go through it, so a committed
+position never covers a message `handle()` has not finished. The consumed
+position the bus tracks is always one message ahead of that whenever a
+message has been fetched and not yet handled.
 
 The window counters start empty at a claim: every bucket older than the
 claim has expired by `claim + window_seconds`, so a new owner self-heals
@@ -22,9 +29,10 @@ why decision 5 exempts those IPs from HOT -> COLD for that window
 """
 
 import logging
+from collections.abc import Iterable
 
 from hammertime.aggregator.window.store import ShardWindow
-from hammertime.bus.interface import Consumer, Producer
+from hammertime.bus.interface import ConsumedMessage, Consumer, Producer
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.time.clock import Clock
 from hammertime.store.interface import ShardStateStore
@@ -42,6 +50,7 @@ class ShardClaims:
         "_clock",
         "_config",
         "_consumer",
+        "_handled",
         "_max_tracked_ips",
         "_producer",
         "_state_store",
@@ -65,6 +74,10 @@ class ShardClaims:
         self._config = config
         self._max_tracked_ips = max_tracked_ips
         self._windows: dict[int, ShardWindow] = {}
+        # A20: per claim, the offset a commit may name for it -- one past the
+        # last message `handle()` finished under it. A claim starts without
+        # one and loses it at revocation.
+        self._handled: dict[tuple[str, int], int] = {}
 
     # --- reads ---------------------------------------------------------------
 
@@ -96,6 +109,45 @@ class ShardClaims:
         """
         self._config = config
 
+    # --- commits (decision 6, A20) -------------------------------------------
+
+    def mark_handled(self, message: ConsumedMessage) -> None:
+        """Record `message.offset + 1` as this claim's handled position.
+
+        The worker calls it under the lock at the end of `handle()` for every
+        outcome except `UNCLAIMED` -- `APPLIED`, the four diverted outcomes
+        and `MALFORMED` all mean the worker is done with the message
+        (decision 3). `UNCLAIMED` never advances it: the message was not
+        handled under this claim, and advancing would commit past the
+        redelivery A20 relies on.
+
+        A partition this object does not hold is a `KeyError`, as item A15
+        chose for `set_state` on an untracked IP: a missing claim is a
+        missing key and a caller bug.
+        """
+        if message.partition not in self._windows:
+            raise KeyError(message.partition)
+        self._handled[message.topic, message.partition] = message.offset + 1
+
+    async def commit_handled(self, partitions: Iterable[tuple[str, int]] | None = None) -> None:
+        """Flush the producer, then commit the handled positions (decision 6).
+
+        `partitions` defaults to every held partition; any that has no handled
+        position yet is omitted, so the mapping may be empty. Both calls are
+        made regardless -- the flush-before-commit rule is "every commit is
+        preceded by a flush", not "every non-empty one", and a committed
+        position must never precede the transitions it produced.
+
+        This is the aggregator's only commit path (A20): the periodic commit,
+        `stop()` and `on_revoked` all arrive here, so what is committed is
+        never the bus's consumed position, which already sits past a message
+        that has been fetched and not yet handled.
+        """
+        keys = self._handled if partitions is None else partitions
+        offsets = {key: self._handled[key] for key in keys if key in self._handled}
+        await self._producer.flush()
+        await self._consumer.commit(offsets)
+
     # --- AssignmentListener --------------------------------------------------
 
     async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None:
@@ -124,10 +176,14 @@ class ShardClaims:
 
         The flush precedes the commit for the reason decision 6 gives for
         every commit: a committed position must never precede the
-        transitions it produced.
+        transitions it produced. What is committed is each revoked
+        partition's handled position, which by construction excludes a
+        message fetched but not yet handled -- so that message is delivered
+        to whichever member holds the partition next (A20). The handled
+        position is dropped with the window: the claim is over.
         """
-        await self._producer.flush()
-        await self._consumer.commit()
-        for _topic, shard in sorted(partitions):
+        await self.commit_handled(partitions)
+        for topic, shard in sorted(partitions):
+            self._handled.pop((topic, shard), None)
             if self._windows.pop(shard, None) is not None:
                 logger.info("shard_revoked shard=%d", shard)

@@ -2,12 +2,14 @@
 
 Spec: section 19, section 20, section 24, section 30, section 37, section 39
 
-ADR-0011 decision 3 as amended by Amendment 5 item A19 (one observation, one
-of seven outcomes; everything the hot path cannot use goes to reconciliation,
-and a message on a partition this member does not hold is `UNCLAIMED`),
-decision 6 (maintenance order, commit cadence, shutdown) and decision 7 as
-amended by Amendment 3 item A12 (`apply_config` is unconditional; the version
-gate is `ConfigPoller.poll_once()`'s alone).
+ADR-0011 decision 3 as amended by Amendment 5 item A19 and Amendment 6 item
+A20 (one observation, one of seven outcomes; everything the hot path cannot
+use goes to reconciliation, and a message is `UNCLAIMED` when this member
+does not hold its partition or holds it under a claim other than the one the
+message was fetched under), decision 6 as amended by A20 (maintenance order,
+commit cadence, shutdown; every commit names the handled position) and
+decision 7 as amended by Amendment 3 item A12 (`apply_config` is
+unconditional; the version gate is `ConfigPoller.poll_once()`'s alone).
 
 One `asyncio.Lock` serialises everything that touches a `ShardWindow`:
 message handling, the maintenance sweep, the configuration pass, and the
@@ -19,8 +21,10 @@ landing in the middle of a message.
 Consumption is at-least-once (ADR-0003). The counters are process-local, so a
 redelivery after a crash rebuilds counters that died with the process rather
 than double-counting them, and a redelivery after a handover lands in a
-window that never held the first copy. The only state that survives is the
-HOT set, which is idempotent under redelivery.
+window that never held the first copy -- including a handover back to this
+same member, because the copy fetched under the old claim is `UNCLAIMED`
+rather than applied to the new window (A20). The only state that survives is
+the HOT set, which is idempotent under redelivery.
 """
 
 import asyncio
@@ -29,7 +33,7 @@ import logging
 import math
 import time
 from collections.abc import AsyncIterator, Callable
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from hammertime.aggregator.lateness import ObservationOutcome, classify_observation
 from hammertime.aggregator.metrics import AggregatorMetrics
@@ -67,6 +71,18 @@ _LATE_OUTCOMES = frozenset(
         ObservationOutcome.EXPIRED_BUCKET,
     }
 )
+
+
+class _Fetched(NamedTuple):
+    """A fetched message and the claim it was fetched under (item A20).
+
+    The window is read in the same event-loop step in which the fetch
+    completed, so it is the `ShardWindow` the bus advanced the consumed
+    position under. `None` means the partition was already unclaimed then.
+    """
+
+    message: ConsumedMessage
+    window: ShardWindow | None
 
 
 class MessageBus(Protocol):
@@ -175,10 +191,10 @@ class AggregatorWorker:
                 if receive_task not in done:
                     await _cancel(receive_task)
                     return
-                message = receive_task.result()
-                if message is None:
+                fetched = receive_task.result()
+                if fetched is None:
                     return
-                await self.handle(message)
+                await self._handle_fetched(fetched)
                 await self._commit_if_due()
         finally:
             await _cancel(stop_task)
@@ -207,9 +223,13 @@ class AggregatorWorker:
     # --- the three coroutines the periodic loops and the tests share ---------
 
     async def handle(self, message: ConsumedMessage) -> ObservationOutcome:
-        """Apply one consumed message; decision 3's seven outcomes."""
+        """Apply one consumed message; decision 3's seven outcomes.
+
+        A message passed in directly was not fetched by the consume loop, so
+        it is judged against the current claim alone (item A20).
+        """
         async with self._lock:
-            return await self._handle(message)
+            return await self._handle(message, self._claims.window(message.partition))
 
     async def run_maintenance(self) -> None:
         """One expiry sweep, warm-up end and retention pass per claimed shard.
@@ -267,17 +287,34 @@ class AggregatorWorker:
 
     # --- internals -----------------------------------------------------------
 
-    @staticmethod
-    async def _receive(stream: AsyncIterator[ConsumedMessage]) -> ConsumedMessage | None:
-        """The next message, or None once the subscription ends."""
+    async def _receive(self, stream: AsyncIterator[ConsumedMessage]) -> _Fetched | None:
+        """The next message and the claim it was fetched under; None at the end.
+
+        Item A20: the window is read in the *same event-loop step* in which
+        `anext` returned -- there must never be an `await` between the two
+        lines below. That step is the one in which the bus advanced the
+        consumed position past this message, so the window read here is
+        exactly the claim the message was fetched under; nothing, not a
+        rebalance callback and not the worker lock, can run in between and
+        make the reading stale. `_handle` then compares that object by
+        identity with the claim in force when it runs.
+        """
         try:
-            return await anext(stream)
+            message = await anext(stream)
         except StopAsyncIteration:
             return None
+        return _Fetched(message, self._claims.window(message.partition))
 
-    async def _handle(self, message: ConsumedMessage) -> ObservationOutcome:
+    async def _handle_fetched(self, fetched: _Fetched) -> ObservationOutcome:
+        """`handle()` for a message the consume loop fetched (item A20)."""
+        async with self._lock:
+            return await self._handle(fetched.message, fetched.window)
+
+    async def _handle(
+        self, message: ConsumedMessage, fetched_under: ShardWindow | None
+    ) -> ObservationOutcome:
         window = self._claims.window(message.partition)
-        if window is None:
+        if window is None or window is not fetched_under:
             # Decision 1: an IP's shard is its message's partition, so a
             # message for a partition this member does not hold has nothing
             # to be applied to. Item A19: the outcome is `UNCLAIMED` --
@@ -286,6 +323,16 @@ class AggregatorWorker:
             # and the message is logged and skipped, deliberately counted
             # under no series, not decoded and not diverted. It belongs to
             # whichever member holds the partition, not to this one.
+            #
+            # Item A20: the same holds when the partition is held again under
+            # a *different* claim. aiokafka's eager protocol revokes and
+            # reassigns every partition on every rebalance, so the common case
+            # is a handover back to this member with a fresh `ShardWindow`;
+            # applying the in-hand message to that window would double-count
+            # it, because the committed handled position precedes it and the
+            # broker redelivers it there. A re-claim always builds a new
+            # window (decision 5), so object identity is claim identity. The
+            # handled position is not advanced either way.
             logger.warning(
                 "unclaimed_partition topic=%s partition=%d offset=%d",
                 message.topic,
@@ -296,6 +343,7 @@ class AggregatorWorker:
 
         decoded = self._decode(message)
         if decoded is None:
+            self._claims.mark_handled(message)
             return ObservationOutcome.MALFORMED
         payload, entry = decoded
 
@@ -311,6 +359,7 @@ class AggregatorWorker:
         )
         if outcome is not ObservationOutcome.APPLIED:
             await self._divert(message, entry_ip=str(entry.ip), outcome=outcome)
+            self._claims.mark_handled(message)
             return outcome
 
         # Item A9: floored with the *target window's* own geometry, so the
@@ -323,6 +372,7 @@ class AggregatorWorker:
         # The evaluation may yield a HOT -> COLD: `observe` subtracts a
         # slot's expired occupant before adding the delta (item A11).
         await self._emitter.evaluate(window, entry.ip, config=self._config, reason="observation")
+        self._claims.mark_handled(message)
         return ObservationOutcome.APPLIED
 
     def _decode(self, message: ConsumedMessage) -> tuple[RequestObservation, Observation] | None:
@@ -393,8 +443,13 @@ class AggregatorWorker:
             await self._flush_and_commit()
 
     async def _flush_and_commit(self) -> None:
-        await self._producer.flush()
-        await self._consumer.commit()
+        """Flush, then commit every held partition's handled position (A20).
+
+        `ShardClaims.commit_handled` is the only commit path: the periodic
+        commit and `stop()` arrive here, `on_revoked` calls it directly, so a
+        message in hand at a commit is never covered by it.
+        """
+        await self._claims.commit_handled()
         self._last_commit = self._monotonic()
 
 

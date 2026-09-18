@@ -230,9 +230,10 @@ class AggregatorService:
         """Request shutdown; idempotent, and safe before `start()`.
 
         ADR-0009 decision 7 / ADR-0011 decision 6: stop fetching, finish the
-        in-flight message, flush the producer and commit the consumer
+        in-flight message, flush the producer and commit the handled
         position -- in that order, so a committed position never precedes the
-        transitions it produced. No state-store write is needed: the HOT set
+        transitions it produced, and never covers a message that has been
+        fetched and not yet handled (item A20). No state-store write is needed: the HOT set
         is always current.
         """
         self._stopping.set()
