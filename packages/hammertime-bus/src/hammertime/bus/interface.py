@@ -9,7 +9,7 @@ implementations MUST be interchangeable behind this interface -- code that
 depends only on `Producer`/`Consumer` should not care which one it got.
 """
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -143,6 +143,24 @@ class Consumer(Protocol):
         """
         ...
 
-    async def commit(self) -> None:
-        """Durably persist this consumer group's current read position."""
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None:
+        """Durably persist this consumer group's read position.
+
+        With no argument this commits the *consumed* position of every
+        partition this consumer holds -- its original meaning, unchanged.
+
+        With `offsets` it commits exactly the given `(topic, partition) ->
+        next offset to read` pairs: those partitions only, at those offsets,
+        and nothing else. The value is the offset of the *next* message to
+        read, i.e. the last handled `offset + 1`. That lets a caller commit
+        what it has actually handled rather than what it has consumed -- the
+        two differ by the message in hand, which is how an at-least-once
+        consumer loses an observation at a rebalance (ADR-0011 amendment 6,
+        item A20).
+
+        An empty mapping is a no-op that returns normally without contacting
+        the broker. A partition this consumer does not hold is an error:
+        `ValueError` from `MemoryConsumer`, aiokafka's `IllegalStateError`
+        from `KafkaConsumer`.
+        """
         ...

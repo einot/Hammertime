@@ -246,8 +246,9 @@ is O(1) after bucket maintenance.
 
 > ADR-0011: the aggregator's ring holds exactly `window_seconds /
 > bucket_seconds` buckets. A bucket starting at `S` is live at time `now` iff
-> `bucket_start(now) - S < window_seconds`; it leaves the window at exactly
-> `now = S + window_seconds`. A delta for a bucket that is no longer live can
+> `0 <= bucket_start(now) - S < window_seconds` (a bucket that has not
+> started is not live; ADR-0011 Amendment 2); it leaves the window at exactly
+> `now = S + window_seconds`. A delta for a bucket that is not live can
 > never affect a future window count and is diverted to reconciliation
 > (Section 24) rather than applied. Counters are process-local, one store per
 > owned shard (Section 20).
@@ -1115,7 +1116,13 @@ Events older than the accepted lateness horizon MAY be dropped, corrected, or se
 > and never silently dropped. A message whose `window_seconds` exceeds the
 > configured window is diverted too (ADR-0010 decision 6). Only a message
 > that fails decoding or the ADR-0004 one-IP-per-message invariant is
-> dropped, with a log record.
+> dropped, with a log record. A message a member fetches for a partition it
+> does not hold — a rebalance can revoke one between fetch and handling — is
+> not applied, diverted or counted by that member: it is logged and skipped,
+> and it is not lost, because a member only ever commits the position after
+> the last message it handled, never the position after the last message it
+> fetched; the partition's next owner therefore resumes at or before it and
+> handles it (ADR-0011 Amendment 5, A19; Amendment 6, A20).
 
 ---
 
@@ -1168,8 +1175,11 @@ An IP with no observations beyond the retention period can be removed from the s
 The trie only needs currently hot IPs if the system's purpose is prefix-level hot detection.
 
 > ADR-0011: the sliding-window store is per shard and process-local. It is
-> bounded by `state_retention_seconds` (a COLD IP with an empty window is
-> evicted once `last_seen + state_retention_seconds` has passed), by
+> bounded by `state_retention_seconds` (a COLD IP is evicted once
+> `last_seen + state_retention_seconds <= now`, whatever its running total
+> says — every bucket it holds has necessarily left the window by then, so
+> the eviction does not test for an empty window; ADR-0011 Amendment 2, item
+> A6), by
 > `HAMMERTIME_AGGREGATOR_MAX_TRACKED_IPS` (the least-recently-seen COLD IP is
 > evicted to make room; a HOT IP is never evicted), and expiry is driven by a
 > schedule of next-expiry times so a sweep touches only IPs that have a
@@ -1371,10 +1381,15 @@ evaluate_ip_state(previous_state, count, configuration)
 MUST be the authoritative implementation of the HOT/COLD state machine.
 
 > ADR-0011: in the aggregator `evaluate_ip_state` is called from exactly one
-> place (`services/aggregator/transitions.py`), on three triggers — an
-> applied observation (deltas are non-negative, so only COLD -> HOT can
-> result), an expiry sweep or warm-up end (only HOT -> COLD), and a
-> configuration re-evaluation (Section 34, either direction). Each emitted
+> place (`services/aggregator/transitions.py`), on four triggers — an
+> applied observation (either direction: deltas are non-negative, but
+> applying one first subtracts the expired bucket that last occupied the
+> ring slot, so the running total can fall and a HOT IP can be demoted on
+> this path; ADR-0011 Amendment 2, item A11), an expiry sweep (only HOT ->
+> COLD), warm-up end (only HOT -> COLD, for the IPs inherited with a shard
+> claim), and a configuration re-evaluation (Section 34, either direction).
+> The transition counters of Section 37 are labelled with the trigger
+> (`observation` | `expiry` | `warmup` | `config`). Each emitted
 > transition is recorded in the shard's durable HOT set *before* the event
 > is published, and `HotIpAdded` carries `weight` (Section 46.4) computed
 > under the configuration in force at that transition.
@@ -1993,13 +2008,15 @@ active_ips
 hot_ips
 cold_to_hot_transitions
 hot_to_cold_transitions
-window_evictions           (ADR-0011; labelled retention | capacity)
+window_evictions           (ADR-0011; labelled shard and retention | capacity)
 shards_claimed             (ADR-0011)
 ```
 
 > ADR-0011: the aggregator labels the two transition counters by `shard`,
 > `config_version` and `reason` (`observation` | `config` for COLD -> HOT;
-> `expiry` | `warmup` | `config` for HOT -> COLD), and is the emitter of
+> `observation` | `expiry` | `warmup` | `config` for HOT -> COLD — an
+> observation can lower the running total by a count that had already
+> expired, Amendment 2 item A11), and is the emitter of
 > `late_messages` (labelled `late` | `future` | `expired_bucket`) and of an
 > aggregator-side `observations_rejected` (`window_too_long` | `malformed`),
 > since it — not ingest — judges lateness (Section 24). `tracked_ips` counts

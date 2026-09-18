@@ -327,6 +327,7 @@ dependencies = [
     { name = "hammertime-bus" },
     { name = "hammertime-core" },
     { name = "hammertime-store" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -334,6 +335,7 @@ requires-dist = [
     { name = "hammertime-bus", editable = "packages/hammertime-bus" },
     { name = "hammertime-core", editable = "packages/hammertime-core" },
     { name = "hammertime-store", editable = "packages/hammertime-store" },
+    { name = "uvicorn", specifier = ">=0.30" },
 ]
 
 [[package]]

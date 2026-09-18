@@ -1,12 +1,27 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted; amended 2026-09-17 (see "Amendment 1" at the end. The
-amendment records the partition count of `hammertime.observations.v1`
-changing from 32 to 128 and pins two edge cases decisions 1 and 5 left
-ambiguous. Decisions 1 and 5 were rewritten in place to state the new
-rules directly; the amendment's opening lists every such edit, and quotes
-the superseded wording, so the before/after is recoverable from this
-document alone)
+Status: accepted; amended 2026-09-17 six times (see "Amendment 1" through
+"Amendment 6" at the end. Amendment 6 closes an at-least-once gap at
+revocation: every commit covers only messages the worker has handled, the
+bus `Consumer.commit` takes explicit offsets, and a message fetched under a
+claim that has since been revoked is left in the log for the partition's
+next owner. Amendment 5 pins `ShardClaims.adopt_config` — how a shard
+claimed after a configuration change gets the version in force — and gives
+a message on an unclaimed partition its own outcome, `UNCLAIMED`,
+uncounted. Amendment 1 records the
+partition count of `hammertime.observations.v1` changing from 32 to 128 and
+pins two edge cases decisions 1 and 5 left ambiguous. Amendment 2 pins eight
+edge cases of the window store, the counter and the lateness classifier that
+surfaced while the M3 window/lateness tests were written. Amendment 3 pins
+three interfaces the M3 worker/transitions tests had to assume — where the
+configuration version gate lives and what `apply_config` returns, the Python
+surface of `AggregatorMetrics`, and what `EmittedTransition.transition` is —
+plus two smaller points raised alongside them. Amendment 4 pins the order of
+`observe`'s alignment and liveness checks and completes Amendment 3's
+follow-up list. Every amendment rewrites
+decision bodies in place to state the rule now in force directly; each
+amendment's opening lists every such edit, and quotes the superseded
+wording, so the before/after is recoverable from this document alone)
 
 Scope note: this ADR settles the interfaces milestone M3 (epics #5, #6, #7
 and issue #48) implements against — what the aggregator keeps per IP, how
@@ -97,7 +112,8 @@ class Consumer(Protocol):
         partitions: Iterable[int] | None = None,
         listener: AssignmentListener | None = None,
     ) -> AsyncIterator[ConsumedMessage]: ...
-    # seek(), commit() unchanged
+    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None: ...   # A20
+    # seek() unchanged
 ```
 
 * `partitions=None` (the default) is group-managed assignment: the broker
@@ -124,6 +140,15 @@ class Consumer(Protocol):
   path with `assign([TopicPartition(...)])`, synthesising the single
   `on_assigned` call itself in the static case (aiokafka does not invoke
   rebalance listeners for manual assignment). See Sources.
+* `commit(offsets)` commits exactly the `(topic, partition) -> next offset
+  to read` pairs given — for those partitions only, at those offsets, and
+  nothing else. `commit()` with no argument keeps its original meaning: the
+  consumed position of every partition this consumer holds. An empty
+  mapping is a no-op that returns normally without contacting the broker;
+  a partition this consumer does not hold is an error (`ValueError` from
+  `MemoryConsumer`; aiokafka's `IllegalStateError` from `KafkaConsumer`).
+  The aggregator never calls `commit()` without `offsets` (Amendment 6,
+  A20).
 
 `HAMMERTIME_SHARD_IDS` is the only sharding setting: `auto` (default,
 group-managed) or an explicit set (`0`, `0-3`, `0,2,5-7`; inclusive ranges;
@@ -175,16 +200,29 @@ Ring semantics (`B = bucket_seconds`, `N = bucket_count`, `W = B * N`;
 `bucket_start` is `hammertime.core.time.buckets.bucket_start`):
 
 * A bucket starting at `S` (always a multiple of `B`) is **live** at time
-  `now` iff `bucket_start(now, B) - S < W`. It enters the ring when its
-  first delta arrives and leaves the window at exactly `now = S + W`. The
-  live buckets at any `now` are the `N` buckets ending with the one that
-  contains `now`, so two live buckets never share a slot
-  (`slot = (S // B) % N`, `core.time.buckets.bucket_index`).
-* `observe(S, delta, now)`: if `S` is not live, return `False` and change
-  nothing. Otherwise, if the slot holds an older bucket, subtract that
+  `now` iff `0 <= bucket_start(now, B) - S < W` — equivalently, `S` is one
+  of the `N` buckets ending with the one that contains `now`. A bucket that
+  has not started yet (`S > bucket_start(now, B)`) is **not** live: the
+  lower bound is what keeps two live buckets from ever sharing a slot
+  (`slot = (S // B) % N`, `core.time.buckets.bucket_index`), because a
+  future bucket's slot is occupied by a bucket that is still live
+  (Amendment 2, item A4). A bucket enters the ring when its first delta
+  arrives and leaves the window at exactly `now = S + W`.
+* `observe(S, delta, now)`: `S % B != 0` is a `ValueError` (the caller
+  floors; A9) and `delta < 0` is a `ValueError`; neither changes anything.
+  The alignment check comes **before** the liveness test: an unaligned `S`
+  raises for every `now`, whether or not the bucket it falls in would be
+  live (A17). If an aligned `S` is not live — including a future `S` —
+  return `False` and change nothing. Otherwise, if the slot holds an older
+  bucket, subtract that
   bucket's count from `total` and reset the slot to `S`; then add `delta`
-  to the slot and to `total`; return `True`. `delta < 0` is a `ValueError`;
-  `delta == 0` is applied (returns `True`, changes nothing).
+  to the slot and to `total`; return `True`. `delta == 0` is applied like
+  any other delta (returns `True`; a stale occupant of the slot is still
+  subtracted; a slot whose count is zero is not a live bucket for
+  `live_buckets`/`next_expiry`, so on a fresh counter it changes nothing
+  observable). Because the older occupant of a slot is always a bucket that
+  has already left the window, `observe` can *lower* `total` — this is the
+  sweep's work done early, not a negative delta (A11).
 * `expire(now)`: zero every slot whose bucket is no longer live, subtract
   the zeroed counts from `total`, and return the amount removed.
 * `next_expiry()`: `min(S) + W` over slots with a non-zero count, `None`
@@ -226,7 +264,7 @@ class ShardWindow:
     def state(self, ip: Address) -> IpState: ...    # COLD when untracked
     def is_tracked(self, ip: Address) -> bool: ...
     def is_inherited(self, ip: Address) -> bool: ...
-    def set_state(self, ip: Address, state: IpState) -> None: ...
+    def set_state(self, ip: Address, state: IpState) -> None: ...   # KeyError for an untracked IP (A15)
     def finish_warmup_if_due(self) -> frozenset[Address] | None: ...
     def expire_due(self) -> list[WindowChange]: ...
     def evict_due(self) -> int: ...
@@ -239,33 +277,63 @@ class ShardWindow:
     def active_count(self) -> int: ...              # tracked IPs whose total > 0
     @property
     def hot_count(self) -> int: ...
-    capacity_evictions: int                         # counter, decision 8
-    retention_evictions: int
+    capacity_evictions: int                         # counter, decision 8; += 1 per IP evicted for capacity
+    retention_evictions: int                        # counter, decision 8; += 1 per IP removed by evict_due()
 ```
 
-* `observe` creates the entry for an untracked IP (state `COLD`, empty
-  ring), applies the delta with `now = clock.now()`, sets
-  `last_seen = max(last_seen, bucket_start)`, and returns the change. It
-  returns `None` and leaves the store untouched — no entry created, no
-  `last_seen` refresh — when the bucket is not live; the caller has already
-  classified that case (decision 3).
+* Every IP in `inherited_hot` is a tracked entry from construction (A5):
+  state `HOT`, `inherited` flag set, an empty ring, and
+  `last_seen = clock.now()` at construction. It is therefore in
+  `tracked_ips()`, counted by `tracked_count`, in `hot_ips()`, not in
+  `active_count` (its total is 0 until its first applied observation), and
+  it occupies a `max_tracked_ips` slot. Construction never evicts and never
+  fails on account of the cap: a shard whose inherited set alone exceeds
+  `max_tracked_ips` starts over capacity, and the capacity rule below deals
+  with it on the next new IP exactly as with any other all-HOT store.
+* `observe(ip, bucket_start, delta)` requires `bucket_start` to be a
+  multiple of `config.bucket_seconds` (the worker floors it, decision 3;
+  the counter raises `ValueError` otherwise). That check is the first
+  thing the call does — before the liveness test and before any entry is
+  created: an unaligned `bucket_start` raises whatever the clock says and
+  leaves the store untouched (A17). It creates the entry for an
+  untracked IP (state `COLD`, empty ring), applies the delta with `now =
+  clock.now()`, sets `last_seen = max(last_seen, bucket_start)`, and
+  returns the change — for `delta == 0` as well (A8): a zero delta creates
+  the entry and refreshes `last_seen` like any other applied observation,
+  and returns a `WindowChange` whose `total_after` equals `total_before`
+  unless the slot held an expired bucket. `total_after < total_before` is
+  possible for any delta when the slot's previous occupant is subtracted
+  (A11). `observe` returns `None` and leaves the store untouched — no entry
+  created, no `last_seen` refresh — when the bucket is not live (past or
+  future, A4); the caller has already classified that case (decision 3).
 * `expire_due()` calls `IpCounter.expire(now)` only on IPs whose
   `next_expiry() <= now` (an expiry schedule ordered by `next_expiry`, in
   the style of `MemoryDedupStore._expiry_heap`) and returns one
   `WindowChange` per IP whose total actually dropped. A sweep therefore
   costs O(expiring IPs · log n), never O(tracked IPs).
-* `evict_due()` removes every IP that is `COLD`, has `total == 0`, and
-  whose `last_seen + config.state_retention_seconds <= now` (§26); returns
-  the number removed. A HOT IP is never evicted; because
-  `state_retention_seconds >= window_seconds` (`DetectionConfig`), a HOT IP
-  always reaches `total == 0` and is demoted (decision 6) before its
-  retention deadline can pass.
+* `evict_due()` removes every IP that is `COLD` and whose
+  `last_seen + config.state_retention_seconds <= now` (§26), increments
+  `retention_evictions` once per IP removed, and returns the number
+  removed. It is self-sufficient: it does not require a preceding
+  `expire_due()` and does not consult the running total (A6). An IP that
+  meets the condition necessarily holds no live bucket — every applied
+  bucket has `S <= last_seen`, and `state_retention_seconds >=
+  window_seconds` (`DetectionConfig`), so every such bucket left the
+  window at or before `last_seen + window_seconds <= now` — and its
+  `total`, if still non-zero, is only a sweep the schedule had not yet
+  run. The entry is dropped whole: no `WindowChange` is produced for it and
+  nothing is counted as expiry. A HOT IP is never evicted; by the same
+  arithmetic a HOT IP always reaches `total == 0` and is demoted (decision
+  6) before its retention deadline can pass.
 * Capacity: when a new IP would make `tracked_count` exceed
   `max_tracked_ips`, the `COLD` IP with the smallest `last_seen` is evicted
   first (`capacity_evictions += 1`). If every tracked IP is HOT the store
   grows past the cap rather than drop a HOT IP; that condition is logged.
-* `set_state(ip, COLD)` clears the `inherited` flag for that IP;
-  `finish_warmup_if_due()` returns — exactly once, the first time it is
+  Inherited IPs count towards `tracked_count` here like any other entry
+  (A5).
+* `set_state(ip, state)` requires `ip` to be tracked and raises `KeyError`
+  otherwise — it never creates an entry (A15). `set_state(ip, COLD)` clears
+  the `inherited` flag for that IP; `finish_warmup_if_due()` returns — exactly once, the first time it is
   called with `clock.now() >= warm_until` — the set of inherited IPs that
   are still HOT, clears every `inherited` flag and sets `warm_until` to
   `None`; every other call returns `None`.
@@ -283,7 +351,7 @@ distinct IPs a shard sees in any ten-minute period, and the cap bounds it
 absolutely. A HOT IP costs the same as any other tracked IP here; the
 per-HOT-IP cost that outlives the process is in decision 5.
 
-### 3. One observation, one of six outcomes; everything the hot path cannot use goes to reconciliation
+### 3. One observation, one of seven outcomes; everything the hot path cannot use goes to reconciliation
 
 ```python
 # hammertime.aggregator.lateness   (Spec: section 24; ADR-0002; ADR-0010 decision 6)
@@ -294,6 +362,8 @@ class ObservationOutcome(StrEnum):
     EXPIRED_BUCKET = "expired_bucket"    # inside the horizon, but the bucket has already left the window
     WINDOW_TOO_LONG = "window_too_long"  # payload.window_seconds > config.window_seconds
     MALFORMED = "malformed"              # never returned by classify_observation; a worker outcome
+    UNCLAIMED = "unclaimed"              # never returned by classify_observation; a worker outcome:
+                                         # message.partition is not a shard this member holds (A19)
 
 def classify_observation(
     *, window_start: int, window_seconds: int, now: int, config: DetectionConfig
@@ -301,14 +371,64 @@ def classify_observation(
 ```
 
 `classify_observation` is pure and checks, in this order: `WINDOW_TOO_LONG`
-(ADR-0010 decision 6), `FUTURE`, `LATE` (the shipped
-`is_within_lateness` horizon, config window), `EXPIRED_BUCKET`
-(`bucket_start(now) - bucket_start(window_start) >= config.window_seconds`,
-i.e. `IpCounter.is_live` is false), else `APPLIED`. `now` is the service
-clock at processing time, not the envelope timestamp: a lagging aggregator
-diverts what it can no longer count rather than counting it into the past.
+(`window_seconds > config.window_seconds`, ADR-0010 decision 6), `FUTURE`
+(`window_start > now`), `LATE` (`now - window_start > config.window_seconds
++ config.allowed_lateness_seconds` — the shipped `is_within_lateness`
+horizon, config window), `EXPIRED_BUCKET`
+(`bucket_start(now, B) - bucket_start(window_start, B) >=
+config.window_seconds` with `B = config.bucket_seconds`, i.e.
+`IpCounter.is_live` is false for the bucket the delta would land in), else
+`APPLIED`. `now` is the service clock at processing time, not the envelope
+timestamp: a lagging aggregator diverts what it can no longer count rather
+than counting it into the past.
 
-The worker (`hammertime.aggregator.worker`) handles one consumed message as:
+Two things about the arithmetic are deliberate and are stated so that no
+test or implementation has to derive them (A9, A10):
+
+* `LATE` and `FUTURE` are judged on the raw age `now - window_start`;
+  `EXPIRED_BUCKET` is judged on *bucket* age, after flooring both ends to
+  `B`. The two measures differ inside the last bucket: with `now` on a
+  bucket boundary and the shipped defaults, an age of 291 s already floors
+  into the bucket 300 s back and is `EXPIRED_BUCKET`, while an aligned
+  `window_start` 290 s back is `APPLIED`. `classify_observation` floors
+  `window_start` itself and does not require it to be aligned; an
+  unaligned `window_start` is never `MALFORMED` (ADR-0010 decision 6 already
+  lands the delta in `bucket_start(window_start, B)`).
+* Every age `>= config.window_seconds` is either `LATE` or
+  `EXPIRED_BUCKET`, never `APPLIED`, for every config and every `now`:
+  `bucket_start(now, B) - bucket_start(now - age, B)` is at least
+  `age - (age mod B)` — the largest multiple of `B` not above `age` — for
+  every position of `now` within its bucket, and that is `>=
+  window_seconds` whenever `age >= window_seconds` because `window_seconds`
+  is itself a multiple of `B` (`DetectionConfig`). In particular an age of
+  exactly `window_seconds + allowed_lateness_seconds` (330 s with the
+  shipped defaults) is inside the horizon (the `LATE` test is strictly
+  `>`) and is always `EXPIRED_BUCKET`. `APPLIED` therefore requires `0 <=
+  age < config.window_seconds` *and* the bucket test; which ages below the
+  window are `APPLIED` depends on where `now` falls within its own bucket,
+  so a test that pins exact ages must pin `now` (the shipped tests use a
+  bucket-aligned `now`).
+
+The worker (`hammertime.aggregator.worker`) handles one consumed message as
+follows. Before step 1 it looks up the `ShardWindow` of `message.partition`
+(`claims.window(p)`); if this member holds no claim for that partition —
+reachable in normal operation, because a rebalance can revoke a partition
+between a message being fetched and being handled — or if the claim it
+holds is not the one the message was fetched under (the partition was
+revoked and claimed again since the fetch; the consume loop records the
+`ShardWindow` of the message's partition in the same event-loop step in
+which the fetch completed, and the handler compares that object by
+identity with the current one — A20), the outcome is
+`UNCLAIMED`: logged at `WARNING event=unclaimed_partition` with the topic,
+partition and offset, **not** counted under any series, not decoded, not
+diverted, the store untouched, and the partition's handled position
+(decision 5, `mark_handled`) not advanced; `handle()` returns it and the
+consumer carries on. The message belongs to whichever member holds the
+partition next, and reaches it: no commit by this member ever covers a
+message it has not handled (decision 6, A20), so the next owner's first
+fetch starts at or before it (A19, A20). A message passed to `handle()`
+directly — by a test — was not fetched by the loop and is judged against
+the current claim alone. Otherwise:
 
 1. `codec.decode`; the payload MUST be a `RequestObservation` with exactly
    one entry whose IP text equals the envelope `subject` and the message key
@@ -316,20 +436,29 @@ The worker (`hammertime.aggregator.worker`) handles one consumed message as:
    `CodecError`, is `MALFORMED`: logged at `WARNING event=malformed_observation`
    with the topic, partition and offset, counted, and skipped. A poison
    message never stops the consumer.
-2. `classify_observation(...)`. `LATE`, `FUTURE`, `EXPIRED_BUCKET` and
-   `WINDOW_TOO_LONG` are **diverted**: the consumed bytes are republished
-   unchanged, under the same key, to
+2. `classify_observation(...)` with `window_start` as a whole UTC epoch
+   second — the floor of the payload's `window_start` (an aware
+   `datetime`; the codec admits sub-second precision, which is discarded
+   because no `bucket_seconds >= 1` can distinguish it, A9), `now =
+   clock.now()`, and `config` the config in force. `LATE`, `FUTURE`,
+   `EXPIRED_BUCKET` and `WINDOW_TOO_LONG` are **diverted**: the consumed
+   bytes are republished unchanged, under the same key, to
    `hammertime.observations-reconciliation.v1` (same `event_id`, so a
    reconciliation consumer can dedupe against the hot path), and counted
    (decision 8). The window store is not touched.
-3. `APPLIED`: `window.observe(ip, bucket_start(window_start), request_count)`
-   on the `ShardWindow` of `message.partition`, then decision 4 for that IP
-   with `reason="observation"`.
+3. `APPLIED`: `window.observe(ip, bucket_start(window_start,
+   window.config.bucket_seconds), request_count)` on the `ShardWindow` of
+   `message.partition` — the worker floors with the target window's own
+   `bucket_seconds`, so the store always receives an aligned bucket — then
+   decision 4 for that IP with `reason="observation"`. The evaluation may
+   yield a HOT -> COLD (A11).
 
 Consumption is at-least-once (ADR-0003). Counters are process-local, so a
 redelivery after a crash rebuilds counters that died with the process
 rather than double-counting them, and a redelivery after a handover lands
-in a `ShardWindow` that never held the first copy. The only state that
+in a `ShardWindow` that never held the first copy — including a handover
+back to this same member, because the copy fetched under the old claim is
+`UNCLAIMED` rather than applied to the new window (A20). The only state that
 survives is the HOT set (decision 5), which is idempotent under
 redelivery: an IP the store already has as HOT is not re-announced.
 
@@ -347,10 +476,12 @@ def transition_attributes(window_count: int, config: DetectionConfig) -> dict[st
 
 ```python
 # hammertime.aggregator.transitions   (Spec: section 6, section 19, section 30, section 46.4)
+from hammertime.core.state.transitions import StateTransition   # (previous, current); A14
+
 @dataclass(frozen=True, slots=True)
 class EmittedTransition:
     ip: Address
-    transition: StateTransition
+    transition: StateTransition        # StateTransition(previous=previous, current=new)
     sequence: int
     window_count: int
     config_version: int
@@ -388,8 +519,13 @@ side effects — while `window.in_warmup and window.is_inherited(ip)`
    `await` it (both bus producers return only once the broker has
    acknowledged; no separate flush per transition).
 5. `window.set_state(ip, new)`; count the transition under `reason`
-   (`observation`, `expiry`, `warmup`, `config`); return the
-   `EmittedTransition`.
+   (`observation`, `expiry`, `warmup`, `config`) —
+   `metrics.increment("cold_to_hot_transitions" | "hot_to_cold_transitions",
+   shard=window.shard, config_version=config.config_version, reason=reason)`
+   (decision 8); return the `EmittedTransition`, whose `transition` is
+   `hammertime.core.state.transitions.StateTransition(previous=previous,
+   current=new)` — the value type core already ships for exactly this edge
+   (A14).
 
 Identity follows the ADR-0003 amendment and ADR-0004: `agent_id` is the
 producing shard, `sequence` is the shard's own counter (persisted, decision
@@ -438,13 +574,65 @@ A2; no TTL) are interchangeable behind it, chosen by
 Claims (`hammertime.aggregator.sharding.assignment.ShardClaims`, the
 aggregator's `AssignmentListener`):
 
+```python
+# hammertime.aggregator.sharding.assignment   (Spec: section 20, section 26, section 32, section 47.2)
+class ShardClaims:                                   # satisfies AssignmentListener (decision 1)
+    def __init__(
+        self,
+        *,
+        state_store: ShardStateStore,
+        producer: Producer,
+        consumer: Consumer,
+        clock: Clock,
+        config: DetectionConfig,                     # what on_assigned builds windows with, until adopt_config
+        max_tracked_ips: int = 1_000_000,
+    ) -> None: ...
+    @property
+    def config(self) -> DetectionConfig: ...         # the config the next claim would build its window with
+    @property
+    def shards(self) -> frozenset[int]: ...          # the partitions claimed right now
+    def window(self, shard: int) -> ShardWindow | None: ...   # None once revoked / never claimed
+    def windows(self) -> tuple[ShardWindow, ...]: ...         # snapshot; the callable the worker binds for A13 (pinned here, A18)
+    def adopt_config(self, config: DetectionConfig) -> None: ...   # A18
+    def mark_handled(self, message: ConsumedMessage) -> None: ...  # A20: the claim's handled position becomes offset + 1
+    async def commit_handled(self, partitions: Iterable[tuple[str, int]] | None = None) -> None: ...  # A20: flush, then commit handled positions
+    async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None: ...
+    async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None: ...
+```
+
 * **`on_assigned(p)`** for each new partition: `state = await
   state_store.load(p)`; construct `ShardWindow(shard=p, config=<in force>,
   clock, inherited_hot=state.hot_ips, next_sequence=state.next_sequence,
   max_tracked_ips)`; log `INFO event=shard_claimed shard=p inherited_hot=N`.
   The window counters start empty: they self-heal within one window,
   because every bucket older than the claim has expired by
-  `claim + window_seconds`.
+  `claim + window_seconds`. "The config in force" is `claims.config`: the
+  constructor's `config` until the first `adopt_config`, then the last one
+  adopted (A18).
+* **`adopt_config(v)`** replaces the config later claims build their windows
+  with, and does nothing else: it touches no window already claimed, emits
+  nothing, compares no versions (the gate is the poller's, A12) and is
+  idempotent. The worker calls it in decision 7 step 3, under the worker
+  lock, in the same pass that gave every already-claimed window the new
+  geometry (step 1, `window.apply_config(v)`) and re-evaluated it (step 2) —
+  so windows built before the change are brought onto `v` by the pass, and
+  windows built after it start on `v` because of this call. Without it a
+  shard claimed after a configuration change would be built on the config
+  this object was constructed with, i.e. a stale one (A18).
+* **`mark_handled(message)`** records `message.offset + 1` as the
+  **handled position** of the claim on `(message.topic,
+  message.partition)` — the next offset a commit may name for it. The
+  worker calls it, under the lock, at the end of `handle()` for every
+  outcome except `UNCLAIMED` (decision 3). A claim starts with no handled
+  position (nothing has been handled under it) and loses it when revoked;
+  a partition this object does not hold is a `KeyError` (A20).
+* **`commit_handled(partitions=None)`**: `producer.flush()`, then
+  `consumer.commit({(topic, p): <handled position>, ...})` over the
+  partitions given (default: every held partition), omitting any that has
+  no handled position yet — the mapping may therefore be empty, and both
+  calls are made regardless. This is the only way the aggregator commits:
+  decision 6's three commit points all go through it, so a committed
+  position never covers a message that has not been handled (A20).
 * **Warm-up.** Until `claim + window_seconds` the new owner under-counts
   every inherited IP (observations that arrived before the claim are not
   in its ring), so demoting one would be a spurious `HotIpRemoved`.
@@ -455,10 +643,14 @@ aggregator's `AssignmentListener`):
   `reason="warmup"`; a quiet one is demoted then, a busy one stays. IPs
   this process itself promoted are evaluated normally throughout.
 * **`on_revoked(p)`**: under the worker lock (so never mid-message):
-  `producer.flush()`, `consumer.commit()`, drop the `ShardWindow`, log
-  `INFO event=shard_revoked shard=p`. Nothing is written to the state
-  store — it is already current — and nothing is emitted; the next owner
-  inherits the HOT set and warms up.
+  `commit_handled(<the revoked partitions>)` — flush, then commit each
+  revoked partition's handled position, which by construction excludes a
+  message fetched but not yet handled (A20) — then drop the `ShardWindow`
+  and the handled position, and log `INFO event=shard_revoked shard=p`.
+  Nothing is written to the state store — it is already current — and
+  nothing is emitted; the next owner inherits the HOT set, warms up, and
+  resumes the partition at the committed position, so a message this
+  member fetched and did not handle is delivered to it.
 * Readiness: `start()` returns once `subscribe()` has delivered the initial
   assignment. An empty assignment under `auto` is ready (the process is
   healthy, the group has more members than partitions) and logs
@@ -476,17 +668,35 @@ claimed shard, under the worker lock:
    reason="warmup")`.
 3. `window.evict_due()`.
 
-Because deltas are non-negative, an observation can only raise a count and
-a sweep can only lower one: COLD -> HOT happens on the observation path (or
-config re-evaluation), HOT -> COLD only on the sweep, warm-up end, or config
-re-evaluation. `hot_to_cold_transitions` is labelled by `reason`
-accordingly.
+Deltas are non-negative, so a sweep can only lower a count and COLD -> HOT
+happens only on the observation path (or config re-evaluation). The
+converse does not hold: `IpCounter.observe` subtracts a slot's expired
+occupant before adding the delta (decision 2), so an observation that lands
+in a slot the sweep has not yet cleared can lower the running total — by an
+amount the next sweep would have removed anyway — and the evaluation that
+follows it (decision 3, step 3) can then demote the IP. That demotion is
+correct (the count is exact) and is counted under `reason="observation"`
+(A11). HOT -> COLD therefore happens on the sweep, at warm-up end, on config
+re-evaluation, or on the observation path; `hot_to_cold_transitions` is
+labelled by `reason` accordingly. Step 3 above does not depend on step 1
+having run — `evict_due()` is self-sufficient (decision 2, A6) — but the
+order stays normative: expiring before evaluating is what turns an expired
+count into a `HotIpRemoved` in the same sweep.
 
 The consumer position is committed every
 `HAMMERTIME_AGGREGATOR_COMMIT_INTERVAL_S` seconds of wall time (default 1.0;
 checked after each message), on every `on_revoked`, and at shutdown —
 always after `producer.flush()`, so a committed position never precedes the
 transitions it produced (the same rule ADR-0010 decision 3 gives the trie).
+What is committed is the **handled** position of each held partition — the
+offset after the last message `handle()` finished for it under the current
+claim — passed explicitly as `Consumer.commit(offsets)`; never the bus's
+consumed position, which already sits past a message that has been fetched
+and not yet handled. All three points go through
+`ShardClaims.commit_handled()` (decision 5), so a message in hand at a
+commit — one a rebalance revoked between fetch and handling, or one fetched
+just before `stop()` took the lock — is never covered by it and is
+redelivered to whichever member next holds the partition (A20).
 The interval is an I/O cadence, not domain time: it is measured on the wall
 clock even when the service clock is a `ManualClock`.
 
@@ -496,8 +706,27 @@ is needed at shutdown; the HOT set is always current.
 
 ### 7. A configuration change re-evaluates every tracked IP, and the version is visible only afterwards
 
-`reload_config()` / the poll loop apply a document per ADR-0009 decision 6
-(strictly greater version; rejected documents ignored). Applying version
+The version rule of ADR-0009 decision 6 (strictly greater version; rejected
+documents ignored) is enforced in exactly one place: `ConfigPoller.poll_once()`
+(ADR-0009 A5). The aggregator's service object constructs the poller with
+`apply=worker.apply_config`, so `AggregatorService.reload_config()` is
+`await poller.poll_once()` and the periodic loop is `poller.run()`, both as
+ADR-0009 A5 and A8 have them. The hook itself is
+
+```python
+# hammertime.aggregator.worker
+class AggregatorWorker:
+    config: DetectionConfig                                      # property: the version in force at the worker
+    async def apply_config(self, config: DetectionConfig) -> None: ...
+```
+
+and is **unconditional**: it applies whatever `DetectionConfig` it is given,
+performs no version comparison of its own, and returns `None` so that it is
+assignable to the poller's `apply: Callable[[DetectionConfig],
+Awaitable[None]]` without an adapter (A12). Its only production caller is
+the poller, which never calls it with a version `<=` the one in force; a
+direct caller (a test, a tool) that passes a lower or equal version gets it
+applied, because the worker is not where the rule lives. Applying version
 `v` means, under the worker lock so that no observation is processed
 mid-pass:
 
@@ -511,7 +740,18 @@ mid-pass:
    IPs (default 1000) so the admin endpoints stay responsive; it is not
    otherwise rate-limited — the log between aggregator and trie is the
    back-pressure.
-3. Adopt `v` as the config in force; `reload_config()` returns it.
+3. Adopt `v` as the config in force at the worker (`worker.config` now
+   reports it) and at its `ShardClaims` (`claims.adopt_config(v)`, decision
+   5, so that a shard claimed after this pass builds its window on `v`;
+   both adoptions happen under the lock the assignment callbacks also take,
+   so no claim can interleave between them — A18) and log `INFO
+   event=config_reevaluated config_version=<v> transitions=<N>`, `N` being
+   the sum of `reevaluate_shard`'s returns over the claimed shards
+   (decision 8). `apply_config` then returns; the poller
+   sets its own `current` to `v`, logs ADR-0009 A7's `config_applied`, and
+   `reload_config()` returns the poller's `current` — which is `v` after a
+   successful apply and the previous version otherwise (a rejected or
+   non-increasing document never reaches the worker).
 
 Holding the lock is what makes ADR-0009's rule ("visible in emitted events
 only after the re-evaluation it triggered has been applied") hold without
@@ -528,21 +768,53 @@ Maintained as plain counters in `hammertime.aggregator.metrics`
 (`AggregatorMetrics`); exporting them on `/metrics` is the telemetry
 epic's (§37, ADR-0009 decision 4 says `/metrics` may be empty until then):
 
+```python
+# hammertime.aggregator.metrics   (Spec: section 37)
+class AggregatorMetrics:
+    def __init__(self) -> None: ...
+    def increment(self, name: str, **labels: object) -> None: ...          # += 1 on an event counter
+    def get(self, name: str, **labels: object) -> int: ...                 # 0 for a series never touched
+    def bind_windows(self, windows: Callable[[], Iterable[ShardWindow]]) -> None: ...
+```
+
+One series is one `(name, label values)` pair, exactly as Prometheus
+identifies a time series (see Sources); label values are compared as
+`str(value)`, so `shard=0` and `shard="0"` name the same series. `name`
+MUST be one of the nine below and `labels` MUST carry exactly that series'
+label names (no more, no fewer); anything else is a `ValueError` from
+`increment` and `get` alike. The four **event counters** —
+`cold_to_hot_transitions`, `hot_to_cold_transitions`, `late_messages`,
+`observations_rejected` — are the only series `increment` accepts; the
+emitter and the worker bump them at the points decisions 3 and 4 name. The
+five **window-derived series** — `tracked_ips`, `active_ips`, `hot_ips`,
+`window_evictions`, `shards_claimed` — are never stored: `get` computes
+them on each call from the windows the bound source returns, which is how
+A7's "read at export time" actually happens (A13). `bind_windows` is called
+once by `AggregatorWorker.__init__` with a callable yielding the currently
+claimed `ShardWindow`s; until it is called, every window-derived series
+reads 0. Rendering on `/metrics` is not defined here.
+
 ```text
 tracked_ips{shard}                      ShardWindow.tracked_count
 active_ips{shard}                       ShardWindow.active_count
 hot_ips{shard}                          ShardWindow.hot_count
 cold_to_hot_transitions{shard,config_version,reason}    reason = observation | config
-hot_to_cold_transitions{shard,config_version,reason}    reason = expiry | warmup | config
+hot_to_cold_transitions{shard,config_version,reason}    reason = observation | expiry | warmup | config   (A11)
 late_messages{reason}                   reason = late | future | expired_bucket
 observations_rejected{reason}           reason = window_too_long | malformed   (aggregator-side)
-window_evictions{reason}                reason = retention | capacity
-shards_claimed                          gauge
+window_evictions{shard,reason}          reason = retention | capacity; read from ShardWindow.retention_evictions /
+                                        .capacity_evictions of each claimed shard (A7); `get` with a shard
+                                        no bound window has, or a `reason` outside the two, reads 0
+shards_claimed                          gauge; the number of windows the bound source yields
 ```
 
 Structured log events (ADR-0009 decision 5 conventions): `shard_claimed`,
-`shard_revoked`, `no_shards_assigned`, `warmup_complete`, `config_applied`
-(with `transitions=N`), `malformed_observation`, `store_over_capacity`.
+`shard_revoked`, `no_shards_assigned`, `warmup_complete`,
+`config_reevaluated` (`config_version`, `transitions`; emitted by the worker
+at the end of `apply_config`, before the poller's own `config_applied` of
+ADR-0009 A7 — A12), `malformed_observation`, `unclaimed_partition`
+(`topic`, `partition`, `offset`; `WARNING`, no counter — A19),
+`store_over_capacity`.
 
 ### 9. Settings and module layout
 
@@ -560,17 +832,22 @@ Structured log events (ADR-0009 decision 5 conventions): `shard_claimed`,
 
 ```text
 services/aggregator/src/hammertime/aggregator/
-  __init__.py, __main__.py, service.py        ADR-0009 (composition root; wraps the worker)
+  __init__.py, __main__.py, service.py        ADR-0009 (composition root; wraps the worker; owns the ConfigPoller
+                                               with apply=worker.apply_config; reload_config() -> DetectionConfig is
+                                               poller.poll_once())
   config.py                                    AggregatorSettings, load_settings, parse_shard_ids
   lateness.py                                  ObservationOutcome, classify_observation
   window/counter.py                            IpCounter
   window/store.py                              ShardWindow, WindowChange (expiry, retention, capacity)
-  sharding/assignment.py                       ShardClaims (AssignmentListener; claim, warm-up, revoke)
-  transitions.py                               TransitionEmitter, EmittedTransition
+  sharding/assignment.py                       ShardClaims (AssignmentListener; claim, warm-up, revoke; adopt_config(config) -> None,
+                                               config (property), shards, window(p), windows(), mark_handled(message),
+                                               commit_handled(partitions=None) -> None)
+  transitions.py                               TransitionEmitter, EmittedTransition (transition: core StateTransition)
   reevaluate.py                                reevaluate_shard(window, emitter, *, config, ips=None, batch_size=1000) -> int
   worker.py                                    AggregatorWorker: consume loop, handle(message) -> ObservationOutcome,
-                                               run_maintenance(), apply_config(), commit cadence
-  metrics.py                                   AggregatorMetrics
+                                               run_maintenance(), apply_config(config) -> None (unconditional; the
+                                               poller's hook), config (property), commit cadence
+  metrics.py                                   AggregatorMetrics (increment, get, bind_windows)
   tests/                                       test_window.py, test_lateness.py, test_hysteresis.py,
                                                test_sharding.py, test_reevaluate.py, test_worker.py
 ```
@@ -698,7 +975,9 @@ prior ADR. Push back on them individually.
 * **Bus package** (`hammertime-bus`): `AssignmentListener`, the widened
   `Consumer.subscribe`, `MemoryConsumer` calling the listener with `{(topic,
   0)}`, `KafkaConsumer` constructed without topics and subscribing with a
-  `ConsumerRebalanceListener` adapter or `assign()`.
+  `ConsumerRebalanceListener` adapter or `assign()`; `Consumer.commit`
+  gains an optional explicit `offsets` mapping on both implementations
+  (Amendment 6, A20).
 * **Store package** (`hammertime-store`): `ShardState`, `ShardStateStore`,
   `MemoryShardStateStore`, `RedisShardStateStore`. The Redis deployment
   warning in `redis.py`'s docstring applies with more force here: an
@@ -765,6 +1044,73 @@ reading can be checked against the original.
   `DefaultPartitioner` — the hook assumption 1 chose not to use.
 * The readthedocs rendering of the same API was not reachable from this
   environment; the raw source above is the primary reference.
+
+Consulted for the series/label model decision 8's `AggregatorMetrics`
+follows (Amendment 3, A13):
+
+* Prometheus data model (source of the published page,
+  `https://raw.githubusercontent.com/prometheus/docs/main/docs/concepts/data_model.md`;
+  `prometheus.io` itself was not reachable from this environment): "Every
+  time series is uniquely identified by its metric name and optional
+  key-value pairs called labels"; "Label values MAY contain any UTF-8
+  characters"; "The change of any label's value, including adding or
+  removing labels, will create a new time series". Taken from it: one
+  series per `(name, label values)`, label values are strings, and a
+  different label set is a different series — hence `str(value)` keying
+  and the exact-label-names rule.
+
+Consulted for the commit and rebalance ordering Amendment 6 (A20) relies
+on. All four are the raw `master` source on GitHub, fetched 2026-09-17; the
+repository pins `aiokafka==0.14.0` (`uv.lock`) and the tagged source was
+not fetched, so a reviewer should check the readings against that tag.
+
+* aiokafka `GroupCoordinator._on_join_prepare` (source,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/group_coordinator.py`):
+  calls `self._subscription.begin_reassignment()`, then
+  `_maybe_do_last_autocommit(previous_assignment)` (which returns at once
+  when `enable_auto_commit` is false, as `KafkaConsumer` sets it), then
+  the listener's `on_partitions_revoked(previous_assignment.tps)`, awaiting
+  it if it is a coroutine, inside `try/except Exception:
+  log.exception(...)`. Taken from it: the revoke callback runs before the
+  join request; the eager protocol revokes *every* previously held
+  partition on every rebalance; and a listener that raises is logged and
+  swallowed, not propagated.
+* aiokafka `GroupCoordinator._on_join_complete` (same file): calls
+  `self._subscription.assign_from_subscribed(assignment.partitions())`
+  and only then the listener's `on_partitions_assigned(assigned)`. Taken
+  from it: the previous assignment is replaced — and, per the next item,
+  deactivated — *after* `on_partitions_revoked` has returned and *before*
+  `on_partitions_assigned` is called.
+* aiokafka `SubscriptionState` / `Subscription` / `Assignment` (source,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/subscription_state.py`):
+  `Subscription._begin_reassignment` only sets
+  `self._reassignment_in_progress = True`; `Subscription._assign` calls
+  `self._assignment._unassign()` on the old assignment and constructs the
+  new one; `Assignment.active` is `self.unassign_future.done() is False`;
+  `Assignment.all_consumed_offsets()` returns each partition's `position`;
+  `TopicPartitionState.consumed_to(position)` is what advances it. Taken
+  from it: during `on_partitions_revoked` the old assignment is still in
+  place and active, so both `commit()` and `commit(offsets)` for the
+  revoked partitions are accepted there; and the "consumed position"
+  `commit()` defaults to is the position after every record already
+  returned to the caller.
+* aiokafka `AIOKafkaConsumer.commit` and `FetchResult.getone` /
+  `check_assignment` (sources,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/consumer.py`,
+  `https://raw.githubusercontent.com/aio-libs/aiokafka/master/aiokafka/consumer/fetcher.py`):
+  `commit(offsets)` "When explicitly passing `offsets` use either offset
+  of next record, or tuple of offset and metadata:: `await
+  consumer.commit({tp: msg.offset + 1})`"; with explicit offsets it raises
+  `IllegalStateError(f"Partition {tp} is not assigned")` for a partition
+  outside the current assignment, and with `offsets=None` it commits
+  `assignment.all_consumed_offsets()`. `FetchResult.getone` returns a
+  buffered record only while `assignment.active` and advances the
+  position as it returns it. Taken from them: the next-offset convention
+  A20 adopts for `Consumer.commit(offsets)`; the constraint that an
+  explicit commit may name only held partitions; and that records of the
+  old assignment can still be returned to the consume loop after
+  `on_partitions_revoked` has run, until `_on_join_complete` replaces the
+  assignment.
 
 ## Amendment 1 (2026-09-17) — 128 partitions; `next_sequence` never moves backwards; an empty static shard set is refused
 
@@ -1015,3 +1361,2076 @@ This item requires no change to shipped code (`MemoryConsumer.subscribe`
 and `KafkaConsumer.subscribe` do not yet take `partitions`; there is no
 `parse_shard_ids`); it is binding on the bus and aggregator briefs and on
 their `test-author`s.
+
+## Amendment 2 (2026-09-17) — future buckets, inherited entries, retention without a sweep, eviction counters, zero deltas, bucket-aligned lateness, the horizon boundary, and demotion on the observation path
+
+Why: the `test-author` writing the M3 window and lateness tests
+(`services/aggregator/src/hammertime/aggregator/tests/test_window.py`,
+`test_lateness.py`) worked from decisions 2 and 3 and surfaced seven places
+where the text either did not decide a case, decided it only by
+implication, or — in two places — decided it in a way the worker did not
+recognise. An eighth item (A11) was not asked about; it fell out of
+answering A8 and contradicts a sentence in decision 6, so it is settled
+here rather than left for the worker brief to trip over. Each item says
+whether the point was (a) already determined by the ADR as written, (b)
+genuinely unspecified and ruled now, or (c) deliberately left open, and
+whether it changes any shipped code. **None does**: at the time of writing
+there is no `IpCounter`, `ShardWindow`, `classify_observation`,
+`AggregatorWorker` or `AggregatorMetrics` in the tree
+(`services/aggregator/src/hammertime/aggregator/window/counter.py`,
+`window/store.py`, `lateness.py`, `worker.py` are docstring-only stubs, and
+`packages/` was grepped for every one of those names: the only hits are
+docstring cross-references in `hammertime-store` and `hammertime-bus`), so
+every ruling is binding on the C4 (`coder`, window store and classifier)
+and T5 (`test-author`, worker/transitions/claims) briefs rather than a
+correction to code. The two shipped test files are consistent with every
+ruling below; where a ruling goes beyond what they assert, the gap is listed
+under *Follow-ups*.
+
+As with Amendment 1, decision bodies were rewritten in place so that a
+reader sees the rule now in force. Every edit outside this section, with the
+superseded wording quoted:
+
+* **Decision 2, ring semantics, first bullet.** Was: "A bucket starting at
+  `S` (always a multiple of `B`) is **live** at time `now` iff
+  `bucket_start(now, B) - S < W`. It enters the ring when its first delta
+  arrives and leaves the window at exactly `now = S + W`. The live buckets
+  at any `now` are the `N` buckets ending with the one that contains
+  `now`, so two live buckets never share a slot (`slot = (S // B) % N`,
+  `core.time.buckets.bucket_index`)." Now gives the rule as `0 <=
+  bucket_start(now, B) - S < W`, says a bucket that has not started is not
+  live, and says why (A4).
+* **Decision 2, ring semantics, `observe` bullet.** Was: "`observe(S,
+  delta, now)`: if `S` is not live, return `False` and change nothing.
+  Otherwise, if the slot holds an older bucket, subtract that bucket's
+  count from `total` and reset the slot to `S`; then add `delta` to the
+  slot and to `total`; return `True`. `delta < 0` is a `ValueError`;
+  `delta == 0` is applied (returns `True`, changes nothing)." Now: an
+  unaligned `S` is a `ValueError` (A9); a future `S` is not live (A4); the
+  `delta == 0` sentence is corrected — a zero delta still subtracts a stale
+  slot occupant, so "changes nothing" holds only for a fresh slot (A8);
+  and a sentence was added stating that `observe` can lower `total` (A11).
+* **Decision 2, `ShardWindow` code block, last two attributes.** The
+  comments "`# counter, decision 8`" (on `capacity_evictions`) and none (on
+  `retention_evictions`) became one comment each stating what increments
+  the counter (A7).
+* **Decision 2, `ShardWindow` bullets.** A new first bullet states that
+  every inherited IP is a tracked entry from construction, what its
+  `last_seen` is, and that construction never evicts (A5). The `observe`
+  bullet — was: "`observe` creates the entry for an untracked IP (state
+  `COLD`, empty ring), applies the delta with `now = clock.now()`, sets
+  `last_seen = max(last_seen, bucket_start)`, and returns the change. It
+  returns `None` and leaves the store untouched — no entry created, no
+  `last_seen` refresh — when the bucket is not live; the caller has already
+  classified that case (decision 3)." — now also requires an aligned
+  `bucket_start` (A9), states the zero-delta case explicitly (A8), states
+  that `total_after < total_before` is possible (A11), and says "not live
+  (past or future)" (A4). The `evict_due()` bullet — was: "`evict_due()`
+  removes every IP that is `COLD`, has `total == 0`, and whose `last_seen +
+  config.state_retention_seconds <= now` (§26); returns the number removed.
+  A HOT IP is never evicted; because `state_retention_seconds >=
+  window_seconds` (`DetectionConfig`), a HOT IP always reaches `total == 0`
+  and is demoted (decision 6) before its retention deadline can pass." —
+  now drops the `total == 0` clause, says the method is self-sufficient and
+  why, says it increments `retention_evictions`, and says no `WindowChange`
+  is produced (A6, A7). The capacity bullet gained a closing sentence that
+  inherited IPs count towards `tracked_count` (A5).
+* **Decision 3, the `classify_observation` paragraph.** Was:
+  "`classify_observation` is pure and checks, in this order:
+  `WINDOW_TOO_LONG` (ADR-0010 decision 6), `FUTURE`, `LATE` (the shipped
+  `is_within_lateness` horizon, config window), `EXPIRED_BUCKET`
+  (`bucket_start(now) - bucket_start(window_start) >=
+  config.window_seconds`, i.e. `IpCounter.is_live` is false), else
+  `APPLIED`. `now` is the service clock at processing time, not the envelope
+  timestamp: a lagging aggregator diverts what it can no longer count rather
+  than counting it into the past." Now spells each predicate out with `B =
+  config.bucket_seconds` explicit, and is followed by two new bullets:
+  raw-age versus bucket-age, flooring, and unaligned `window_start` never
+  being `MALFORMED` (A9); and the proof that every age `>= window_seconds`
+  is `LATE` or `EXPIRED_BUCKET`, including the exact horizon (A10).
+* **Decision 3, worker step 2.** Was: "`classify_observation(...)`. `LATE`,
+  `FUTURE`, ..." Now says what `window_start`, `now` and `config` are
+  passed, including the whole-second floor of the payload's `datetime`
+  (A9). The diversion sentence is unchanged.
+* **Decision 3, worker step 3.** Was: "`APPLIED`: `window.observe(ip,
+  bucket_start(window_start), request_count)` on the `ShardWindow` of
+  `message.partition`, then decision 4 for that IP with
+  `reason="observation"`." Now names the bucket size used for the floor
+  (the target window's `config.bucket_seconds`, A9) and notes that the
+  evaluation may demote (A11).
+* **Decision 6, the paragraph after the three maintenance steps.** Was:
+  "Because deltas are non-negative, an observation can only raise a count
+  and a sweep can only lower one: COLD -> HOT happens on the observation
+  path (or config re-evaluation), HOT -> COLD only on the sweep, warm-up
+  end, or config re-evaluation. `hot_to_cold_transitions` is labelled by
+  `reason` accordingly." Rewritten: the second half was false under
+  decision 2's own slot-reuse rule (A11); the paragraph now also records
+  that step 3 does not depend on step 1 (A6) and why the order stays.
+* **Decision 8.** `hot_to_cold_transitions{shard,config_version,reason}`'s
+  reason set — was "`expiry | warmup | config`" — gained `observation`
+  (A11). `window_evictions{reason}` — was "`reason = retention |
+  capacity`" — became `window_evictions{shard,reason}` with a note that it
+  is read from the two per-window counters (A7).
+* **Status line.** Marked amended twice.
+* **`docs/spec/hammertime_spec_1.md`, four pointer notes** (the spec's
+  restatements of this ADR, kept in step). The amendment as first
+  committed updated the §5 and §37 notes and claimed no other spec text
+  changed; the `supervisor` review found the §26 and §30 notes still
+  restating rules A6 and A11 had superseded, and the correction pass that
+  followed (same day) updated those two and added them here. Superseded
+  wording for all four:
+  * **§5's note.** Was: "A bucket starting at `S` is live at time `now`
+    iff `bucket_start(now) - S < window_seconds`; it leaves the window at
+    exactly `now = S + window_seconds`. A delta for a bucket that is no
+    longer live can never affect a future window count and is diverted to
+    reconciliation (Section 24) rather than applied." Now: "... iff `0 <=
+    bucket_start(now) - S < window_seconds` (a bucket that has not started
+    is not live; ADR-0011 Amendment 2); ... A delta for a bucket that is
+    not live can never affect ..." (A4). The note's first and last
+    sentences are unchanged.
+  * **§26's note.** Was: "It is bounded by `state_retention_seconds` (a
+    COLD IP with an empty window is evicted once `last_seen +
+    state_retention_seconds` has passed), by ...". Now: "(a COLD IP is
+    evicted once `last_seen + state_retention_seconds <= now`, whatever
+    its running total says — every bucket it holds has necessarily left
+    the window by then, so the eviction does not test for an empty
+    window; ADR-0011 Amendment 2, item A6)" (A6; also states the deadline
+    as decision 2's `<= now` rather than "has passed"). The rest of the
+    note is unchanged.
+  * **§30's note.** Was: "... is called from exactly one place
+    (`services/aggregator/transitions.py`), on three triggers — an applied
+    observation (deltas are non-negative, so only COLD -> HOT can result),
+    an expiry sweep or warm-up end (only HOT -> COLD), and a configuration
+    re-evaluation (Section 34, either direction). Each emitted transition
+    ..." Now says four triggers, that an applied observation can go either
+    direction and why, lists the expiry sweep and warm-up end separately,
+    and names the four `reason` labels of §37 (A11; the trigger list now
+    matches decision 8's reason set). The sentence from "Each emitted
+    transition" onwards is unchanged.
+  * **§37, the aggregator metrics list and its note.** The list line was
+    "`window_evictions           (ADR-0011; labelled retention | capacity)`";
+    now "labelled shard and retention | capacity" (A7). The note was:
+    "(`observation` | `config` for COLD -> HOT; `expiry` | `warmup` |
+    `config` for HOT -> COLD), and is the emitter of ..."; now "(...;
+    `observation` | `expiry` | `warmup` | `config` for HOT -> COLD — an
+    observation can lower the running total by a count that had already
+    expired, Amendment 2 item A11), and is the emitter of ..." (A11).
+
+  No other spec text changed: the §20, §24 and §34 ADR-0011 notes restate
+  rules this amendment does not touch. `docs/spec/README.md`'s section
+  index maps the same sections to the same modules and is untouched.
+
+Decisions 1, 4, 5, 7 and 9, the Assumptions list, Consequences, Sources and
+Amendment 1 are untouched.
+
+### A4. A bucket that has not started is not live; the counter refuses it
+
+**Classification: (b), with a contradiction in the text.** Decision 2's
+formula `bucket_start(now, B) - S < W` is satisfied by every `S > now`, but
+the sentence after it — "the live buckets at any `now` are the `N` buckets
+ending with the one that contains `now`" — excludes them. The two cannot
+both hold, and the difference matters: the slot of a future bucket `S =
+bucket_start(now) + kB` (`1 <= k < N`) is the slot of `S - W`, which *is*
+live at `now`. Admitting the future bucket would evict a live bucket from
+the ring on a write — a corruption of exactly the invariant ("two live
+buckets never share a slot") the ring depends on. The prose was right and
+the formula was incomplete.
+
+Ruling: `IpCounter.is_live(S, now)` is `0 <= bucket_start(now, B) - S < W`.
+`observe(S, delta, now)` with a future `S` returns `False` and changes
+nothing, exactly as for an expired `S`. `ShardWindow.observe` therefore
+returns `None` for it, with no entry created and no `last_seen` refresh.
+This is defence in depth, not a second policy: decision 3 filters `FUTURE`
+before the store is reached, and after that filter `now >= window_start`
+implies `bucket_start(now) >= bucket_start(window_start)`, so decision 3's
+"i.e. `IpCounter.is_live` is false" reading of `EXPIRED_BUCKET` is
+unchanged by the added lower bound.
+
+Assumptions:
+
+* **Refuse rather than raise.** A future `S` reaching the counter is a
+  caller bug (the classifier should have diverted it), so a `ValueError`
+  was the alternative. Refusing keeps `observe`'s contract two-valued
+  (applied or not) and keeps the store's "not live -> `None`, untouched"
+  rule uniform; a test can still tell the two apart through `is_live`.
+* **"Future" is judged against `bucket_start(now, B)`, not `now`.** For an
+  aligned `S` the two are the same test; stating it on the floored value
+  keeps the formula in one currency.
+
+Shipped code: none affected. The shipped tests never call `is_live` or
+`observe` with `now < S`; a future-bucket test is a follow-up.
+
+### A5. An inherited HOT IP is a tracked entry from construction
+
+**Classification: (a) by implication, now stated.** Decision 2 lists what
+the store holds "per tracked IP" — counter, state, `last_seen`, `inherited`
+flag — and decision 5 gives an inherited IP a state and a flag; decision 4
+reads `window.state(ip)`, which "is `COLD` when untracked", so an IP that
+is to report `HOT` must be tracked; and decision 7 re-evaluates "a snapshot
+of `window.tracked_ips()`" and says "the warm-up exemption of decision 5
+still applies", which only means anything if inherited IPs are in that
+snapshot. Nothing in the ADR admits a HOT-but-untracked IP. The worker was
+right that the consequences — `tracked_count`, the capacity slot,
+`last_seen` — were never written down.
+
+Ruling (decision 2 now says this): every IP in `inherited_hot` is an entry
+from construction — `is_tracked` true, in `tracked_ips()` and
+`tracked_count`, in `hot_ips()`/`hot_count`, not in `active_count` until
+its first applied observation (`total == 0`), and occupying a
+`max_tracked_ips` slot. Its `last_seen` is `clock.now()` at construction.
+Construction never evicts: a shard whose inherited set alone exceeds the
+cap starts over capacity, and the existing all-HOT rule applies on the next
+new IP (grow past the cap, log `store_over_capacity`). Its first
+observation returns `WindowChange(state=HOT, total_before=0,
+total_after=delta)`.
+
+Assumptions:
+
+* **`last_seen = clock.now()` at construction**, not `0`/`None` and not the
+  bucket boundary. Decision 2 defines `last_seen` as the event time of the
+  newest applied bucket, which an inherited IP does not have. `clock.now()`
+  is the last moment the process *knew* the IP mattered (the claim), so
+  retention runs from the claim: an inherited IP demoted at warm-up end
+  (`claim + window_seconds`) becomes evictable at `claim +
+  state_retention_seconds` — the same deadline an IP observed at claim time
+  would get. `0` would make it evictable on the first sweep after
+  demotion, which is defensible but makes retention mean two things.
+  Service time and event time are the same axis in this ADR (decision 2
+  compares `clock.now()` with `bucket_start` directly), so no unit is mixed.
+* **No log at construction for an over-cap inherited set.** The
+  `shard_claimed` record already carries `inherited_hot=N`; the
+  `store_over_capacity` record fires when the cap first actually bites.
+* **`inherited_hot` is de-duplicated silently** (it is consumed into a
+  set); passing an IP twice is not an error.
+
+Shipped code: none affected. The shipped tests assert `state`,
+`is_inherited`, `hot_ips()` and `total == 0` for inherited IPs and never
+`tracked_count` with a non-empty `inherited_hot`; that assertion is a
+follow-up.
+
+### A6. `evict_due()` is self-sufficient; the running total is not part of the retention test
+
+**Classification: (b).** Decision 2 made eviction conditional on `total ==
+0`, and `total` is lowered only by `expire()`, which only `expire_due()`
+calls. Read literally, an IP whose last bucket left the window but whose
+sweep has not run reports `total > 0` and survives `evict_due()`. Decision
+6 orders the sweep before eviction, so in the maintenance loop the literal
+reading and the intended one coincide — but the ADR never said that
+`evict_due()` *presumes* the order, and the worker could not tell whether
+a standalone `evict_due()` was allowed to expire internally, so it
+(correctly) deleted the test it had written.
+
+Ruling: the `total == 0` clause is removed from the retention condition,
+not because the intent changed but because it is implied. `evict_due()`
+removes every IP that is `COLD` and has `last_seen +
+config.state_retention_seconds <= now`, whatever its running total says.
+The implication: `last_seen` is `>=` every applied bucket start `S`
+(decision 2's `max`), and `state_retention_seconds >= window_seconds` is
+enforced by `DetectionConfig`, so every bucket of such an IP satisfies `S +
+window_seconds <= last_seen + window_seconds <= last_seen +
+state_retention_seconds <= now` — it has left the window. A non-zero
+`total` on such an IP is only a sweep the schedule had not yet reached.
+`apply_config` does not break this: it re-buckets each `(S, count)` to
+`bucket_start(S, B') <= S` and does not touch `last_seen`, and the config
+in force always satisfies the retention inequality. Consequences:
+
+* `evict_due()` needs no preceding `expire_due()` and may be called at any
+  time; calling it alone at the deadline evicts.
+* It drops the entry whole. It produces no `WindowChange`, and the count it
+  discards is not reported as expiry — no transition can be lost, because
+  only `COLD` IPs are eligible and decision 6 only evaluates `HOT` ones on
+  expiry.
+* Decision 6's order (expire, warm-up, evict) stays normative for the
+  reason given there: a `HOT` IP must be expired *and evaluated* in the
+  sweep that empties it, and that is step 1's job, not step 3's.
+* A stale schedule entry for an evicted IP is the implementation's to
+  ignore (lazy deletion, as `MemoryDedupStore._expiry_heap` does).
+
+Assumptions:
+
+* **Redefine rather than document the precondition.** The alternative was
+  to keep `total == 0` and state "`evict_due()` assumes `expire_due()` ran
+  at this `now`". Rejected: a hidden ordering dependency between two
+  public methods is exactly the kind of thing the next reader misses, and
+  the redefinition costs nothing because the clause was redundant.
+* **The capacity path is unchanged.** It evicts the least-recently-seen
+  `COLD` IP whether or not its window is empty (assumption 16); only the
+  retention path was ambiguous.
+
+Shipped code: none affected. The shipped retention tests all call
+`expire_due()` before `evict_due()` and pass under either reading; a
+standalone-`evict_due()` test is a follow-up.
+
+### A7. `retention_evictions` counts IPs removed by `evict_due()`; `window_evictions` is per shard
+
+**Classification: (b) by omission.** Decision 2 said `capacity_evictions
++= 1` for the capacity path and listed `retention_evictions: int` with no
+sentence incrementing it; decision 8 needed a `window_evictions{reason=
+retention}` fed from somewhere.
+
+Ruling: `ShardWindow.retention_evictions` is incremented by one for every
+IP `evict_due()` removes, so `evict_due()`'s return value equals the
+counter's increase across the call. Both eviction counters start at 0 at
+construction, are monotonic for the window's life, and are per
+`ShardWindow`. Decision 8's metric becomes
+`window_evictions{shard,reason}`, read directly from the two counters of
+each claimed shard at export time — the same shape and lifecycle as
+`tracked_ips{shard}`: when a shard is revoked its window and its series go
+away together, and no process-level carry has to be kept.
+
+Assumptions:
+
+* **A `shard` label rather than a process-level accumulator.** The
+  alternative (process totals maintained by the worker after each
+  `observe`/`evict_due`, or folded in at `on_revoked`) keeps a Prometheus
+  counter from ever appearing to drop, but needs bookkeeping at every call
+  site that can evict. Per-shard series already exist for the gauges and
+  the transition counters, and a series that stops at revocation is the
+  normal per-shard shape. This is a metric-shape choice the telemetry epic
+  can revisit before `/metrics` exports it (ADR-0009 decision 4 says it
+  may be empty until then).
+* **Construction and `apply_config` never increment either counter.**
+  Neither removes an entry (A5; decision 2's `apply_config` bullet).
+
+Shipped code: none affected (`metrics.py` is a stub). The shipped test
+`test_retention_eviction_is_counted` asserts exactly this increment.
+
+### A8. A zero delta is an observation: it creates the entry and returns a change
+
+**Classification: (a) by composition, now stated.** Decision 2's counter
+applies `delta == 0` and returns `True`; decision 2's store "creates the
+entry for an untracked IP ... applies the delta ... and returns the
+change". Nothing carves out zero, so a zero delta creates a tracked entry
+whose total is 0 — tracked but not active under §37's definition — and
+refreshes `last_seen`. The worker's `active_count` test relies on precisely
+this and is right to.
+
+Ruling (decision 2 now says this): `ShardWindow.observe(ip, S, 0)` for a
+live `S` creates the entry if absent, sets `last_seen = max(last_seen,
+S)`, and returns `WindowChange(ip, state, total_before, total_after)` — not
+`None`, which is reserved for "bucket not live". `total_after ==
+total_before` unless the slot held an expired bucket (A11). The counter's
+"changes nothing" wording was corrected for the same reason: a zero delta
+into a slot with a stale occupant resets the slot, and `live_buckets` /
+`next_expiry` — defined over non-zero slots — do not report the zero-count
+slot.
+
+Assumptions:
+
+* **Not refused, not special-cased.** Ingest never publishes a zero delta
+  (`services/ingest/.../publisher.py` drops them before fan-out, per
+  ADR-0008), so on the hot path this case is reachable only from a
+  hand-built or foreign message. Refusing it at the store would need a
+  third return value or a `ValueError` for something that is not an error;
+  treating it as an ordinary applied observation costs one bounded entry
+  (retention and the cap still apply). Whether ingest's drop should be
+  relaxed is not this ADR's question.
+* **A zero delta refreshes `last_seen`.** It is an observation the agent
+  chose to send; distinguishing "seen with nothing to report" from "seen"
+  would be a new concept.
+
+Shipped code: none affected. The shipped store test
+(`test_active_means_a_non_zero_total`) asserts `tracked_count == 2` /
+`active_count == 1` after a zero delta and never inspects the return value;
+the `WindowChange` return is a follow-up assertion.
+
+### A9. `EXPIRED_BUCKET` is judged on bucket age; `window_start` is floored, never rejected for alignment
+
+**Classification: (a) for the bucket formula; (a) for flooring; (b) for
+the counter's treatment of an unaligned `S` and for the `datetime` to
+epoch-second conversion.**
+
+The bucket formula: decision 3 wrote `EXPIRED_BUCKET` as `bucket_start(now)
+- bucket_start(window_start) >= config.window_seconds` and glossed it as
+"`IpCounter.is_live` is false". That is the bucket-age reading, and it is
+the only one consistent with the ring: the counter can only take a delta
+whose *bucket* is live, and the raw age `now - window_start` says nothing
+about that inside the last bucket. The apparent conflict in the T4 brief —
+"`EXPIRED_BUCKET` for age in [300, 330]" and "at `S + 299` it is live" —
+is not one: the first is about the classifier with a bucket-aligned `now`,
+the second about `is_live(S, now)` for an aligned `S`, and both follow from
+the same formula. The shipped test
+`test_liveness_is_judged_on_buckets_not_on_the_raw_age` (age 291 with an
+aligned `now` is `EXPIRED_BUCKET`) is ratified; an implementation of the
+plainer `now - window_start >= window_seconds` is wrong and will fail it.
+
+Alignment: `docs/protocol/observation-v1.md` requires `window_start` to be
+"aligned to `bucket_seconds`" and ingest rejects an unaligned one with
+`400` (`services/ingest/.../validation/limits.py`,
+`check_window_alignment`). That guarantees alignment to *ingest's*
+configured `bucket_seconds` at acceptance, which is not always the
+aggregator's: during a config rollout ingest may be on a version whose
+`bucket_seconds` is not a multiple of the aggregator's, and a message on
+the bus may come from a producer other than ingest. ADR-0010 decision 6
+already lands the delta "in the bucket containing `window_start` —
+`bucket_start(window_start, bucket_seconds)`", i.e. it floors. Ruling: the
+aggregator floors and never treats misalignment as `MALFORMED`.
+`classify_observation` floors both `now` and `window_start` itself (so its
+callers need not); the worker floors `window_start` with the **target
+window's** `config.bucket_seconds` before `ShardWindow.observe`; and
+`ShardWindow.observe`/`IpCounter.observe` require an aligned bucket start
+and raise `ValueError` for an unaligned one — that is an in-process caller
+bug, not a message property, and `MALFORMED` remains reserved for the
+codec and the ADR-0004 invariant (decision 3, step 1).
+
+Conversion: `RequestObservation.window_start` is an aware `datetime` and
+`classify_observation` takes an `int`; the codec (`_parse_timestamp`)
+accepts sub-second precision. The worker passes the whole-second floor of
+the UTC epoch value. Sub-seconds cannot change the bucket (`bucket_seconds
+>= 1` and the floor of a floor is the floor), so nothing is lost for
+counting; they are discarded rather than rounded so that `FUTURE`/`LATE`
+compare integers with the integer `Clock.now()`.
+
+Assumptions:
+
+* **`ValueError` at the counter for an unaligned `S`, rather than
+  flooring twice.** Flooring in the store as well would be harmless but
+  would hide a worker that forgot to, and would make "which `B`?" a
+  question in two places. One floor, at the boundary where the message's
+  geometry meets the window's, is easier to reason about.
+* **The target window's `bucket_seconds`, not the service's config in
+  force.** Outside decision 7's locked pass the two are identical; inside
+  it, step 1 has already given the window the new geometry and no
+  observation is processed until step 3, so they are identical there too.
+  Naming the window's value makes alignment hold by construction rather
+  than by an argument about lock ordering.
+* **Floor, not round or reject, for sub-second `window_start`.** Rejecting
+  would make the codec's accepted input the aggregator's `MALFORMED`,
+  which ADR-0004's invariant check does not cover; rounding could move a
+  value across `now`.
+* **The protocol text is not changed.** "MUST be aligned" stays an agent
+  requirement enforced by ingest; this item only says what the aggregator
+  does when the bus carries something else. No `CHANGES` entry: nothing an
+  agent or operator can observe changes.
+
+Shipped code: none affected. `bucket_start`, `is_within_lateness`
+(`hammertime.core.time.buckets`) and ingest's alignment check are
+consistent with this item and untouched.
+
+### A10. An age of exactly `window_seconds + allowed_lateness_seconds` is `EXPIRED_BUCKET`, for every config and every `now`
+
+**Classification: (a), determined by decision 3's arithmetic; the worker
+missed it, then pinned it anyway.** The shipped tests parametrise `age`
+over `[300, 301, 305, 310, 329, 330]` and assert `EXPIRED_BUCKET`, and the
+property test's `_expected` mirror pins 330 to `EXPIRED_BUCKET` for every
+sampled config. Ratified, and generalised in decision 3 so nobody has to
+derive it again:
+
+With `age = now - window_start >= 0`, `r = now mod B` and `a = age`,
+`bucket_start(now, B) - bucket_start(now - a, B)` equals `B * ceil((a - r)
+/ B)`. Since `0 <= r < B`, that is at least `B * floor(a / B)` — the largest
+multiple of `B` not above `a` — and `window_seconds` is a multiple of `B`,
+so `a >= window_seconds` gives a bucket age `>= window_seconds`:
+`EXPIRED_BUCKET` if inside the horizon, `LATE` if past it. At the horizon
+itself (`a = window_seconds + allowed_lateness_seconds`) the `LATE` test is
+strictly `>`, so the outcome is `EXPIRED_BUCKET`; with the shipped
+defaults that is age 330. `APPLIED` requires `0 <= age < window_seconds`
+*and* the bucket test, and exactly which sub-window ages pass depends on
+`r` — for `r = 0` (a bucket-aligned `now`, which is what the shipped tests
+use) an aligned `window_start` passes iff `age <= window_seconds - B`.
+
+Assumptions: none beyond the arithmetic. The stale sentence in
+`test_lateness.py`'s module docstring (lines 42-46: "the tests below assert
+only that it is not `LATE`") describes a hedge the tests do not make; it
+is listed under *Follow-ups* for a `test-author` pass.
+
+Shipped code: none affected.
+
+### A11. HOT -> COLD can happen on the observation path; `reason="observation"` is a legal demotion label
+
+**Classification: (b), not asked; forced by decision 2.** Decision 6 said
+"an observation can only raise a count and a sweep can only lower one" and
+"HOT -> COLD only on the sweep, warm-up end, or config re-evaluation", and
+decision 8 listed only `expiry | warmup | config` for
+`hot_to_cold_transitions`. But decision 2's `observe` subtracts a slot's
+older occupant before adding the delta, and that occupant is always a
+bucket that has already left the window (its start is `S - W` or earlier).
+So an observation for bucket `S` that arrives after `S` has begun but
+before the maintenance tick that would have expired `S - W` lowers the
+running total — by the expired count, which the next sweep would have
+removed anyway — and decision 3's step 3 then evaluates the IP on the
+exact, lower count. With a 1 s maintenance interval and 10 s buckets this
+is reached in normal operation: any observation processed in the first
+second of a bucket, for that bucket, for an IP whose slot held a non-zero
+count one window earlier. If the exact count is below `cold_threshold`,
+`evaluate_ip_state` returns `COLD`, and decision 4 has no rule saying not to
+emit it.
+
+Ruling: the demotion is emitted. It is correct (the count is exact and
+would have produced the same `HotIpRemoved` on the next sweep, a second
+later, with the same `window_count`), and refusing it would mean either
+deferring evaluation on the observation path or having `observe` run
+`expire` first — the latter still lowers the count before the evaluation
+and merely moves the subtraction, so nothing is gained. Decision 6's
+sentence is rewritten, decision 8's `hot_to_cold_transitions` reason set
+gains `observation`, and decision 4's step 5 (which already counts "under
+`reason`") needs no change. The warm-up exemption is unaffected: decision 4
+already returns `None` for a HOT -> COLD of an inherited IP during
+warm-up "whatever the trigger", and an observation is a trigger.
+
+Assumptions:
+
+* **Label it `observation`, not `expiry`.** The count that was subtracted
+  was expired, so `expiry` is arguable; but the label names the *path*
+  that emitted the transition (decision 4 step 5 counts "under `reason`"
+  as passed by the caller), and the caller is the observation path.
+  Consistency of the label with the call site beats consistency with the
+  arithmetic.
+* **§30's and §37's pointer notes are updated to match**, since they
+  enumerate the triggers and the labels respectively (§37 in the amendment
+  as first committed; §30 in the correction pass recorded in the edit
+  list above, which had left it saying "only COLD -> HOT can result").
+
+Footprint — every site that carries an A11 rule, listed so that a reader
+weighing whether to keep a ruling nobody asked for can find all of it
+without a search. Sites 1, 2 and 6 state the arithmetic fact A11 made
+explicit (an applied observation can lower `total`); sites 3, 4, 5, 7 and
+8 state the ruling itself (the resulting demotion is emitted and labelled
+`observation`):
+
+1. Decision 2, ring semantics, the `observe` bullet — the closing sentence
+   "Because the older occupant of a slot is always a bucket that has
+   already left the window, `observe` can *lower* `total` — this is the
+   sweep's work done early, not a negative delta (A11)."
+2. Decision 2, the `ShardWindow` `observe` bullet — "`total_after <
+   total_before` is possible for any delta when the slot's previous
+   occupant is subtracted (A11)."
+3. Decision 3, worker step 3 — "The evaluation may yield a HOT -> COLD
+   (A11)."
+4. Decision 6, the paragraph after the three maintenance steps — from "The
+   converse does not hold" through "labelled by `reason` accordingly".
+5. Decision 8 — `observation` in the `hot_to_cold_transitions` reason set.
+6. Amendment 2 item A8, ruling paragraph — "unless the slot held an
+   expired bucket (A11)".
+7. `docs/spec/hammertime_spec_1.md`, §30's ADR-0011 note — the applied
+   observation trigger is "either direction", with the reason.
+8. `docs/spec/hammertime_spec_1.md`, §37's ADR-0011 note — `observation`
+   among the HOT -> COLD labels, with the parenthetical explaining why.
+9. This item.
+
+The amendment's preamble, its edit list (which quotes the superseded
+wording of sites 1-5, 7 and 8) and its *Follow-ups* refer to A11 but state
+no rule of their own. The `observation` label for COLD -> HOT (decision 4
+step 5, decision 8) predates A11 and is not part of its footprint.
+
+Shipped code: none affected. `hammertime.core.state.machine.evaluate_ip_state`
+is pure over `(previous, count, config)` and does not know why it was
+called.
+
+### Follow-ups (not part of this amendment; for the top-level session to dispatch)
+
+* `test-author`: `test_lateness.py` lines 42-46 (module docstring) claim the
+  exact-horizon outcome is left unpinned; the tests pin it to
+  `EXPIRED_BUCKET` (A10). Correct the docstring to say so.
+* `test-author`, tests the rulings above call for that T4 did not write:
+  `is_live`/`observe` with a future `S` (A4); `IpCounter.observe` and
+  `ShardWindow.observe` with an unaligned `S` raising `ValueError` (A9);
+  `tracked_count`, `is_tracked`, `active_count` and the capacity slot with a
+  non-empty `inherited_hot`, and an inherited IP's retention deadline after
+  demotion (A5); `evict_due()` evicting without a preceding `expire_due()`
+  (A6); the `WindowChange` returned for a zero delta (A8); a
+  `total_after < total_before` `WindowChange` on `observe` into a stale
+  slot, and — in T5's scope — a `HotIpRemoved` emitted with
+  `reason="observation"` (A11); `window_evictions{shard,reason}` (A7).
+
+## Amendment 3 (2026-09-17) — the version gate has one home, `AggregatorMetrics` has a Python surface, `StateTransition` is core's, `set_state` on an untracked IP, and the aggregator's own log records
+
+Why: the `test-author` writing the M3 worker/transitions/claims/re-evaluation
+tests (`test_hysteresis.py`, `test_sharding.py`, `test_reevaluate.py`,
+`test_worker.py`, commit `abaf12b`) had to assume three interfaces this ADR
+named but did not pin, and a `supervisor` review confirmed the first of them
+contradicts ADR-0009 as written: (1) the tests pin the configuration version
+gate *on* `AggregatorWorker.apply_config` and give it a `DetectionConfig`
+return, while ADR-0009 A5 puts the gate in `ConfigPoller.poll_once()` and
+types the hook as returning `None` — so the hook as tested could not be
+wired into the poller under mypy, and the gate would have existed twice;
+(2) decision 8 named `AggregatorMetrics` and its series but no constructor,
+increment or read path; (3) decision 4's `EmittedTransition.transition:
+StateTransition` named a type with no module path. Two smaller points came
+with them: C4 implemented `ShardWindow.set_state` on an untracked IP as a
+bare `KeyError` and asked for a ruling, and the T5 brief asked for a
+`shard_claimed ... inherited_hot=2` log assertion that T5 declined to write.
+
+Each item says whether the point was (a) already determined and missed, (b)
+genuinely unspecified and ruled now, or (c) left open with consequences, and
+whether it changes any shipped code. **None changes shipped code on
+`master`**: at the time of writing `worker.py`, `transitions.py`,
+`reevaluate.py`, `metrics.py`, `config.py`, `sharding/assignment.py` and
+`service.py` are docstring-only stubs (or absent), and C4's `ShardWindow` /
+`IpCounter` / `classify_observation` (commit `90276eb`, on a branch not
+checked out here and not readable from this working tree) is affected only
+by A15, which ratifies what C4 reported. ADR-0009 is **not** amended: every
+rule below is consistent with ADR-0009 decision 6 and A5/A7/A8 as written,
+and A12 exists precisely to make this ADR agree with them. The four shipped
+T5 test files are consistent with A13, A14, A15 and A16 as written; the
+assertions A12 invalidates are listed under *Follow-ups*, for a `test-author`
+pass.
+
+As with Amendments 1 and 2, decision bodies were rewritten in place. Every
+edit outside this section, with the superseded wording quoted:
+
+* **Decision 7, opening paragraph.** Was: "`reload_config()` / the poll
+  loop apply a document per ADR-0009 decision 6 (strictly greater version;
+  rejected documents ignored). Applying version `v` means, under the worker
+  lock so that no observation is processed mid-pass:". Now names
+  `ConfigPoller.poll_once()` as the only place the version rule is
+  enforced, says the service constructs the poller with
+  `apply=worker.apply_config`, gives the `apply_config(config) -> None`
+  signature and the `config` property in a code block, and says the hook is
+  unconditional (A12).
+* **Decision 7, step 3.** Was: "Adopt `v` as the config in force;
+  `reload_config()` returns it." Now: adopt `v` at the worker, log
+  `config_reevaluated`, return; the poller then sets `current`, logs
+  `config_applied`, and `reload_config()` returns the poller's `current`
+  (A12).
+* **Decision 8, opening.** Gained the `AggregatorMetrics` code block and
+  the paragraph after it (series identity, `str(value)` keying, the
+  name/label-name validation rule, event counters versus window-derived
+  series, `bind_windows`) — normative text that did not exist before
+  (A13).
+* **Decision 8, the series table.** `window_evictions{shard,reason}`'s
+  comment gained "`get` with a shard no bound window has, or a `reason`
+  outside the two, reads 0"; `shards_claimed` — was "gauge" — is now
+  "gauge; the number of windows the bound source yields" (A13).
+* **Decision 8, the log events sentence.** Was: "`warmup_complete`,
+  `config_applied` (with `transitions=N`), `malformed_observation`". Now:
+  "`warmup_complete`, `config_reevaluated` (`config_version`,
+  `transitions`; emitted by the worker at the end of `apply_config`, before
+  the poller's own `config_applied` of ADR-0009 A7 — A12),
+  `malformed_observation`" (A12).
+* **Decision 4, the `EmittedTransition` code block.** Gained the import
+  line `from hammertime.core.state.transitions import StateTransition` and
+  the comment "`StateTransition(previous=previous, current=new)`" on the
+  `transition` field (A14).
+* **Decision 4, step 5.** Was: "`window.set_state(ip, new)`; count the
+  transition under `reason` (`observation`, `expiry`, `warmup`, `config`);
+  return the `EmittedTransition`." Now also spells the `metrics.increment`
+  call and says `transition` is core's `StateTransition(previous=previous,
+  current=new)` (A13, A14).
+* **Decision 2, the `ShardWindow` code block.** `set_state`'s line gained
+  the comment "`KeyError` for an untracked IP (A15)".
+* **Decision 2, the `set_state` bullet.** Was: "`set_state(ip, COLD)`
+  clears the `inherited` flag for that IP; `finish_warmup_if_due()`
+  returns ...". Now opens with "`set_state(ip, state)` requires `ip` to be
+  tracked and raises `KeyError` otherwise — it never creates an entry
+  (A15)." and continues as before.
+* **Decision 9, the module layout.** `service.py`'s line now says it owns
+  the `ConfigPoller` with `apply=worker.apply_config` and that
+  `reload_config() -> DetectionConfig` is `poller.poll_once()`;
+  `transitions.py`'s line gained "(transition: core `StateTransition`)";
+  `worker.py`'s line — was "`run_maintenance(), apply_config(), commit
+  cadence`" — now reads "`run_maintenance(), apply_config(config) -> None
+  (unconditional; the poller's hook), config (property), commit cadence`";
+  `metrics.py`'s line — was "`AggregatorMetrics`" — now
+  "`AggregatorMetrics (increment, get, bind_windows)`".
+* **Sources.** Gained the Prometheus data-model citation A13 relies on.
+* **Status line.** Marked amended three times.
+* **`docs/spec/README.md`, the §30/§39 row.** Gained
+  `core/state/transitions.py`, which A14 makes the carrier of the
+  transition value the aggregator emits. No other row changed.
+
+Decisions 1, 3, 5 and 6, the Assumptions list, Consequences, Amendment 1
+and Amendment 2 are untouched. `docs/spec/hammertime_spec_1.md` is
+untouched: its §30, §34, §37 and §47.3 ADR pointer notes were re-read for
+restatements of the three rules — §47.3 already says the poller is shared
+and `reload_config()` is one poll of it returning the configuration in
+force, which is exactly A12; §37 lists the series without a Python API; §30
+does not name the transition value type; and no spec text names the
+aggregator's `config_applied (with transitions=N)` record (§47.7's
+`config_applied` is ADR-0009's, which is unchanged). `docs/protocol/` has
+no restatement of any of the three. `docs/spec/integration-scenarios.md`
+§4 step 4 asserts the non-increasing rule through `publish_config` ->
+`reload_config()`, i.e. through the poller — consistent with A12 and
+untouched. ADR-0009 was grepped for the same rules; A5 and A7 already state
+what A12 relies on and are unchanged.
+
+### A12. The version gate lives in `ConfigPoller.poll_once()` only; `apply_config(config) -> None` is unconditional
+
+**Classification: (a), already determined by ADR-0009 A5 read with this
+ADR's decision 7, and missed — by the T5 brief and by this ADR's own
+imprecision.** ADR-0009 A5 is explicit on both halves: `poll_once()` returns
+`current` unchanged, silently, when `candidate.config_version <=
+current.config_version` and never calls `apply` for it; the hook is typed
+`Callable[[DetectionConfig], Awaitable[None]]`; and "the aggregator, trie
+and detector MUST use `ConfigPoller` for decision 6 rather than
+reimplementing it (their `apply` is their re-evaluation: `reevaluate.py`,
+...)". Decision 7 of this ADR deferred to "ADR-0009 decision 6" for the
+rule and listed `apply_config()` in decision 9 without a signature, which
+left room for the T5 brief to say "a version `<=` the one in force is
+ignored" *of `apply_config`* and "the returned config is the one in force"
+— the two statements ADR-0009 makes of `poll_once()`. T5 followed the brief.
+The result was a hook returning `DetectionConfig`, which is not assignable
+to `Awaitable[None]` (`Awaitable` is covariant and `DetectionConfig` is not
+a subtype of `None`), and a gate in two places.
+
+Ruling, now stated in decision 7 and decision 9:
+
+* `AggregatorWorker.apply_config(config: DetectionConfig) -> None`. It is
+  decision 7's three steps under the worker lock, then a
+  `config_reevaluated` record, then return. It compares no versions. It is
+  the callable the service passes as `ConfigPoller(..., apply=
+  worker.apply_config)`.
+* `AggregatorWorker.config` is a read-only property giving the version in
+  force at the worker: the constructor's `config` until the first
+  successful `apply_config`, then the last one applied.
+* `AggregatorService.reload_config() -> DetectionConfig` is `await
+  poller.poll_once()` — ADR-0009 A5's rule verbatim — and returns the
+  poller's `current`. The gate, the `config_rejected` record and the
+  `config_applied` record are the poller's; the aggregator adds nothing to
+  them and duplicates none of them.
+* Decision 8's aggregator-side record is renamed from `config_applied (with
+  transitions=N)` to `config_reevaluated` with fields `config_version` and
+  `transitions`. This is a consequence, not a separate ruling: ADR-0009 A7
+  pins `config_applied`'s fields as `path, config_version,
+  previous_config_version` and says the names and fields are contract, so
+  a second `config_applied` with different fields from a different emitter
+  would contradict it, and under this ruling both would fire on every
+  change. The worker's record fires first (inside `apply_config`), the
+  poller's second.
+
+What `poll_once` does about "its own gate": nothing changes — it *is* the
+gate. There is no second one to reconcile.
+
+Why the poller and not the worker, given the caller said either was
+defensible: the rule is ADR-0009's and is already implemented and tested in
+core (`test_runtime.py::TestConfigPoller`, including the version-visible-
+only-after-apply property); the trie and detector will wire the same
+poller the same way, so the aggregator having its own copy would be the one
+service where the rule could drift; and a hook that trusts its caller is
+the shape A5's `_Applier` test double already has. The cost is that the
+worker-level tests that asserted the gate on `apply_config` have to move to
+the seam where the gate is (*Follow-ups*).
+
+Assumptions (push back individually):
+
+* **`apply_config` applies a lower or equal version rather than raising.**
+  A `ValueError` precondition was the alternative. Rejected because it is a
+  second, refusing gate under another name — the thing this item removes —
+  and because a direct caller re-applying the version in force is a useful
+  way to force a full re-evaluation pass (nothing else exposes one).
+* **A failed pass leaves partial effects.** If step 2 raises (a store
+  failure, decision 4 / assumption 7), the exception propagates out of
+  `apply_config` and `poll_once()`; `worker.config` and the poller's
+  `current` are unchanged, but windows re-bucketed in step 1 keep the new
+  geometry and transitions already emitted carry `v`. Decision 7 said this
+  before ("a failure here propagates") and A9's "the target window's
+  `bucket_seconds`" already keeps observations aligned in that state; the
+  next poll retries the same document (ADR-0009 A5). Whether the pass
+  should instead be made atomic is **left open** and is not ruled here.
+* **`config_reevaluated` carries `config_version` and `transitions` only.**
+  A per-shard breakdown was considered and not added; nothing asked for it.
+* **The worker keeps its own `config` rather than reading the poller's
+  `current`.** The worker is constructed without a poller (the tests build
+  it with a `DetectionConfig` and no path) and must work that way; the two
+  values agree except during the instant between `apply_config` returning
+  and the poller assigning `current`, during which no observation is
+  processed under the poller's value because the worker never reads it.
+
+Shipped code: none affected. Binding on the C5 brief; invalidates the T5
+assertions listed under *Follow-ups*.
+
+### A13. `AggregatorMetrics`: constructor, increment path, read path, and how the window-derived series are read
+
+**Classification: (b).** Decision 8 named nine series and their labels and
+said "plain counters", nothing more. T5 assumed `AggregatorMetrics()` with
+no required arguments and `metrics.get(name, **labels) -> int` returning 0
+for an untouched series, behind a `_counter()` helper; both are ratified.
+The ruling is decision 8's new code block and paragraph; restated here with
+the reasons:
+
+* `AggregatorMetrics()` — no arguments. One instance per process, built by
+  the service and handed to the worker and the emitter.
+* `increment(name, **labels) -> None` adds 1 to one series. Only the four
+  event counters accept it: `cold_to_hot_transitions` and
+  `hot_to_cold_transitions` (`shard`, `config_version`, `reason`; called by
+  the emitter, decision 4 step 5), `late_messages` (`reason`) and
+  `observations_rejected` (`reason`; both called by the worker, decision 3
+  steps 1-2).
+* `get(name, **labels) -> int` reads one series: an event counter's value
+  (0 if never incremented), or a window-derived value computed on the call.
+* `bind_windows(windows: Callable[[], Iterable[ShardWindow]]) -> None` is
+  how the derived series get their source. `AggregatorWorker.__init__`
+  binds a callable that yields the currently claimed windows
+  (`ShardClaims.windows()`, pinned by Amendment 5, A18; as first written
+  this sentence left the spelling to the implementation). On each `get` of
+  a derived series the callable is
+  invoked and the answer computed from the windows it yields:
+  `tracked_ips{shard}` / `active_ips{shard}` / `hot_ips{shard}` are the
+  named window's `tracked_count` / `active_count` / `hot_count`;
+  `window_evictions{shard,reason=retention|capacity}` is its
+  `retention_evictions` / `capacity_evictions`; `shards_claimed` is the
+  number of windows yielded. A `shard` value no yielded window has, or a
+  `reason` outside the two, reads 0; before `bind_windows` every derived
+  series reads 0. A revoked shard's series therefore vanish with its window,
+  exactly as A7 said.
+* Identity: a series is `(name, tuple of (label name, str(value)) in a
+  fixed order)`. `name` must be one of the nine; the label names passed
+  must equal the series' label names exactly; `ValueError` otherwise from
+  both methods. Label *values* are not validated.
+
+Assumptions (push back individually):
+
+* **Strict names and label names.** A registry that accepted any string
+  would turn a typo (`hot_to_cold_transition`) into a silently empty series;
+  Prometheus client libraries require label names to be declared up front
+  for the same reason. The cost is that adding a series is an edit to this
+  table and to the module — which is the point.
+* **`str(value)` keying.** Follows the Prometheus data model cited under
+  Sources (label values are strings; a different value is a different
+  series) and lets callers pass `shard=window.shard` (an `int`) without
+  converting.
+* **Derived series computed on read through a bound callable, rather than
+  gauges the worker sets.** The alternative — `set_gauge` calls after every
+  `observe`, `evict_due` and claim — is the bookkeeping A7 rejected for
+  `window_evictions`, and it would let a gauge lag reality. Computing on
+  read is O(claimed shards) per call, which is fine for a test and for a
+  scrape. `bind_windows` as a mutating method (rather than a constructor
+  argument) is what lets `AggregatorMetrics()` stay argument-free and be
+  built before the worker.
+* **`increment` is by 1 only.** No caller needs another amount; a
+  `count=` parameter can be added without breaking anything.
+* **No enumeration or rendering surface.** What `/metrics` needs beyond
+  `get` (enumerating the label sets that exist, Prometheus naming such as
+  a `_total` suffix on counters) is the telemetry epic's to add; ADR-0009
+  decision 4 lets `/metrics` be empty until then, and pinning an export
+  shape here would be designing that epic's interface without its
+  requirements.
+* **Not thread-safe.** A plain dict; every caller is on the one event
+  loop.
+
+Shipped code: none affected (`metrics.py` does not exist). The T5
+`_counter()` helper and every `metrics.get(...)` call site in
+`test_hysteresis.py` and `test_worker.py` use exactly the names and label
+names above and need no change. Closes T5's gap 8 (`test_sharding.py`
+module docstring): `window_evictions{shard,reason}` is now assertable
+through `get` on a worker's metrics (*Follow-ups*).
+
+### A14. `EmittedTransition.transition` is `hammertime.core.state.transitions.StateTransition`
+
+**Classification: (a), already determined and missed — by this ADR, which
+named the type without its module, and by the T5 brief and T5, which took
+"no module" to mean "undefined".** The type exists and has shipped since
+before this ADR: `packages/hammertime-core/src/hammertime/core/state/transitions.py`
+(docstring `Spec: section 19, section 30`) defines
+`@dataclass(frozen=True, slots=True) class StateTransition(previous:
+IpState, current: IpState)` with `became_hot` and `became_cold` properties
+and the docstring "A COLD->HOT or HOT->COLD edge. Non-transitions are never
+represented." That is precisely what decision 4 emits.
+
+Ruling (decision 4 now says this): `EmittedTransition.transition =
+StateTransition(previous=previous, current=new)` where `previous =
+window.state(ip)` read at the top of `evaluate` and `new` is
+`evaluate_ip_state`'s result. A promotion therefore has `transition.became_hot`
+true and a demotion `transition.became_cold` true, and the two compare
+unequal (frozen dataclass equality), which is what T5's
+`test_the_two_directions_are_distinguishable_on_the_transition_field`
+already asserts. The module is imported directly
+(`hammertime.core.state.transitions`); it is not re-exported from
+`hammertime.core.state.__init__` today and this amendment does not ask for
+that.
+
+Assumptions: none beyond ratifying the shipped type. No enum of direction
+names is introduced; `became_hot`/`became_cold` are the direction.
+
+Shipped code: none affected. `docs/spec/README.md`'s §30/§39 row gains
+`core/state/transitions.py`.
+
+### A15. `ShardWindow.set_state` on an untracked IP is a `KeyError`
+
+**Classification: (b) by omission; ratifies C4's disclosed default.**
+Decision 2 listed `set_state(ip, state) -> None` and said only what
+`set_state(ip, COLD)` does to the `inherited` flag. C4 implemented the
+untracked case as a bare `KeyError` and flagged it.
+
+Ruling (decision 2 now says this): `set_state` requires a tracked IP and
+raises `KeyError` otherwise; it never creates an entry. The emitter cannot
+reach that path: decision 4 reads `window.state(ip)` (`COLD` when
+untracked) and `window.total(ip)` (0 when untracked), so an untracked IP
+evaluates `COLD -> COLD` and `evaluate` returns `None` before step 5; and
+because `evaluate` runs under the worker lock (decisions 6 and 7), no
+`evict_due()` can remove the entry between the read and the
+`set_state`. So the `KeyError` is a caller-bug signal, not a runtime path.
+
+Assumptions: **raise rather than create.** Creating an entry on
+`set_state` would give the store a second way to admit an IP with no
+observation behind it, alongside `inherited_hot`, and would make
+`tracked_count` move on a call whose name says nothing about tracking.
+`KeyError` rather than `ValueError` because the argument is a missing key,
+which is what C4 chose and what a dict-backed store raises naturally.
+
+Shipped code: C4's `ShardWindow` (commit `90276eb`, not readable from this
+tree) is reported to do exactly this; nothing changes.
+
+### A16. The aggregator's own log records are not given a unit-test seam here
+
+**Classification: (c), left open with the consequence stated.** The T5
+brief asked for an assertion on `shard_claimed shard=p inherited_hot=N`
+(Amendment 2, A5). T5 did not write it, on the grounds that ADR-0009 A7
+pins a record shape only through `configure_logging`'s JSON carrier and a
+`logger=` injection seam that exists on `connect_with_retry` and
+`ConfigPoller` — not on anything in this ADR. That reading is correct: the
+event names and fields in decision 8 are contract, and the carrier is A7's,
+but no `logger=` parameter is pinned on `ShardClaims` or `AggregatorWorker`,
+so a unit test has no way to capture the record short of configuring
+process-wide logging.
+
+Ruling: no seam is added by this amendment, and the `inherited_hot=2`
+assertion is **not** an outstanding brief item. The observable half is
+already asserted on the window (`hot_count == 2`,
+`test_every_inherited_ip_is_a_tracked_entry_from_construction`). If a
+later pass wants the records assertable, the established shape is
+ADR-0009 A2's `logger: Any = None` parameter (an object with
+`info`/`warning`/`error(event, **fields)`) on `ShardClaims` and
+`AggregatorWorker`; that is a small, separate ruling and is deliberately
+not made here, because nothing in Q1-Q3 depends on it.
+
+Assumption: that the telemetry epic, which owns `/metrics` and the log
+pipeline, is the natural place to decide whether every component takes a
+`logger=`; pinning it piecemeal per ADR was judged worse than leaving it.
+
+### Follow-ups (not part of this amendment; for the top-level session to dispatch)
+
+* `test-author` (`test_reevaluate.py`), required by A12:
+  * Module docstring ASSUMPTION 1 (lines 25-32): `apply_config` returns
+    `None` and performs no version comparison; the gate is
+    `ConfigPoller.poll_once()`'s (ADR-0009 A5), and `reload_config()` on
+    the service is that poll.
+  * Module docstring ASSUMPTION 2 (lines 33-35): `reevaluate_shard`'s
+    `int` return is the `transitions` field of the worker's
+    `config_reevaluated` record, not of `config_applied` — after A12 that
+    name is the poller's record, and ADR-0009 A7 gives it `path`,
+    `config_version` and `previous_config_version` only.
+  * `test_the_version_in_force_afterwards_is_the_new_one` (lines 272-284):
+    drop `returned = ...` and the two `returned.*` assertions (278-281);
+    keep the `worker.config.*` and window assertions. May assert
+    `await worker.apply_config(V2) is None`.
+  * `TestTheVersionGate` (lines 321-377): `test_a_lower_version_is_ignored`
+    (325-337) and `test_the_version_in_force_is_ignored_even_with_different_thresholds`
+    (339-356) assert a gate `apply_config` no longer has and are wrong
+    under A12. Re-point them at the poller: build the worker as now, write
+    the candidate document to a `tmp_path` file, construct
+    `ConfigPoller(path, worker.config, apply=worker.apply_config)` and
+    `await poller.poll_once()`; assert the poller's returned config, the
+    worker's `config`, and that no records were emitted. That is the wiring
+    `AggregatorService.reload_config()` performs (decision 9), asserted
+    without a service-level construction seam, and it is also the static
+    demonstration that `apply_config` is assignable to the hook (mypy runs
+    strict over the tests). `test_a_descriptive_only_change_is_adopted_and_produces_no_transitions`
+    (358-377): drop the `returned = ...` assignment (370) and the two
+    `returned.*` assertions (372-373) — `await worker.apply_config(v4)`
+    stays as a bare statement, or as `assert await worker.apply_config(v4)
+    is None`; keep the rest; the class docstring (322-323) should say
+    which tests go through the poller.
+* `test-author`, optional under A13 and A14: assert
+  `metrics.get("window_evictions", shard=0, reason="retention") == 1` and
+  `metrics.get("shards_claimed") == 1` on a running worker after a
+  retention eviction (closes `test_sharding.py`'s gap 8); assert
+  `promotion.transition.became_hot` / `demotion.transition.became_cold` in
+  `test_hysteresis.py`; assert `ValueError` from `increment`/`get` for an
+  unknown name or a wrong label set.
+* Open, not ruled (A12's second assumption): whether a failed
+  re-evaluation pass should be atomic.
+
+## Amendment 4 (2026-09-17) — `observe` checks alignment before liveness; Amendment 3's follow-up list completed
+
+Why: two `supervisor` reviews. The first, of the T4b test pass (commit
+`814620e`), found that every one of the five new alignment tests in
+`test_window.py` (`TestIpCounterAlignment`, lines 295-316, and the two
+`ShardWindow` tests at lines 603-622) passes an `S` that is unaligned *and*
+not live — `S = BASE + offset` with the clock at `BASE`, so A4's
+`bucket_start(now, B) - S` is negative — and expects `ValueError`. A4 says a
+non-live `S` returns `False`/`None` and changes nothing; A9 says an
+unaligned `S` raises. Both rules apply to those inputs and neither
+amendment said which is tested first, so the tests were pinning an order
+the ADR had not stated. The user ruled that the ADR should pin the order
+rather than the tests be loosened; A17 does that. The second review, of
+Amendment 3, found its *Follow-ups* list short by two items of test text
+that follow from A12's `config_reevaluated` rename; they are added to that
+list in place, and the edit is recorded below.
+
+This amendment rules on one point and nothing else. Every edit outside
+this section, with the superseded wording quoted:
+
+* **Decision 2, ring semantics, `observe` bullet.** Was: "`observe(S,
+  delta, now)`: `S % B != 0` is a `ValueError` (the caller floors; A9) and
+  `delta < 0` is a `ValueError`; neither changes anything. If `S` is not
+  live — including a future `S` — return `False` and change nothing.
+  Otherwise, ..." Now inserts, after "neither changes anything.", the
+  sentence "The alignment check comes **before** the liveness test: an
+  unaligned `S` raises for every `now`, whether or not the bucket it falls
+  in would be live (A17)." and reads "If an aligned `S` is not live ..."
+  (A17). The rest of the bullet is unchanged.
+* **Decision 2, `ShardWindow` `observe` bullet.** Was: "`observe(ip,
+  bucket_start, delta)` requires `bucket_start` to be a multiple of
+  `config.bucket_seconds` (the worker floors it, decision 3; the counter
+  raises `ValueError` otherwise). It creates the entry for an untracked IP
+  ..." Now inserts, after "otherwise).", the sentence "That check is the
+  first thing the call does — before the liveness test and before any
+  entry is created: an unaligned `bucket_start` raises whatever the clock
+  says and leaves the store untouched (A17)." (A17). The rest of the
+  bullet is unchanged.
+* **Amendment 3, *Follow-ups*, the `test_reevaluate.py` item.** Gained a
+  second sub-bullet, between the ASSUMPTION 1 and
+  `test_the_version_in_force_afterwards_is_the_new_one` sub-bullets:
+  "Module docstring ASSUMPTION 2 (lines 33-35): `reevaluate_shard`'s `int`
+  return is the `transitions` field of the worker's `config_reevaluated`
+  record, not of `config_applied` — after A12 that name is the poller's
+  record, and ADR-0009 A7 gives it `path`, `config_version` and
+  `previous_config_version` only." The
+  `test_a_descriptive_only_change_is_adopted_and_produces_no_transitions`
+  instruction — was: "(358-377): drop the two `returned.*` assertions
+  (372-373); keep the rest; the class docstring (322-323) should say which
+  tests go through the poller." — now: "(358-377): drop the `returned =
+  ...` assignment (370) and the two `returned.*` assertions (372-373) —
+  `await worker.apply_config(v4)` stays as a bare statement, or as `assert
+  await worker.apply_config(v4) is None`; keep the rest; the class
+  docstring (322-323) should say which tests go through the poller." Both
+  are consequences of A12 as already ruled; neither is a new ruling, and
+  the line numbers are those of `test_reevaluate.py` at commit `abaf12b`,
+  verified against the working tree.
+* **Status line.** Marked amended four times, with a one-sentence summary
+  of this amendment.
+
+Decisions 1 and 3-9, the Assumptions list, Consequences, Sources,
+Amendments 1 and 2, and every item of Amendment 3 other than the follow-up
+list are untouched. Before closing this list, `docs/spec/`, `docs/adr/` and
+`docs/protocol/` were grepped for restatements of `observe`'s rejection
+behaviour (`ValueError`, `not live`, `is_live`, `aligned`, `unaligned`,
+`multiple of`). Findings: the spec's §5 ADR-0011 note restates the
+liveness rule and that a non-live delta is diverted rather than applied,
+but says nothing about the counter's `ValueError` or the order of checks;
+`docs/spec/integration-scenarios.md` §2.4 restates the protocol's
+alignment requirement and the counting rule, not the store's contract;
+`docs/protocol/observation-v1.md` states the agent-facing "MUST be
+aligned" requirement and ingest's `400`, which A9 left unchanged and this
+amendment does not touch; ADR-0010 decision 6 lands the delta in
+`bucket_start(window_start, bucket_seconds)` and says nothing about
+rejection. No ADR other than this one names `IpCounter.observe` or
+`ShardWindow.observe`. So no text outside this ADR restates the rule A17
+pins, and `docs/spec/hammertime_spec_1.md`, `docs/spec/README.md` and
+`docs/protocol/` are untouched. No `CHANGES` entry: the order of two
+in-process precondition checks is not something an agent or operator can
+observe.
+
+### A17. `observe` checks alignment before liveness, in `IpCounter` and in `ShardWindow`
+
+**Classification: (b), genuinely unspecified and ruled now.** A9 states
+the `ValueError` and A4 states the refusal, and each says what happens for
+its own input, but for an `S` that is both unaligned and not live the two
+rules both apply and no sentence ordered them. A9's *purpose* points one
+way — its stated reason for the `ValueError` is that flooring in the store
+"would hide a worker that forgot to", and a check that runs only after the
+liveness test would hide exactly that worker whenever the unaligned `S` is
+also expired or future — but an implementation that tested liveness first
+would not have contradicted any sentence of decision 2 as it stood, so
+this is a ruling, not a recovery of one already made.
+
+Ruling (decision 2 now says this, in both `observe` bullets):
+
+* `IpCounter.observe(S, delta, now)` tests `S % B != 0` before it tests
+  whether `S` is live. An unaligned `S` therefore raises `ValueError` for
+  every `now` — past, present or future relative to `S` — and changes
+  nothing. The `False` return of A4 is reserved for an *aligned* `S` that
+  is not live.
+* `ShardWindow.observe(ip, bucket_start, delta)` does the same: the
+  alignment check (against the window's `config.bucket_seconds`) is the
+  first thing the call does, before the liveness test and before any
+  entry is created. An unaligned `bucket_start` raises `ValueError`
+  whatever the clock says, creates no entry, refreshes no `last_seen` and
+  leaves the store untouched. The `None` return of A4 is reserved for an
+  aligned `bucket_start` that is not live. Decision 2 already put entry
+  creation after the liveness test ("no entry created ... when the bucket
+  is not live"), so the full sequence is: alignment, liveness, create the
+  entry if needed, apply the delta, refresh `last_seen`.
+
+Why alignment first: the alignment check is a property of the arguments
+alone, and the liveness test is a property of the arguments *and the
+clock*. Putting the clock-independent check first means the set of calls
+that raise does not depend on `now`, which is the only order under which
+A9's "caller bug" framing holds — a precondition violation that is
+reported only when the clock happens to make the bucket live is a
+precondition that is not enforced. A worker that forgot to floor (A9)
+would, under the other order, be caught only for observations whose bucket
+was still live, and silently refused for the rest; a lagging aggregator
+processes many of the rest. The other order also has no advantage to set
+against that: it saves nothing, since both checks are O(1) and the
+alignment test is a single modulo.
+
+Assumptions (push back individually):
+
+* **The order is contract, not an implementation detail.** That is what
+  the user ruled in asking for the ADR to pin it rather than the tests to
+  avoid it; the T4b tests may and do depend on it.
+* **The same order in both classes.** Nothing required the store to
+  mirror the counter, but the two `observe` methods share A4's and A9's
+  rules and a caller sees one contract; a store that could return `None`
+  for an input its own counter would raise on would be a second rule in
+  disguise.
+* **Scope: the `delta < 0` check is not ordered here.** Decision 2 lists a
+  third rejection, `delta < 0` is a `ValueError`. This item says nothing
+  about whether that check precedes or follows the liveness test — the
+  question raised was alignment versus liveness, and the shipped tests
+  that use a negative delta (`test_window.py` lines 172-182) do so with a
+  live `S`, so nothing depends on it. It is named so that a reader does
+  not infer an ordering for it from this item.
+* **"Whatever the clock says" includes a `now` earlier than any bucket.**
+  No test or implementation was found that could observe a difference,
+  but the rule is stated without a carve-out so that none arises.
+
+Shipped code: C4's `IpCounter` / `ShardWindow` (commit `90276eb`, on a
+branch not checked out here; `window/counter.py` and `window/store.py` in
+this working tree are docstring-only stubs) could not be read for this
+item. The top-level session reports that the five T4b tests pass against
+it, which is possible only under this order, so the ruling ratifies C4's
+behaviour rather than changing it; the `coder` brief that lands C4 should
+cite A17 in the two `observe` docstrings. Shipped tests: every `observe`
+call in `test_window.py`, `test_hysteresis.py`, `test_reevaluate.py` and
+`test_sharding.py` was read; the only unaligned bucket starts are the five
+T4b tests above, all expecting `ValueError`, all now ratified, and the two
+hypothesis strategies (`_LIVE_BUCKET`, `test_slot_reuse_needs_no_explicit_expire_call`)
+generate aligned buckets only. **No committed test is invalidated.** No
+follow-up test is called for: the T4b tests already demonstrate the
+ruled order, on both classes.
+
+## Amendment 5 (2026-09-17) — `ShardClaims.adopt_config`, and a message on an unclaimed partition is `UNCLAIMED`, not `MALFORMED`
+
+Why: a `supervisor` review of C5, the aggregator implementation (commit
+`e2b4b12`, read directly for this amendment in the worktree that holds it),
+raised two gaps in this ADR — not defects in C5. (1) C5 added a public
+method `ShardClaims.adopt_config(config)`, called at the end of
+`AggregatorWorker.apply_config`, which decision 5, decision 7 and decision
+9 do not name; it exists because decision 5's own wording (`on_assigned`
+builds `ShardWindow(shard=p, config=<in force>, ...)`) cannot be honoured
+after a configuration change without it. (2) C5 returns `MALFORMED` for a
+message whose partition this member does not hold, logs it, and — unlike
+every other `MALFORMED` — increments no counter; decision 3 step 1 says a
+`MALFORMED` message is "logged, counted, and skipped" and decision 8 gives
+it `observations_rejected{reason=malformed}`, so the returned outcome and
+the metric disagreed. Decision 3 did not cover the case, and
+`test_sharding.py`'s module docstring explicitly leaves the return value
+unpinned.
+
+This amendment rules on those two points and nothing else. Each item says
+whether the point was (a) already determined and missed, (b) genuinely
+unspecified and ruled now, or (c) left open with consequences, and what C5
+must change. Two open points are deliberately **not** reopened: A13 names
+no error for `increment` on a declared non-event series (C5 chose
+`ValueError`), and A12's first assumption (a direct caller of
+`apply_config` gets a lower or equal version applied); neither item below
+depends on either.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Decision 3, heading.** Was: "One observation, one of six outcomes;
+  everything the hot path cannot use goes to reconciliation". Now "one of
+  seven outcomes" (A19).
+* **Decision 3, the `ObservationOutcome` code block.** Gained one member
+  after `MALFORMED`: `UNCLAIMED = "unclaimed"`, with the comment "never
+  returned by classify_observation; a worker outcome: message.partition is
+  not a shard this member holds (A19)". The six existing lines are
+  unchanged.
+* **Decision 3, the sentence introducing the worker's steps.** Was: "The
+  worker (`hammertime.aggregator.worker`) handles one consumed message
+  as:". Now: "... handles one consumed message as follows. Before step 1
+  it looks up the `ShardWindow` of `message.partition` ..." — a paragraph
+  stating the `UNCLAIMED` rule (lookup before decoding; `WARNING
+  event=unclaimed_partition` with topic, partition and offset; not counted,
+  not decoded, not diverted, store untouched) and ending "Otherwise:" (A19).
+  Steps 1-3 keep their numbers and their text, so every existing
+  cross-reference to "decision 3 step 1/2/3" still resolves.
+* **Decision 5, the `ShardClaims` paragraph.** Was the sentence "Claims
+  (`hammertime.aggregator.sharding.assignment.ShardClaims`, the aggregator's
+  `AssignmentListener`):" followed directly by the `on_assigned` bullet.
+  Now a `ShardClaims` code block sits between them — constructor, `config`
+  property, `shards`, `window(p)`, `windows()`, `adopt_config`,
+  `on_assigned`, `on_revoked` (A18). The `on_assigned` bullet gained a
+  closing sentence defining "the config in force" as `claims.config`, and a
+  new `adopt_config(v)` bullet follows it (A18). The warm-up, `on_revoked`
+  and readiness bullets are unchanged.
+* **Decision 7, step 3.** Was: "Adopt `v` as the config in force at the
+  worker (`worker.config` now reports it) and log `INFO
+  event=config_reevaluated config_version=<v> transitions=<N>`, `N` being
+  the sum of `reevaluate_shard`'s returns over the claimed shards (decision
+  8)." Now inserts, after "reports it)", "and at its `ShardClaims`
+  (`claims.adopt_config(v)`, decision 5, so that a shard claimed after this
+  pass builds its window on `v`; both adoptions happen under the lock the
+  assignment callbacks also take, so no claim can interleave between them
+  — A18)" (A18). The rest of the step, and steps 1-2, are unchanged.
+* **Decision 8, the log events sentence.** Was: "... `malformed_observation`,
+  `store_over_capacity`." Now: "... `malformed_observation`,
+  `unclaimed_partition` (`topic`, `partition`, `offset`; `WARNING`, no
+  counter — A19), `store_over_capacity`." (A19). The series table is
+  unchanged: `observations_rejected`'s reasons stay `window_too_long |
+  malformed`.
+* **Decision 9, the module layout.** `sharding/assignment.py`'s line — was
+  "`ShardClaims (AssignmentListener; claim, warm-up, revoke)`" — now reads
+  "`ShardClaims (AssignmentListener; claim, warm-up, revoke;
+  adopt_config(config) -> None, config (property), shards, window(p),
+  windows())`" (A18). `lateness.py`'s and `worker.py`'s lines are unchanged
+  (`ObservationOutcome` and `handle(message) -> ObservationOutcome` are
+  still the names).
+* **Status line.** Marked amended five times, with a one-sentence summary
+  of this amendment.
+* **`docs/spec/hammertime_spec_1.md`, §24's ADR-0011 note.** Was, as its
+  last sentence: "Only a message that fails decoding or the ADR-0004
+  one-IP-per-message invariant is dropped, with a log record." Now
+  followed by: "A message a member fetches for a partition it does not hold
+  — a rebalance can revoke one between fetch and handling — is not applied,
+  diverted, dropped or counted by that member: it is logged and skipped as
+  belonging to whichever member holds the partition (ADR-0011 Amendment 5,
+  A19)." (A19). The rest of the note is unchanged.
+
+Decisions 1, 2, 4 and 6, the Assumptions list (assumption 10, "`MALFORMED`
+is dropped, not diverted", is untouched: it is about codec and invariant
+failures and says nothing about ownership), Consequences, Sources and
+Amendments 1-4 are untouched. Before closing this list, `docs/spec/`,
+`docs/adr/` and `docs/protocol/` were grepped for `ShardClaims`,
+`ObservationOutcome`, `observations_rejected`, `MALFORMED`/`malformed`,
+`adopt_config`, `unclaimed` and "six outcomes". Findings: outside this ADR,
+`ShardClaims` and `ObservationOutcome` appear nowhere in `docs/`; "six
+outcomes" appears only in this ADR's decision 3 heading (edited above);
+`observations_rejected` appears in the spec's §37 metric list and its
+ADR-0011 note ("`window_too_long` | `malformed`"), which this amendment
+leaves as it is because `UNCLAIMED` is not counted, and in
+`docs/spec/integration-scenarios.md` not at all; `malformed` outside this
+ADR is ingest's `400`/`401` vocabulary (`docs/protocol/observation-v1.md`,
+ADR-0006/0007/0008/0009, spec §36) and unrelated; the §24 note was the one
+restatement of what a non-applied message's fates are, and is edited
+above. `docs/spec/README.md`'s section index maps the same sections to the
+same modules and is untouched. No `CHANGES` entry: the aggregator has not
+shipped in any release, so its arrival entry (Consequences, *`CHANGES`*)
+covers the whole of its behaviour, and neither a Python enum member nor a
+private-to-the-process method is a wire format, schema, config key or
+default.
+
+**Correction pass (same day).** A `supervisor` review of this amendment as
+first committed (commit `7884c2a`) made three findings. Two are corrected
+in place here; the third is the gap Amendment 6 rules. The superseded
+wording of each edit:
+
+* **Status line** (finding: misreported work). Was: "amended 2026-09-17
+  five times (see "Amendment 1", "Amendment 2", "Amendment 3", "Amendment
+  4" and "Amendment 5" at the end. ... All four amendments rewrite decision
+  bodies in place" — the count had been raised to five while the sentence
+  after it still said four. Now: "six times (see "Amendment 1" through
+  "Amendment 6" at the end. ...)" — the correction pass and Amendment 6
+  landed together — and "Every amendment rewrites decision bodies in
+  place".
+* **Amendment 3, A13, the `bind_windows` bullet** (finding: scope
+  expansion). Was: "`AggregatorWorker.__init__` binds a callable that
+  yields the currently claimed windows (through `ShardClaims.shards` /
+  `window(p)`; how it is spelled is the implementation's)." Now:
+  "... yields the currently claimed windows (`ShardClaims.windows()`,
+  pinned by Amendment 5, A18; as first written this sentence left the
+  spelling to the implementation)." The A18 code block had pinned
+  `windows() -> tuple[ShardWindow, ...]` while A18's justification called
+  it "the callable A13 said the worker binds 'however it is spelled'" —
+  presenting a new pin as an existing one, with no edit to A13 listed, so
+  A13 and decision 5 disagreed. Resolution: the pin is **kept** (C5
+  implements `windows()` and the worker's `run_maintenance`,
+  `apply_config` and `bind_windows` all use it, so the name is load-bearing
+  beyond A13's metrics source) and A13 now agrees with it. No committed
+  test calls `windows()`, so the pin costs no test change; the alternative
+  — dropping it from the block — would have cost the same number of edits
+  and left a public method the block's own "whole public surface" claim
+  omitted. The `windows()` comment in the block — was "`# snapshot; what
+  the worker binds (A13)`" — now reads "`# snapshot; the callable the
+  worker binds for A13 (pinned here, A18)`".
+* **A18, last assumption.** Was: "**The rest of the code block is a
+  restatement, not a new rule.** The constructor is T5's ASSUMPTION 1 and
+  `shards` / `window(p)` its ASSUMPTION 2, both already implemented by C5;
+  `windows()` is the callable A13 said the worker binds "however it is
+  spelled". They are listed so that the block is the whole public surface
+  — `adopt_config`'s contract refers to the constructor's `config`, and a
+  partial block would invite the same "the surface is exactly this"
+  reading that ASSUMPTION 1 got. Nothing about them changes; a reviewer
+  who would rather the block named only `adopt_config` and `config`
+  should say so." Now headed "**... a restatement, except `windows()`,
+  which it pins.**", says A13 was edited to match, records the finding,
+  and says unpinning would cost no test change.
+* **§24's ADR-0011 note** (finding: the sentence this amendment added
+  asserted the message is "not ... dropped" while the shipped revocation
+  commit, `consumer.commit()` of the consumed position, dropped it for
+  everyone). That is not a wording defect but the gap A19's last
+  assumption declined to rule. Amendment 6 rules it, re-edits the note,
+  and quotes this amendment's wording as the superseded text in its own
+  edit list; A19's last assumption is edited to point there (its
+  superseded wording is likewise quoted in Amendment 6's edit list).
+
+### A18. `ShardClaims.adopt_config(config)`: how a claim made after a configuration change gets the version in force
+
+**Classification: (b), genuinely unspecified and ruled now — by
+ratifying C5's method.** Decision 5 says `on_assigned` constructs
+`ShardWindow(shard=p, config=<in force>, ...)`, and decision 7 step 3 says
+`apply_config` adopts `v` "as the config in force at the worker". Nothing
+said how the object that performs claims learns of `v`. `ShardClaims` is
+constructed once, by `AggregatorWorker.__init__`, with the worker's
+starting `config` (T5's ASSUMPTION 1, which C5 implements), and
+`on_assigned`'s signature is fixed by the `AssignmentListener` protocol
+(decision 1), so the config cannot be passed in per claim. Without a
+channel, every shard claimed after the first configuration change — which
+under `HAMMERTIME_SHARD_IDS=auto` is every rebalance for the rest of the
+process's life — would be built on the starting config: wrong geometry if
+`bucket_seconds`/`window_seconds` changed, and a `window.config` that
+disagrees with `worker.config`, which A9's "the target window's
+`bucket_seconds`" argument assumes never happens outside the locked pass.
+So the method is needed, and it is an interface question, which is why it
+is settled here rather than left as a `coder` choice.
+
+Ruling (decision 5 now says this, and decision 7 step 3 and decision 9
+name it):
+
+* `ShardClaims.adopt_config(config: DetectionConfig) -> None` replaces the
+  configuration that subsequent `on_assigned` calls build windows with,
+  observable as `claims.config`. It does nothing else: it does not touch,
+  re-bucket or re-evaluate any window already claimed, emits nothing,
+  compares no versions, and calling it twice with the same value is the
+  same as calling it once.
+* The worker calls it in decision 7 step 3 — after step 1
+  (`window.apply_config(v)` on every claimed window) and step 2 (the
+  re-evaluation pass), under the worker lock, alongside its own adoption
+  of `v`. Windows that exist at the time of the change are therefore
+  brought onto `v` by steps 1-2 and are *not* the concern of
+  `adopt_config`; windows built afterwards start on `v` because of it.
+  Because `AggregatorWorker.on_assigned` takes the same lock, no claim can
+  be built between the worker adopting `v` and the claims object adopting
+  it, so the relative order of the two assignments inside step 3 is
+  unobservable and is not pinned.
+* `claims.config` is the constructor's `config` until the first
+  `adopt_config`, then the last value adopted. It is what decision 5's
+  "`config=<in force>`" means.
+
+Assumptions (push back individually):
+
+* **A mutator on `ShardClaims`, rather than a callable or a back-reference
+  to the worker.** Constructing `ShardClaims` with `config:
+  Callable[[], DetectionConfig]` (reading `worker.config` at claim time)
+  would remove the second copy of the value, but changes the constructor
+  T5 pinned (`config=DEFAULTS` in `test_sharding.py`'s `_claims()`) and
+  that every claims test builds against, for no observable difference:
+  the two copies can only diverge inside step 3, under the lock, where no
+  claim can be built. Ratifying the shipped shape costs no test change; the
+  alternative costs a `test-author` pass.
+* **No version comparison.** Same reasoning as A12's first assumption: the
+  gate has one home, `ConfigPoller.poll_once()`. A direct caller that
+  adopts a lower version gets it adopted; the worker never does so in
+  production because the poller never calls `apply_config` with one.
+* **A failed pass leaves `claims.config` at the old version.** If step 2
+  raises, step 3 does not run, so neither `worker.config` nor
+  `claims.config` changes — the two stay equal, which is the property this
+  item cares about — while the windows re-bucketed in step 1 keep the new
+  geometry. That is exactly the partial-effects state A12's second
+  assumption already describes and leaves open (whether the pass should be
+  atomic); this item does not reopen it. A shard claimed in that state is
+  built on the old config, and the next poll's retry of the same document
+  (ADR-0009 A5) brings it onto `v` through steps 1-2 like any other
+  window.
+* **The rest of the code block is a restatement, except `windows()`, which
+  it pins.** The constructor is T5's ASSUMPTION 1 and `shards` /
+  `window(p)` its ASSUMPTION 2, both already implemented by C5.
+  `windows() -> tuple[ShardWindow, ...]` is C5's spelling of the callable
+  A13 had left to the implementation ("how it is spelled is the
+  implementation's"); listing it in the block makes it contract, and A13's
+  sentence was edited to say so. (As first committed this bullet called
+  `windows()` "the callable A13 said the worker binds 'however it is
+  spelled'", presenting the pin as an existing one with no edit to A13;
+  the correction pass recorded in this amendment's edit list fixed both
+  places.) They are listed so that the block is the whole public surface —
+  `adopt_config`'s contract refers to the constructor's `config`, and a
+  partial block would invite the same "the surface is exactly this"
+  reading that ASSUMPTION 1 got. A reviewer who would rather `windows()`
+  stay unpinned should say so: no committed test calls it, so unpinning
+  costs no test change.
+
+Shipped code: C5's `sharding/assignment.py` (`adopt_config`, lines 89-97;
+`config`, lines 71-74) and `worker.py` (`apply_config`, line 260, calling
+it after `self._config = config` under the lock) do exactly this; **no
+behaviour changes.** `adopt_config`'s docstring should cite decision 5 and
+A18; that is a docstring edit for the `coder` landing C5, not a code
+change. Shipped tests: no committed test calls `adopt_config` or asserts
+which config a post-change claim is built on, and `test_sharding.py`'s
+ASSUMPTION 1 enumerates the *constructor*, which is unchanged — **no
+committed test is invalidated and none must change.** Follow-up
+(`test-author`, optional): after `apply_config(v2)` on a running worker,
+revoke and re-claim partition 0 (or claim a second partition on a
+`ShardClaims` built directly, calling `adopt_config(v2)` first) and assert
+`window.config is v2` — the case that motivated the method.
+
+### A19. A message on a partition this member does not hold is `UNCLAIMED` — a seventh outcome, logged, uncounted
+
+**Classification: (b), genuinely unspecified and ruled now.** Decision 3
+enumerated six outcomes and, in its worker steps, assumed "the
+`ShardWindow` of `message.partition`" exists; decision 1 says the aggregator
+"learns an IP's shard from `ConsumedMessage.partition`" and decision 5's
+`on_revoked` drops the window. Nothing said what `handle()` does when the
+lookup finds nothing. The case is reachable in normal operation, not only
+by a bug: under group management a rebalance can revoke a partition after
+a message from it has been fetched and before `handle()` takes the lock —
+`run()` awaits the next message *then* awaits the lock, and
+`on_revoked` runs under that lock (decision 5) — so the message arrives at
+`_handle` with no window to apply it to. T5 asserted the absence of every
+effect (`test_a_message_for_a_revoked_partition_is_not_applied`: no window,
+nothing on the hot-ip topic, nothing on the reconciliation topic) and
+explicitly left the return value unpinned. C5 chose `MALFORMED`, uncounted.
+
+Ruling (decision 3 now says this):
+
+* `ObservationOutcome` gains a seventh member, `UNCLAIMED = "unclaimed"`,
+  never returned by `classify_observation` (like `MALFORMED`, a worker
+  outcome).
+* The worker looks up `claims.window(message.partition)` **before** step 1
+  (decoding). If there is no window, the outcome is `UNCLAIMED`: a
+  `WARNING event=unclaimed_partition topic=... partition=... offset=...`
+  record, **no** counter increment under any series, no decode, no
+  diversion, no store access; `handle()` returns `UNCLAIMED` and the
+  consumer carries on. `MALFORMED` is unchanged and stays "logged, counted
+  and skipped" exactly as decision 3 step 1 and decision 8 say.
+* `observations_rejected{reason}` keeps its two reasons, `window_too_long
+  | malformed`. Decision 8's table and §37's note are unchanged.
+
+Why a new member rather than either of the two ways of keeping six.
+*Reusing `MALFORMED` and counting it* makes the metric agree with the
+return value at the cost of making `observations_rejected{reason=malformed}`
+— a signal about producers (assumption 10: a message that "cannot be
+trusted to name the IP it is keyed by") — tick on every rebalance, for
+messages that are perfectly well formed; anyone alerting on that series
+would be paged by a scale-out. *Reusing `MALFORMED` and documenting that
+this one case is uncounted* keeps the divergence and writes it down: a
+caller of `handle()` — the tests, a future tool — could not tell a poison
+message from a handover from the return value, and decision 3's "one
+observation, one outcome" would have one outcome meaning two things.
+The enum's purpose is to say what the hot path did with the message;
+"nothing, it is not mine" is a distinct answer from "nothing, it is
+garbage", and giving it its own name is what makes both the return value
+and the counter truthful. The cost is stated under *Shipped tests* below:
+one assertion and some docstring text.
+
+Why uncounted. What a counter would measure is "messages fetched by the
+old owner after revocation", which is (i) an ownership event, not a
+content or lateness event — none of the existing four event counters
+means that; (ii) bounded by the messages fetched but not yet handled at
+the moment of revocation, which under the worker's one-message-at-a-time
+loop is at most the message in hand per rebalance; and (iii) already
+observable in the `shard_revoked` record, in `shards_claimed` dropping,
+and in the `unclaimed_partition` record itself, which names the exact
+offset. A new series for it would also touch A13's closed list of nine
+names for a counter that fires roughly once per rebalance; not worth the
+surface. If a deployment ever shows the record more often than that, the
+right response is to look at the bus's fetch/revoke ordering, not to
+count it.
+
+Assumptions (push back individually):
+
+* **Lookup before decoding.** C5 already does this. A message this member
+  does not own is not this member's to judge, and the lookup is a dict
+  probe; so a malformed message on an unclaimed partition is `UNCLAIMED`,
+  not `MALFORMED`, and is not counted as malformed. The other order would
+  count the same poison message once per member that happened to fetch
+  it.
+* **`WARNING`, not `INFO`.** Ratifies C5. The record names an offset this
+  member fetched and did not process, which an operator tracing a
+  particular observation would want to find; a rebalance is normal, but a
+  message handled by nobody is worth a warning. If the record proves noisy
+  in practice, lowering it is a one-word change with no contract behind
+  it beyond decision 8's name and fields.
+* **The name `UNCLAIMED` and the value `"unclaimed"`.** Chosen to match
+  the shipped record name `unclaimed_partition` and decision 5's
+  vocabulary ("claim", "shard claims held"). `NOT_OWNED` was the
+  alternative; no test or spec text depends on the spelling.
+* **Whether the partition's new owner sees the message was left open here
+  and is ruled by A20 (Amendment 6).** This item pins what *this* member
+  does. As first written, this bullet said the message's fate at the new
+  owner was "a property of the bus's commit and redelivery semantics —
+  decision 6's commit points and ADR-0003's at-least-once rule" and chose
+  "belongs to whichever member holds the partition" over "will be
+  processed by" for that reason. A20 found that decision 5's revocation
+  commit, as then specified (`consumer.commit()`, the consumed position),
+  covered the message in hand, so *nobody* processed it, and closed the
+  gap: under A20 the message is delivered to the next owner.
+* **Scope: `handle()`'s return type is unchanged.** `handle(message) ->
+  ObservationOutcome` (decision 9) stands; the alternative of returning
+  `None` for "not mine" was rejected because it types the same fact as
+  "no outcome" rather than as one, and would ripple into every caller's
+  annotation.
+
+Shipped code — what C5 must change (a `coder` brief; behaviour is
+unchanged except for the returned value):
+
+* `lateness.py`: add `UNCLAIMED = "unclaimed"` after `MALFORMED`, with a
+  comment that it is a worker outcome for a message on a partition this
+  member does not hold, never returned by `classify_observation`. The
+  class docstring's "the value is the metric label" should say "for the
+  counted outcomes" or equivalent, since neither `APPLIED` nor `UNCLAIMED`
+  is a label.
+* `worker.py` `_handle`, the `window is None` branch (lines 277-291):
+  return `ObservationOutcome.UNCLAIMED` instead of `MALFORMED`; the
+  comment should cite A19 instead of saying decision 3 is silent. The
+  module docstring's and `handle()`'s "six outcomes" become "seven" (or
+  cite decision 3 without a number). The `WARNING unclaimed_partition`
+  record and the absence of any counter are already as ruled.
+* No change to `metrics.py`, `_malformed()`, `_divert()`,
+  `_LATE_OUTCOMES`, `sharding/assignment.py` or any other module.
+
+Shipped tests — what must change (a `test-author` brief):
+
+* `test_lateness.py`: `TestObservationOutcomeEnum::test_it_has_exactly_the_six_documented_members`
+  (lines 136-144) asserts the member set and **is invalidated**; it gains
+  `"UNCLAIMED": "unclaimed"` and a name that says seven. The class
+  docstring (lines 129-130, "six outcomes") and the module docstring's
+  enum listing (lines 11-18) and its `MALFORMED` sentence (lines 34-35)
+  should name the seventh member and say it, too, is never returned by
+  `classify_observation`. `test_malformed_is_never_returned` (lines
+  319-328) may add `assert outcome is not ObservationOutcome.UNCLAIMED`;
+  optional, since its closing `assert outcome in (...)` over the five
+  classifier outcomes already excludes it.
+* `test_sharding.py`: the module docstring's "NOT asserted" bullet (lines
+  59-61) and the comment in
+  `test_a_message_for_a_revoked_partition_is_not_applied` (lines 696-700)
+  say the return value is unpinned; both are now stale and should cite
+  A19. The test should assert `await worker.handle(message) is
+  ObservationOutcome.UNCLAIMED` and, with a metrics object passed in, that
+  `observations_rejected{reason=malformed}` reads 0 afterwards — the
+  divergence this item closes, demonstrated. That assertion is required,
+  not optional: it is the only place the ruling is observable.
+* `test_worker.py`: line 12's "the six outcomes" is docstring text only;
+  update for accuracy. No assertion in that file is invalidated: every
+  `MALFORMED` assertion there is for a codec or invariant failure on a
+  claimed partition, and line 386's loop over `("window_too_long",
+  "malformed")` still names every reason `observations_rejected` has.
+* `test_window.py` line 292 and `test_worker.py` line 570 say `MALFORMED`
+  is reserved for the codec and the ADR-0004 invariant; still true.
+
+Order: the `test-author` change and the `coder` change land together (the
+enum assertion fails against six members and the sharding assertion fails
+against `MALFORMED`); the C5 landing brief should carry both.
+
+## Amendment 6 (2026-09-17) — every commit covers only handled messages; `Consumer.commit` takes explicit offsets; a message fetched under a revoked claim is left for the next owner
+
+Why: Amendment 5's A19 pinned what a member does with a message fetched
+for a partition it no longer holds (`UNCLAIMED`, uncounted) and, in its
+last assumption, deliberately declined to say whether the partition's next
+owner sees that message. Reading C5 (`e2b4b12`) for that item exposed that
+the answer under the ADR as written was **no**: decision 5's `on_revoked`
+called `consumer.commit()` with no arguments, which on both bus
+implementations commits the *consumed* position — the offset after every
+message already returned to the consume loop (`MemoryConsumer._consume`
+sets `_positions[topic] = offset + 1` before it yields; aiokafka's
+`FetchResult.getone` calls `consumed_to` as it returns the record, and
+`commit()` defaults to `all_consumed_offsets()`; see Sources). So in the
+ordering A19 itself describes as reachable in normal operation — the loop
+fetches a message for partition `p`; a rebalance revokes `p` before
+`handle()` takes the lock; `on_revoked` commits; `handle()` returns
+`UNCLAIMED` — the committed offset was already past the message, the new
+owner started after it, and **nobody processed it**. The `supervisor`
+review of Amendment 5 raised the same point from the other side: the §24
+sentence that amendment added says the message is "not ... dropped", and
+the shipped code dropped it. §32 names the sliding-window state as *the
+authoritative information*, ADR-0003 and decision 3 promise at-least-once
+consumption, and this was silent observation loss on an ordinary
+rebalance. This amendment rules on that one gap (A20) and nothing else; the
+two `supervisor` findings on Amendment 5's text are corrected in place
+there, under "Correction pass".
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Recorded under Amendment 5's correction pass (the two
+  edits landed together).
+* **Decision 1, the bus interface code block.** Was: "`# seek(), commit()
+  unchanged`". Now shows `async def commit(self, offsets:
+  Mapping[tuple[str, int], int] | None = None) -> None: ...   # A20` and
+  "`# seek() unchanged`". A new bullet after the `KafkaConsumer` bullet
+  states `commit(offsets)`'s contract (A20); the four existing bullets are
+  unchanged.
+* **Decision 3, the `UNCLAIMED` paragraph.** Was: "... if this member
+  holds no claim for that partition — reachable in normal operation,
+  because a rebalance can revoke a partition between a message being
+  fetched and being handled — the outcome is `UNCLAIMED`: logged at
+  `WARNING event=unclaimed_partition` with the topic, partition and
+  offset, **not** counted under any series, not decoded, not diverted,
+  and the store untouched; `handle()` returns it and the consumer carries
+  on. The message belongs to whichever member holds the partition, not to
+  this one (A19). Otherwise:". Now adds the second `UNCLAIMED` condition
+  (the claim held is not the one the message was fetched under), says the
+  handled position is not advanced, replaces "belongs to whichever member
+  holds the partition, not to this one" with "belongs to whichever member
+  holds the partition next, and reaches it", and says a message passed to
+  `handle()` directly is judged against the current claim alone (A20).
+* **Decision 3, the at-least-once paragraph.** Was: "... and a redelivery
+  after a handover lands in a `ShardWindow` that never held the first
+  copy. The only state that survives ...". Now inserts "— including a
+  handover back to this same member, because the copy fetched under the
+  old claim is `UNCLAIMED` rather than applied to the new window (A20)"
+  (A20).
+* **Decision 5, the `ShardClaims` code block.** Gained two lines after
+  `adopt_config`: `mark_handled(message: ConsumedMessage) -> None` and
+  `commit_handled(partitions: Iterable[tuple[str, int]] | None = None) ->
+  None`, each with an A20 comment. (`windows()`'s comment changed under
+  Amendment 5's correction pass.) Two new bullets, `mark_handled` and
+  `commit_handled`, sit between the `adopt_config` bullet and the warm-up
+  bullet (A20).
+* **Decision 5, the `on_revoked` bullet.** Was: "**`on_revoked(p)`**:
+  under the worker lock (so never mid-message): `producer.flush()`,
+  `consumer.commit()`, drop the `ShardWindow`, log `INFO
+  event=shard_revoked shard=p`. Nothing is written to the state store — it
+  is already current — and nothing is emitted; the next owner inherits the
+  HOT set and warms up." Now: `commit_handled(<the revoked partitions>)`
+  in place of the two calls, the handled position dropped with the window,
+  and a closing clause that the next owner resumes at the committed
+  position and so receives a message this member fetched and did not
+  handle (A20).
+* **Decision 6, the commit paragraph.** Between "(the same rule ADR-0010
+  decision 3 gives the trie)." and "The interval is an I/O cadence ..." —
+  which were consecutive — a passage was inserted stating that what is
+  committed is the handled position, passed explicitly, at all three
+  points, through `ShardClaims.commit_handled()`, and that a message in
+  hand at a commit is never covered by it (A20). The sentences before and
+  after are unchanged; the flush-before-commit rule stands.
+* **Decision 9, the module layout.** `sharding/assignment.py`'s line —
+  was "`... config (property), shards, window(p), windows())`" — now
+  "`... config (property), shards, window(p), windows(),
+  mark_handled(message), commit_handled(partitions=None) -> None)`" (A20).
+* **Consequences, *Bus package*.** Was: "... subscribing with a
+  `ConsumerRebalanceListener` adapter or `assign()`." Now adds ";
+  `Consumer.commit` gains an optional explicit `offsets` mapping on both
+  implementations (Amendment 6, A20)".
+* **Sources.** Gained the four aiokafka citations A20 relies on
+  (`_on_join_prepare`, `_on_join_complete`, `subscription_state.py`,
+  `commit`/`getone`), with a note that `master` was fetched while the
+  repository pins 0.14.0.
+* **Amendment 5, A19, last assumption.** Was: "**Nothing is said about
+  whether the partition's new owner sees the message.** This item pins
+  what *this* member does. Whether the message reaches the new owner is a
+  property of the bus's commit and redelivery semantics — decision 6's
+  commit points and ADR-0003's at-least-once rule — and is unchanged by
+  this item; the wording "belongs to whichever member holds the partition"
+  is deliberately not "will be processed by"." Now headed "**Whether the
+  partition's new owner sees the message was left open here and is ruled
+  by A20 (Amendment 6).**", quotes its own original reasoning, and says
+  that under A20 the message is delivered to the next owner.
+* **`docs/spec/hammertime_spec_1.md`, §24's ADR-0011 note, last
+  sentence.** Was (Amendment 5's wording): "A message a member fetches for
+  a partition it does not hold — a rebalance can revoke one between fetch
+  and handling — is not applied, diverted, dropped or counted by that
+  member: it is logged and skipped as belonging to whichever member holds
+  the partition (ADR-0011 Amendment 5, A19)." Now: "... is not applied,
+  diverted or counted by that member: it is logged and skipped, and it is
+  not lost, because a member only ever commits the position after the last
+  message it handled, never the position after the last message it
+  fetched; the partition's next owner therefore resumes at or before it
+  and handles it (ADR-0011 Amendment 5, A19; Amendment 6, A20)." The rest
+  of the note is unchanged.
+
+Decisions 2, 4, 7 and 8, the Assumptions list (assumption 15, "Commit
+every 1 s of wall time", is untouched: it is about the cadence, and A20
+changes what is committed, not when), Amendments 1-4, and every item of
+Amendment 5 other than the A19 assumption above are untouched. Before
+closing this list, `docs/spec/`, `docs/adr/` and `docs/protocol/` were
+grepped for restatements of what A20 changes: `commit`, `committed
+position`, `committed offset`, `consumer position`, `revoke`/`revoked`/
+`revocation`, `on_revoked`, `at-least-once`, `redeliver`, `flush`, and the
+§24 sentence itself. Findings outside this ADR: `docs/spec/hammertime_spec_1.md`
+§24 (the note edited above); §33's ADR-0009 note ("On shutdown [the trie]
+writes a final snapshot after committing its consumer position") and §47.4
+("finish the message it is applying, commit its consumer position, flush
+its producer") restate the *shutdown order* for every service and say
+nothing about which position is committed — consistent with A20 and
+untouched; `docs/spec/integration-scenarios.md` mentions commit only in
+the `kill_trie()` harness row (the trie, unchanged); `docs/protocol/` has
+no restatement at all; ADR-0003's Consequences ("aggregator consumers are
+therefore at-least-once-safe only for idempotent operations and must not
+re-apply counters on redelivery — the consumer tracks committed offsets
+per shard") and ADR-0004's at-least-once sentence are the requirement A20
+enforces, unchanged; ADR-0009 decision 7 ("finishes the message it is
+currently applying, then commits its consumer position — never
+mid-message") is consistent with A20 and unchanged; ADR-0010 decision 3
+(the trie flushes before it commits) is unchanged, and the trie's bare
+`commit()` keeps its meaning. One pre-existing discrepancy was noticed and
+deliberately **not** touched, because it is not this amendment's question:
+§47.4 and ADR-0009 decision 7 list "commit, then flush" while decision 6
+of this ADR and ADR-0010 decision 3 require "flush, then commit"; it is
+named in the hand-off report for a separate ruling. `docs/spec/README.md`'s
+section index maps the same sections to the same modules and is untouched
+(§19's row already maps `packages/hammertime-bus`; §20/21's row already
+maps `sharding/assignment.py`). No `CHANGES` entry: the aggregator has
+not shipped in any release (its arrival entry under Consequences covers
+its behaviour), and `Consumer.commit(offsets)` is a backward-compatible
+Python API addition to an in-repo package — not a wire format, schema,
+config key or default.
+
+### A20. Every commit names the handled position explicitly; the bus `commit` takes offsets; a message fetched under a revoked claim is `UNCLAIMED` even if the same member re-claims the partition
+
+**Classification: (a) for the requirement, missed by decision 5's own
+wording; (b) for the mechanism, ruled now.** That the aggregator consumes
+at-least-once is not new: ADR-0003's Consequences require it, ADR-0009
+decision 7 restates it for shutdown ("never mid-message"), decision 3 of
+this ADR opens its last paragraph with "Consumption is at-least-once", and
+§32 makes the window state authoritative. What was missed is that
+decision 5's `on_revoked` — "`producer.flush()`, `consumer.commit()`" —
+specified a commit of the *consumed* position at the one moment the
+consumed position is guaranteed to be ahead of what has been handled. The
+requirement was already determined; the revocation rule contradicted it.
+How to satisfy it — which position, passed how, tracked where, and what
+happens to the message in hand when the same member gets the partition
+back — was never specified, and is ruled here.
+
+**The gap, traced in the shipped code** (`worker.py` and
+`sharding/assignment.py` at `e2b4b12`; the bus at the same commit):
+
+1. `AggregatorWorker.run()` awaits `_receive(stream)` in its own task,
+   then awaits `self.handle(message)`, which takes the lock. Between the
+   receive task completing and `run()` resuming there is at least one
+   event-loop step in which any other task may run.
+2. On `InMemoryBus`, `MemoryConsumer._consume` has already set
+   `_positions[topic] = offset + 1` before yielding the message. On
+   Kafka, `FetchResult.getone` has already advanced the partition's
+   position (Sources).
+3. A rebalance's `on_partitions_revoked` runs in the coordinator's task,
+   takes the worker lock through `AggregatorWorker.on_revoked`, and
+   `ShardClaims.on_revoked` calls `producer.flush()` then
+   `consumer.commit()` — the position from step 2, one past the message
+   in hand — and drops the window.
+4. `handle()` acquires the lock, finds no window, returns `UNCLAIMED`
+   (A19). The message is not applied, not diverted, not counted.
+5. The partition's next owner — another member, or this one after
+   `on_assigned` — starts from the committed offset, after the message.
+
+Under aiokafka's eager rebalance protocol *every* held partition is revoked
+and reassigned on *every* rebalance (`_on_join_prepare` passes
+`previous_assignment.tps` to the listener; Sources), so this is not a
+scale-down corner: any scale-out, any member restart, any session timeout
+puts every partition through steps 3-5, and whichever message is in hand
+at that moment is lost. The loss is silent (a `WARNING` that reads as
+routine), at most one observation per rebalance per member, and on the
+authoritative state: a `request_count` that never reaches any ring. That
+is exactly what decision 3's "everything the hot path cannot use goes to
+reconciliation" and §24's "never silently dropped" exist to prevent.
+
+**Ruling.** Four parts, stated in decisions 1, 3, 5 and 6:
+
+1. **The bus interface.** `Consumer.commit(offsets: Mapping[tuple[str,
+   int], int] | None = None) -> None`. With `offsets`, exactly the given
+   `(topic, partition) -> next offset to read` pairs are committed — those
+   partitions only, at those offsets, nothing else; the value is the
+   offset of the next message to read, i.e. the last handled `offset + 1`
+   (aiokafka's own convention for explicit commits, and already what
+   `InMemoryBus._committed` stores). An empty mapping is a no-op that
+   returns normally without contacting the broker. A partition this
+   consumer does not hold is an error: `ValueError` from `MemoryConsumer`
+   (partition not `0`, or a topic this consumer has not subscribed), and
+   aiokafka's `IllegalStateError` propagating from `KafkaConsumer`.
+   `commit()` with no argument keeps its current meaning on both
+   implementations — the trie (ADR-0010 decision 3) and the bus tests use
+   it and are unaffected.
+2. **The handled position.** `ShardClaims` keeps, per claim, a *handled
+   position*: `ShardClaims.mark_handled(message)` sets it to
+   `message.offset + 1` for `(message.topic, message.partition)`; a
+   partition not held is a `KeyError`. A claim starts with none and loses
+   it when revoked. The worker calls `mark_handled` under the lock at the
+   end of `handle()` for every outcome except `UNCLAIMED` — `APPLIED`,
+   the four diverted outcomes and `MALFORMED` all mean the worker is done
+   with the message. `ShardClaims.commit_handled(partitions=None)` is
+   `producer.flush()` followed by `consumer.commit(<the handled positions
+   of the given partitions, default all held, omitting those with
+   none>)`; both calls are made even when the mapping is empty. It is the
+   **only** commit path in the aggregator: the periodic commit and
+   `stop()` call `commit_handled()`, and `on_revoked(partitions)` calls
+   `commit_handled(partitions)` before dropping the windows. Decision 6's
+   flush-before-commit rule is untouched — `commit_handled` *is* that
+   rule with the right offsets — and the shipped
+   `test_a_revoke_flushes_before_it_commits` (`trace == ["flush",
+   "commit"]`) remains true.
+3. **The message in hand and a re-claim by the same member.** Committing
+   the handled position alone is not enough. Because every rebalance
+   revokes and reassigns every partition, the common outcome for a
+   healthy member is `on_revoked(p)` followed by `on_assigned(p)` for the
+   same `p`, with a fresh `ShardWindow`. If the message fetched under the
+   old claim were then handled against the new window it would be
+   applied there — and, because the committed position precedes it, the
+   broker redelivers it to the same new window: a double count in the
+   very case decision 3's "lands in a `ShardWindow` that never held the
+   first copy" argument assumed away. So the consume loop records the
+   `ShardWindow` of the message's partition **in the same event-loop step
+   in which the fetch completed** — immediately after `anext(stream)`
+   returns, with no `await` in between, which is the same step in which
+   the bus advanced the consumed position — and the handler treats the
+   message as `UNCLAIMED` when the partition's current window is `None`
+   **or is not that object**. `handle(message)`'s public signature is
+   unchanged; how the loop passes the recorded window to the handler is
+   the implementation's. A message a caller passes to `handle()` directly
+   has no fetch step and is judged against the current claim only, as
+   today. Object identity is the claim identity: a re-claim always builds
+   a new `ShardWindow` (decision 5), and no counter is needed.
+4. **§24.** The spec note now says the truth that follows: the message
+   is not applied, diverted or counted by this member, and it is not
+   lost, because the committed position is the handled position and the
+   next owner resumes at or before it.
+
+**Why this and not the alternatives the question listed.**
+
+* *Seek back on revocation.* Seeking moves *this* member's fetch position
+  for a partition it is about to lose; what the next owner reads is the
+  committed offset, so a seek changes nothing unless followed by a commit
+  of the seeked position — which is the handled-position commit by another
+  name, with the extra cost that the worker must know the in-hand offset
+  at revocation time and that aiokafka's `seek` requires an assigned
+  partition and is documented for use "on rebalance listeners or after
+  all pending messages are processed" (Sources). Rejected as the same fix
+  with more moving parts.
+* *Accept the loss and document it.* The blast radius is one
+  `RequestObservation` per member per rebalance, silently, from the
+  authoritative state, forever — a detection delayed or missed at the
+  threshold, unrecoverable because the reconciliation path never saw it
+  either. The fix costs one integer per held partition, one identity
+  comparison per message, and an optional argument on a two-implementation
+  protocol. Rejected: no proportionality argument survives that ratio.
+* *Commit only up to the offset before the message in hand, at
+  `on_revoked` only.* This is the chosen fix, generalised. Stating it for
+  `on_revoked` alone would leave the same in-hand exposure at `stop()`
+  (which takes the lock and commits while `run()` may hold a fetched,
+  unhandled message; the message is handled before `run()` returns, so
+  the loss there needs a crash during the drain, but the committed
+  position is still ahead of the handled one) and would give the worker
+  two commit semantics. One rule — a commit names handled positions —
+  closes both with one code path.
+* *Pause fetching around the lock, or fetch under the lock.* Would
+  serialise the coordinator against the consume loop and turn every
+  rebalance into a stall of the fetch; and aiokafka can still hand out a
+  record of the old assignment after `on_partitions_revoked` has returned
+  (Sources), so the in-hand case cannot be closed by scheduling alone.
+
+**Interaction with ADR-0011's at-least-once posture** (decision 3, last
+paragraph): unchanged in substance and now true in the re-claim case. A
+redelivery after a crash still rebuilds counters that died with the
+process; a redelivery after a handover still lands in a window that never
+held the first copy, because the first copy — fetched under the old claim
+— is `UNCLAIMED` rather than applied to the new window. The durable HOT
+set stays idempotent under redelivery. Nothing about warm-up (decision 5)
+changes: the new window warms up as before and the redelivered message is
+one of the observations it counts.
+
+**What Kafka does at the two points this relies on** (Sources): during
+`on_partitions_revoked` the previous assignment is still in place and
+active — `_begin_reassignment` only sets a flag — so `commit(offsets)` for
+the revoked partitions is accepted there, exactly as the bare `commit()`
+was; the assignment is replaced, and the old one deactivated, in
+`_on_join_complete` before `on_partitions_assigned`, after which the fetch
+position of every reassigned partition is taken from the committed offset.
+`commit(offsets)` for a partition outside the current assignment raises
+`IllegalStateError`; the aggregator never produces one because the handled
+positions it commits are those of partitions it holds — at revocation, of
+the partitions being revoked, which are held for the duration of the
+callback — and a revoked partition's position is dropped with its window.
+
+Assumptions (push back individually):
+
+* **An explicit-offsets argument on `commit`, rather than a "commit up to
+  this message" helper or a separate `commit_offsets` method.** It is the
+  shape aiokafka has, the memory bus already stores next-offset-to-read
+  per `(topic, group)`, and keeping one method with an optional argument
+  leaves the trie's and the bus tests' bare `commit()` untouched.
+* **Key shape `tuple[str, int]`**, matching `AssignmentListener`'s
+  `frozenset[tuple[str, int]]`, not a new `TopicPartition` type.
+* **Empty mapping is a no-op that still returns normally**, so that
+  `commit_handled` can call flush and commit unconditionally and the
+  flush-then-commit trace stays observable; `KafkaConsumer` short-circuits
+  before calling aiokafka rather than relying on what aiokafka does with
+  `{}`.
+* **The error for an unheld partition is not unified across
+  implementations** (`ValueError` versus aiokafka's `IllegalStateError`).
+  No caller catches it — it is a caller bug — and wrapping aiokafka's
+  exception would be code for a case the aggregator never reaches. The
+  interface docstring says both.
+* **The handled position lives on `ShardClaims`, not on `ShardWindow` or
+  the worker.** `ShardClaims` owns the consumer, the producer and the
+  per-partition claims, and is the object `on_revoked` runs on; `ShardWindow`
+  is the counter store (decision 2) and does not know the topic; the
+  worker would then need a second commit path for revocation. `next_sequence`
+  on the window is a precedent for per-claim bookkeeping on the window,
+  but `next_sequence` is loaded from the state store at claim, which the
+  handled position is not.
+* **`commit_handled` always flushes, even with nothing to commit.** A
+  flush with nothing pending is cheap on both implementations, and the
+  invariant "every commit is preceded by a flush" is easier to test than
+  "every non-empty commit is".
+* **`UNCLAIMED` does not advance the handled position** even when the
+  partition is held under a new claim: the message was not handled under
+  that claim, and advancing would commit past the redelivery the ruling
+  relies on.
+* **Identity by `ShardWindow` object, not a generation counter.** A
+  re-claim always constructs a new window (decision 5), so identity is
+  exactly claim identity; a counter would be a second thing to keep in
+  step. If a future change ever reuses a window across claims this
+  assumption must be revisited.
+* **The capture is in the same event-loop step as the fetch completing.**
+  This is an obligation on `coder`: no `await` between `anext(stream)`
+  returning and reading `claims.window(message.partition)`. It is what
+  makes the recorded window the claim under which the bus advanced the
+  consumed position, with no dependence on lock fairness or on how fast a
+  rebalance completes. (If `on_revoked` has already run when the fetch
+  completes, the capture is `None`, and the handler's `window is None`
+  test comes first — a `None` capture never counts as "the same claim".)
+* **A direct `handle()` caller is judged against the current claim.**
+  Tests are the only such caller; requiring them to state a fetched-under
+  window would change T5's `handle(message)` usage for no gain.
+* **`mark_handled` on an unheld partition is a `KeyError`**, as A15 chose
+  for `set_state` on an untracked IP: a missing claim is a missing key
+  and a caller bug (the worker only calls it after a non-`UNCLAIMED`
+  outcome, under the lock).
+* **The `stop()` in-hand case is covered by the general rule and not
+  given its own item.** It is the same mechanism (a commit of the consumed
+  position while a message is fetched and unhandled), differs only in
+  needing a crash during the drain to become a loss, and is closed by the
+  same sentence; it is named so that the reader knows it was seen, not
+  because it was asked about.
+* **No new metric or log record.** An identity-mismatch `UNCLAIMED` logs
+  the same `unclaimed_partition` record as A19's; the offset in it is
+  enough to correlate with the redelivery.
+* **aiokafka `master` was read, not the pinned 0.14.0.** The three
+  facts relied on (revoke callback before the join request; old
+  assignment live during it; explicit commits restricted to assigned
+  partitions) are long-standing behaviour, but the tag was not fetched;
+  see Sources.
+* **The trie is out of scope.** ADR-0010 decision 3's trie consumer has
+  no partition claims and no rebalance listener; its bare `commit()` is
+  unchanged and its own at-least-once analysis is that ADR's.
+
+Shipped code — what `coder` must change (behaviour changes: the committed
+position at every commit point, and the outcome of a message fetched under
+a since-replaced claim):
+
+* `packages/hammertime-bus/src/hammertime/bus/interface.py`:
+  `Consumer.commit(self, offsets: Mapping[tuple[str, int], int] | None =
+  None) -> None`, docstring stating decision 1's contract (explicit pairs
+  only; next-offset convention; empty mapping no-op; unheld partition is
+  an error; `None` unchanged). `Mapping` from `collections.abc`.
+* `packages/hammertime-bus/src/hammertime/bus/memory.py`
+  `MemoryConsumer.commit`: `offsets=None` keeps lines 164-166's behaviour;
+  a mapping validates each key (partition must be `0`; topic must be one
+  this consumer has a position for, i.e. has subscribed) and calls
+  `_set_committed_offset(topic, group, offset)` for each; it does **not**
+  touch `_positions` (the consumed position is the consumer's own; only a
+  new consumer for the group reads the committed one, as the interface
+  docstring already says).
+* `packages/hammertime-bus/src/hammertime/bus/kafka.py`
+  `KafkaConsumer.commit`: `offsets=None` keeps line 249; a mapping returns
+  at once if empty, else `await self._client.commit({TopicPartition(t, p):
+  o for (t, p), o in offsets.items()})`.
+* `services/aggregator/src/hammertime/aggregator/sharding/assignment.py`:
+  add the per-claim handled-position dict (keyed `(topic, partition)`),
+  `mark_handled(message)`, `commit_handled(partitions=None)`; `on_revoked`
+  (lines 122-133) becomes `await self.commit_handled(partitions)` then the
+  existing drop loop, also popping the handled position; module and
+  method docstrings cite decision 5, decision 6 and A20 (the module
+  docstring's "committing the consumer position" should say "committing
+  the handled position").
+* `services/aggregator/src/hammertime/aggregator/worker.py`: `_receive`
+  (lines 269-275) records `self._claims.window(message.partition)`
+  immediately after `anext` returns and passes it to the handler with the
+  message (a private two-argument `_handle`, or a small record — the
+  spelling is `coder`'s; `handle(message)` stays as it is and passes the
+  current window); `_handle` returns `UNCLAIMED` when `window is None or
+  window is not fetched_under` (the existing `window is None` branch,
+  lines 278-291, extended; the comment cites A19 and A20); every other
+  return path of `_handle` calls `self._claims.mark_handled(message)`
+  before returning; `_flush_and_commit` (lines 391-394) becomes `await
+  self._claims.commit_handled()` plus the `_last_commit` update. The
+  module docstring's at-least-once paragraph gains the re-claim sentence
+  decision 3 now has.
+* No change to `metrics.py`, `lateness.py`, `transitions.py`,
+  `reevaluate.py`, `service.py` (its `stop()` docstring's "commit the
+  consumer position" may say "the handled position"; docstring only) or
+  any store module.
+
+Shipped tests — what must change (`test-author`):
+
+* `services/aggregator/.../tests/test_sharding.py`, `_RecordingConsumer`
+  (lines 149-178): `commit(self)` must become `commit(self, offsets=None)`
+  forwarding `offsets` to the inner consumer — **invalidated as written**:
+  the wrapper no longer satisfies `Consumer` structurally (mypy) and
+  `ShardClaims.commit_handled` calls it with an argument (`TypeError` at
+  runtime). The trace assertion `["flush", "commit"]` in
+  `test_a_revoke_flushes_before_it_commits` (line 464) stays correct and
+  must not change. The module docstring's decision-5 summary (lines 27-28,
+  "calls `producer.flush()` then `consumer.commit()`") and
+  `TestRevokingAShard`'s docstring (lines 448-450) should say the commit
+  is of the handled positions; the "Real rebalance ordering" bullet (lines
+  62-65) stays true. `_claims()`'s docstring (lines 190-196) stays true.
+* `services/aggregator/.../tests/test_worker.py`
+  `TestOffsetsAreCommittedAtShutdown` (lines 830-879): still valid — both
+  messages were handled before `stop()`, so the handled and consumed
+  positions coincide — and must keep passing; its docstring may say
+  "handled" for precision.
+* `packages/hammertime-bus/.../tests/test_memory_bus.py`,
+  `test_assignment.py`: every bare `commit()` stays valid. Required new
+  tests, drawn from decision 1's `commit(offsets)` bullet: (i)
+  `commit({(topic, 0): n})` makes a fresh consumer for the group resume at
+  `n` even though the committing consumer had read further; (ii)
+  `commit({})` is a no-op — a fresh consumer resumes where the previous
+  commit left it; (iii) a partition other than `0`, and a topic the
+  consumer has not subscribed, raise `ValueError` and commit nothing;
+  (iv) `commit()` with no argument still commits the consumed position.
+  `KafkaConsumer` has no unit tests by design (its module docstring) and
+  gains none here.
+* Required new aggregator tests, drawn from decisions 3, 5 and 6 as now
+  written. **These are runnable today on `InMemoryBus`**: what cannot be
+  reproduced there is a *coordinator-driven* rebalance, but the
+  interleaving the gap needs — fetch completes, `on_revoked` runs,
+  `handle()` runs — can be scripted, and the committed position is
+  observable through a fresh consumer for the group, as
+  `TestOffsetsAreCommittedAtShutdown` already does.
+  1. `ShardClaims` level (with the `_claims()` fixture, whose inner
+     consumer is subscribed): publish one message; read it from the inner
+     consumer's stream so its consumed position moves past it; do **not**
+     call `mark_handled`; `on_revoked({(topic, 0)})`; a fresh
+     `bus.consumer("hammertime-aggregator")` subscribing to the topic
+     receives that same message first. Then the converse: same setup with
+     `mark_handled(message)` before the revoke; the fresh consumer resumes
+     after it. Together these demonstrate that the revocation commit is
+     the handled position and nothing else.
+  2. `AggregatorWorker` level — the exact ordering of the gap: a
+     `MessageBus` double whose `consumer(group)` returns a wrapper around
+     the real `MemoryConsumer` whose stream, for the first message,
+     schedules `asyncio.create_task(worker.on_revoked({(topic, 0)}))`
+     *before* yielding the message (so the revoke's first step runs
+     between the fetch completing and `run()` resuming, which is the real
+     ordering); run the worker; assert the message is not applied
+     (`worker.window(0) is None` after the revoke, nothing on the hot-ip
+     or reconciliation topics), then `stop()` the worker and assert a
+     fresh consumer for the group receives that message first (publish a
+     second message after `stop()` to prove the order). Against `e2b4b12`
+     this fails — the fresh consumer gets the second message — which is
+     the loss, demonstrated.
+  3. The re-claim variant of 2: the scheduled task does `await
+     worker.on_revoked(...)` then `await worker.on_assigned(...)` for
+     partition 0 before the loop handles the message; assert the new
+     window (`worker.window(0)` is a different object from the one before)
+     does not track the message's IP, nothing was emitted, and a fresh
+     group consumer still receives the message first. This pins ruling
+     part 3; a fix that committed handled positions without the identity
+     check would apply the message to the new window here.
+  Because `InMemoryBus` never resets a consumer's own position to the
+  committed offset (it has no rebalance), the *redelivery* itself — the
+  same worker receiving the message again after its re-claim — is not
+  observable in a unit test; only the committed position is. That half
+  needs a real broker.
+* What cannot be tested today, and where it would live: that aiokafka
+  accepts `commit(offsets)` inside `on_partitions_revoked`, that a
+  reassigned partition's fetch resumes from the committed offset, and the
+  end-to-end handover (member A fetches, rebalance, member B applies the
+  observation and the HOT transition is emitted exactly once) need a real
+  broker and a two-member `hammertime-aggregator` group. That is an
+  `integration` scenario for `docs/spec/integration-scenarios.md` under
+  issue #26, and the `integration` job is disabled pending #26 (recorded
+  in `CLAUDE.md`, "Disabled CI coverage"). The scenario is *not* written
+  by this amendment; it is a named follow-up for the architect once #26
+  is scheduled, and until then the unit tests above are the only
+  executable evidence.
+
+Order: the bus change (`interface.py`, `memory.py`, `kafka.py`, and its
+test-author pass) lands first, on its own branch, because the aggregator
+change imports the new signature; the aggregator `coder` and
+`test-author` changes land together on the C5 branch (the
+`_RecordingConsumer` signature fails against the new `ShardClaims` and the
+new worker tests fail against the old commit), rebased onto the bus
+change. Nothing in this amendment blocks A18's or A19's landing items,
+which remain as Amendment 5 lists them.
