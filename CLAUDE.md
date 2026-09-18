@@ -1,3 +1,19 @@
+## Standing order (pre-1.0)
+
+Until the 1.0.0 release ships: **where there is one clearly best next
+step, the top-level session takes it without consulting the user first.**
+Only genuine forks — two or more defensible options with no clear winner —
+are put to the user before acting.
+
+This is a rule about *asking*, not about *telling*. Anything this file
+requires the session to report, it still reports, in the same turn it
+acts; reporting is not consulting, because it does not block. Nor does it
+loosen any other rule here: delegation, branch protection, the full test
+bar and supervisor pairing all apply exactly as written. It only removes
+the wait for a reply when the recommendation is unambiguous.
+
+Recorded at the user's direction, and effective until 1.0.0.
+
 ## CHANGES
 
 Record user-visible changes in `CHANGES` at the repo root, newest entry first.
@@ -50,12 +66,26 @@ a report that doesn't match what actually changed, or anything resembling
 a backdoor, credential/secret exfiltration, or a disabled safety/security
 check.
 
-**Hard stop:** if `supervisor` reports any finding, STOP ALL PROCESSING
-immediately — do not merge, push, dispatch further agents, or continue
-reconciling — and report the finding to the user verbatim before doing
-anything else. This overrides every other standing instruction in this
-file, including the pre-1.0 exception below. Only the user decides how to
-proceed from a supervisor finding.
+**Hard stop:** if `supervisor` reports any finding, report it to the user
+verbatim before doing anything else. That duty is unconditional — it
+survives every other rule in this file, and no finding is ever summarised,
+paraphrased, or held back.
+
+What follows the report depends on whether there is a clear next step.
+Under the pre-1.0 standing order at the top of this file, where the
+session has one clearly best recommendation it may act on it in the same
+turn as the verbatim report, without waiting for a reply. Where it does
+not — two defensible ways forward, or no confident reading of what the
+finding means — the original rule stands in full: STOP ALL PROCESSING, do
+not merge, push, dispatch further agents, or continue reconciling, and let
+the user decide.
+
+A finding that names a backdoor, credential/secret exfiltration, or a
+disabled safety/security check always stops, whatever else looks obvious,
+because for those the clear recommendation *is* to stop and hand it to the
+user — the session does not get to decide it understood such a finding
+well enough to work past it. That follows from the standing order rather
+than being carved out of it.
 
 `reviewer`/`security-auditor` are themselves read-only and structurally
 incapable of taking an unauthorized action (no write access at all), so
