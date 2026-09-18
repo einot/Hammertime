@@ -5,8 +5,12 @@ interface gaps the M5 test-author raised while writing `test_metadata.py`
 and `test_prefix_state.py` are ruled: `combine_path` on an unregistered
 name, name validation in the trie's metadata setters, the family order of
 `IpAttributeStore.records()`, and `evaluate_prefix_state` with
-`hot_count > capacity`; three test-author assumptions are confirmed. The
-amendment is open-ended — later items continue the A-numbering. In the body
+`hot_count > capacity`; three test-author assumptions are confirmed. Items
+A6-A12, added the same day from the structure test-author's report, pin the
+arena accessor and root id, `edges()` sibling order, `logical_prefixes()`
+uniqueness, LIFO slot reuse and reset-on-allocate, the `NodeId` alias, the
+IPv6 analogue of §42's example, and the property machine's sampling rule.
+The amendment is open-ended — later items continue the A-numbering. In the body
 below, numbered Assumptions are referred to as "assumption N"; "A<n>" names
 an amendment item.)
 
@@ -134,6 +138,17 @@ per-family: `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` (IPv4, default 8) and
 IPv6 length whose capacity (2^24) equals IPv4's /8, so both families report
 the same 25 capacity levels per transition (assumption 6).
 
+The same capacity mirroring gives every IPv4 example in this ADR, the spec
+and the tests its IPv6 analogue: an IPv4 prefix `a.b.c.d/L` maps to
+`2001:db8::a.b.c.d/(L + 96)` — the IPv4 bits become the low 32 bits under
+the documentation prefix `2001:db8::/96`, and every length shifts by 96, so
+§42's `10.20.30.0/24` (capacity 256) is `2001:db8::10.20.30.0/120` (capacity
+256), which sits inside the IPv6 reported range `[104, 128]` exactly as /24
+sits inside `[8, 32]` (A11).
+
+> Amended 2026-09-18 (A11): the paragraph above was added; nothing before it
+> changed.
+
 ### 2. Node, arena, and the two tries
 
 ```python
@@ -164,7 +179,9 @@ cleanest distinction is to store nothing derived (assumption 3).
 # hammertime.trie.structure.arena   (Spec: section 11, section 27)
 class NodeArena:
     def __init__(self) -> None: ...
-    def allocate(self, network: int, prefix_length: int) -> NodeId   # hot_count 0, no children, no metadata; reuses a freed slot before growing
+    def allocate(self, network: int, prefix_length: int) -> NodeId   # reuses the MOST RECENTLY freed slot (LIFO) before growing (A9);
+                                                                     # the returned node is always hot_count 0, no children, no
+                                                                     # metadata, whatever the slot held before it was freed (A10)
     def free(self, node: NodeId) -> None                              # ValueError if the slot is not live
     def __getitem__(self, node: NodeId) -> TrieNode                    # O(1); ValueError if the slot is not live
     @property
@@ -198,8 +215,10 @@ class BinaryTrie:            # and PatriciaTrie, identically
     def longest_match(self, ip: Address) -> Prefix | None   # longest prefix containing ip with hot_count > 0; None iff hot_ip_count == 0
     def hot_ips(self) -> Iterator[Address]           # every HOT address, ascending by value
     def logical_prefixes(self, *, min_length: int = 0) -> Iterator[tuple[Prefix, int]]
-                                                     # every logical prefix with hot_count > 0 and length >= min_length, any order
-    def edges(self) -> Iterator[Edge]                # every materialized node with hot_count > 0 or pinned, pre-order (decision 3)
+                                                     # every logical prefix with hot_count > 0 and length >= min_length, each
+                                                     # exactly once, any order (A8)
+    def edges(self) -> Iterator[Edge]                # every materialized node with hot_count > 0 or pinned, pre-order with
+                                                     # child0 before child1 (decision 3; A7)
     def set_local_metadata(self, prefix: Prefix, name: str, value: object) -> None   # section 16; validate_metadata_name(name) first
                                                      # (ValueError, nothing stored); materializes the node (decision 5)   -- A2
     def clear_local_metadata(self, prefix: Prefix, name: str) -> None                # validate_metadata_name(name) first (ValueError);
@@ -210,6 +229,15 @@ class BinaryTrie:            # and PatriciaTrie, identically
     def hot_ip_count(self) -> int: ...               # == hot_count(root)
     @property
     def node_count(self) -> int: ...                 # materialized nodes (the trie_nodes metric)
+
+    # PatriciaTrie only (A6) -- the surface invariant I8 is checked through:
+    @property
+    def arena(self) -> NodeArena: ...                # the trie's own arena. "Read-only" means the reference is never rebound;
+                                                     # the NodeArena is mutable, and mutating it (free, set_child, hot_count)
+                                                     # bypasses the trie and breaks I1-I9 -- it is an inspection surface, not
+                                                     # an encapsulation guarantee (A6)
+    @property
+    def root(self) -> NodeId: ...                    # the root node's id; always a live slot of `arena`
 ```
 
 `BinaryTrie` is the oracle: one node per visited bit, `hot_count += 1` at
@@ -226,6 +254,15 @@ with one child and no metadata (assumptions 4, 5).
 > Amended 2026-09-18 (A2): the two metadata setters above validate `name`
 > with `validate_metadata_name` before touching the trie; the first version
 > of this block said nothing about validation there.
+
+> Amended 2026-09-18 (A6-A10): `PatriciaTrie.arena` and `PatriciaTrie.root`
+> were added to the API block (there was no accessor, so invariant I8 had no
+> public surface); `edges()`'s comment was "pre-order (decision 3)" and now
+> fixes the sibling order (child0 first); `logical_prefixes()`'s comment was
+> "any order" and now says "each exactly once, any order"; `NodeArena.
+> allocate`'s comment was "hot_count 0, no children, no metadata; reuses a
+> freed slot before growing" and now names the reuse order (LIFO) and makes
+> the reset unconditional.
 
 ### 3. The logical view, the equivalence contract, and the invariants
 
@@ -305,15 +342,60 @@ def assert_hysteresis_holds(history: object) -> None               # unchanged s
 `hypothesis.stateful.RuleBasedStateMachine` whose rules are `add_hot_ip`,
 `remove_hot_ip` (biased towards addresses already hot, so removal and
 oscillation are exercised), `set_local_metadata`, `clear_local_metadata`,
-against a `BinaryTrie` and a `PatriciaTrie` of one family in lock-step, with
-`@invariant()` methods running `check_invariants` on both, the equivalence
-contract of decision 3, and `node_count <= 2 * hot_ip_count + pinned + 1`.
+against a `BinaryTrie` and a `PatriciaTrie` of one family in lock-step.
+
+**Sampling rule (A12).** Rules draw addresses from a **fixed per-family
+pool**, not from the whole address space: a random 32- or 128-bit address
+almost never shares a prefix with another, so an unconstrained draw
+exercises neither branching, nor compression, nor the merge that follows a
+prune. The pool MUST contain at least 8 addresses per family (the shipped
+test uses 12 IPv4, 6 IPv6 — the IPv6 pool may be smaller because its
+per-step cost is 4x), constructed so that: at least three pairs share a
+`/24` (IPv6: `/120`) but not a `/32` (`/128`); at least two pairs differ only
+in their last bit (sibling leaves, so pruning one merges the other into its
+parent's edge); at least two addresses share no prefix longer than `/8`
+(`/104`) with any other; and, for IPv4, pool members lie under `10.20.30.0/24`,
+`10.20.31.0/24` and `198.51.100.0/24` so the §42 shape (two hot /24s under one
+/23, one lone address elsewhere) is reachable. Metadata rules draw prefixes
+from the pool's ancestors at lengths {8, 16, 23, 24, 32} (IPv6: +96) — the
+lengths at which the pool has structure, each exercising a different rule
+of decision 5: /8 and /16 lie above every member and are never leaves, so
+metadata set there must reach a /32 lookup through `path_metadata` without
+being materialized downward (§17); /24 is the branching level of the §42
+shape and /23 its compressed-away ancestor, so setting metadata at /23 must
+split an edge and pin the new node, and clearing it must merge the edge
+back; /32 is a leaf, where metadata and a hot address share one node and
+the pin must outlive the address. The pool is a module-level constant with
+a comment stating which of these properties each member provides.
+
+**Check cadence (A12).** After every rule: `check_invariants` on both tries
+(O(`node_count`)), the I9 bound, and a *bounded probe* of the equivalence
+contract — the addresses and prefixes the rule touched plus a fixed sample
+of at most 8 pool members and their ancestors. The **full** contract of
+decision 3 (every pool member, every ancestor, `set(logical_prefixes())` for
+each `min_length`, `list(hot_ips())`, `path_metadata`) and the testkit
+helpers (`assert_hot_count_consistent`, O(|hot| x bit_length) at best) run
+at `@initialize` and in `teardown()`, not per step. Budget: the module MUST
+complete in under 30 s of CI wall time. The shipped bounds (IPv4 25 steps x
+25 examples, IPv6 10 x 12) are the test-author's estimate of what fits that
+budget; they have **not** been timed — the modules the test targets do not
+exist yet, so the file cannot run — and are to be measured once C1 lands,
+then raised or lowered so that the budget holds.
+
 Hypothesis 6.168.0 runs an `@invariant()` "after every rule" (installed
 `hypothesis/stateful.py` line 1114) and exposes the machine as a test through
 its `.TestCase` attribute, whose default settings already disable the
 deadline (line 504). The strategies live in `hammertime.testkit.generators`
 (`addresses(family)`, `prefixes(family)`, `hot_ip_streams(family)`), so the
 service's own tests can reuse them.
+
+> Amended 2026-09-18 (A12): the first paragraph originally ended "with
+> `@invariant()` methods running `check_invariants` on both, the equivalence
+> contract of decision 3, and `node_count <= 2 * hot_ip_count + pinned + 1`."
+> — a per-step full contract with unconstrained draws. The "Sampling rule"
+> and "Check cadence" paragraphs replace that clause. The budget sentence
+> first claimed the shipped bounds "satisfy" the 30 s budget; corrected the
+> same day to an untimed estimate, since nothing could have measured it.
 
 ### 5. Prefix metadata: stored where declared, combined on lookup, pins its node
 
@@ -1244,6 +1326,131 @@ tests stand. C2's brief gains the third condition.
   restate the defaults and does not depend on them; a test that does should
   say so in its docstring, as T2's does.
 
+### A6. Invariant I8 gets a public surface: `PatriciaTrie.arena` and `PatriciaTrie.root` — change, corrected in place
+
+Decision 3 lists I8 (`node_count == arena.live_count`; every live slot
+reachable from the root) but decision 2 gave `PatriciaTrie` no way to reach
+its arena, so only `check_invariants` could assert it. Ruling: `PatriciaTrie`
+gains two read-only properties, `arena: NodeArena` (the trie's own arena,
+the same object for the trie's lifetime) and `root: NodeId` (the root node's
+id, always a live slot). With them, `NodeArena.live_ids()`,
+`arena[node].child(bit)` and `root` are enough to walk the materialized tree
+by id and compare the reachable set with the live set — the test
+`hammertime-trie-inspect --verify` (`docs/runbook.md`) will also need.
+`BinaryTrie` gains neither: it need not use an arena at all (assumption 25),
+and I8 is a Patricia invariant. The root's id is not pinned to 0. "Read-only"
+promises only that the property always returns the same `NodeArena` object;
+it does not make that object immutable. A holder can still call `free`,
+rewire children with `set_child` or write `hot_count`, and doing so bypasses
+every invariant the trie maintains — `arena` is an inspection surface for
+`check_invariants`, tests and `hammertime-trie-inspect`, and no production
+code path other than `PatriciaTrie` itself may mutate through it.
+
+Test/brief impact: T1's current reading (I8 left to `check_invariants`) is
+correct and needs no change; T1 MAY add a reachability test over
+`arena.live_ids()` vs a walk from `root`. C1's brief gains the two
+properties and the rule that `arena` is never reassigned.
+
+### A7. `edges()` visits `child0` before `child1` — clarification, corrected in place
+
+Decision 2 said "pre-order" without a sibling order. Ruling: child0 first.
+Pre-order with 0 before 1 yields materialized nodes in ascending `(network,
+prefix_length)` order — the natural order for a dump — and makes the
+sequence deterministic for `test_patricia_equivalence.py`'s
+`set(logical_prefixes(edges()))` and for M6's snapshot of pinned nodes.
+
+Test/brief impact: T1's parent-before-child assertion stands and MAY be
+tightened to the full order. C1's brief gains "child0 before child1".
+
+### A8. `logical_prefixes()` yields each logical prefix exactly once — clarification, corrected in place
+
+The "any order" of decision 2 did not say "without duplicates". Ruling:
+every logical prefix with `hot_count > 0` and length `>= min_length` appears
+exactly once. This is a theorem of the representation — every logical
+prefix lies on exactly one edge, the one to the materialized node at or
+below it — stated so that `set(...)` in decision 3's contract is meaningful
+and so that a `Counter`-based comparison would pass too.
+
+Test/brief impact: T1's no-duplicates assertion is correct. C1's brief
+gains the word "exactly once".
+
+### A9. `NodeArena.allocate` reuses the most recently freed slot (LIFO) — change (narrowing), corrected in place
+
+Decision 2 said a freed slot "is handed out again before the list grows"
+without saying which. Ruling: LIFO — the slot freed most recently is the
+next one allocated. Reasons: it is `list.append`/`list.pop`, the cheapest
+free list there is; under HOT/COLD oscillation the just-freed slot is the
+one most likely still in cache; and a pinned order is what lets a later
+reader predict ids in a dump. Node ids are never persisted (M6 snapshots
+records, not ids — decision 11), so the choice has no compatibility cost.
+
+Test/brief impact: T1's set-based assertion passes either way and MAY be
+tightened to assert `allocate()` returns the id of the last `free()`. C1's
+brief gains "LIFO".
+
+### A10. A reused slot is reset by `allocate` — clarification, corrected in place
+
+Decision 2's "hot_count 0, no children, no metadata" is a post-condition of
+`allocate` for every returned id, reused or fresh. Ruling: confirmed; the
+arena MAY reset on `free` or on `allocate`, but a caller can observe only
+the `allocate` post-condition, since `__getitem__` on a free slot is a
+`ValueError`.
+
+Test/brief impact: T1's reading is correct; no change. C1's brief gains the
+"whatever the slot held before" wording.
+
+### A11. `NodeId` is a bare alias; the IPv6 analogue of every IPv4 example — note and clarification, the latter corrected in place
+
+`NodeId = int` is a type alias exported for readability of signatures; a
+test never needs to import it and `isinstance(x, int)` is the whole check.
+No change.
+
+The IPv6 analogue: T1 mirrored IPv4 examples into `2001:db8::/96`, mapping
+§42's `/24` to `/120`. Confirmed and pinned in decision 1: `a.b.c.d/L` maps
+to `2001:db8::a.b.c.d/(L + 96)`, the capacity-preserving shift assumption 6
+already implies (a /120 has 256 addresses, like a /24), so every IPv4
+number in §42 and `docs/spec/integration-scenarios.md` carries over to IPv6
+unchanged. `2001:db8::/32` is the documentation prefix (RFC 3849, cited from
+recall — the RFC hosts were unreachable, see Sources); CPython accepts the
+embedded dotted-quad spelling `2001:db8::10.20.30.0` and canonicalises it
+to `2001:db8::a14:1e00`, so a test that compares `prefix` text must compare
+canonical forms, not the spelling it typed.
+
+Test/brief impact: T1's assumption 3 is correct; T1 SHOULD ensure any
+string comparison on IPv6 prefixes uses `str(Prefix.parse(...))` rather
+than the typed literal. C1: none.
+
+### A12. The property machine's sampling rule and check cadence — change, corrected in place
+
+Decision 4 as first written implied unconstrained address draws and the
+full equivalence contract after every step. T1 found the latter O(|hot| x
+bit_length^2) per step through `assert_hot_count_consistent` and, on its
+own initiative, moved to a fixed pool (12 IPv4, 6 IPv6 chosen for prefix
+sharing), a bounded per-step probe with the full check at the boundaries,
+and per-family step/example bounds. Ruling: accepted, and turned into the
+rule now in decision 4 so a later reader does not have to re-derive it from
+the test file: a fixed per-family pool of at least 8 addresses with the
+stated prefix-sharing properties (three /24-sharing pairs, two sibling-leaf
+pairs, two isolated members, the §42 shape reachable for IPv4), metadata
+prefixes from the pool's ancestors at {8, 16, 23, 24, 32} (+96 for IPv6),
+`check_invariants` and the I9 bound after every step, a bounded equivalence
+probe (touched items plus at most 8 pool members) after every step, the full
+contract and the testkit helpers at `@initialize` and `teardown()`, and a
+30 s CI budget for the module. An unconstrained draw was rejected as a
+matter of test power, not only cost: random 32-bit addresses essentially
+never share a prefix, so it never merges an edge.
+
+Test/brief impact: T1's file already satisfies the rule if its pool meets
+the four structural properties — T1 SHOULD verify and, if a property is
+missing (most likely the two isolated members or the sibling-leaf pairs),
+add the members; its cadence stands, and its step/example bounds stand as
+an untimed estimate until the module is measured against a real
+implementation (nobody has run it: its targets do not exist yet). Separately, T1 MAY make
+`assert_hot_count_consistent` O(|hot| x bit_length) by accumulating the
+expected counts of every ancestor into one dict in a single pass over
+`hot_ips()` before comparing against `edges()`; that is a testkit
+implementation detail, not contract. C1: none.
+
 No `CHANGES` entry: nothing here has shipped; the rulings pin behaviour of
 code that is being written against them.
 
@@ -1263,3 +1470,18 @@ Assumptions of this amendment (push back individually):
 * *Reference-form rewrite.* Rewriting "(A6)" to "(assumption 6)" throughout
   the body touches many lines for no semantic change; done so that "A<n>"
   can mean one thing in this document, as it does in ADR-0009 and ADR-0011.
+* *A6 exposes the arena rather than adding `PatriciaTrie.reachable_ids()`.*
+  A raw accessor is more than a test needs, but the inspect tool
+  (`tools/trie-inspect`, `--verify`) needs the same walk, and one accessor
+  is less surface than a family of walkers. The property is documented as
+  read-only by convention; Python cannot enforce it.
+* *A9 picks LIFO over FIFO.* FIFO would spread reuse across slots and was
+  not chosen because nothing benefits from that and it costs a deque.
+* *A11 uses `2001:db8::/96` as the mirror, not an IPv4-mapped (`::ffff:`)
+  or 6to4 prefix.* The documentation prefix is reserved for exactly this
+  use and cannot collide with a deployment's real IPv6 space; the mapped
+  forms carry semantics CPython treats specially (`ipv4_mapped`).
+* *A12's pool minimum (8) and budget (30 s) are judgment calls.* 8 is the
+  smallest pool that can hold all four structural properties with no
+  member doing double duty; 30 s is well under the suite's current total
+  and leaves headroom for the IPv6 machine, whose steps cost 4x.
