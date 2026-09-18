@@ -2,7 +2,10 @@
 
 Status: accepted; amended 2026-09-17 (see "Amendment 1" at the end — the
 decisions above it are unchanged in substance, the amendment pins the
-*surface* through which each one is observed and tested)
+*surface* through which each one is observed and tested); amended
+2026-09-18 (see "Amendment 2" — decision 7's drain order is corrected in
+place: a service flushes its producer *before* it commits its consumer
+position, and that order binds every commit point of every service)
 
 Scope note: this ADR defines what a Hammertime service *process* is — how it
 starts, becomes ready, is observed, stops, and what it exits with — and the
@@ -256,13 +259,37 @@ service:
 
 * stops accepting new work (HTTP servers stop accepting connections; consumers
   stop fetching);
-* finishes the message it is currently applying, then commits its consumer
-  position (`Consumer.commit`) — never mid-message, so at-least-once redelivery
-  after a crash re-applies at most one message per partition (ADR-0003);
+* finishes the message it is currently applying — never stops mid-message,
+  so at-least-once redelivery after a crash re-applies at most one message
+  per partition (ADR-0003);
 * flushes its producer;
+* then commits its consumer position (`Consumer.commit`) — after the flush,
+  never before it (the rule below);
 * trie: writes a final snapshot (§33) *after* the commit above, so the
   snapshot's recorded position is never ahead of the committed one;
 * closes bus, store and socket resources.
+
+**Flush before commit — one rule, every service, every commit point.** A
+service that consumes one topic and produces to another MUST have
+`Producer.flush()` return before it calls `Consumer.commit` for a position
+that covers the messages whose handling produced those events — at the
+drain above, at every periodic commit, and at every rebalance revocation
+(ADR-0011 decision 6 for the aggregator; ADR-0010 decision 3 for the
+trie). The two orders fail differently, and only one failure is
+recoverable. *Commit, then flush:* a process that dies between the two has
+committed past messages whose emitted events never reached the event log;
+the consumer group will not re-read them, and nothing downstream can
+re-derive the transitions — the aggregator's window state is
+process-local, and §32 names it the authoritative information the trie is
+reconstructed from. *Flush, then commit:* a death between the two
+re-delivers messages that were already applied, which is exactly the
+at-least-once redelivery ADR-0003 commits every consumer to absorbing
+(process-local counters and an idempotent durable HOT set, ADR-0011
+decision 3; replace-on-add and `hot_count >= 0` in the trie, §46.5 and
+§11). The trie's final snapshot keeps its place in the list — after the
+commit, so its recorded position is never ahead of the committed one — and
+is therefore also after the flush, so no event the snapshot covers has
+stats that never reached the log.
 
 Deadline met -> exit 0. Deadline exceeded -> `WARNING event=shutdown_timeout`
 -> exit 1. A second signal during the drain aborts it immediately -> exit 1.
@@ -272,6 +299,11 @@ is 10 s (Kubernetes' default `terminationGracePeriodSeconds` is 30 s, so the
 tighter of the two governs); the drain must finish inside that or the
 container is SIGKILLed mid-snapshot, which is exactly the outcome the trie's
 final snapshot exists to prevent.
+
+> Amended 2026-09-18: the drain flushes the producer *before* committing
+> the consumer position, and that order binds every commit point of every
+> service; the first version of the bullet list had commit before flush
+> (A11). See Amendment 2.
 
 ### 8. Exit codes
 
@@ -956,3 +988,239 @@ Everything else above documents behaviour that already exists and is now
 contract. Spec §47.2, §47.3, §47.6 and the new §47.7 are updated in step;
 `docs/protocol/observation-v1.md`, `docs/protocol/read-api-v1.md` and
 `docs/spec/integration-scenarios.md` carry A8/A9.
+
+## Amendment 2 (2026-09-18) — the drain flushes the producer before it commits the consumer position
+
+Why: decision 7's bullet list, and spec §47.4 which restates it, had a
+draining service commit its consumer position and *then* flush its
+producer. ADR-0010 decision 3 (the trie: "the producer is flushed before
+the consumer position for the hot-ip topic is committed, so a crash cannot
+commit an update whose stats were never emitted") and ADR-0011 decision 6
+(the aggregator: the position is committed "always after
+`producer.flush()`, so a committed position never precedes the transitions
+it produced") require the opposite order, and ADR-0011 decision 6's
+shutdown sentence — "`stop()` follows ADR-0009 decision 7: stop fetching,
+finish the in-flight message, flush, commit, close bus and store clients"
+— claimed to follow decision 7 while listing the steps in the other order.
+ADR-0011 Amendment 6 noticed the discrepancy, left it alone as not its
+question, and named it for a separate ruling. This is that ruling.
+
+This amendment follows Amendment 1's convention: the decision is corrected
+in place and carries a dated blockquote pointing here, and every edit made
+outside this section is listed below with the superseded wording quoted.
+Unlike Amendment 1, it changes a decision in substance — the order of two
+steps — so the sentence in the status line that Amendment 1 leaves the
+decisions "unchanged in substance" applies to Amendment 1 only.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Was: "Status: accepted; amended 2026-09-17 (see
+  "Amendment 1" at the end — the decisions above it are unchanged in
+  substance, the amendment pins the *surface* through which each one is
+  observed and tested)". Now adds "; amended 2026-09-18 (see "Amendment 2"
+  — decision 7's drain order is corrected in place: a service flushes its
+  producer *before* it commits its consumer position, and that order binds
+  every commit point of every service)".
+* **Decision 7, the drain bullet list, bullets two to four.** Was:
+
+  > * finishes the message it is currently applying, then commits its
+  >   consumer position (`Consumer.commit`) — never mid-message, so
+  >   at-least-once redelivery after a crash re-applies at most one message
+  >   per partition (ADR-0003);
+  > * flushes its producer;
+  > * trie: writes a final snapshot (§33) *after* the commit above, so the
+  >   snapshot's recorded position is never ahead of the committed one;
+
+  Now:
+
+  > * finishes the message it is currently applying — never stops
+  >   mid-message, so at-least-once redelivery after a crash re-applies at
+  >   most one message per partition (ADR-0003);
+  > * flushes its producer;
+  > * then commits its consumer position (`Consumer.commit`) — after the
+  >   flush, never before it (the rule below);
+  > * trie: writes a final snapshot (§33) *after* the commit above, so the
+  >   snapshot's recorded position is never ahead of the committed one;
+
+  The first and last bullets ("stops accepting new work ..." and "closes
+  bus, store and socket resources") are unchanged. The "never mid-message
+  ... at most one message per partition" clause moved from the commit
+  bullet to the finish-the-message bullet, where the thing it explains
+  (not stopping mid-message) now lives; its wording was carried over and
+  not re-examined (see Assumptions).
+* **Decision 7, new paragraph.** Between the bullet list and "Deadline met
+  -> exit 0" — which were consecutive — the paragraph headed "**Flush
+  before commit — one rule, every service, every commit point.**" was
+  inserted. It is the rule this amendment makes, stated once; A11 below is
+  its record.
+* **Decision 7, blockquote.** A dated "Amended 2026-09-18" pointer was
+  appended after the 8 s paragraph, in the form the Amendment 1
+  blockquotes use.
+* **`docs/spec/hammertime_spec_1.md`, §47.4, first paragraph.** Was: "On
+  `SIGTERM` or `SIGINT` a service MUST stop accepting new work, finish the
+  message it is applying, commit its consumer position, flush its
+  producer, and (trie) write a final snapshot whose recorded position is
+  not ahead of the committed one — all within
+  `HAMMERTIME_SHUTDOWN_TIMEOUT_S` (default 8) — then exit 0. A drain that
+  exceeds the deadline, or is interrupted by a second signal, exits 1."
+  Now: the same sentence with "flush its producer, then commit its
+  consumer position" in place of "commit its consumer position, flush its
+  producer", plus one sentence stating that the flush MUST precede the
+  commit at every commit point and why, citing this amendment. The final
+  "A drain that exceeds ..." sentence is unchanged.
+
+Touched nowhere else, and why — before closing this list `docs/spec/`,
+`docs/adr/` and `docs/protocol/` were grepped (case-insensitively) for
+`flush`, `commit`, `drain`, `snapshot.*position` / `position.*snapshot`,
+and `docs/runbook.md` for `snapshot`, `shutdown`, `SIGTERM` and `drain`:
+
+* `docs/spec/hammertime_spec_1.md` §33's ADR-0009 note ("On shutdown it
+  writes a final snapshot after committing its consumer position (Section
+  47.4)") orders only the snapshot relative to the commit, which is
+  unchanged, and defers to §47.4 for the rest. Untouched: adding the flush
+  there would be a second statement of the rule. §24's ADR-0011 note says
+  which position is committed, not when relative to the flush. Untouched.
+* ADR-0010 decision 3 already states the ruled order for the trie, with
+  its reason. Untouched.
+* ADR-0011 decision 6 already states the ruled order for the aggregator
+  and its three commit points; its sentence "`stop()` follows ADR-0009
+  decision 7: stop fetching, finish the in-flight message, flush, commit,
+  close bus and store clients" is now literally true of decision 7.
+  Decision 5's `commit_handled` and `on_revoked` bullets and Amendment 6
+  (A20) restate flush-then-commit for the aggregator and are consistent.
+  Amendment 6's grep note records that it noticed this discrepancy and
+  deferred it; that is accurate history and is untouched. Editing ADR-0011
+  to cite this decision instead of ADR-0010 for the general rule would cost
+  an ADR-0011 amendment for no change in rule, and was not done.
+* ADR-0003's Consequences (at-least-once; "the consumer tracks committed
+  offsets per shard") and ADR-0004's flush-then-record-sequence rule for
+  ingest are the posture this amendment relies on. Untouched.
+* `docs/spec/integration-scenarios.md` mentions commit only in the
+  `kill_trie()` harness row ("no final snapshot, no commit"), which is
+  about skipping the drain, not its order. Untouched.
+* `docs/protocol/` and `docs/runbook.md` contain no restatement of the
+  drain sequence or of commit/flush ordering. `docs/spec/README.md`'s §47
+  row maps the same sections to the same modules. Untouched.
+
+### A11. Flush before commit — documents what exists; corrects decision 7 and §47.4
+
+**Classification: (a) already determined and missed.** The order was
+settled before this ADR listed the steps: ADR-0003 fixes at-least-once
+consumption as the posture every consumer is built to absorb, and ADR-0010
+decision 3 — written alongside this ADR, which cites it in decision 2 —
+states flush-before-commit for the trie with the reason ("a crash cannot
+commit an update whose stats were never emitted"). Decision 7 gave no
+reason for putting the commit first; the only rationale attached to its
+commit bullet ("never mid-message ...") is about finishing the in-flight
+message before committing, which both orders satisfy. §47.4 copied the
+list. ADR-0011 decision 6 then followed ADR-0010 and cited decision 7 for
+the drain skeleton while listing the flush first. What is new here, and
+is a (b) ruling rather than a correction, is scope: the rule is now stated
+once, in decision 7, as binding every service and every commit point,
+rather than per service in two other ADRs.
+
+**The ruling.** Flush, then commit. The reasoning is the paragraph
+inserted in decision 7, and it is not a close call: commit-then-flush turns
+a crash between the two steps into silent, unrecoverable loss of
+transitions — the same class of loss ADR-0011 Amendment 6 (A20) closed at
+revocation, arriving from the other direction — while flush-then-commit
+turns the same crash into a redelivery every consumer is already required
+to absorb.
+
+**The trie's snapshot constraint holds.** Decision 7's trie bullet is
+unchanged: the final snapshot is written after the commit, so its recorded
+position is never ahead of the committed one — at a clean drain the two
+are equal, because the snapshot is taken immediately after a commit of the
+handled position with fetching stopped. Moving the flush ahead of the
+commit does not disturb that; it adds that the snapshot is also after the
+flush, so a restart that loads the snapshot and replays from its position
+(decision 4) cannot skip an event whose `PrefixStatsChanged` never reached
+the log. That is the property the snapshot actually needs from the drain
+order, and under the old order it held only by accident of the flush
+happening before the snapshot as well.
+
+**Shipped code — no change.** Read at `78936af` (branch
+`claude/flush-before-commit`):
+
+* `services/aggregator/src/hammertime/aggregator/sharding/assignment.py`:
+  `ShardClaims.commit_handled` is `await self._producer.flush()` then
+  `await self._consumer.commit(offsets)` (lines 148-149); `on_revoked`
+  calls it (line 185). The aggregator's only commit path.
+* `services/aggregator/src/hammertime/aggregator/worker.py`:
+  `stop()` sets the stop event, takes the lock and calls
+  `_flush_and_commit` (lines 209-211), which is `commit_handled()` (line
+  452); the periodic commit goes the same way (line 443). Its docstrings
+  already say "ADR-0009 decision 7 and ADR-0011 decision 6: always flush
+  before committing" — a citation of decision 7 for an order decision 7
+  did not state until now; it is accurate after this amendment and needs
+  no edit.
+* `services/aggregator/src/hammertime/aggregator/service.py`: `stop()`'s
+  docstring (lines 232-236) already says "flush the producer and commit
+  the handled position -- in that order". Accurate; no edit.
+* `services/ingest/`: no consumer, no commit; `stop()` unwinds the lifespan
+  which flushes and closes the producer. Bound trivially.
+* `services/trie/` and `services/detector/`: no `flush` or `commit` in any
+  source file — `worker.py` and `snapshot/writer.py` are stubs. The rule
+  binds their epics; there is nothing to change yet.
+* `packages/hammertime-core/src/hammertime/core/runtime.py`: the runner
+  calls `service.stop()` and waits for `run()`; it does not itself flush,
+  commit or snapshot, so the order is each service's to implement.
+
+No committed test changes. `test_sharding.py::TestRevokingAShard::
+test_a_revoke_flushes_before_it_commits` (`assert trace == ["flush",
+"commit"]`, line 509) and
+`test_commit_handled_flushes_and_commits_even_with_nothing_handled` (line
+655) assert the ruled order; `test_worker.py::TestOffsetsAreCommittedAtShutdown`
+(lines 984-1033) asserts that `stop()` commits, without asserting an order
+relative to the flush, and stays valid. No test asserts commit-then-flush.
+
+No `CHANGES` entry: no shipped behaviour changes (the code already does
+what the corrected text says), and the aggregator has not shipped in any
+release; this is a documentation correction.
+
+Assumptions (push back individually):
+
+* *The rule covers every commit point, not only the drain.* Decision 7 is
+  about shutdown; ADR-0011 decision 6 and ADR-0010 decision 3 already apply
+  the order to periodic and revocation commits per service. Stating it
+  here for all commit points is this amendment's generalisation, made so
+  the aggregator's and the trie's rule have one origin. Ingest is bound
+  vacuously (no consumer). The detector's commit point does not exist yet
+  and is bound when it does.
+* *"Flush" is the `Producer.flush()` contract — "wait until every message
+  published so far is durably acknowledged" (`hammertime.bus.interface`,
+  line 67) — not what the shipped producers happen to do.* Both shipped
+  `publish` implementations already wait for the acknowledgement
+  (`KafkaProducer.publish` is `send_and_wait`, `kafka.py` line 79;
+  `MemoryProducer.publish` appends synchronously and its `flush` is a
+  documented no-op, `memory.py` lines 78-84; ADR-0011 decision 4 step 4
+  relies on this), so for the aggregator today the flush carries nothing
+  and the order has no observable effect. The rule is stated against the
+  interface because a producer that batches — the trie's twenty-five
+  `PrefixStatsChanged` per transition are the case ADR-0010 designed for,
+  and aiokafka's `send()` without `_and_wait` is one line away — is
+  exactly where the order decides between loss and redelivery.
+* *Redelivery after a crash between flush and commit is the accepted
+  failure, and every consumer is assumed idempotent under it.* For the
+  aggregator that is ADR-0011 decision 3's at-least-once paragraph; for
+  the trie, §46.5 and §11 as ADR-0011's Consequences restate them. For the
+  detector it is the "latest known stats" reading ADR-0010 decision 5
+  gives its view, which is idempotent by construction — but the detector
+  is unbuilt, so that is a requirement on its epic, not a verified
+  property.
+* *The trie's periodic (non-drain) snapshot is not ruled here.* The same
+  reasoning says a periodic snapshot must not cover an event whose stats
+  have not been flushed, or a restart from it skips re-emitting them.
+  ADR-0010's Consequences already defer how the snapshot records its
+  position to the trie epic; that epic should settle the periodic
+  snapshot's relation to the flush at the same time. Named, not decided,
+  because it is the trie's design and outside this amendment's one item.
+* *The "at most one message per partition" clause was moved, not
+  re-examined.* It travelled with the "never mid-message" reasoning it
+  belongs to. Whether it is exactly right under a 1 s periodic commit
+  (ADR-0011 decision 6), where a crash re-delivers everything handled
+  since the last commit rather than one message, is a separate question
+  about that sentence and is not this amendment's; it is named in the
+  hand-off report.
+* *The 2026-09-18 date and the "A11" numbering* continue Amendment 1's
+  sequence; nothing else in this ADR's numbering moves.

@@ -2803,11 +2803,17 @@ logged, and the next poll retries.
 ## 47.4 Shutdown
 
 On `SIGTERM` or `SIGINT` a service MUST stop accepting new work, finish the
-message it is applying, commit its consumer position, flush its producer, and
-(trie) write a final snapshot whose recorded position is not ahead of the
-committed one — all within `HAMMERTIME_SHUTDOWN_TIMEOUT_S` (default 8) — then
-exit 0. A drain that exceeds the deadline, or is interrupted by a second
-signal, exits 1.
+message it is applying, flush its producer, then commit its consumer
+position, and (trie) write a final snapshot whose recorded position is not
+ahead of the committed one — all within `HAMMERTIME_SHUTDOWN_TIMEOUT_S`
+(default 8) — then exit 0. The flush MUST precede the commit — here and at
+every other point at which a service commits a consumer position — so that a
+committed position never covers a message whose emitted events have not
+reached the event log: a crash between the two re-delivers messages that were
+already applied, which every consumer absorbs (Section 23, ADR-0003), whereas
+the opposite order would lose transitions the log can never replay (ADR-0009
+decision 7, Amendment 2). A drain that exceeds the deadline, or is
+interrupted by a second signal, exits 1.
 
 ## 47.5 Exit status
 
