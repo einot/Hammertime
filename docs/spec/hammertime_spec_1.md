@@ -2718,7 +2718,10 @@ calls `hammertime.<service>.__main__:main()`. `main()` MUST:
    and from the detection configuration document at `HAMMERTIME_CONFIG_PATH`
    (Section 34);
 3. reject an invalid configuration before opening any network connection,
-   exiting with status 2;
+   exiting with status 2 — where "invalid" includes a connection URL the
+   client library would refuse to build a client from (`HAMMERTIME_REDIS_URL`
+   is validated when `HAMMERTIME_STORE_KIND` is `redis` and ignored when it
+   is `memory`; ADR-0009 A12);
 4. delegate the remainder of the lifecycle to the shared runner in
    `hammertime.core.runtime` (ADR-0009).
 
