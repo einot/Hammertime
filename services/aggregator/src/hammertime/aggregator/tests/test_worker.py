@@ -118,6 +118,7 @@ from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import HotIpAdded, HotIpRemoved, Observation, RequestObservation
 from hammertime.core.state.enums import IpState
 from hammertime.core.time.clock import ManualClock
+from hammertime.store.interface import ShardState
 from hammertime.store.memory import MemoryShardStateStore
 
 HOT_IP_TOPIC = "hammertime.hot-ip.v1"
@@ -296,6 +297,20 @@ async def _yield_until(predicate: Callable[[], bool], *, steps: int = 10_000) ->
             return
         await asyncio.sleep(0)
     raise AssertionError("the condition was never reached")
+
+
+async def _drain(worker: AggregatorWorker, task: asyncio.Task[None]) -> None:
+    """`stop()` (which commits), then let `run()` return. Never sleeps."""
+
+    await worker.stop()
+    for _ in range(1_000):
+        if task.done():
+            break
+        await asyncio.sleep(0)
+    if not task.done():
+        task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 class _Feed:
@@ -1052,29 +1067,20 @@ class TestAMessageFetchedUnderARevokedClaim:
     revocation the fresh consumer gets the second message instead, and
     nobody ever processes the first: the silent loss A20 exists to close.
 
-    Not observable here, per A20: the *redelivery* itself. `InMemoryBus` never
-    resets a live consumer's own position to the committed offset, so only the
-    committed position can be read back; the handover needs a real broker and
-    is an `integration` scenario (issue #26).
+    Not observable here, per A20: the *redelivery* to the same member.
+    `InMemoryBus` never resets a live consumer's own position to the committed
+    offset, so what a member that re-claims the partition would be handed
+    needs a real broker and is an `integration` scenario (issue #26). What
+    *is* observable in process is the handover to a different member, whose
+    fresh consumer starts at the committed position:
+    `TestTheMessageInHandReachesTheNextMember` below takes the same scripted
+    rebalance one step further and lets the next member apply the message.
     """
 
     async def _publish(self, bus: InMemoryBus, ip: Address) -> None:
         await bus.producer().publish(
             OBSERVATIONS_TOPIC, key=str(ip), value=_observation(ip, 1200, window_start=BASE)
         )
-
-    async def _drain(self, worker: AggregatorWorker, task: asyncio.Task[None]) -> None:
-        """`stop()` (which commits), then let `run()` return. Never sleeps."""
-
-        await worker.stop()
-        for _ in range(1_000):
-            if task.done():
-                break
-            await asyncio.sleep(0)
-        if not task.done():
-            task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
 
     async def _first_message_of_the_group(self, bus: InMemoryBus) -> ConsumedMessage:
         resumed = bus.consumer(GROUP)
@@ -1109,7 +1115,7 @@ class TestAMessageFetchedUnderARevokedClaim:
         assert (await state_store.load(0)).hot_ips == frozenset()
         assert _counter(metrics, "observations_rejected", reason="malformed") == 0
 
-        await self._drain(worker, task)
+        await _drain(worker, task)
         await self._publish(bus, IP_B)
 
         assert (await self._first_message_of_the_group(bus)).key == str(IP_A).encode()
@@ -1139,7 +1145,7 @@ class TestAMessageFetchedUnderARevokedClaim:
         assert _records(bus, RECONCILIATION_TOPIC) == []
         assert (await state_store.load(0)).hot_ips == frozenset()
 
-        await self._drain(worker, task)
+        await _drain(worker, task)
         await self._publish(bus, IP_B)
 
         assert (await self._first_message_of_the_group(bus)).key == str(IP_A).encode()
@@ -1180,7 +1186,107 @@ class TestAMessageFetchedUnderARevokedClaim:
         assert _records(bus, RECONCILIATION_TOPIC) == []
         assert (await state_store.load(0)).hot_ips == frozenset()
 
-        await self._drain(worker, task)
+        await _drain(worker, task)
         await self._publish(bus, IP_B)
 
         assert (await self._first_message_of_the_group(bus)).key == str(IP_A).encode()
+
+
+class TestTheMessageInHandReachesTheNextMember:
+    """Amendment 6 item A20, ruling part 2, from the next owner's side: member
+    A fetches a message, loses the partition before handling it, and the
+    message is applied -- once, and by B -- when member B takes the shard.
+
+    ADR-0001 Amendment 1 clause 6 ("no double count and no loss at a
+    rebalance") and ADR-0003 Amendment 2 point 1(b): the redelivery "after a
+    claim changed hands" lands in a `ShardWindow` that never counted it, and
+    the first copy was `UNCLAIMED` rather than applied, so B's application is
+    the first and only one. The two members are sequential -- A is drained
+    before B is constructed -- which is what the memory bus supports (ADR-0011
+    decision 1: at most one live member per group per topic); the scripted
+    rebalance is `_FetchGap`, exactly as `TestAMessageFetchedUnderARevokedClaim`
+    drives it, and the second member gets a plain consumer (`_GapBus`).
+    """
+
+    async def test_the_next_member_applies_the_message_the_first_member_left_in_hand(self) -> None:
+        clock = ManualClock(initial=BASE)
+        a_metrics = AggregatorMetrics()
+        b_metrics = AggregatorMetrics()
+        state_store = MemoryShardStateStore()
+        gap = _FetchGap(inline=False)
+        bus = _GapBus(gap)
+        await bus.producer().publish(
+            OBSERVATIONS_TOPIC, key=str(IP_A), value=_observation(IP_A, 1200, window_start=BASE)
+        )
+
+        # Member A: fetches the message, is revoked before handling it.
+        a = _worker(bus=bus, clock=clock, metrics=a_metrics, state_store=state_store)
+        gap.worker = a
+        await a.start()
+        a_task = asyncio.create_task(a.run())
+        try:
+            await _yield_until(lambda: gap.refetched)
+            assert gap.uninterrupted is True
+            assert a.window(0) is None
+            # A emitted nothing and recorded nothing: the message was
+            # `UNCLAIMED` under A (A19), and A's revoke committed no position
+            # for it (A20), so it is still in the log for the next owner.
+            assert _records(bus, HOT_IP_TOPIC) == []
+            assert await state_store.load(0) == ShardState(hot_ips=frozenset(), next_sequence=0)
+        finally:
+            await _drain(a, a_task)
+
+        # Member B: a fresh member of the same group, started only after A
+        # is gone. Its first fetch is the message A left in hand.
+        b = _worker(bus=bus, clock=clock, metrics=b_metrics, state_store=state_store)
+        await b.start()
+        b_task = asyncio.create_task(b.run())
+        try:
+            # HOT is set after the store write and the publish (decision 4
+            # steps 2, 4, 5), so waiting on it covers everything asserted
+            # below; `is_tracked` would already hold at `observe`.
+            await _yield_until(lambda: _window_of(b).state(IP_A) is IpState.HOT)
+
+            window = _window_of(b)
+            assert window.total(IP_A) == 1200
+            assert window.state(IP_A) is IpState.HOT
+            # Exactly one transition, emitted by B, at shard 0's sequence 0:
+            # A consumed no sequence number because it emitted nothing.
+            decoded = _decoded(bus)
+            identities = [
+                (key, envelope.event_type, envelope.subject, envelope.agent_id, envelope.sequence)
+                for key, envelope in decoded
+            ]
+            assert identities == [(str(IP_A).encode(), "HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0)]
+            payload = decoded[0][1].payload
+            assert isinstance(payload, HotIpAdded)
+            assert payload.window_count == 1200
+            assert await state_store.load(0) == ShardState(
+                hot_ips=frozenset({IP_A}), next_sequence=1
+            )
+            # The promotion is B's, on the observation path (decision 3 step
+            # 3, decision 8's `reason="observation"`); A's counters never saw
+            # it.
+            assert (
+                _counter(
+                    b_metrics,
+                    "cold_to_hot_transitions",
+                    shard=0,
+                    config_version=1,
+                    reason="observation",
+                )
+                == 1
+            )
+            assert (
+                _counter(
+                    a_metrics,
+                    "cold_to_hot_transitions",
+                    shard=0,
+                    config_version=1,
+                    reason="observation",
+                )
+                == 0
+            )
+            assert _records(bus, RECONCILIATION_TOPIC) == []
+        finally:
+            await _drain(b, b_task)

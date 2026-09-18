@@ -998,6 +998,21 @@ The architecture SHOULD initially prefer Option A if throughput permits, because
 
 Option B becomes attractive when the global trie becomes a measurable bottleneck.
 
+> ADR-0001 chooses Option A: one logical trie owner (a single writer per
+> address family) fed by every aggregator shard, no cross-shard aggregation
+> in v1, exact prefix counts. A "shard" here is a partition of
+> `hammertime.observations.v1` (ADR-0011 decision 1; §20's note); all shards
+> publish their transitions to `hammertime.hot-ip.v1` keyed by IP, so each
+> IP's transitions reach the trie in order under one `agent_id`
+> (`aggregator-shard-{p}`) and one `sequence` that is continued — never
+> restarted, though not contiguous — whichever worker holds the shard
+> (ADR-0001 Amendment 1, clauses 1-3). The two scaling
+> ceilings are distinct: the aggregator's is the observations topic's
+> partition count (§20's note; ADR-0011 Amendment 1, A1), the trie's is the
+> single writer — and only the second is what `trie_updates` and
+> `hot_transition_to_prefix_update_latency` are watched for to decide when
+> Option B is needed (ADR-0001 Consequences).
+
 ---
 
 # 22. Consistency Model
@@ -1025,6 +1040,34 @@ HOT
 while the prefix aggregate catches up milliseconds later.
 
 The system SHOULD expose timestamps/version numbers for derived classifications when operational correctness matters.
+
+> Defined: **eventually consistent** across IPs and therefore for every
+> prefix; **ordered per IP**. ADR-0001 Amendment 1 states the model in six
+> clauses: one owning shard per IP whose identity (`agent_id`, persisted
+> `sequence`) is continued — not restarted, though not contiguous — across
+> worker handovers; per IP the trie applies transitions in emission order,
+> so its view is a prefix of the published stream and, relative to the IP's
+> true history, in order with possible gaps (a transition persisted but
+> never published), never a reordering; across IPs there is no ordering,
+> and a prefix aggregate catches up as transitions are applied. Every trie
+> and detector response carries `as_of`, `event_sequence` (the trie's count
+> of applied hot-ip events; the detector reports that counter as carried on
+> the newest `PrefixStatsChanged` it applied) and `config_version`
+> (`docs/protocol/read-api-v1.md`; ADR-0010 decision 4). A shard handover
+> may delay a demotion by up to `window_seconds` plus the rebalance time
+> plus one maintenance interval, and may replay a `HotIpAdded` for an IP the
+> trie already holds, a `HotIpRemoved` for one it does not, or a
+> same-`event_id` duplicate from a producer retry; all are no-ops for the
+> trie (§11, §46.5; ADR-0003 Amendment 2). Observations are consumed
+> at-least-once with no double count (ADR-0003 Amendment 2) and none lost at
+> a rebalance (ADR-0011 Amendment 6, A20). Not promised: strong consistency
+> between `GET /ip` and `GET /prefix`, a bound on the catch-up lag, a dense
+> `sequence`, exactly-once transport of a transition record, fencing of a
+> worker that acts after losing its shard (ADR-0011 Amendment 1, A2),
+> detection of overlapping static `HAMMERTIME_SHARD_IDS` sets — in static
+> mode disjointness across members is an unenforced operator invariant — or
+> any guarantee across a change of the observations topic's partition count
+> (A1).
 
 ---
 

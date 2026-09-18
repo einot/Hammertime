@@ -5,8 +5,10 @@ The authoritative architecture specification is
 Prefix Detection Service*, 47 sections (1-45 as originally written; §46 added by
 ADR-0005, which also adds pointer notes to §9, §12, §16, §29, §33, §34, §37;
 §47 added by ADR-0009, which adds pointer notes to §33 and §34, ADR-0010
-adds pointer notes to §13 and §29, and ADR-0011 adds pointer notes to §5, §20,
-§24, §26, §30, §34 and §37).
+adds pointer notes to §13 and §29, ADR-0011 adds pointer notes to §5, §20,
+§24, §26, §30, §34 and §37, and ADR-0001 Amendment 1 — the consistency model
+for many aggregator shards feeding one trie — adds pointer notes to §21 and
+§22).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -41,10 +43,10 @@ Section index used throughout the code:
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` |
 | 19 | Event-driven internals | `core/events`, `packages/hammertime-bus`, `docs/adr/0004` |
-| 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`), `packages/hammertime-store` (`ShardStateStore`), `services/ingest/publisher.py`, `docs/adr/0004`, `docs/adr/0011` |
-| 22 | Consistency model | `docs/adr/0001` |
+| 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py`), `packages/hammertime-store` (`ShardStateStore`), `services/ingest/publisher.py`, `docs/adr/0001` (Amendment 1), `docs/adr/0004`, `docs/adr/0011` |
+| 22 | Consistency model | `docs/adr/0001` (Amendment 1), `docs/adr/0003` (Amendment 2), `docs/adr/0011` (decisions 4, 5; A20), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
-| 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `services/aggregator/worker.py`, `core/time/buckets.py`, `docs/adr/0011` |
+| 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `services/aggregator/worker.py`, `core/time/buckets.py`, `docs/adr/0002` (Amendment 1), `docs/adr/0011` |
 | 26 | Memory / retention | `services/aggregator/window/store.py`, `packages/hammertime-store` (`ShardStateStore`), `docs/adr/0011` |
 | 27 | Trie representation | `services/trie/structure/patricia.py` |
 | 28 | Atomicity | `services/trie/worker.py` |
