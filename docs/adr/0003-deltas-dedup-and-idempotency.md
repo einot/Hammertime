@@ -67,8 +67,20 @@ pointer to this section.
 
 **Ruling.** The *requirement* behind the sentence stands unchanged: a
 `RequestObservation` delivered more than once to the aggregator MUST NOT be
-counted more than once in any `ShardWindow`, and a `HotIpAdded`/`HotIpRemoved`
-MUST NOT be emitted twice for one transition. The *mechanism* the sentence
+counted more than once in any `ShardWindow`, and the aggregator's emitter
+MUST produce exactly one `HotIpAdded`/`HotIpRemoved` record, with one
+`event_id`, per transition it evaluates. That second promise is made at the
+emitter, **not at the transport**: `KafkaProducer` (`kafka.py:62`) leaves
+aiokafka's `enable_idempotence=False` default in place (installed
+`aiokafka==0.14.0`, `producer/producer.py:216`; its docstring, lines
+157-160: "If `False`, producer retries due to broker failures, etc., may
+write duplicates of the retried message in the stream"), so the hot-ip log
+can hold two byte-identical copies of one record after a producer retry.
+Both copies carry the same `event_id`, and the trie MUST treat a
+same-`event_id` duplicate as a no-op — which §46.5's replace-on-add and
+§11's `hot_count >= 0` already give it for free (ADR-0001 Amendment 1
+clause 5). Whether to set `enable_idempotence=True` instead is **not decided
+here**; see the follow-up below. The *mechanism* the sentence
 implied — that the consumer recognises a redelivery and declines to apply its
 counters — is not how it is met, and is not required. Under ADR-0011 the
 aggregator meets it structurally:
@@ -118,10 +130,26 @@ this ADR allows independent counters and a shared one is the stricter
 choice, so `event_id`'s `(agent_id, sequence, event_type, subject)`
 derivation is unaffected), and `subject` is the IP (ADR-0004). Because both
 are properties of the *shard*, not of the worker process, an IP's event
-identity and sequence are continuous across a handover: the next owner
-continues the same `agent_id` from the same `next_sequence`. That continuity
-is what ADR-0001 Amendment 1 relies on for the per-IP ordering guarantee it
-states for §22.
+identity is continued — not restarted — across a handover: the next owner
+carries on the same `agent_id` from the persisted `next_sequence`. The
+sequence is strictly increasing per shard but not contiguous (a number is
+consumed before the transition is persisted, and one counter serves both
+event types — ADR-0011 decision 4 step 2, assumption 14); consumers may rely
+on monotonicity, never on density. That continuation is what ADR-0001
+Amendment 1 relies on for the per-IP ordering guarantee it states for §22.
+
+**Follow-up for the top-level session, not assumed here:** turning on
+`enable_idempotence=True` in `KafkaProducer` would make the transport
+promise match the emitter's (exactly one copy of each record in the
+stream). The trade-off, from the same docstring: it forces `acks="all"`
+(a `ValueError` if set otherwise), which adds replication latency to every
+`publish` the aggregator awaits per transition and every per-IP message
+ingest awaits per batch, and it requires broker support for idempotent
+producers. It is a code and deployment change outside M4's brief and
+changes an observable default, so it needs its own decision and a
+`CHANGES` entry if made. The design is correct without it because the trie
+absorbs duplicates; the question is only whether to also remove them at the
+source.
 
 Assumptions (each a judgment call; push back individually):
 
