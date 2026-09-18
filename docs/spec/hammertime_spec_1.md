@@ -2385,6 +2385,15 @@ Do not prematurely distribute the trie if a single instance can sustain the requ
 
 The fundamental trie operation is only 32 steps for IPv4, so the likely bottlenecks should be measured before introducing distributed prefix aggregation.
 
+> ADR-0012: every component the reference deployment runs, imports or
+> builds with is under an OSI-approved licence, and any single-vendor
+> component with a paid tier has a named, exercised open-source drop-in.
+> The durable event log (item 12) is Apache Kafka in the reference
+> deployment, with Redpanda as a documented deployment-only substitute;
+> the dedup and shard-state store is Valkey. Every container image is
+> pinned to at least `major.minor`. The licence inventory and the rule a
+> dependency-changing PR must satisfy are in that ADR.
+
 ---
 
 # 44. Future Extensions

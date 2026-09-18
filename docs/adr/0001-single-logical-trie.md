@@ -224,7 +224,9 @@ Assumptions (each a judgment call, push back individually):
   in offset order) is asserted here of Redpanda only on the strength of its
   serving the Kafka wire protocol, which is what the trie epic's integration
   tests will exercise. If that turns out not to hold, clause 3 is the clause
-  affected.
+  affected. ADR-0012 (decision 9) makes Apache Kafka the reference broker
+  and Redpanda a deployment-only substitute, so once that compose change
+  lands the citation above and the reference deployment agree.
 * **Shard assignment is deterministic because the producer's partitioner
   is.** aiokafka's `DefaultPartitioner`, read from the installed
   `aiokafka==0.14.0`

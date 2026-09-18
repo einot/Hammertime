@@ -6,9 +6,10 @@ Prefix Detection Service*, 47 sections (1-45 as originally written; §46 added b
 ADR-0005, which also adds pointer notes to §9, §12, §16, §29, §33, §34, §37;
 §47 added by ADR-0009, which adds pointer notes to §33 and §34, ADR-0010
 adds pointer notes to §13 and §29, ADR-0011 adds pointer notes to §5, §20,
-§24, §26, §30, §34 and §37, and ADR-0001 Amendment 1 — the consistency model
+§24, §26, §30, §34 and §37, ADR-0001 Amendment 1 — the consistency model
 for many aggregator shards feeding one trie — adds pointer notes to §21 and
-§22).
+§22, and ADR-0012 — open-source-only components with named drop-ins — adds
+a pointer note to §43).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -59,5 +60,6 @@ Section index used throughout the code:
 | 36.1-36.4 | Agent credentials (hashed tokens, rotation, provisioning) | `services/ingest/auth/agents.py`, `core/auth/tokens.py`, `tools/agent-token`, `schemas/agent_registry.v2.json`, `docs/adr/0006` |
 | 36.5-36.7 | Auth throttling, request cost, throttled responses | `services/ingest/auth`, `services/ingest/ratelimit`, `services/ingest/api/routes.py`, `docs/adr/0007`, `docs/adr/0008` |
 | 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `deploy/grafana` |
+| 43 | Recommended initial implementation; reference components (event log, store, images) and their licence policy | `deploy/docker-compose.yml`, `docs/adr/0012` |
 | 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events`, `core/config`, `docs/adr/0005`, `docs/adr/0011` |
 | 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `docs/adr/0009`, `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |
