@@ -329,7 +329,9 @@ class HotCountTrie(Protocol):     # satisfied structurally by BinaryTrie and Pat
     def hot_count(self, prefix: Prefix) -> int: ...
     def edges(self) -> Iterator[Any]: ...      # items with .prefix, .parent_length, .hot_count, .pinned
 
-def assert_hot_count_consistent(trie: HotCountTrie) -> None        # I1, I2, I4 recomputed bottom-up from hot_ips()
+def assert_hot_count_consistent(trie: HotCountTrie) -> None        # I1, I2, I4: expected counts accumulated from hot_ips() in one pass and
+                                                                    # compared with an expansion of edges(); structural only -- it does not
+                                                                    # call hot_count(prefix), whose answers the equivalence contract covers (A12)
 def assert_no_negative_counts(trie: HotCountTrie) -> None          # I3 over edges()
 def assert_attribute_records_consistent(trie: HotCountTrie, records: Iterable[Address]) -> None
                                                                     # section 46.5: {a for a in records if a.family is trie.family} == set(hot_ips())
@@ -349,8 +351,9 @@ pool**, not from the whole address space: a random 32- or 128-bit address
 almost never shares a prefix with another, so an unconstrained draw
 exercises neither branching, nor compression, nor the merge that follows a
 prune. The pool MUST contain at least 8 addresses per family (the shipped
-test uses 12 IPv4, 6 IPv6 — the IPv6 pool may be smaller because its
-per-step cost is 4x), constructed so that: at least three pairs share a
+test uses 12 IPv4 and 8 IPv6; an earlier 6-member IPv6 pool could not hold
+two sibling-leaf pairs and two isolated members at once, which is what the
+floor of 8 is for), constructed so that: at least three pairs share a
 `/24` (IPv6: `/120`) but not a `/32` (`/128`); at least two pairs differ only
 in their last bit (sibling leaves, so pruning one merges the other into its
 parent's edge); at least two addresses share no prefix longer than `/8`
@@ -366,7 +369,10 @@ shape and /23 its compressed-away ancestor, so setting metadata at /23 must
 split an edge and pin the new node, and clearing it must merge the edge
 back; /32 is a leaf, where metadata and a hot address share one node and
 the pin must outlive the address. The pool is a module-level constant with
-a comment stating which of these properties each member provides.
+a comment stating which of these properties each member provides, and the
+module carries a test that computes the pairwise common-prefix lengths of
+the pool and asserts all four properties, so an edit to the pool cannot
+silently weaken the machine.
 
 **Check cadence (A12).** After every rule: `check_invariants` on both tries
 (O(`node_count`)), the I9 bound, and a *bounded probe* of the equivalence
@@ -387,7 +393,11 @@ Hypothesis 6.168.0 runs an `@invariant()` "after every rule" (installed
 its `.TestCase` attribute, whose default settings already disable the
 deadline (line 504). The strategies live in `hammertime.testkit.generators`
 (`addresses(family)`, `prefixes(family)`, `hot_ip_streams(family)`), so the
-service's own tests can reuse them.
+service's own tests can reuse them — `test_patricia_equivalence.py` does.
+The property machine itself does not import them: under the sampling rule
+its addresses come from the fixed pool and its metadata prefixes from the
+pool's own ancestors, so an unbounded address or prefix strategy has no
+place in it.
 
 > Amended 2026-09-18 (A12): the first paragraph originally ended "with
 > `@invariant()` methods running `check_invariants` on both, the equivalence
@@ -1425,8 +1435,9 @@ than the typed literal. C1: none.
 Decision 4 as first written implied unconstrained address draws and the
 full equivalence contract after every step. T1 found the latter O(|hot| x
 bit_length^2) per step through `assert_hot_count_consistent` and, on its
-own initiative, moved to a fixed pool (12 IPv4, 6 IPv6 chosen for prefix
-sharing), a bounded per-step probe with the full check at the boundaries,
+own initiative, moved to a fixed pool (12 IPv4 and, first, 6 IPv6 chosen
+for prefix sharing — raised to 8 IPv6 when six proved unable to hold two
+sibling-leaf pairs and two isolated members together), a bounded per-step probe with the full check at the boundaries,
 and per-family step/example bounds. Ruling: accepted, and turned into the
 rule now in decision 4 so a later reader does not have to re-derive it from
 the test file: a fixed per-family pool of at least 8 addresses with the
@@ -1450,6 +1461,25 @@ implementation (nobody has run it: its targets do not exist yet). Separately, T1
 expected counts of every ancestor into one dict in a single pass over
 `hot_ips()` before comparing against `edges()`; that is a testkit
 implementation detail, not contract. C1: none.
+
+**What `assert_hot_count_consistent` does and does not check (ruled here so
+the helper is not read as stronger than it is).** T1 made the helper linear
+as permitted, and in doing so dropped a statement it previously carried:
+that every compressed-away logical prefix *answers* `hot_count(prefix)`
+with the count of the edge below it. Ruling: that drop is correct. Decision
+3's table is what `check_invariants` enforces, and I1, I2 and I4 are
+statements about stored counts on materialized nodes and their relation to
+the hot set — structural facts recoverable from `hot_ips()` and `edges()`
+alone. Whether `hot_count(prefix)` *answers* correctly for a logical prefix
+is a property of the query method, and it is the equivalence contract's
+job (decision 3: `hot_count(prefix)` and `path_counts(ip)` agree with the
+oracle for every prefix and address). It is covered at the boundaries of
+the property machine (full contract at `@initialize`/`teardown()`), per
+operation in `test_patricia_equivalence.py`, and directly in
+`test_structure.py`'s compressed-ancestor case; that is sufficient, and the
+helper's comment in decision 3 now says it is structural only. A reader
+who needs the answering property asserted per step should add it to the
+machine's bounded probe, not to the testkit helper.
 
 No `CHANGES` entry: nothing here has shipped; the rulings pin behaviour of
 code that is being written against them.
