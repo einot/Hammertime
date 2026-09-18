@@ -144,23 +144,87 @@ which is what the last consequence of this ADR claimed.
 
 Assumptions (each a judgment call, push back individually):
 
-* **Per-partition ordering of the hot-ip topic is relied on, and the Kafka
-  documentation stating it could not be fetched from this environment**
-  (kafka.apache.org is blocked by the egress proxy; the GitHub mirrors of
-  the docs tree returned 404 on 2026-09-18). Clause 3 rests on the
-  well-known guarantee that a producer's records to one partition are
-  appended in send order and a consumer reads a partition in log order, and
-  on `KafkaProducer.publish` (`packages/hammertime-bus/.../kafka.py:79`)
-  awaiting `send_and_wait` per message — which in the installed
-  `aiokafka==0.14.0` is `future = await self.send(...); return await
-  future` (`.venv/lib/python3.12/site-packages/aiokafka/producer/producer.py:512-523`)
-  — so the emitter's publish order is its send order. The broker-side
-  ordering clause itself **remains unverified against a primary source**:
-  the R-M4-0 reviewer also found kafka.apache.org blocked and the GitHub
-  docs paths 404 from this environment. It is stated from recall and
-  should be checked against Kafka's "Guarantees" documentation by whoever
-  next has access. `InMemoryBus` gives the same order trivially (one log per
-  topic).
+* **Per-partition ordering of the hot-ip topic is relied on; the Kafka
+  guarantee behind it was verified against a primary source on
+  2026-09-18, and clause 3 stands as written.** Source: the Apache Kafka
+  4.3.1 release's own site documentation, `kafka_2.13-4.3.1-site-docs.tgz`
+  from `https://archive.apache.org/dist/kafka/4.3.1/` (sha512 checked
+  against the published `.sha512`; this tarball is what
+  kafka.apache.org/documentation serves — the site itself is blocked by
+  this environment's egress proxy, so the archive copy was read instead).
+  Paths below are inside that tarball.
+  *Consumer side* — `getting-started/introduction.md` line 83: "Events with
+  the same event key ... are written to the same partition, and Kafka
+  guarantees that any consumer of a given topic-partition will always read
+  that partition's events in exactly the same order as they were written";
+  `design/design.md` line 197 ("Message Delivery Semantics"): "All replicas
+  have the exact same log with the same offsets. The consumer controls its
+  position in this log"; line 285 (Replication): "All writes go to the
+  leader of the partition ... The logs on the followers are identical to
+  the leader's log--all have the same offsets and messages in the same
+  order". *Producer side* — `design/protocol.md` line 45: "on a single TCP
+  connection, requests will be processed in the order they are sent ...
+  The broker's request processing allows only a single in-flight request
+  per connection in order to guarantee this ordering."
+  **The qualification #89 anticipated is real but does not apply here.**
+  `generated/producer_config.html`, entry
+  `max.in.flight.requests.per.connection` (line 674): "if this configuration
+  is set to be greater than 1 and `enable.idempotence` is set to false,
+  there is a risk of message reordering after a failed send due to retries
+  (i.e., if retries are enabled); if retries are disabled or if
+  `enable.idempotence` is set to true, ordering will be preserved." (Those
+  are the Java client's knobs; the same file's `retries` entry, line 54,
+  spells out the failure: "if two batches are sent to a single partition,
+  and the first fails and is retried but the second succeeds, then the
+  records in the second batch may appear first".) So "appended
+  in send order" holds unconditionally only with at most one produce
+  request in flight per connection, or with idempotence on. The installed
+  `aiokafka==0.14.0` (`uv.lock`) has no `max_in_flight_requests` setting,
+  leaves `enable_idempotence=False` (ADR-0003 Amendment 2) and does retry
+  (`producer/sender.py:884-890`, `_can_retry`: every retriable error is
+  retried until the batch expires), so it meets the condition
+  structurally rather than by configuration, in two independent ways:
+  (i) its sender allows **one produce request in flight per broker node** —
+  `producer/sender.py:65` keeps `self._in_flight` as a set of node ids,
+  `drain_by_nodes(ignore_nodes=self._in_flight, ...)` (`sender.py:140-143`;
+  the skip is `message_accumulator.py:493-494`) never drains a partition
+  whose leader has a request outstanding, the node is added at
+  `sender.py:148` and removed only after the request handler completes
+  (`sender.py:290`); a batch that fails retriably is collected in
+  `_to_reenqueue` (`sender.py:792`, `:879`) and put back at the **head** of
+  its partition's queue (`message_accumulator.py:464-468`, `reenqueue`:
+  `self._batches[tp].appendleft(batch)`), ahead of anything accumulated
+  since — the equivalent of `max.in.flight.requests.per.connection=1`;
+  (ii) the emitter never has two hot-ip records outstanding anyway:
+  `KafkaProducer.publish` (`packages/hammertime-bus/.../kafka.py:79`)
+  awaits `send_and_wait` per record — in `aiokafka==0.14.0` that is
+  `future = await self.send(...); return await future`
+  (`producer/producer.py:512-523`), and a re-enqueued retry keeps that
+  future pending — and every path that emits a transition awaits
+  `TransitionEmitter.evaluate` one IP at a time (`worker.py:244`, `:253`,
+  `:374`; `reevaluate.py:53`), which awaits the publish at
+  `transitions.py:142` before returning. Hence, for this client and this
+  emitter, the guarantee is exactly as clause 3 states, clause 3 is **not**
+  amended, and `enable_idempotence` (ADR-0003 Amendment 2's follow-up, #88)
+  is **not load-bearing for ordering** — it remains only the question of
+  removing at the source the same-`event_id` duplicate that clause 5 and
+  `design/design.md` line 193 ("the message may be written to the log again
+  during resending") already account for. (Ingest publishes its per-IP
+  observation messages concurrently with `asyncio.gather`,
+  `services/ingest/.../publisher.py:116`; that is the observations topic,
+  whose ordering clause 3 does not claim.) `InMemoryBus` gives the same
+  order trivially (one log per topic).
+* **The reference deployment's broker is Redpanda, and the citation above
+  is Kafka's.** `deploy/docker-compose.yml:5` runs `redpandadata/redpanda:latest`
+  (unpinned), not Apache Kafka. Redpanda's own documentation is not
+  reachable from this environment and was not checked. The client-side
+  half of the argument (one request in flight per node; awaited per-record
+  publish) is a property of aiokafka and of this emitter and holds against
+  any broker; the broker-side half (a partition is an append-only log read
+  in offset order) is asserted here of Redpanda only on the strength of its
+  serving the Kafka wire protocol, which is what the trie epic's integration
+  tests will exercise. If that turns out not to hold, clause 3 is the clause
+  affected.
 * **Shard assignment is deterministic because the producer's partitioner
   is.** aiokafka's `DefaultPartitioner`, read from the installed
   `aiokafka==0.14.0`
