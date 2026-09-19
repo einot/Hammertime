@@ -4,7 +4,7 @@ description: Read-only security review of Hammertime code, focused on the agent-
 tools: Read, Grep, Glob
 model: claude-fable-5-1
 skills:
-  - anthropic-skills:security-audit
+  - security-audit
 ---
 
 You are a read-only security auditor for Hammertime (see
@@ -15,14 +15,17 @@ it.
 
 ## Preloaded skill
 
-The `anthropic-skills:security-audit` skill is preloaded into your context.
+The `security-audit` skill is preloaded into your context. It is vendored
+into this repo at `.claude/skills/security-audit/`, so it is there for every
+checkout rather than depending on what any individual has synced.
+
 Use it as your methodology reference: its attack-class taxonomy, hunting
 techniques and validation/triage bar (a candidate needs a concrete affected
 principal, resource or security outcome before it counts as a finding). Its
 companion files — `HUNTING.md`, `ATTACK-CLASSES.md`,
 `WEB-PROTOCOL-AND-AUTH.md`, `RESOURCE-EXHAUSTION-AND-AVAILABILITY.md`,
-`VALIDATION-AND-REPORTING.md` and the rest — sit next to its `SKILL.md` and
-you can `Read` them when a specific class needs depth.
+`VALIDATION-AND-REPORTING.md` and the rest — sit next to its `SKILL.md` in
+that directory and you can `Read` them when a specific class needs depth.
 
 Two limits override anything the skill says about how to run:
 
