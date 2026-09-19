@@ -25,10 +25,80 @@
 #                        and against the path made relative to
 #                        `${CLAUDE_PROJECT_DIR:-$cwd}`. Only consulted
 #                        when `node` is in ALLOW_CMDS.
+#   SCOPE_AGENT_TYPES  - agent types this policy applies to, matched
+#                        against the payload's `agent_type`. Unset or
+#                        empty polices every Bash call that reaches this
+#                        hook (the historical behaviour). Set polices
+#                        only the listed agents and passes every other
+#                        caller through untouched. See WIRING below --
+#                        this exists because the hook has to be
+#                        installed session-wide.
 #
 # Reads the PreToolUse JSON payload on stdin (see
 # https://code.claude.com/docs/en/hooks) and inspects tool_input.command.
 # Any tool other than Bash passes through.
+#
+# WIRING -- read this before believing the guard is doing anything.
+#
+# This hook must be wired in `.claude/settings.json` or
+# `.claude/settings.local.json`. It must NOT be wired in an agent file's
+# `hooks:` frontmatter. The CLI's markdown-agent parser reads name,
+# description, tools, skills, color and model, and drops `hooks` without
+# complaint, so an agent configured that way runs completely unfenced
+# with no error anywhere. That is not a guess: it was established by
+# experiment after this guard had been reviewed nine times without once
+# being invoked. The smoke test that caught it was the wired
+# security-auditor successfully running `sed -n 1,2p CHANGES`, with `sed`
+# absent from its ALLOW_CMDS.
+#
+#   * agent-file `hooks:` frontmatter -- does NOT fire. Three probes: the
+#     real agent, a throwaway file-based probe with an absolute hook
+#     path, and the same probe with ${CLAUDE_PROJECT_DIR}. All three ran
+#     the command that should have been denied.
+#   * inline `--agents` JSON hooks -- DO fire, including `VAR='x' /path`
+#     env assignments and ${CLAUDE_PROJECT_DIR}.
+#   * settings.json / settings.local.json hooks -- DO fire for subagent
+#     Bash calls, and ${CLAUDE_PROJECT_DIR} expands there.
+#
+# Settings-level hooks are session-wide, so they see every Bash call in
+# the session and not just the agent you meant to fence. That is what
+# SCOPE_AGENT_TYPES is for: the payload's `agent_type` names the caller
+# ("security-auditor" for that subagent, absent for a top-level call), so
+# a policy can be aimed at the agent it was written for.
+#
+# One entry carries one policy. The env vars come from the hook's own
+# command line, so two agents needing different allowlists need two
+# settings entries, each with its own SCOPE_AGENT_TYPES and its own
+# ALLOW_CMDS; there is no way to express two policies in one entry. Two
+# entries whose SCOPE_AGENT_TYPES overlap would both run, and the
+# stricter one's denial wins, since any deny is final.
+#
+# Two properties of this arrangement. Both are things a reader needs to
+# know, and neither is a safety claim:
+#
+#   SCOPING IS FAIL-OPEN BY DESIGN. An absent or unrecognised agent_type
+#   means "not my business", not "deny". It is routing, not a check. This
+#   guard exists to fence one agent against one policy; every other
+#   caller is governed by its own configuration, or by Claude Code's own
+#   sandbox. A version that denied unrecognised callers would break the
+#   session it was installed in and would still not be a security
+#   boundary for them, because it knows nothing about what they may do.
+#   So do not read an exit 0 here as approval -- for an out-of-scope
+#   caller it means only that this policy did not apply.
+#
+#   THE GUARD IS INERT UNLESS CONFIGURED, and that is the failure mode
+#   that cost nine rounds. An empty ALLOW_CMDS exits 0. An unmatched
+#   agent_type now exits 0. A hook wired where the parser ignores it
+#   never runs at all. From outside, all three are indistinguishable from
+#   a working guard: the command simply succeeds. Reading the settings
+#   file is not enough either, because it does not tell you the hook was
+#   reached. The only way to know it is live is to run a command that
+#   MUST be denied and look at the refusal: it has to say "Hammertime
+#   bash guard:". If it instead says "Claude Code may only write to files
+#   in the allowed working directories", that is the platform sandbox and
+#   this guard is not running. Do that check after any change to the
+#   wiring, and treat a silent success on a command that should be
+#   refused as evidence the fence is missing rather than as a pass.
 #
 # What it enforces beyond the name allowlist: the whole command is
 # rejected if it contains redirection, backgrounding, process
@@ -353,6 +423,7 @@ input="$(cat)"
 tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
 command_str="$(printf '%s' "$input" | jq -r '.tool_input.command // empty')"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
+agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
 
 deny() {
   local reason="$1"
@@ -367,6 +438,33 @@ deny() {
 }
 
 [[ "$tool_name" == "Bash" ]] || exit 0
+
+# Scope routing -- deliberately NOT a check. This hook has to be wired
+# session-wide (see WIRING in the header), so it sees Bash calls from
+# callers this policy was never written for. When SCOPE_AGENT_TYPES is
+# set, only the listed agents are policed and everyone else passes
+# through untouched: an absent agent_type (a top-level Bash call carries
+# none) or one that is not on the list means "not my business", not
+# "deny". Unset behaves as it always has and polices every Bash call
+# that reaches this hook, which is what the test suite exercises.
+#
+# This test deliberately sits first, before the allowlist and the
+# command are even looked at, so that an out-of-scope caller costs
+# nothing and cannot be affected by this policy's configuration.
+if [[ -n "${SCOPE_AGENT_TYPES:-}" ]]; then
+  in_scope=0
+  if [[ -n "$agent_type" ]]; then
+    for scoped_agent in $SCOPE_AGENT_TYPES; do
+      if [[ "$agent_type" == "$scoped_agent" ]]; then
+        in_scope=1
+        break
+      fi
+    done
+  fi
+  if (( ! in_scope )); then
+    exit 0
+  fi
+fi
 
 # No command allowlist means this agent is not guarded on Bash at all.
 [[ -n "${ALLOW_CMDS:-}" ]] || exit 0
