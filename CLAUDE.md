@@ -166,14 +166,18 @@ Anything switched off in CI is recorded here together with the condition
 for switching it back on. Nothing gets disabled without an entry, and no
 entry is deleted until the thing is genuinely running again.
 
-**`integration` job — disabled, pending #26.** `.github/workflows/ci.yml`
-carries `if: false` on that job. It could never pass:
-`tests/integration` and `tests/e2e` contain no collectable tests (pytest
-exits 5), and three of the four services — aggregator, trie, detector —
-have no `def` or `class` outside their own test directories, so they
-crash-loop under `docker compose`. **No test is skipped or quarantined by
-this**: there are none in those directories to skip. A disabled job shows
-as skipped rather than green, so nothing claims to pass that does not.
+**`integration` job — disabled, pending #52.** (Originally tracked by
+#26, closed 2026-09-17; #52 now carries the remaining work. Note that
+`.github/workflows/ci.yml` and several ADRs still cite #26 — in the ADRs
+that is a correct historical record and is left alone.)
+`.github/workflows/ci.yml` carries `if: false` on that job. It could
+never pass: `tests/integration` and `tests/e2e` contain no collectable
+tests (pytest exits 5), and three of the four services — aggregator,
+trie, detector — have no `def` or `class` outside their own test
+directories, so they crash-loop under `docker compose`. **No test is
+skipped or quarantined by this**: there are none in those directories to
+skip. A disabled job shows as skipped rather than green, so nothing
+claims to pass that does not.
 
 Re-enable when all three of these hold:
 
