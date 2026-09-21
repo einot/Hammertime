@@ -2,26 +2,31 @@
 
 These are configuration regression tests rather than spec tests. They exist
 because of issue #102: every write-capable subagent (`coder`, `architect`,
-`test-author`) ran completely unfenced, because its guard was declared under a
-`hooks:` key in the agent file's own YAML frontmatter. The CLI's markdown-agent
-parser accepts that key and silently discards it -- no error, no warning, no
-observable signal anywhere. The guard simply never ran, and from outside that is
-indistinguishable from a guard that runs and allows everything.
+`test-author`) had its guard declared under a `hooks:` key in the agent file's
+own YAML frontmatter, and a guard declared that way has been observed to
+silently not fire -- no error, no warning, nothing to notice. From outside, that
+is indistinguishable from a guard that runs and allows everything.
 
-The only wiring location that fires is `.claude/settings.json`. Hooks declared
-there are *session-wide*, so each policy names the agent(s) it applies to with a
-`SCOPE_AGENT_TYPES='<name>'` assignment on the hook's command line; a policy
-that constrains paths but names no agent would police every caller, including
-the top-level session.
+The same frontmatter block has also been seen to fire on a later probe, so the
+mechanism is unreliable rather than reliably broken. That is worse, not better:
+a policy declared there can look enforced while it is not, and what makes the
+difference has not been characterised.
+
+`.claude/settings.json` is the documented wiring location, and its enforcement
+has been verified by direct probe, which is why it is the only one permitted
+here. Hooks declared there are *session-wide*, so each policy names the agent(s)
+it applies to with a `SCOPE_AGENT_TYPES='<name>'` assignment on the hook's
+command line; a policy that constrains paths but names no agent would police
+every caller, including the top-level session.
 
 Every invariant below is derived by globbing `.claude/agents/*.md` and reading
 `.claude/settings.json`, so a newly added agent that can write or execute fails
 these tests without anyone having to remember to update them.
 
 See also `.claude/hooks/path-guard.sh` and `.claude/hooks/bash-guard.sh`, whose
-own headers record the experiment that established the frontmatter wiring is
-dead, and `tests/config/test_path_guard_behavior.py`, which exercises the guard
-script itself.
+own headers record the probes of the frontmatter wiring, and
+`tests/config/test_path_guard_behavior.py`, which exercises the guard script
+itself.
 """
 
 import dataclasses
@@ -47,14 +52,15 @@ GUARDED_TOOLS = frozenset({"Edit", "Write", "Bash"})
 # policy setting none of these is inert, whatever else it says.
 CONSTRAINT_VARS = ("DENY_GLOBS", "ALLOW_GLOBS", "ALLOW_CMDS")
 
-WHY_FRONTMATTER_HOOKS_ARE_DEAD = (
-    "A frontmatter 'hooks:' key does not wire anything and never did: the CLI's "
-    "markdown-agent parser reads name/description/tools/skills/color/model and "
-    "discards 'hooks' without complaint -- no error, no warning, nothing to notice "
-    "(issue #102). An agent configured that way runs completely unfenced while its "
-    "own file claims it is guarded, which is worse than having no guard at all. "
-    "Declare the policy in .claude/settings.json under hooks.PreToolUse instead, "
-    "scoped with SCOPE_AGENT_TYPES='<agent name>' on the hook command line."
+WHY_FRONTMATTER_HOOKS_ARE_BANNED = (
+    "A frontmatter 'hooks:' key is not a reliable way to wire a guard. A policy declared "
+    "there has been observed to silently not fire -- no error, no warning, nothing to "
+    "notice (issue #102) -- and has also been seen to fire on a later probe, and what "
+    "makes the difference has not been characterised. An agent configured that way can "
+    "run unfenced while its own file claims it is guarded, which is worse than having no "
+    "guard at all. Declare the policy in .claude/settings.json under hooks.PreToolUse "
+    "instead: that is the documented location, and its enforcement has been verified by "
+    "direct probe. Scope it with SCOPE_AGENT_TYPES='<agent name>' on the hook command line."
 )
 
 
@@ -168,7 +174,7 @@ def load_agents() -> list[AgentFile]:
 def load_pretooluse_entries() -> list[dict[str, Any]]:
     assert SETTINGS_PATH.is_file(), (
         f"{SETTINGS_PATH} does not exist, and it is the only place a subagent "
-        f"PreToolUse hook actually fires from. {WHY_FRONTMATTER_HOOKS_ARE_DEAD}"
+        f"PreToolUse hook may be wired from. {WHY_FRONTMATTER_HOOKS_ARE_BANNED}"
     )
     settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     hooks = settings.get("hooks")
@@ -176,7 +182,7 @@ def load_pretooluse_entries() -> list[dict[str, Any]]:
     entries = hooks.get("PreToolUse")
     assert isinstance(entries, list) and entries, (
         f"{SETTINGS_PATH} has no non-empty hooks.PreToolUse array, so no guard is wired "
-        f"for any subagent at all. {WHY_FRONTMATTER_HOOKS_ARE_DEAD}"
+        f"for any subagent at all. {WHY_FRONTMATTER_HOOKS_ARE_BANNED}"
     )
     return entries
 
@@ -278,9 +284,9 @@ def test_settings_declares_well_formed_pretooluse_hooks() -> None:
 def test_agent_file_declares_no_frontmatter_hooks(agent: AgentFile) -> None:
     assert "hooks" not in agent.fields, (
         f"{agent.path} declares a frontmatter 'hooks:' key. "
-        f"{WHY_FRONTMATTER_HOOKS_ARE_DEAD} Delete the block from the agent file: "
+        f"{WHY_FRONTMATTER_HOOKS_ARE_BANNED} Delete the block from the agent file: "
         "leaving it beside a working settings.json policy is a second copy of the "
-        "policy that nothing enforces and nothing keeps in sync."
+        "policy that nothing reliably enforces and nothing keeps in sync."
     )
 
 
@@ -305,7 +311,7 @@ def test_write_or_exec_capable_agent_is_named_by_a_policy(agent: AgentFile) -> N
     assert policies_for(agent.name), (
         f"agent '{agent.name}' ({agent.path}) holds {list(agent.guarded_tools)} but no "
         f"PreToolUse entry in {SETTINGS_PATH} names it in SCOPE_AGENT_TYPES, so nothing "
-        f"fences it. {WHY_FRONTMATTER_HOOKS_ARE_DEAD}"
+        f"fences it. {WHY_FRONTMATTER_HOOKS_ARE_BANNED}"
     )
 
 
