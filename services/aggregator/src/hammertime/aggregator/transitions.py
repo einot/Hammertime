@@ -138,9 +138,15 @@ class TransitionEmitter:
             payload=payload,
         )
         # Both bus producers return only once the broker has acknowledged, so
-        # there is no separate flush per transition.
+        # there is no separate flush per transition. The `event_id` travels
+        # as the log's own dedup key (ADR-0013 decision 4; ADR-0003 Amendment
+        # 3 item 3), so a retried publish inside the duplicate window is one
+        # record.
         await self._producer.publish(
-            HOT_IP.name, key=HOT_IP.key_selector(payload), value=encode(envelope)
+            HOT_IP.name,
+            key=HOT_IP.key_selector(payload),
+            value=encode(envelope),
+            message_id=envelope.event_id,
         )
 
         window.set_state(ip, new)

@@ -21,6 +21,12 @@ paths (spec section 47.6). The configuration version gate lives in
 `ConfigPoller.poll_once()` and nowhere else (ADR-0011 Amendment 3 item A12):
 this service adds no check of its own, it merely hands the poller
 `worker.apply_config` as its `apply` hook.
+
+The bus is NATS JetStream (ADR-0013): `NatsBus` is started under
+`connect_with_retry` with the bus package's own transient tuple, and closed
+-- which `nak`s whatever was fetched but never handled -- only after the
+worker's `stop()` has sent its final acknowledgement on the live consumer
+(decision 8, Amendment 1 ruling T8).
 """
 
 import asyncio
@@ -29,13 +35,12 @@ from collections.abc import Iterator, Mapping
 from urllib.parse import urlsplit
 
 import uvicorn
-from aiokafka.errors import KafkaConnectionError
 from hammertime.aggregator.config import AggregatorSettings
 from hammertime.aggregator.metrics import AggregatorMetrics
-from hammertime.aggregator.worker import CONSUMER_GROUP, AggregatorWorker, MessageBus
-from hammertime.bus.interface import Consumer, Producer
-from hammertime.bus.kafka import KafkaConsumer, KafkaProducer
+from hammertime.aggregator.worker import CONSUMER_GROUP, AggregatorWorker
+from hammertime.bus.interface import MessageBus
 from hammertime.bus.memory import InMemoryBus
+from hammertime.bus.nats import TRANSIENT_ERRORS, NatsBus, bus_endpoints
 from hammertime.core.config.loader import load as load_detection_config
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.runtime import ConfigPoller, Readiness, connect_with_retry, create_admin_app
@@ -54,7 +59,6 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 SERVICE_NAME = "aggregator"
 
 #: Spec section 47.2: connectivity is retried, a rejected credential is not.
-_TRANSIENT_BUS_ERRORS: tuple[type[BaseException], ...] = (OSError, KafkaConnectionError)
 _TRANSIENT_STORE_ERRORS: tuple[type[BaseException], ...] = (
     OSError,
     RedisConnectionError,
@@ -94,39 +98,6 @@ class _RunnerControlledServer(uvicorn.Server):
         yield
 
 
-class _KafkaBus:
-    """The Kafka producer/consumer pair, behind the worker's `MessageBus`.
-
-    `hammertime.bus.kafka` ships the two clients rather than a bus object, so
-    this is where they are paired and where their `start()`/`stop()` -- which
-    the in-memory bus does not need -- are owned.
-    """
-
-    def __init__(self, brokers: str) -> None:
-        self._brokers = brokers
-        self._producer = KafkaProducer(bootstrap_servers=brokers)
-        self._consumers: list[KafkaConsumer] = []
-
-    def producer(self) -> Producer:
-        return self._producer
-
-    def consumer(self, group_id: str) -> Consumer:
-        consumer = KafkaConsumer(bootstrap_servers=self._brokers, group_id=group_id)
-        self._consumers.append(consumer)
-        return consumer
-
-    async def start(self) -> None:
-        """Connect both clients, retrying a broker that is not up yet."""
-        await connect_with_retry("bus", self._producer.start, transient=_TRANSIENT_BUS_ERRORS)
-        for consumer in self._consumers:
-            await connect_with_retry("bus", consumer.start, transient=_TRANSIENT_BUS_ERRORS)
-
-    async def close(self) -> None:
-        for consumer in self._consumers:
-            await consumer.stop()
-        await self._producer.stop()
-
-
 class AggregatorService:
     """The aggregator as ADR-0009 decision 3's `Service`."""
 
@@ -136,7 +107,7 @@ class AggregatorService:
         worker: AggregatorWorker,
         detection_config: DetectionConfig,
         *,
-        transport: _KafkaBus | None = None,
+        transport: NatsBus | None = None,
         store_client: Redis | None = None,
     ) -> None:
         self.name = SERVICE_NAME
@@ -169,11 +140,13 @@ class AggregatorService:
         Readiness for the aggregator is "config loaded; consumer subscribed;
         shard claims held": the detection configuration was loaded in
         `build_service`, and `AggregatorWorker.start()` returns only once
-        `subscribe()` has delivered the initial assignment (ADR-0011
-        decision 1).
+        `subscribe()` has delivered the static assignment and every shard's
+        lease is held (ADR-0013 decisions 3 and 7). A shard another member
+        holds is `ShardOwnedElsewhereError` out of here -- not transient, so
+        `run_service` logs `start_failed` and exits 1.
         """
         if self._transport is not None:
-            await self._transport.start()
+            await connect_with_retry("bus", self._transport.start, transient=TRANSIENT_ERRORS)
         if self._store_client is not None:
             await connect_with_retry("store", self._ping_store, transient=_TRANSIENT_STORE_ERRORS)
         await self._worker.start()
@@ -229,12 +202,14 @@ class AggregatorService:
     async def stop(self) -> None:
         """Request shutdown; idempotent, and safe before `start()`.
 
-        ADR-0009 decision 7 / ADR-0011 decision 6: stop fetching, finish the
-        in-flight message, flush the producer and commit the handled
-        position -- in that order, so a committed position never precedes the
-        transitions it produced, and never covers a message that has been
-        fetched and not yet handled (item A20). No state-store write is needed: the HOT set
-        is always current.
+        ADR-0009 decision 7 / ADR-0013 decision 8: stop fetching, finish the
+        in-flight message, flush the producer, acknowledge what was handled
+        and release the shard leases -- in that order, so an acknowledgement
+        never precedes the transitions it produced and never covers a
+        message that was fetched and not yet handled. The bus is closed
+        afterwards, by `run()`'s teardown, so the acknowledgement goes out on
+        a live consumer. No state-store write is needed: the HOT set is
+        always current.
         """
         self._stopping.set()
         self._readiness.mark_stopping()
@@ -246,7 +221,7 @@ class AggregatorService:
     # --- decision 3's per-service additions ---------------------------------
 
     async def run_maintenance(self) -> None:
-        """One expiry/warm-up/retention pass -- what the periodic loop calls."""
+        """One lease renewal and expiry/warm-up/retention pass -- what the periodic loop calls."""
         await self._worker.run_maintenance()
 
     async def reload_config(self) -> DetectionConfig:
@@ -259,18 +234,22 @@ class AggregatorService:
         return await self._poller.poll_once()
 
     def startup_fields(self) -> Mapping[str, object]:
-        """Decision 5 step 3's `starting` record, with no credential in it."""
+        """Decision 5 step 3's `starting` record, with no credential in it.
+
+        `bus_endpoints` stands in for the configured `HAMMERTIME_BUS_BROKERS`:
+        a NATS URL may carry userinfo, and no record may carry it (ADR-0013
+        decision 3 as amended by Amendment 2, ruling 3).
+        """
         fields: dict[str, object] = {
             "bus_kind": self._settings.bus_kind,
-            "bus_brokers": self._settings.bus_brokers,
+            "bus_endpoints": bus_endpoints(self._settings.bus_brokers),
             "store_kind": self._settings.store_kind,
             "config_path": str(self._settings.detection_config_path),
             "config_version": self._poller.current.config_version,
             "bind": f"{self._settings.host}:{self._settings.port}",
             "consumer_group": CONSUMER_GROUP,
-            "shard_ids": (
-                "auto" if self._settings.shard_ids is None else sorted(self._settings.shard_ids)
-            ),
+            "member_id": self._settings.member_id,
+            "shard_ids": sorted(self._settings.shard_ids),
         }
         if self._settings.store_kind == "redis":
             # HAMMERTIME_REDIS_URL may embed a password: host and db only.
@@ -294,7 +273,7 @@ class AggregatorService:
             ) from exc
 
     async def _maintenance_loop(self) -> None:
-        """Sleep `HAMMERTIME_AGGREGATOR_MAINTENANCE_INTERVAL_S`, sweep, repeat."""
+        """Sleep `HAMMERTIME_AGGREGATOR_MAINTENANCE_INTERVAL_S`, renew and sweep, repeat."""
         while not self._stopping.is_set():
             try:
                 await asyncio.wait_for(self._stopping.wait(), self._settings.maintenance_interval_s)
@@ -302,12 +281,16 @@ class AggregatorService:
                 pass
             else:
                 return
-            # A sweep that raises (a state-store outage, ADR-0011 assumption
-            # 7) takes the process down through `run()`: transitions that
-            # cannot be recorded must not be silently skipped.
+            # A sweep that raises -- a state-store outage (ADR-0011
+            # assumption 7) or a lost lease (ADR-0013 decision 7) -- takes
+            # the process down through `run()`: transitions that cannot be
+            # recorded, or a shard another member now owns, must not be
+            # silently carried on with.
             await self.run_maintenance()
 
     async def _close_clients(self) -> None:
+        # The bus first: closing it `nak`s what was fetched and never
+        # handled, after `stop()` has acknowledged what was (decision 8).
         transport, self._transport = self._transport, None
         if transport is not None:
             await transport.close()
@@ -334,17 +317,19 @@ def build_service(
     made, so a malformed one is a `ConfigurationError` out of the factory --
     which `run_service` reports as `config_invalid` and exit 2 -- rather than
     a traceback from inside `start()`, which would be exit 1 (ADR-0009
-    decisions 2 and 8).
+    decisions 2 and 8). The worker's producer and consumer are taken from
+    the bus here, before `start()`, which `NatsBus` permits (ADR-0013
+    decision 3, Amendment 1 ruling C8).
     """
     resolved_clock = SystemClock() if clock is None else clock
     detection_config = load_detection_config(settings.detection_config_path)
 
-    transport: _KafkaBus | None = None
+    transport: NatsBus | None = None
     resolved_bus: MessageBus
     if bus is not None:
         resolved_bus = bus
-    elif settings.bus_kind == "kafka":
-        transport = _KafkaBus(settings.bus_brokers)
+    elif settings.bus_kind == "nats":
+        transport = NatsBus(settings.bus_brokers)
         resolved_bus = transport
     else:
         resolved_bus = InMemoryBus()
@@ -369,6 +354,8 @@ def build_service(
         max_tracked_ips=settings.max_tracked_ips,
         commit_interval_s=settings.commit_interval_s,
         reevaluation_batch=settings.reevaluation_batch,
+        member_id=settings.member_id,
+        lease_ttl_s=settings.lease_ttl_s,
     )
     return AggregatorService(
         settings,
