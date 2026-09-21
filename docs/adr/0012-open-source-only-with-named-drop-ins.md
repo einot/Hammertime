@@ -446,7 +446,7 @@ exercise the reference images in CI. Until then the Status column's
 | pytest-asyncio | 1.4.0 | Apache-2.0 | no | compliant |
 | pytest-benchmark | 5.3.0 | BSD-2-Clause | no | compliant |
 | fakeredis (installed as `fakeredis[lua]` since 2026-09-21, Amendment 3; `dev` group) | 2.38.0 | BSD-3-Clause | no | compliant |
-| lupa (pulled by `fakeredis[lua]` as `lupa>=2.1`; test process only — it exists so the in-process fake can run the Lua `EVAL` of `RedisShardStateStore`'s lease, ADR-0013 decision 7; added 2026-09-21, Amendment 3) | 2.8 on PyPI (the locked version is to be read from `uv.lock` once the C1-followup change lands; the architect has no Bash) | MIT — the legacy `license` field reads `"MIT style"` and there is no `license_expression`; `license_files = ["LICENSE.txt"]`, which carries the MIT notice for Lupa ("Copyright (c) 2010-2017 Stefan Behnel") followed by the MIT licence of the bundled Lua ("Copyright © 1994–2017 Lua.org, PUC-Rio") | no (single maintainer; no paid tier) | compliant (test process only; wheel-only on PyPI for 2.8, see Amendment 3 assumption 2) |
+| lupa (pulled by `fakeredis[lua]` as `lupa>=2.1`; test process only — it exists so the in-process fake can run the Lua `EVAL` of `RedisShardStateStore`'s lease, ADR-0013 decision 7; added 2026-09-21, Amendment 3) | 2.8 (locked in `uv.lock` by the C1-followup change, recorded 2026-09-21; CI installs the `cp312-manylinux_2_17_x86_64` wheel, and PyPI also carries an sdist) | MIT — the legacy `license` field reads `"MIT style"` and there is no `license_expression`; `license_files = ["LICENSE.txt"]`, which carries the MIT notice for Lupa ("Copyright (c) 2010-2017 Stefan Behnel") followed by the MIT licence of the bundled Lua ("Copyright © 1994–2017 Lua.org, PUC-Rio") | no (single maintainer; no paid tier) | compliant (test process only; see Amendment 3 assumption 2, corrected 2026-09-21) |
 | types-jsonschema | 4.26.0.20260518 | Apache-2.0 | no | compliant |
 | ruff | 0.16.7 (lock; 0.16.8 on PyPI) | MIT | yes (Astral) — irrelevant under decision 3 | compliant |
 | mypy | 2.3.1 | MIT | no | compliant |
@@ -903,6 +903,11 @@ Read on 2026-09-21 for Amendment 3 (the `lupa` row):
   `https://pypi.org/pypi/lupa/2.8/json` — wheels
   `lupa-2.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl`
   and the `aarch64` equivalent (uploaded 2026-04-15); no sdist listed.
+  *Corrected 2026-09-21: the page does list an sdist, `lupa-2.8.tar.gz`
+  (sha256 `d8022641...`, 6 156 370 bytes, uploaded 2026-04-15, per
+  `uv.lock` as recorded by the C1-followup coder; the architect's re-read
+  of the page the same day confirms the filename). The summarised fetch
+  behind the original reading omitted it — Amendment 3 assumption 2.*
 * `https://raw.githubusercontent.com/scoder/lupa/master/LICENSE.txt`
   (summarised by the fetch tool; `master`, not the 2.8 tag) — the MIT
   licence, "Copyright (c) 2010-2017 Stefan Behnel. All rights reserved.",
@@ -1242,20 +1247,39 @@ Assumptions made by this amendment (push back individually):
    the evidence; the same tag-versus-branch posture Amendments 1 and 2
    took for Redpanda and `nats`. The bundled Lua is MIT under its own
    notice, so the wheel carries two MIT notices and no other licence.
-2. **Wheel-only is acceptable for a test dependency.** PyPI lists no
-   sdist for lupa 2.8, so a platform without a matching wheel cannot
-   install it at all rather than compiling it. CI (`ubuntu-latest`,
+2. **A wheel on the supported platforms is enough for a test
+   dependency.** *(Corrected 2026-09-21; the original text is quoted
+   below.)* PyPI does list an sdist for lupa 2.8 — `lupa-2.8.tar.gz`,
+   sha256 `d8022641...`, 6 156 370 bytes, uploaded 2026-04-15, as recorded
+   in `uv.lock` by the C1-followup change and reported by its coder; the
+   architect's own re-read of `https://pypi.org/pypi/lupa/2.8/json` on
+   2026-09-21 confirms the filename (the fetch tool truncated the digest
+   and size) — so a platform without a matching wheel builds it from
+   source (a C extension: a compiler and Lua headers, or the bundled Lua)
+   rather than failing to install. `uv.lock` resolves lupa 2.8; CI
+   (`ubuntu-latest`, x86_64, CPython 3.12) installs the
+   `cp312-manylinux_2_17_x86_64` wheel, and the service images never
+   install the `dev` group. A contributor whose platform lacks a wheel
+   gets a source build; if that fails the fallback is to pin an older
+   lupa, not to relax the lease to `WATCH`/`MULTI`. Original text: "PyPI
+   lists no sdist for lupa 2.8, so a platform without a matching wheel
+   cannot install it at all rather than compiling it. CI (`ubuntu-latest`,
    x86_64, CPython 3.12) and the developer platforms the repository
    supports have wheels; the service images never install the `dev`
    group. If a contributor's platform lacks a wheel, the fallback is to
    pin an older lupa with an sdist, not to relax the lease to
-   `WATCH`/`MULTI`.
+   `WATCH`/`MULTI`." The earlier "no sdist" reading came from a
+   summarised fetch of the same PyPI page that omitted the sdist entry;
+   ADR-0013 assumption 30 repeated it and is corrected the same day.
 3. **Not single-vendor.** One maintainer, no company, no paid tier;
    irrelevant under decision 3 in any case.
 4. **The locked version is not recorded here.** The architect cannot run
    `uv lock`; the `C1-followup` PR's `Licences` line (decision 6) states
    the version `uv.lock` resolves, and the row's "2.8 on PyPI" is to be
    replaced by it at the next amendment that touches this table.
+   *Done 2026-09-21: the C1-followup coder reported the lock resolves
+   lupa 2.8 (and recorded the sdist that assumption 2 had missed); the
+   row now says so.*
 5. **No `CHANGES` entry.** A test-only dependency has no user-visible
    effect (`CLAUDE.md`'s `CHANGES` rule: dependency bumps with no
    observable effect are not recorded).

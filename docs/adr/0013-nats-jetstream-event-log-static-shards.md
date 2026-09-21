@@ -11,7 +11,11 @@ partition and after a commit, `on_assigned(frozenset())`, the settings
 field names, the exact `auto` message, and decision 7's Lua under fakeredis.
 Every edit is in place with a dated note and is listed there; no decision
 changes in substance except decision 9's no-snapshot `start_offset`, which
-was wrong for the memory bus). Epic #95's first reason for the swap — that Kafka's cold start
+was wrong for the memory bus); amended again 2026-09-21 (see "Amendment
+2" — bus URLs may carry userinfo and no log record may carry it, reduced
+by `hammertime.bus.nats.bus_endpoints` and logged as `bus_endpoints`; the
+provisioning tool's records and test seams are pinned; assumption 30's
+"no sdist for lupa 2.8" is corrected). Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
 owner "may wish to revisit the decision" in that case, so the top-level
@@ -311,6 +315,40 @@ day-one step that runs **before** the services, and it is idempotent:
   schedule) or a stream conflicts, 2 on invalid arguments. It logs one
   `INFO event=stream_provisioned stream=<name> action=<created|updated|unchanged>`
   per stream through `configure_logging("provision", level)`.
+  *(Added 2026-09-21, Amendment 2 — the tool's surface, records and test
+  seams, so that its tests are written from this text.)* The module
+  `hammertime.tools.provision.__main__` exposes `build_parser() ->
+  argparse.ArgumentParser`, `async def provision(servers: list[str], *,
+  replicas: int, timeout_s: float) -> dict[str, str]` (stream name ->
+  action; raises the last transient error when `timeout_s` expires,
+  `StreamConfigConflictError` on an immutable difference, any other
+  `nats.errors.Error` as itself), `main(argv: Sequence[str] | None = None)
+  -> int`, `TRANSIENT_PROVISION_ERRORS` (a superset of
+  `hammertime.bus.nats.TRANSIENT_ERRORS` that adds
+  `nats.js.errors.ServiceUnavailableError` — a server whose JetStream is
+  not yet serving is "unreachable" for provisioning), `DEFAULT_REPLICAS =
+  1` and `DEFAULT_TIMEOUT_S = 60.0`. `--servers` is comma-separated,
+  entries stripped, empties dropped, at least one required; `--replicas`
+  MUST be a positive integer and `--timeout` a positive number; an invalid
+  invocation is argparse's `SystemExit(2)`, and an invalid
+  `HAMMERTIME_LOG_LEVEL` is a `config_invalid` record and a returned 2.
+  Its records, all through the logger configured by `main()`: `ERROR
+  stream_conflict stream=<name> field=<f> expected=<e> actual=<a>` (exit
+  1); `ERROR provision_failed reason=unreachable bus_endpoints=<list>
+  timeout_s=<s> error=<str>` when the deadline expired (exit 1); `ERROR
+  provision_failed reason=broker_error bus_endpoints=<list> error=<str>`
+  for any other `nats.errors.Error` (exit 1). **The `--servers` value never
+  appears in a record: every record that names the servers carries
+  `bus_endpoints = hammertime.bus.nats.bus_endpoints(servers)` (decision 3)
+  and nothing else derived from the value**, because a NATS URL may carry
+  a password or a token in its userinfo (decision 10, as amended). Test
+  seams: `main()` calls `provision` by looking it up on its own module at
+  call time; `provision` connects with `nats.connect(servers=<the list, as
+  given>, ...)` looked up on the `nats` module at call time and reconciles
+  with `ensure_streams`, imported by name into the tool's module — so a
+  test replaces `hammertime.tools.provision.__main__.provision`,
+  `nats.connect` and `hammertime.tools.provision.__main__.ensure_streams`
+  respectively, and no test needs a broker.
 * The reference deployment runs it as a one-shot compose service
   (`provision`) that depends on the broker being healthy, and every
   application service depends on `provision` having completed successfully
@@ -526,7 +564,43 @@ class NatsBus:                                   # satisfies MessageBus
     def producer(self) -> Producer               # one NatsProducer over the shared connection
     def consumer(self, group_id: str) -> Consumer   # a new NatsConsumer over the shared connection
     async def end_offset(self, topic: str) -> int   # stream_info(...).state.last_seq + 1 (amended 2026-09-21)
+
+def bus_endpoints(servers: str | Iterable[str]) -> list[str]:   # added 2026-09-21, Amendment 2
+    """`<scheme>://<host>[:<port>]` per server URL; userinfo, path, query and fragment dropped."""
 ```
+
+**`bus_endpoints(servers)`** *(added 2026-09-21, Amendment 2)* is the one
+reduction of a server list to something a log record may carry, and it is
+re-exported from `hammertime.bus`. A `str` argument is split exactly as
+`NatsBus.__init__` splits `HAMMERTIME_BUS_BROKERS` — on `,`, entries
+stripped, empties dropped — and an iterable is taken entry by entry, each
+stripped. An entry containing no `://` is read as `nats://<entry>` first
+(nats-py's own normalisation of a scheme-less server: Sources, Amendment
+2). Each entry is then `urlsplit`, and the result is `<scheme>://` followed
+by the part of the authority after its **last** `@` — the whole authority
+when there is no `@`. Nothing to the left of that `@` reaches the output:
+not a password, and not a username either, because nats-py reads a
+username with no password as an auth token (`nats://token@host:4222`;
+Sources, Amendment 2). Path, query and fragment are dropped (they carry
+nothing NATS uses). The function never raises: an entry `urlsplit` refuses
+(an unbalanced `[`, `ValueError: Invalid IPv6 URL`) is rendered as the
+fixed string `<unparseable>`, with nothing derived from the entry; an
+empty list is `[]`. It does not consult `SplitResult.port`, which raises a
+`ValueError` echoing the text it could not parse (the hazard ADR-0009
+A12 item 4 records for `redis://user:secret/0`). Examples, which tests
+pin: `nats://nats:4222` -> `nats://nats:4222`;
+`nats://user:s3cret@nats:4222` -> `nats://nats:4222`;
+`nats://s3cret-token@nats:4222` -> `nats://nats:4222`;
+`tls://user:s3cret@[::1]:4222/?x=1` -> `tls://[::1]:4222`;
+`user:s3cret@nats:4222` -> `nats://nats:4222`;
+`"nats://a:4222, nats://u:p@b:4222,"` -> `["nats://a:4222",
+"nats://b:4222"]`; `nats://[::1` -> `<unparseable>`. Every log record that
+names the bus servers carries this list under the field name
+`bus_endpoints` — the services' `starting` record (in place of
+`bus_brokers`; ADR-0009 A7's row is superseded, Amendment 2) and the
+provisioning tool's `provision_failed` records (decision 2) — and no
+record of any event carries `HAMMERTIME_BUS_BROKERS` or `--servers`
+verbatim or in any other derived form.
 
 `producer()` and `consumer()` are callable before `start()`: the objects
 they return use the connection lazily and raise `RuntimeError("NatsBus is
@@ -1062,7 +1136,7 @@ JetStream stream has one sequence across all its subjects, and
 | key | before | now |
 | --- | --- | --- |
 | `HAMMERTIME_BUS_KIND` | `kafka` (default) or `memory` | `nats` (default) or `memory`; `kafka` is a `ValueError` (exit 2) |
-| `HAMMERTIME_BUS_BROKERS` | Kafka bootstrap list, default `localhost:19092` | comma-separated NATS server URLs (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), default `nats://localhost:4222`; not validated by `load_settings` (unchanged posture; ADR-0009 A12's last assumption; assumption 15) |
+| `HAMMERTIME_BUS_BROKERS` | Kafka bootstrap list, default `localhost:19092` | comma-separated NATS server URLs (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), default `nats://localhost:4222`; not validated by `load_settings` (unchanged posture; ADR-0009 A12's last assumption; assumption 15). *Amended 2026-09-21 (Amendment 2): an entry MAY carry userinfo in the two forms nats-py reads — `nats://user:password@host:4222` and `nats://token@host:4222` — and so may `hammertime-provision --servers`; the value is passed to `nats.connect` as given, and no log record of any service or tool carries it: records name the servers only as `bus_endpoints = bus_endpoints(value)` (decision 3). This extends spec §47.7's "no record may contain a credential" to the userinfo of a bus URL and supersedes ADR-0009 A7's "`bus_brokers` is logged verbatim", which was written for Kafka's `host:port` bootstrap list.* |
 | `HAMMERTIME_SHARD_IDS` | `auto` (default) or a set | **required**; `all` or a set within `0..127`; `auto` rejected (decision 6) |
 | `HAMMERTIME_AGGREGATOR_MEMBER_ID` | — | new; default `socket.gethostname()` (decision 7) |
 | `HAMMERTIME_AGGREGATOR_LEASE_TTL_S` | — | new; default 30 (decision 7) |
@@ -1254,7 +1328,12 @@ not make. Push back on them individually.
     provisioner.
 13. **No credentials or TLS in the reference deployment.** As with Kafka
     today. `TRANSIENT_ERRORS` is correct for that configuration; the
-    credential rule of ADR-0009 A1 binds whoever adds them.
+    credential rule of ADR-0009 A1 binds whoever adds them. *Amended
+    2026-09-21 (Amendment 2): "no credentials in the reference deployment"
+    is not "no credentials anywhere" — `HAMMERTIME_BUS_BROKERS` and
+    `--servers` MAY carry userinfo (decision 10, as amended), which is why
+    the no-userinfo-in-logs rule and `bus_endpoints` are settled now,
+    before any deployment carries one, rather than when one does.*
 14. **Connection options: fail-fast connect, unbounded reconnect, by
     switching the client's options after the initial connect.**
     *(Rewritten 2026-09-21, Amendment 1.)* So that `connect_with_retry`
@@ -1628,7 +1707,9 @@ Read on 2026-09-21 for Amendment 1:
   `license_files = ["LICENSE.txt"]`, author Stefan Behnel; wheels
   `lupa-2.8-cp312-cp312-manylinux2014_x86_64...` and the `aarch64`
   equivalent are present (uploaded 2026-04-15) and no sdist is listed for
-  2.8. `https://raw.githubusercontent.com/scoder/lupa/master/LICENSE.txt`
+  2.8 — *corrected 2026-09-21 (Amendment 2): the page does list
+  `lupa-2.8.tar.gz`; the summarised fetch omitted it. See the Amendment 2
+  Sources block.* `https://raw.githubusercontent.com/scoder/lupa/master/LICENSE.txt`
   (summarised): the MIT licence, "Copyright (c) 2010-2017 Stefan Behnel",
   followed by the MIT licence of the bundled Lua, "Copyright © 1994–2017
   Lua.org, PUC-Rio". Taken from them: ruling C5.1 and ADR-0012 Amendment
@@ -1797,11 +1878,18 @@ continues the ADR's list):
     it exists for (#90, two members racing for one shard) and a single
     server-side step has no retry loop to reason about; `release_lease`'s
     "delete iff mine" is the standard scripted idiom; and the cost is one
-    MIT, wheel-only, test-process dependency (no sdist for 2.8 is listed
-    on PyPI, so a platform without a `cp312` manylinux/macOS/Windows
-    wheel cannot install it — CI runners and the reference `python:3.12-slim`
-    build have x86_64 wheels; the service images do not install the
-    `dev` group).
+    MIT, test-process dependency. *Corrected 2026-09-21 (Amendment 2):
+    the parenthesis that followed — "wheel-only ... (no sdist for 2.8 is
+    listed on PyPI, so a platform without a `cp312` manylinux/macOS/Windows
+    wheel cannot install it — CI runners and the reference
+    `python:3.12-slim` build have x86_64 wheels; the service images do not
+    install the `dev` group)" — was wrong: PyPI lists `lupa-2.8.tar.gz`
+    (sha256 `d8022641...`, 6 156 370 bytes, uploaded 2026-04-15), which
+    `uv lock` recorded, so a platform without a wheel builds the C
+    extension from source rather than failing to install. The lock
+    resolves lupa 2.8; CI installs the `cp312-manylinux_2_17_x86_64`
+    wheel; the service images still do not install the `dev` group.
+    ADR-0012 Amendment 3 assumption 2 is corrected the same way.*
 31. **`on_assigned(frozenset())` is a `ValueError`, not a no-op.** A no-op
     would let a directly constructed `ShardClaims` hold nothing and sit
     idle "ready", the state ADR-0011 A3 refuses at the bus; refusing the
@@ -1842,3 +1930,212 @@ continues the ADR's list):
 40. **T1's harness choices are accepted as test-side judgement**, not
     interface: `_TappedBus`, `_PrefetchBus`, the `bus._logs` reads and the
     0.6-1.3 s sleeps against fakeredis. None constrains the code.
+
+## Amendment 2 (2026-09-21) — bus URLs with userinfo in log records; the provisioning tool's surface; two corrections
+
+Why: three follow-ups from Amendment 1's dispatches. (1) The supervisor
+review of the provisioning tool (brief C4) found that both its
+`provision_failed` records log `servers=args.servers` verbatim, so a
+`--servers nats://user:pass@host:4222` would put the password in a log
+line; the services' `starting` record logs `bus_brokers` verbatim under
+ADR-0009 A7's "broker addresses are not secrets", which was true of a
+Kafka `host:port` list and is not true of a NATS URL. Nothing in the spec
+or the ADRs said whether a bus URL may carry credentials at all, and the
+tool's records and test seams were not pinned anywhere, so its tests had
+nothing to be written from. (2) The C1-followup coder found that `uv lock`
+recorded an sdist for lupa 2.8, which ADR-0012 Amendment 3 assumption 2
+and this ADR's assumption 30 said did not exist. (3) ADR-0010 Amendment 1
+item 4 still said `last_offset(topic)`.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Gained the "amended again 2026-09-21" clause.
+* **Decision 2, CLI bullet.** Appended the paragraph that names the
+  tool's public surface (`build_parser`, `provision`, `main`,
+  `TRANSIENT_PROVISION_ERRORS`, `DEFAULT_REPLICAS`, `DEFAULT_TIMEOUT_S`),
+  its argument rules, its three failure records with `bus_endpoints`, and
+  its three test seams. Nothing before it changed.
+* **Decision 3, `hammertime.bus.nats` block.** Gained `bus_endpoints`, and
+  a paragraph after the block defines it with examples.
+* **Decision 10, `HAMMERTIME_BUS_BROKERS` row.** Appended the dated
+  userinfo ruling.
+* **Assumption 13.** Appended the dated note.
+* **Assumption 30.** Was "... the cost is one MIT, wheel-only,
+  test-process dependency (no sdist for 2.8 is listed on PyPI, so a
+  platform without a `cp312` manylinux/macOS/Windows wheel cannot install
+  it — CI runners and the reference `python:3.12-slim` build have x86_64
+  wheels; the service images do not install the `dev` group)." Now
+  corrected in place, the original quoted there.
+* **Sources, Amendment 1 block, lupa item.** Dated correction appended
+  to "no sdist is listed for 2.8".
+* **Outside this file** (same day, same change set): ADR-0012 Amendment 3
+  assumption 2, its Sources lupa item, the Class 2 `lupa` row and
+  assumption 4 (corrected; the row now records the locked version);
+  ADR-0010 Amendment 1 item 4 (`last_offset` -> `end_offset`, with the
+  readiness inequality of decision 9). **Not edited, and needing a dated
+  pointer in a later dispatch that may touch them:** ADR-0009 A7's table
+  row for `starting` (`bus_brokers`) and its sentence "`bus_brokers` is
+  logged verbatim (broker addresses are not secrets, decision 5 step
+  3)", and spec §47.7's enumeration "not the userinfo of a store URL" —
+  both superseded by ruling 1 below. This dispatch's scope excluded them.
+
+**Rulings.**
+
+1. **`HAMMERTIME_BUS_BROKERS` and `--servers` MAY carry userinfo.** In
+   the two forms nats-py reads from a server URL — `user:password@` and
+   `token@` (a username with no password is sent as `auth_token`;
+   Sources) — and in no other. The value is handed to `nats.connect` as
+   given; nothing in this repository parses it for any other purpose than
+   ruling 2. The alternative, refusing userinfo at `load_settings` and
+   requiring credentials through separate keys, was rejected: it needs a
+   validator that assumption 15 deliberately does not add, it would
+   diverge from the store side (`HAMMERTIME_REDIS_URL` may carry a
+   password and is reduced for logging, not refused), and it would still
+   need ruling 2 for the value's journey from environment to refusal.
+2. **No log record may carry it.** The rendered text of every record —
+   any service, any tool, any event — MUST NOT contain the userinfo of a
+   bus URL. This is spec §47.7's "no record — of any event — may contain
+   a credential" applied to a credential the enumeration did not name:
+   the general clause already binds; the enumeration ("not the userinfo
+   of a store URL") is extended by one item, and ADR-0009 A7's
+   "`bus_brokers` is logged verbatim" is **superseded**. So it is not a
+   new principle, but it is a new obligation on two existing records and
+   one new tool.
+3. **The reduction is `hammertime.bus.nats.bus_endpoints`, and the field
+   is `bus_endpoints`.** Defined in decision 3 (as amended): scheme plus
+   the authority after its last `@`, never raising, `<unparseable>` for
+   an entry `urlsplit` refuses. One helper in the bus package rather than
+   three inline `urlsplit` expressions — the store side's `store_endpoint`
+   is inline in two services and ADR-0009 A12 item 4 already lists its
+   duplication and its `hostname:port/path` quirks as a ticket; the bus
+   has three callers (ingest, aggregator, the tool) from the start and
+   the tool already imports from `hammertime.bus.nats`. The store's
+   inline reduction is not reused because it keeps the path and consults
+   `.port`, both wrong here (ruling 3's "never raising"). The services'
+   `starting` record logs `bus_endpoints` **in place of** `bus_brokers`:
+   a distinct name for a reduced value, as `store_endpoint` is distinct
+   from the URL, so no reader mistakes the field for the configured
+   value. The tool's two `provision_failed` records log `bus_endpoints`
+   in place of `servers`.
+4. **Where the edits land.** The tool and the helper are one `coder`
+   dispatch now (the tool is on the branch and logs the value today).
+   The services' `startup_fields()` changes belong in the C2 (aggregator)
+   and C3 (ingest) briefs, which have not been dispatched and already
+   rewrite those services' bus wiring and their `test_config.py`/service
+   tests; a separate dispatch would touch the same files twice. Both
+   briefs gain the paragraph in the hand-off report, and their
+   test-author counterparts gain the corresponding `starting` assertion.
+   The `CHANGES` line for the rename is written by C2/C3 (one line,
+   whichever lands first): "Log `bus_endpoints` (bus URLs without
+   userinfo) in the `starting` record in place of `bus_brokers`". The
+   tool gets no `CHANGES` line: it has not reached `master`, so its
+   records have never been observable.
+5. **The tool's surface, records and seams are pinned in decision 2** so
+   that `test-author` writes its tests from this ADR. The names are the
+   ones C4 implemented; recording them changes no code.
+6. **lupa sdist.** Assumption 30 and ADR-0012 Amendment 3 assumption 2
+   are corrected: an sdist exists, so a wheel-less platform builds from
+   source. The lease stays in Lua; nothing else follows.
+7. **ADR-0010 Amendment 1 item 4** is corrected to `end_offset` with
+   decision 9's inequality.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+41. **Userinfo is allowed rather than refused.** Ruling 1's reasons; the
+    judgement call is that parity with the store side and no new
+    validator outweigh the operational preference for credentials in
+    separate variables. A deployment that wants the latter can still use
+    nats-py's `user=`/`password=`/`token=`/`user_credentials=` connect
+    arguments (Sources) once someone plumbs them through `NatsBus`; that
+    is a follow-up, not ruled here, and would not change ruling 2.
+42. **The username is dropped along with the password.** Because nats-py
+    treats a lone username as a token. The store's reduction keeps no
+    username either.
+43. **Scheme and host are kept; path, query and fragment are dropped.**
+    The scheme matters to an operator (`tls://` versus `nats://`); the
+    rest carries nothing NATS reads. A query parameter could in principle
+    carry a secret in some other URL grammar; dropping it costs nothing.
+44. **`<unparseable>` for an entry `urlsplit` refuses.** A fixed string
+    rather than a best-effort rendering, on ADR-0009 A12 item 4's
+    argument that a malformed value is exactly the input a redaction
+    cannot be trusted on. The entry count is still visible (one
+    `<unparseable>` per bad entry).
+45. **Scheme-less entries are read as `nats://<entry>`**, mirroring
+    nats-py's `_parse_server_uri` (`elif ":" in connect_url: nats://...`;
+    a bare host also gets `:4222` there, which `bus_endpoints` does not
+    add — the port is not invented for a log line). Read from `main`,
+    not the 2.16.0 tag (assumption 28's caveat).
+46. **Exception text is not scanned.** Ruling 2 binds the fields the code
+    writes; `error=str(exc)` in `dependency_unavailable`,
+    `provision_failed`, `start_failed` and `nats_client_error` carries
+    whatever nats-py put in the exception. For an unreachable or
+    refusing server that text names no URL (`nats: no servers available
+    for connection`, an `OSError` with host and port). For a **malformed**
+    URL nats-py's own `urlparse(...).port` can raise a `ValueError`
+    echoing the userinfo (`redis://user:secret/0`'s hazard, ADR-0009 A12
+    item 4, applies verbatim to `nats://user:secret/0`), and that
+    `ValueError` is not in any transient tuple, so a service reports it
+    as `start_failed error=... exception=<traceback>`. That residual is
+    named, not closed: it is the reason the "validation of
+    `HAMMERTIME_BUS_BROKERS`" follow-up under Consequences now has a
+    security argument as well as an exit-code one, and a driver-parser
+    helper in the shape of `validate_redis_url` (raising a message that
+    repeats nothing of the value) is the recommended form.
+47. **Field renamed (`bus_endpoints`) rather than value replaced under
+    `bus_brokers`.** A reader of `starting` should not have to know
+    whether the field is the configured value or a reduction of it. The
+    cost is one `CHANGES` line and the test updates C2/C3 make anyway.
+48. **The tool's `provision_complete` record is not pinned.** It is the
+    coder's summary line (`streams`, `created`, `updated`, `unchanged`,
+    `replicas`) and may change; tests pin `stream_provisioned`, the three
+    failure records and the exit codes.
+49. **The tool's tests live in
+    `tools/provision/src/hammertime/tools/provision/tests/`**, the
+    package-internal layout `tools/agent-token` established (the only
+    tool with tests today; `tools/replay` has none), collected through
+    the root `testpaths`' `tools` entry.
+50. **The sdist digest and size are the coder's reading of `uv.lock`.**
+    The architect's fetch of `https://pypi.org/pypi/lupa/2.8/json`
+    confirmed the filename `lupa-2.8.tar.gz` and was truncated before the
+    digest; the eight-character prefix `d8022641`, 6 156 370 bytes and
+    the 2026-04-15 upload are recorded as relayed.
+
+Read on 2026-09-21 for Amendment 2:
+
+* `https://raw.githubusercontent.com/nats-io/nats.py/main/nats/src/nats/aio/client.py`
+  (summarised by the fetch tool; `main`, not the 2.16.0 tag):
+  `_setup_server_pool` calls `_parse_server_uri` per entry for both a
+  `str` and a `list`; `_parse_server_uri` keeps an entry containing
+  `nats://`, `tls://`, `ws://` or `wss://` as given, prefixes `nats://`
+  to one containing `:`, and renders a bare host as `nats://<host>:4222`;
+  the CONNECT options read `uri.username`/`uri.password` from the
+  current server's URL — `if self._current_server.uri.password is None:
+  options["auth_token"] = self._current_server.uri.username` else
+  `options["user"]`/`options["pass"]`; `connect()` also takes `user`,
+  `password`, `token`, `user_credentials`, `nkeys_seed`,
+  `nkeys_seed_str`, all defaulting to `None`. Taken from it: rulings 1
+  and 3, assumptions 42 and 45.
+* `https://pypi.org/pypi/lupa/2.8/json` (summarised and truncated by the
+  fetch tool): the `urls` array contains an sdist entry `lupa-2.8.tar.gz`
+  and, among the wheels, `lupa-2.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl`
+  and `lupa-2.8-cp312-abi3-musllinux_1_2_x86_64.whl`; the sdist's digest,
+  size and upload time were cut off. Taken from it: ruling 6, assumption
+  50.
+* Repository facts: `tools/provision/src/hammertime/tools/provision/__main__.py`
+  (the two `provision_failed` records at the `TRANSIENT_PROVISION_ERRORS`
+  and `nats.errors.Error` handlers; `_connect` calling `nats.connect`;
+  `provision`'s signature); `packages/hammertime-bus/src/hammertime/bus/nats.py`
+  (`NatsBus.__init__`'s split of `servers`; `TRANSIENT_ERRORS`);
+  `services/aggregator/src/hammertime/aggregator/service.py` lines
+  261-279 and `services/ingest/src/hammertime/ingest/service.py` lines
+  183-197 (`startup_fields`, `bus_brokers` verbatim, `store_endpoint`
+  inline); `packages/hammertime-store/src/hammertime/store/url.py`
+  (`validate_redis_url`: validation only, no reduction helper);
+  `packages/hammertime-core/src/hammertime/core/runtime.py`
+  (`connect_with_retry`: 0.5 s initial delay doubling to 5 s; raises
+  when `remaining <= delay`); `packages/hammertime-core/src/hammertime/core/telemetry/logging.py`
+  (`configure_logging` is idempotent and binds `sys.stdout` at call
+  time); `tools/agent-token/src/hammertime/tools/agent_token/tests/test_cli.py`
+  (the tools' test layout); ADR-0009 A7 (the `starting` row and the
+  verbatim sentence), A12 item 4 (the `.port` hazard); spec §47.7.

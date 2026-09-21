@@ -269,8 +269,18 @@ Ruling (ADR-0013 decision 9, restated so it can be read from this ADR):
    ADR-0013's hand-off report; it would touch `docs/protocol/read-api-v1.md`
    and ADR-0001 clause 4, which this amendment does not.
 4. Readiness (ADR-0009 decision 4: replayed "to the log end as it stood
-   when `start()` began") uses the bus's `last_offset(topic)` read at
-   `start()` (ADR-0013 assumption 20).
+   when `start()` began") uses the bus's `await bus.end_offset(topic)`,
+   read at `start()` — the offset the next appended message will receive,
+   `1` for an empty stream and `0` for an empty memory log. The service
+   has replayed to the log end once the last applied offset is
+   `>= end_offset - 1`, or immediately when `end_offset <= start_offset`
+   (ADR-0013 decision 9 and assumption 20, as amended).
+
+   > Amended 2026-09-21: was "uses the bus's `last_offset(topic)` read at
+   > `start()` (ADR-0013 assumption 20)". ADR-0013 Amendment 1 (ruling
+   > C5.2) renamed it `end_offset`, made it `async` on the `MessageBus`
+   > protocol, and redefined it as the next offset so that one readiness
+   > inequality holds on both buses.
 5. The detector is bound by ADR-0013 decision 9's redelivery constraint:
    it holds a durable subscription, so after a crash it may be handed an
    older `PrefixStatsChanged` after a newer one for the same prefix, and
