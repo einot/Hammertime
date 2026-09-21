@@ -34,12 +34,15 @@
 #
 # This hook must be wired in `.claude/settings.json` (or
 # `.claude/settings.local.json`). It must NOT be wired in an agent file's
-# `hooks:` frontmatter: the CLI's markdown-agent parser reads name,
-# description, tools, skills, color and model, and drops `hooks` without
-# complaint, so an agent configured that way runs completely unfenced,
-# with no error anywhere to say so. That was established by experiment,
-# not inferred -- see issue #102, and the long version under WIRING in
-# bash-guard.sh.
+# `hooks:` frontmatter: a guard declared there has been observed to
+# silently not fire -- no error, no warning, nothing to notice, so the
+# agent ran completely unfenced (issue #102). The same frontmatter block
+# has also been seen to fire under other conditions, so the mechanism is
+# unreliable rather than reliably broken. That is worse, not better: a
+# policy declared there can look enforced while it is not, and what makes
+# the difference has not been characterised. `.claude/settings.json` is
+# the documented location, and its enforcement has been verified by
+# direct probe -- see also WIRING in bash-guard.sh.
 #
 # Settings-level hooks are session-wide: they fire for every agent and for
 # the top-level session, not only the agent a policy was written for. That
