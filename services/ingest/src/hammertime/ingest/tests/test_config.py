@@ -20,6 +20,18 @@ connection URL the client library would refuse to build a client from" --
 is rejected before any network connection is opened), section 47.5 (exit
 status 2) and section 47.7 (no record carries the userinfo of a store URL),
 i.e. ADR-0009 decision 2 as corrected by Amendment 3 item A12.
+
+`TestBusKind` covers ADR-0013 decision 10's table, written from that text
+alone: `HAMMERTIME_BUS_KIND` is "`nats` (default) or `memory`; `kafka` is a
+`ValueError` (exit 2)"; `HAMMERTIME_BUS_BROKERS` is "comma-separated NATS
+server URLs ..., default `nats://localhost:4222`; not validated by
+`load_settings`" (assumption 15). The ADR states one rule for both
+services, so this class and `services/aggregator/.../tests/test_config.py`'s
+`TestBusKind` are deliberately diffable copies.
+
+ASSUMPTIONS for `TestBusKind`: `IngestSettings.bus_kind` / `bus_brokers` are
+the field names `test_pipeline.py::_settings` already constructs; the kind
+is matched as written (no claim about case-insensitivity either way).
 """
 
 from __future__ import annotations
@@ -383,3 +395,73 @@ class TestAMalformedRedisUrlExitsTwo:
         assert PASSWORD not in out
         for record in records:
             assert PASSWORD not in json.dumps(record)
+
+
+# --------------------------------------------------------------------------
+# ADR-0013 decision 10: `HAMMERTIME_BUS_KIND` is `nats` | `memory`
+# --------------------------------------------------------------------------
+
+DEFAULT_BUS_BROKERS = "nats://localhost:4222"
+
+
+class TestBusKind:
+    """ADR-0013 decision 10: "`nats` (default) or `memory`; `kafka` is a
+    `ValueError` (exit 2)"."""
+
+    def test_the_default_is_nats(self) -> None:
+        assert load_settings({}).bus_kind == "nats"
+
+    @pytest.mark.parametrize("kind", ["nats", "memory"])
+    def test_nats_and_memory_are_accepted(self, kind: str) -> None:
+        assert load_settings({"HAMMERTIME_BUS_KIND": kind}).bus_kind == kind
+
+    def test_kafka_is_a_value_error_naming_the_variable(self) -> None:
+        with pytest.raises(ValueError, match="HAMMERTIME_BUS_KIND"):
+            load_settings({"HAMMERTIME_BUS_KIND": "kafka"})
+
+    @pytest.mark.parametrize("kind", ["", "redpanda", "jetstream"])
+    def test_any_other_kind_is_a_value_error_naming_the_variable(self, kind: str) -> None:
+        with pytest.raises(ValueError, match="HAMMERTIME_BUS_KIND"):
+            load_settings({"HAMMERTIME_BUS_KIND": kind})
+
+    def test_the_brokers_default_is_a_nats_url(self) -> None:
+        assert load_settings({}).bus_brokers == DEFAULT_BUS_BROKERS
+
+    def test_the_brokers_value_is_stored_untouched_and_not_validated(self) -> None:
+        # Assumption 15: "not validated by `load_settings`"; a malformed
+        # value surfaces at `connect()` as `start_failed`, not here.
+        for value in ("nats://nats:4222,nats://nats-2:4222", "not a url at all"):
+            assert load_settings({"HAMMERTIME_BUS_BROKERS": value}).bus_brokers == value
+
+
+class TestAKafkaBusKindExitsTwo:
+    """Decision 10's `kafka` row, end to end: `config_invalid` naming the
+    variable and exit 2, before anything starts. Same shape as
+    `TestAMalformedRedisUrlExitsTwo`."""
+
+    ENV: ClassVar[dict[str, str]] = {
+        "HAMMERTIME_BUS_KIND": "kafka",
+        "HAMMERTIME_STORE_KIND": "memory",
+        "HAMMERTIME_LOG_LEVEL": "info",
+    }
+
+    def _run(self) -> int:
+        env = dict(self.ENV)
+        return run_service("ingest", lambda: build_service(load_settings(env)), env=env)
+
+    def test_the_process_exits_2(self) -> None:
+        assert self._run() == 2
+
+    def test_config_invalid_names_the_variable(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._run()
+
+        _, records = _stdout_records(capsys)
+        invalid = [record for record in records if record.get("event") == "config_invalid"]
+        assert len(invalid) == 1
+        assert "HAMMERTIME_BUS_KIND" in str(invalid[0].get("error"))
+
+    def test_nothing_started(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._run()
+
+        _, records = _stdout_records(capsys)
+        assert [record for record in records if record.get("event") == "starting"] == []

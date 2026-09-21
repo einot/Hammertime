@@ -47,9 +47,13 @@ not the meaning of the assertions:
    ADR-0009 A7 gives it `path`, `config_version` and
    `previous_config_version` only.
 3. `AggregatorWorker(*, bus, state_store, clock, config, metrics,
-   shard_ids=None, max_tracked_ips=...)`, `start()`/`stop()`,
-   `worker.window(shard)`, `worker.config`. Same assumption as
-   `test_sharding.py` and `test_worker.py`.
+   shard_ids=None, max_tracked_ips=..., member_id="aggregator",
+   lease_ttl_s=30.0)`, `start()`/`stop()`, `worker.window(shard)`,
+   `worker.config`. Same assumption as `test_sharding.py` and
+   `test_worker.py`. `shard_ids=None` is "every partition as the bus defines
+   it" -- `{0}` on `InMemoryBus` (ADR-0013 decision 6; it is no longer
+   `auto`, which ADR-0013 removed); the two lease keywords keep their
+   defaults here because nothing in this file runs two members.
 4. `TransitionEmitter(*, producer, state_store, clock, metrics)` and
    `ShardWindow(shard=..., config=..., clock=..., inherited_hot=...,
    next_sequence=...)` are decision 4's and decision 2's own code blocks.
