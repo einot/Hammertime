@@ -23,7 +23,9 @@ that ADR's text alone:
 * Decision 6: "`load_settings` treats an **unset** `HAMMERTIME_SHARD_IDS` as
   a `ValueError` naming the variable"; `all` -> `frozenset(range(128))`;
   `auto` -> `ValueError` "so a deployment carrying the old default fails
-  loudly with `config_invalid` and exit 2"; an id at or above the count is a
+  loudly with `config_invalid` and exit 2", whose message (Amendment 1
+  ruling T10) "MUST contain the variable name, the word `all`, `ADR-0013`
+  and at least one explicit-set example"; an id at or above the count is a
   `ValueError` naming the variable and the count. `AggregatorSettings.shard_ids`
   "becomes `frozenset[int]` (never `None`)". The grammar itself is
   `test_sharding.py::TestParseShardIds`'s.
@@ -314,11 +316,20 @@ class TestShardIdsAreRequired:
 
     def test_auto_is_a_value_error_naming_the_variable(self) -> None:
         # "`auto` -> `ValueError` whose message says that shard assignment is
-        # static since ADR-0013 and names the two accepted forms".
+        # static since ADR-0013 and names the two accepted forms". As amended
+        # (Amendment 1 ruling T10), the message "MUST contain the variable
+        # name, the word `all`, `ADR-0013` and at least one explicit-set
+        # example, and tests pin those four substrings rather than the whole
+        # sentence". The examples the ADR's own wording carries are `'0'`,
+        # `'0-3'` and `'0,2,5-7'`; the bare `0` would be satisfied by
+        # `ADR-0013` itself, so the single-id example is matched quoted.
         with pytest.raises(ValueError, match="HAMMERTIME_SHARD_IDS") as excinfo:
             load_settings(_env(HAMMERTIME_SHARD_IDS="auto"))
 
-        assert "all" in str(excinfo.value)
+        message = str(excinfo.value)
+        assert "all" in message
+        assert "ADR-0013" in message
+        assert any(example in message for example in ("0-3", "0,2,5-7", "'0'"))
 
     @pytest.mark.parametrize("text", ["", "   "], ids=["empty", "whitespace-only"])
     def test_set_but_empty_is_a_value_error(self, text: str) -> None:

@@ -88,11 +88,16 @@ the meaning of the assertions:
    `handle()`. `_TappedBus.consumer` returns `Any` for the same reason
    `test_worker.py`'s bus doubles always have: a wrapper is not a
    `MemoryConsumer`.
-5. Decision 7 says `acquire_lease(p, ...)` is called "for each shard in
-   sorted order and **before** `state_store.load(p)`". What is asserted is
-   exactly that: per shard the acquire precedes the load, and the acquires
-   come in ascending shard order; whether the loads are interleaved with the
-   acquires or follow them as a block is not pinned.
+5. Ruled, no longer assumed (Amendment 1 ruling T6; assumption 35).
+   Decision 7 says `acquire_lease(p, ...)` is called "for each shard in
+   sorted order and **before** `state_store.load(p)` -- strictly
+   sequentially per shard: acquire `p`, load `p`, build `p`'s window, and
+   only then the next shard's acquire". What is asserted is exactly that
+   ordered `acquire_lease`/`load` subsequence
+   (`test_every_shard_is_leased_in_sorted_order_before_its_load`); the
+   earlier, weaker form -- per shard the acquire precedes the load, and the
+   acquires come in ascending order -- is kept alongside it, as the ruling
+   permits.
 6. `worker.stop()` does not close the consumer -- decision 8: "the service
    closes the bus ... afterwards". On the memory bus an unacknowledged
    message is deliverable to the next consumer whether or not the previous
@@ -107,14 +112,26 @@ the meaning of the assertions:
    ... so a member that has lost a shard emits nothing more for it"; that is
    asserted as "no demotion was recorded or published after a refused
    renewal", with the demotion otherwise due in that very sweep.
-9. `handled_position(p)` survives `commit_handled()`: decision 8 says the
-   commit "clears the list" of handled, unacknowledged messages, and ADR-0003
-   Amendment 3 item 2 says the position "is kept for item 1(c)'s test, not
-   for any commit" -- so it is not reset by an acknowledgement.
-10. `on_assigned(frozenset())` is not exercised. ADR-0013 decision 8: "an
-    empty assignment is now impossible: a static set is never empty and
-    `all` is never empty", and A3 refuses it at the bus; what `ShardClaims`
-    would do with an empty set handed to it directly is unspecified.
+9. Ruled, no longer assumed (Amendment 1 rulings T3 and T4; assumption 32).
+   Decision 8 as amended: "`handled_position(shard)` returns `None` for a
+   shard this object does not hold, exactly as for a held shard nothing has
+   been handled on: the read surface (`window`, `handled_position`) is total
+   and the write surface (`mark_handled`) raises `KeyError`"; and "The
+   position belongs to the claim for the life of the process:
+   `commit_handled()` clears the handled *list* and leaves the position
+   where it is ... and nothing ever lowers it". So `handled_position(p)`
+   survives `commit_handled()`, and asking about an unheld `p` -- before any
+   claim, or for a partition outside the claimed set -- is `None`, not
+   `KeyError`.
+10. Ruled, no longer assumed (Amendment 1 ruling T5; assumption 31).
+    Decision 8 as amended: "`on_assigned(frozenset())` is a `ValueError`. It
+    is unreachable through the bus -- `static_partitions` refuses an empty
+    set before the listener is called, and `partitions=None` always resolves
+    to a non-empty set -- so only a direct call can reach it; a member
+    holding nothing must not report itself ready ... and the direct call is
+    refused for the same reason." The direct call is exercised
+    (`test_on_assigned_with_an_empty_set_is_a_value_error`): it raises, holds
+    nothing, and touches the store not at all.
 
 NOT asserted here, and why:
 
@@ -700,11 +717,20 @@ class TestParseShardIds:
     def test_auto_is_a_value_error_naming_the_accepted_forms(self) -> None:
         # "`auto` -> `ValueError` whose message says that shard assignment is
         # static since ADR-0013 and names the two accepted forms, so a
-        # deployment carrying the old default fails loudly".
+        # deployment carrying the old default fails loudly". As amended
+        # (Amendment 1 ruling T10), the message "MUST contain the variable
+        # name, the word `all`, `ADR-0013` and at least one explicit-set
+        # example, and tests pin those four substrings rather than the whole
+        # sentence". The examples the ADR's own wording carries are `'0'`,
+        # `'0-3'` and `'0,2,5-7'`; the bare `0` would be satisfied by
+        # `ADR-0013` itself, so the single-id example is matched quoted.
         with pytest.raises(ValueError, match="HAMMERTIME_SHARD_IDS") as excinfo:
             parse_shard_ids("auto")
 
-        assert "all" in str(excinfo.value)
+        message = str(excinfo.value)
+        assert "all" in message
+        assert "ADR-0013" in message
+        assert any(example in message for example in ("0-3", "0,2,5-7", "'0'"))
 
     @pytest.mark.parametrize("text", ["AUTO", "Auto"])
     def test_auto_is_rejected_whatever_its_case(self, text: str) -> None:
@@ -875,6 +901,24 @@ class TestClaimingAShard:
         assert first.next_sequence == 1
         assert second.next_sequence == 4
 
+    async def test_on_assigned_with_an_empty_set_is_a_value_error(self) -> None:
+        # ASSUMPTION 10 (ruled, T5; assumption 31): "`on_assigned(frozenset())`
+        # is a `ValueError`" -- "a member holding nothing must not report
+        # itself ready", so the direct call is refused as the bus refuses it.
+        # It holds nothing afterwards and never reaches the store: no lease
+        # is taken and nothing is loaded.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        claims = await _claims(clock=clock, state_store=store)
+        store.clear()
+
+        with pytest.raises(ValueError):
+            await claims.on_assigned(frozenset())
+
+        assert claims.shards == frozenset()
+        assert claims.windows() == ()
+        assert store.calls == []
+
 
 class TestShardLeasesAreTakenOnClaim:
     """ADR-0013 decision 7: "Before a member builds a `ShardWindow` for shard
@@ -917,7 +961,10 @@ class TestShardLeasesAreTakenOnClaim:
         assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
 
     async def test_every_shard_is_leased_in_sorted_order_before_its_load(self) -> None:
-        # ASSUMPTION 5: per shard, acquire before load; acquires ascending.
+        # ASSUMPTION 5 (ruled, T6): "strictly sequentially per shard: acquire
+        # `p`, load `p`, build `p`'s window, and only then the next shard's
+        # acquire" -- the ordered `acquire_lease`/`load` subsequence is
+        # exactly `acquire 0, load 0, acquire 1, load 1, acquire 2, load 2`.
         clock = ManualClock(initial=BASE)
         store = _RecordingStore(clock)
         claims = await _claims(clock=clock, state_store=store)
@@ -932,6 +979,15 @@ class TestShardLeasesAreTakenOnClaim:
             acquire_at = store.calls.index(("acquire_lease", shard, MEMBER_A, LEASE_TTL_SECONDS))
             load_at = store.calls.index(("load", shard))
             assert acquire_at < load_at
+        sequence = [call[:2] for call in store.calls if call[0] in ("acquire_lease", "load")]
+        assert sequence == [
+            ("acquire_lease", 0),
+            ("load", 0),
+            ("acquire_lease", 1),
+            ("load", 1),
+            ("acquire_lease", 2),
+            ("load", 2),
+        ]
         assert claims.shards == frozenset({0, 1, 2})
 
     async def test_a_shard_leased_elsewhere_is_refused(self) -> None:
@@ -1489,8 +1545,26 @@ class TestAcknowledgingHandledMessages:
 
         assert claims.handled_position(0) == second.offset + 1
 
+    async def test_handled_position_for_an_unheld_partition_is_none(self) -> None:
+        # ASSUMPTION 9 (ruled, T3; assumption 32): "`handled_position(shard)`
+        # returns `None` for a shard this object does not hold, exactly as
+        # for a held shard nothing has been handled on: the read surface
+        # (`window`, `handled_position`) is total and the write surface
+        # (`mark_handled`) raises `KeyError`" -- before any claim, and for a
+        # partition outside the claimed set.
+        clock = ManualClock(initial=BASE)
+        claims = await _claims(clock=clock)
+        assert claims.handled_position(0) is None
+
+        await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        assert claims.handled_position(1) is None
+        assert claims.handled_position(0) is None
+
     async def test_handled_position_survives_the_acknowledgement(self) -> None:
-        # ASSUMPTION 9.
+        # ASSUMPTION 9 (ruled, T4): "`commit_handled()` clears the handled
+        # *list* and leaves the position where it is ... and nothing ever
+        # lowers it".
         clock = ManualClock(initial=BASE)
         bus = InMemoryBus()
         claims, consumer = await _claims_and_consumer(clock=clock, bus=bus)

@@ -47,8 +47,37 @@ and the semantics below alone". What that block pins, and is asserted here:
   `InMemoryBus` "implements the same contract with one partition per topic".
 * "Removed: `Consumer.seek`, `Consumer.commit`". `MessageBus` is a
   `runtime_checkable` Protocol in `hammertime.bus.interface` ("moved here
-  from `hammertime.aggregator.worker`"), with `producer()` and
-  `consumer(group_id)`.
+  from `hammertime.aggregator.worker`"), with `producer()`,
+  `consumer(group_id)` and -- since Amendment 1 -- `end_offset(topic)`.
+
+Amendment 1 (2026-09-21) added these sentences to decision 3 and decision 9;
+each is pinned by the class named after it:
+
+* `subscribe`, `start_offset` bullet (rulings C5.7 / T2): "`start_offset`
+  MUST be `>= 0`: a negative value is a `ValueError` raised before any broker
+  is contacted and before `listener` is called, on both implementations";
+  "`start_offset=0` is the portable 'from the first retained message': it is
+  the first index of the memory log" (`TestPositionalSubscriptions`).
+* `ack` paragraph, check order (ruling C5.4): "The checks are ordered: a
+  closed consumer is a `ValueError` and a positional subscription is a
+  `ValueError` whatever the iterable holds, an empty one included; only a
+  live durable subscription -- or an instance that has not subscribed yet,
+  which has delivered nothing and so accepts exactly the empty iterable --
+  returns normally on an empty iterable." (`TestAckPrecedence`).
+* `ack` paragraph, duplicates (rulings C5.5 / T1): "A message named more than
+  once in one call is acknowledged once and is not an error:
+  `ConsumedMessage` is a value, the identity of an acknowledgement is
+  `(topic, partition, offset)`, and 'already acknowledged' means
+  acknowledged by an *earlier* call." (`TestDuplicatesWithinOneAck`).
+* `MessageBus.end_offset(topic)` (ruling C5.2; assumption 33):
+  "`InMemoryBus.end_offset(topic)` is the length of the topic's log (`0` for
+  a topic never published to), `async` like `NatsBus.end_offset`"; decision
+  9: on both buses it is "the offset the next appended message will receive
+  (`1` for an empty stream, `0` for an empty memory log)", and a service "has
+  replayed to the log end once every delivered message with `offset <
+  end_offset` has been applied, i.e. once the last applied offset is `>=
+  end_offset - 1`, or immediately when `end_offset <= start_offset`"
+  (`TestEndOffset`).
 
 ASSUMPTIONS -- things decision 3 implies but does not spell out. Adjust the
 helper, not the meaning of the assertion:
@@ -59,12 +88,14 @@ helper, not the meaning of the assertion:
    (`test_the_deduplicated_publish_leaves_no_gap_in_the_log`). A bounded
    read is otherwise used: a sentinel with a fresh id is published after the
    duplicate, and exactly as many messages as should exist are read.
-2. "`start_offset` below the first offset delivers from the start" is
-   exercised with `first.offset - 1`, which on a 0-based log is `-1`. The ADR
-   pins only "the first message whose `offset >= start_offset`"; a negative
-   `start_offset` satisfies that literally for every message. If the
-   implementation rejects negatives, that is a gap for the architect, not a
-   reason to bend this test.
+2. Ruled, no longer assumed (Amendment 1 rulings C5.7 / T2). A negative
+   `start_offset` is rejected, not read as "below the first offset":
+   "`start_offset` MUST be `>= 0`: a negative value is a `ValueError` ... on
+   both implementations", and "`start_offset=0` is the portable 'from the
+   first retained message'". "'Below the first offset' therefore cannot be
+   exercised with a negative number; on `InMemoryBus`, which never discards,
+   it cannot be exercised at all" -- so no test here tries to; the earlier
+   `first.offset - 1` test is withdrawn by the ruling.
 3. A positional subscription keeps yielding messages published after it
    was opened (it "ends ... after `close()`", not at the log end); the trie's
    replay-then-tail shape (decision 9) depends on it.
@@ -86,6 +117,7 @@ must end on its own.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator
 
 import pytest
@@ -110,9 +142,7 @@ async def _take(stream: AsyncIterator[ConsumedMessage], n: int) -> list[Consumed
     return messages
 
 
-async def _read_group(
-    bus: InMemoryBus, group_id: str, topic: str, n: int
-) -> list[ConsumedMessage]:
+async def _read_group(bus: InMemoryBus, group_id: str, topic: str, n: int) -> list[ConsumedMessage]:
     """Read exactly `n` messages from `topic` on a *fresh* consumer for `group_id`."""
 
     consumer = bus.consumer(group_id)
@@ -124,6 +154,16 @@ async def _publish_three(bus: InMemoryBus, topic: str = TOPIC) -> None:
     await producer.publish(topic, key="k1", value=b"first", message_id="id-1")
     await producer.publish(topic, key="k2", value=b"second", message_id="id-2")
     await producer.publish(topic, key="k3", value=b"third", message_id="id-3")
+
+
+class _RecordingListener:
+    """An `AssignmentListener` that records every `on_assigned` call it receives."""
+
+    def __init__(self) -> None:
+        self.assigned: list[frozenset[tuple[str, int]]] = []
+
+    async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None:
+        self.assigned.append(partitions)
 
 
 class TestOrderingForASingleConsumer:
@@ -276,13 +316,14 @@ class TestPublishDeduplicatesByMessageId:
         assert received[51].value == b"sentinel"
 
     async def test_the_duplicate_publish_returns_normally(self) -> None:
+        # "is acknowledged and **not** appended, and `publish` returns
+        # normally": `publish` is declared `-> None`, so "returns normally" is
+        # exactly that the second call raises nothing.
         bus = InMemoryBus()
         producer = bus.producer()
         await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
 
-        result = await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
-
-        assert result is None
+        await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
 
 
 class TestFlush:
@@ -294,8 +335,10 @@ class TestFlush:
         producer = bus.producer()
         await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
 
-        assert await producer.flush() is None
-        assert await producer.flush() is None
+        # `flush` is declared `-> None`: "returns normally" is that neither
+        # call raises, and the log is untouched by either.
+        await producer.flush()
+        await producer.flush()
 
         assert [m.value for m in await _read_group(bus, GROUP, TOPIC, 1)] == [b"first"]
 
@@ -413,13 +456,14 @@ class TestAcknowledgementIsThePosition:
 
     async def test_an_empty_iterable_is_a_no_op(self) -> None:
         # "An empty iterable returns normally without touching the broker":
-        # nothing becomes acknowledged.
+        # `ack` is declared `-> None`, so "returns normally" is that the call
+        # raises nothing -- and nothing becomes acknowledged.
         bus = InMemoryBus()
         await _publish_three(bus)
         consumer = bus.consumer(GROUP)
         await _take(await consumer.subscribe(TOPIC), 2)
 
-        assert await consumer.ack([]) is None
+        await consumer.ack([])
 
         resumed = await _read_group(bus, GROUP, TOPIC, 1)
         assert resumed[0].value == b"first"
@@ -454,6 +498,11 @@ class TestAcknowledgementRejections:
             await consumer_a.ack([other[1]])
 
     async def test_a_message_already_acknowledged_is_a_value_error(self) -> None:
+        # "one it already acknowledged" -- and, as amended (rulings C5.5 /
+        # T1), "'already acknowledged' means acknowledged by an *earlier*
+        # call": the first `ack` here is that earlier call. Naming a message
+        # twice within one call is `TestDuplicatesWithinOneAck`'s and is not
+        # an error.
         bus = InMemoryBus()
         await _publish_three(bus)
         consumer = bus.consumer(GROUP)
@@ -552,10 +601,150 @@ class TestAcknowledgementRejections:
         assert resumed[0].value == b"second"
 
 
+class TestDuplicatesWithinOneAck:
+    """Decision 3, `ack` paragraph as amended (rulings C5.5 / T1): "A message
+    named more than once in one call is acknowledged once and is not an
+    error: `ConsumedMessage` is a value, the identity of an acknowledgement is
+    `(topic, partition, offset)`, and 'already acknowledged' means
+    acknowledged by an *earlier* call." This is what lets decision 8's
+    `commit_handled()` hand `ack()` "a `REDELIVERED` copy alongside its
+    original, without deduplicating"."""
+
+    async def test_a_message_named_twice_in_one_call_is_acknowledged_once(self) -> None:
+        # (a) `ack([m, m])` returns normally, and a fresh consumer for the
+        # group resumes after `m`.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer(GROUP)
+        first = (await _take(await consumer.subscribe(TOPIC), 1))[0]
+
+        await consumer.ack([first, first])
+
+        resumed = await _read_group(bus, GROUP, TOPIC, 2)
+        assert [message.value for message in resumed] == [b"second", b"third"]
+
+    async def test_a_duplicate_alongside_another_message_acknowledges_both(self) -> None:
+        # (b) `ack([m1, m1, m2])` acknowledges both: the fresh consumer
+        # resumes after `m2`.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer(GROUP)
+        m1, m2 = await _take(await consumer.subscribe(TOPIC), 2)
+
+        await consumer.ack([m1, m1, m2])
+
+        resumed = await _read_group(bus, GROUP, TOPIC, 1)
+        assert resumed[0].value == b"third"
+
+    async def test_an_equal_copy_counts_as_the_same_message(self) -> None:
+        # "`ConsumedMessage` is a value, the identity of an acknowledgement is
+        # `(topic, partition, offset)`": a freshly constructed copy with the
+        # same five fields is the same acknowledgement, not a second one and
+        # not "a message this instance never delivered".
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer(GROUP)
+        first = (await _take(await consumer.subscribe(TOPIC), 1))[0]
+        copy = ConsumedMessage(
+            topic=first.topic,
+            partition=first.partition,
+            offset=first.offset,
+            key=first.key,
+            value=first.value,
+        )
+
+        await consumer.ack([first, copy])
+
+        resumed = await _read_group(bus, GROUP, TOPIC, 1)
+        assert resumed[0].value == b"second"
+
+    async def test_the_same_message_in_a_later_call_is_still_a_value_error(self) -> None:
+        # "'already acknowledged' means acknowledged by an *earlier* call":
+        # once `ack([m, m])` has returned, `m` is acknowledged, and naming it
+        # again in a *second* call is the rejection
+        # `TestAcknowledgementRejections` pins.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer(GROUP)
+        first = (await _take(await consumer.subscribe(TOPIC), 1))[0]
+        await consumer.ack([first, first])
+
+        with pytest.raises(ValueError):
+            await consumer.ack([first])
+
+
+class TestAckPrecedence:
+    """Decision 3, `ack` paragraph as amended (ruling C5.4): "The checks are
+    ordered: a closed consumer is a `ValueError` and a positional
+    subscription is a `ValueError` whatever the iterable holds, an empty one
+    included; only a live durable subscription -- or an instance that has not
+    subscribed yet, which has delivered nothing and so accepts exactly the
+    empty iterable -- returns normally on an empty iterable."."""
+
+    async def test_an_empty_ack_after_close_is_a_value_error(self) -> None:
+        # "a closed consumer is a `ValueError` ... whatever the iterable
+        # holds, an empty one included".
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer(GROUP)
+        await _take(await consumer.subscribe(TOPIC), 1)
+        await consumer.close()
+
+        with pytest.raises(ValueError):
+            await consumer.ack([])
+
+    async def test_an_empty_ack_on_a_positional_subscription_is_a_value_error(self) -> None:
+        # "a positional subscription is a `ValueError` whatever the iterable
+        # holds, an empty one included".
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer(GROUP)
+        await _take(await consumer.subscribe(TOPIC, start_offset=0), 1)
+
+        with pytest.raises(ValueError):
+            await consumer.ack([])
+
+    async def test_an_empty_ack_before_subscribe_returns_normally(self) -> None:
+        # "an instance that has not subscribed yet, which has delivered
+        # nothing and so accepts exactly the empty iterable". `ack` is
+        # declared `-> None`: "returns normally" is that nothing is raised.
+        bus = InMemoryBus()
+        consumer = bus.consumer(GROUP)
+
+        await consumer.ack([])
+
+    async def test_any_message_before_subscribe_is_a_value_error(self) -> None:
+        # "... accepts exactly the empty iterable": a real message of the
+        # log, read by another group, is still "one this instance never
+        # delivered".
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        probe = await _read_group(bus, "probe", TOPIC, 1)
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(ValueError):
+            await consumer.ack(probe)
+
+    async def test_a_live_durable_subscription_accepts_the_empty_iterable(self) -> None:
+        # The one remaining branch of the ordered checks: "only a live
+        # durable subscription ... returns normally on an empty iterable".
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer(GROUP)
+        await consumer.subscribe(TOPIC)
+
+        await consumer.ack([])
+
+
 class TestPositionalSubscriptions:
     """Decision 3, `start_offset=<int>`: "delivery starts at the first message
     whose `offset >= start_offset` ..., no position is kept anywhere". The
-    trie replays from its snapshot this way (decision 9)."""
+    trie replays from its snapshot this way (decision 9). As amended
+    (rulings C5.7 / T2): "`start_offset` MUST be `>= 0`: a negative value is
+    a `ValueError` raised before any broker is contacted and before
+    `listener` is called, on both implementations", and "`start_offset=0` is
+    the portable 'from the first retained message': it is the first index of
+    the memory log"."""
 
     async def test_start_offset_delivers_every_message_at_or_after_it(self) -> None:
         bus = InMemoryBus()
@@ -583,19 +772,33 @@ class TestPositionalSubscriptions:
 
         assert [message.value for message in replayed] == [b"first", b"second", b"third"]
 
-    async def test_start_offset_below_the_first_offset_delivers_from_the_start(self) -> None:
-        # ASSUMPTION 2: `first.offset - 1` is the only way to be below the
-        # first retained message on a log that never discards anything.
+    async def test_a_negative_start_offset_is_a_value_error(self) -> None:
+        # ASSUMPTION 2 (ruled): "`start_offset` MUST be `>= 0`: a negative
+        # value is a `ValueError` ... on both implementations". `-1` is what
+        # the withdrawn "below the first offset" test used to pass.
         bus = InMemoryBus()
         await _publish_three(bus)
-        first = (await _read_group(bus, "probe", TOPIC, 1))[0]
-
         consumer = bus.consumer("replayer")
-        replayed = await _take(await consumer.subscribe(TOPIC, start_offset=first.offset - 1), 3)
 
-        assert [message.value for message in replayed] == [b"first", b"second", b"third"]
+        with pytest.raises(ValueError):
+            await consumer.subscribe(TOPIC, start_offset=-1)
+
+    async def test_a_negative_start_offset_never_calls_the_listener(self) -> None:
+        # "... raised before any broker is contacted and before `listener` is
+        # called": a recording listener sees no `on_assigned` at all.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        listener = _RecordingListener()
+        consumer = bus.consumer("replayer")
+
+        with pytest.raises(ValueError):
+            await consumer.subscribe(TOPIC, start_offset=-1, listener=listener)
+
+        assert listener.assigned == []
 
     async def test_start_offset_zero_delivers_from_the_start(self) -> None:
+        # "`start_offset=0` is the portable 'from the first retained message':
+        # it is the first index of the memory log".
         bus = InMemoryBus()
         await _publish_three(bus)
 
@@ -603,6 +806,7 @@ class TestPositionalSubscriptions:
         replayed = await _take(await consumer.subscribe(TOPIC, start_offset=0), 3)
 
         assert [message.value for message in replayed] == [b"first", b"second", b"third"]
+        assert replayed[0].offset == 0
 
     async def test_a_positional_read_keeps_no_position(self) -> None:
         # Two positional consumers of one group, one after the other, are
@@ -825,6 +1029,133 @@ class TestConsumedMessageValue:
 
         assert [message.partition for message in received] == [0] * len(keys)
         assert [message.topic for message in received] == [TOPIC] * len(keys)
+
+
+class TestEndOffset:
+    """Decision 3 as amended (ruling C5.2; assumption 33):
+    "`InMemoryBus.end_offset(topic)` is the length of the topic's log (`0`
+    for a topic never published to), `async` like `NatsBus.end_offset`".
+    Decision 9: on both buses it is "the offset the next appended message
+    will receive (`1` for an empty stream, `0` for an empty memory log)", and
+    "the service has replayed to the log end once every delivered message
+    with `offset < end_offset` has been applied, i.e. once the last applied
+    offset is `>= end_offset - 1`, or immediately when `end_offset <=
+    start_offset`"."""
+
+    async def test_it_is_zero_before_any_publish(self) -> None:
+        # "`0` for a topic never published to" / "`0` for an empty memory
+        # log".
+        bus = InMemoryBus()
+
+        assert await bus.end_offset(TOPIC) == 0
+
+    async def test_it_is_awaitable(self) -> None:
+        # "`async` like `NatsBus.end_offset` so that the trie and the detector
+        # call it the same way on both".
+        bus = InMemoryBus()
+
+        pending = bus.end_offset(TOPIC)
+
+        assert inspect.isawaitable(pending)
+        assert await pending == 0
+
+    async def test_it_is_the_length_of_the_log(self) -> None:
+        # "the length of the topic's log": three appends, `3`.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        assert await bus.end_offset(TOPIC) == 3
+
+    async def test_it_is_one_past_the_last_offset(self) -> None:
+        # "the offset the next appended message will receive": with
+        # ASSUMPTION 1 (offsets are the log index) that is `last.offset + 1`.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        last = (await _read_group(bus, "probe", TOPIC, 3))[2]
+
+        assert await bus.end_offset(TOPIC) == last.offset + 1
+
+    async def test_it_is_per_topic(self) -> None:
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        assert await bus.end_offset(TOPIC) == 3
+        assert await bus.end_offset(OTHER_TOPIC) == 0
+
+    async def test_a_deduplicated_publish_leaves_it_unchanged(self) -> None:
+        # A duplicate is "acknowledged and **not** appended", so the offset
+        # the next appended message will receive does not move.
+        bus = InMemoryBus()
+        producer = bus.producer()
+        await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
+        before = await bus.end_offset(TOPIC)
+
+        await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
+
+        assert await bus.end_offset(TOPIC) == before == 1
+
+    async def test_it_is_the_offset_the_next_appended_message_receives(self) -> None:
+        # The next publish lands exactly there: `end_offset` before the
+        # append is the delivered `offset` of what was appended.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        expected = await bus.end_offset(TOPIC)
+
+        await bus.producer().publish(TOPIC, key="k4", value=b"fourth", message_id="id-4")
+
+        fourth = (await _read_group(bus, "probe", TOPIC, 4))[3]
+        assert fourth.offset == expected
+        assert await bus.end_offset(TOPIC) == expected + 1
+
+    async def test_a_subscription_from_end_offset_yields_only_the_next_publish(self) -> None:
+        # Decision 9's replay-then-tail: a positional subscription opened at
+        # `end_offset` has nothing to replay -- the first message it yields
+        # is the next one appended, none of the three already in the log.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        consumer = bus.consumer("replayer")
+        stream = await consumer.subscribe(TOPIC, start_offset=await bus.end_offset(TOPIC))
+
+        await bus.producer().publish(TOPIC, key="k4", value=b"fourth", message_id="id-4")
+
+        tailed = await _take(stream, 1)
+        assert [message.value for message in tailed] == [b"fourth"]
+        assert tailed[0].offset == 3
+
+    async def test_a_full_replay_from_zero_ends_at_end_offset_minus_one(self) -> None:
+        # The readiness inequality: every message "with `offset < end_offset`"
+        # is delivered by a positional read from 0, and the last of them has
+        # offset `end_offset - 1` -- so "the last applied offset is `>=
+        # end_offset - 1`" holds exactly when the replay has caught up.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        end = await bus.end_offset(TOPIC)
+        consumer = bus.consumer("replayer")
+
+        replayed = await _take(await consumer.subscribe(TOPIC, start_offset=0), end)
+
+        assert all(message.offset < end for message in replayed)
+        assert replayed[-1].offset == end - 1
+        assert replayed[-1].offset >= end - 1
+
+    async def test_an_empty_log_is_replayed_immediately(self) -> None:
+        # "or immediately when `end_offset <= start_offset`": with no
+        # snapshot the trie starts at `0` (decision 9), and an empty memory
+        # log's `end_offset` is `0`, so there is nothing to wait for.
+        bus = InMemoryBus()
+
+        assert await bus.end_offset(TOPIC) <= 0
+
+    def test_end_offset_is_on_the_message_bus_protocol(self) -> None:
+        # "on the `MessageBus` protocol" (ruling C5.2); `InMemoryBus` still
+        # satisfies the widened protocol.
+        assert hasattr(MessageBus, "end_offset")
+        assert isinstance(InMemoryBus(), MessageBus)
+
+    async def test_a_message_bus_typed_reference_can_read_it(self) -> None:
+        bus: MessageBus = InMemoryBus()
+
+        assert await bus.end_offset(TOPIC) == 0
 
 
 class TestTheInterfaceAfterAdr0013:
