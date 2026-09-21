@@ -30,6 +30,10 @@ The mapping, from ADR-0013 decisions 1, 2, 4 and 5:
 * `NatsBus.end_offset(topic)` is `stream_info(...).state.last_seq + 1`: the
   offset the next appended message will receive, the readiness number of
   decision 9, `1` for an empty stream.
+* `bus_endpoints(servers)` is the spec section 47.7 reduction for bus URLs:
+  the only form in which a log record may name the servers (ADR-0013
+  Amendment 2), since a NATS URL may carry a password or token in its
+  userinfo.
 """
 
 import asyncio
@@ -39,6 +43,7 @@ from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit
 
 import nats
 import nats.errors
@@ -274,6 +279,50 @@ async def _close_quietly(nc: NATS) -> None:
         await nc.close()
 
 
+def _split_servers(servers: str) -> list[str]:
+    """`HAMMERTIME_BUS_BROKERS` -> entries: split on `,`, stripped, empties dropped."""
+    return [url.strip() for url in servers.split(",") if url.strip()]
+
+
+#: What `bus_endpoints` renders for an entry `urlsplit` refuses (ADR-0013
+#: assumption 44): a fixed string, nothing derived from the entry.
+UNPARSEABLE_ENDPOINT = "<unparseable>"
+
+
+def bus_endpoints(servers: str | Iterable[str]) -> list[str]:
+    """`<scheme>://<host>[:<port>]` per server URL; userinfo, path, query and fragment dropped.
+
+    The one reduction of a bus server list to something a log record may
+    carry (ADR-0013 decision 3 as amended by Amendment 2, rulings 2-3;
+    spec section 47.7: no record may contain a credential, and a NATS URL
+    may carry `user:password@` or `token@` in its userinfo). A `str` is
+    split exactly as `NatsBus.__init__` splits `HAMMERTIME_BUS_BROKERS`;
+    an iterable is taken entry by entry, each stripped. An entry with no
+    `://` is read as `nats://<entry>` first (nats-py's own normalisation;
+    assumption 45 -- no port is invented). The result per entry is the
+    scheme plus the authority after its **last** `@` -- the whole authority
+    when there is no `@` -- so neither a password nor a username reaches
+    the output (a lone username is a token to nats-py; assumption 42).
+
+    Never raises: an entry `urlsplit` refuses (an unbalanced `[`) is the
+    fixed string `<unparseable>` (assumption 44). `SplitResult.port`,
+    `.hostname`, `.username` and `.password` are never consulted -- `.port`
+    raises a `ValueError` that echoes the text it could not parse, which
+    is exactly what must not reach a log line.
+    """
+    entries = _split_servers(servers) if isinstance(servers, str) else [s.strip() for s in servers]
+    endpoints: list[str] = []
+    for entry in entries:
+        url = entry if "://" in entry else f"nats://{entry}"
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            endpoints.append(UNPARSEABLE_ENDPOINT)
+            continue
+        endpoints.append(f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}")
+    return endpoints
+
+
 class NatsBus:
     """`MessageBus` over one shared NATS connection (ADR-0013 decision 3).
 
@@ -286,7 +335,7 @@ class NatsBus:
     """
 
     def __init__(self, servers: str) -> None:
-        urls = [url.strip() for url in servers.split(",") if url.strip()]
+        urls = _split_servers(servers)
         if not urls:
             raise ValueError("NatsBus needs at least one server URL, got an empty list")
         self._servers = urls

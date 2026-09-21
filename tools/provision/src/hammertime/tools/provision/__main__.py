@@ -20,6 +20,12 @@ when the servers stayed unreachable within `--timeout` or a stream exists
 with a different immutable field (`StreamConfigConflictError`: nothing is
 changed); 2 on invalid arguments or an invalid `HAMMERTIME_LOG_LEVEL`.
 
+The `--servers` value may carry userinfo (`nats://user:password@host:4222`,
+`nats://token@host:4222`) and is passed to `nats.connect` as given; it never
+appears in a log record. The `provision_failed` records name the servers
+only as `bus_endpoints = hammertime.bus.nats.bus_endpoints(servers)` --
+scheme and host, userinfo dropped (ADR-0013 Amendment 2; spec section 47.7).
+
 Nothing here knows a stream's configuration: that is
 `hammertime.bus.nats.stream_config_for`, so this tool and the services'
 startup verification cannot drift apart. Consumers are not provisioned
@@ -41,6 +47,7 @@ from hammertime.bus.nats import (
     CONNECT_TIMEOUT_S,
     TRANSIENT_ERRORS,
     StreamConfigConflictError,
+    bus_endpoints,
     ensure_streams,
 )
 from hammertime.bus.topics import all_topics
@@ -235,13 +242,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.error(
             "provision_failed",
             reason="unreachable",
-            servers=args.servers,
+            bus_endpoints=bus_endpoints(args.servers),
             timeout_s=args.timeout,
             error=str(exc),
         )
         return EXIT_FAILURE
     except nats.errors.Error as exc:
-        log.error("provision_failed", reason="broker_error", servers=args.servers, error=str(exc))
+        log.error(
+            "provision_failed",
+            reason="broker_error",
+            bus_endpoints=bus_endpoints(args.servers),
+            error=str(exc),
+        )
         return EXIT_FAILURE
 
     for stream, action in outcome.items():
