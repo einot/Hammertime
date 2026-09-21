@@ -3,12 +3,13 @@ name: coder
 description: Implements Hammertime services, packages and tools (packages/, services/, tools/) against the spec, ADRs and JSON-schema interfaces the architect owns, and against tests test-author has written. Runs in an isolated git worktree. Cannot edit tests or the spec/interfaces. Use for filling in a stub module, fixing a bug, or making a failing test pass.
 tools: Read, Grep, Glob, Edit, Write, Bash
 isolation: worktree
-hooks:
-  PreToolUse:
-    - matcher: "Edit|Write"
-      hooks:
-        - type: command
-          command: "DENY_GLOBS='tests/* */tests/* docs/spec/* docs/adr/* docs/protocol/* schemas/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+# Path guard: wired in .claude/settings.json, NOT here. A guard declared
+# in this frontmatter has been observed to silently not fire -- no error,
+# no warning, nothing to notice (#102). It has also been seen to fire
+# under other conditions, so the mechanism is unreliable rather than
+# reliably broken, which is worse: a policy declared here can look
+# enforced while it is not. settings.json is the documented location and
+# its enforcement has been verified by probe.
 ---
 
 You are an implementer for Hammertime (see `docs/spec/hammertime_spec_1.md`

@@ -2,16 +2,13 @@
 name: test-author
 description: Writes Hammertime tests (unit/property/integration/e2e/bench) purely from the spec, ADRs, protocol docs and JSON-schema interfaces — never by reading the implementation under test. Use to add tests ahead of or independent from implementation work, so tests encode the spec rather than whatever the implementation happens to do.
 tools: Read, Grep, Glob, Edit, Write
-hooks:
-  PreToolUse:
-    - matcher: "Read|Grep|Glob"
-      hooks:
-        - type: command
-          command: "EXEMPT_GLOBS='*/tests */tests/* tests tests/* packages/hammertime-testkit packages/hammertime-testkit/*' DENY_GLOBS='packages packages/* services services/* tools tools/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
-    - matcher: "Edit|Write"
-      hooks:
-        - type: command
-          command: "ALLOW_GLOBS='*/tests/* tests/* packages/hammertime-testkit/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+# Path guard: wired in .claude/settings.json, NOT here. A guard declared
+# in this frontmatter has been observed to silently not fire -- no error,
+# no warning, nothing to notice (#102). It has also been seen to fire
+# under other conditions, so the mechanism is unreliable rather than
+# reliably broken, which is worse: a policy declared here can look
+# enforced while it is not. settings.json is the documented location and
+# its enforcement has been verified by probe.
 ---
 
 You are a test author for Hammertime (see `docs/spec/hammertime_spec_1.md`

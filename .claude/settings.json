@@ -9,6 +9,42 @@
             "command": "SCOPE_AGENT_TYPES='security-auditor' ALLOW_CMDS='ls cat head tail wc stat find grep rg jq diff cmp git node' ALLOW_GIT_SUBCMDS='log show diff status ls-files ls-tree cat-file blame rev-parse rev-list shortlog grep describe' ALLOW_NODE_SCRIPTS='.claude/skills/security-audit/validate-findings.cjs .claude/skills/security-audit/validate-coverage-ledger.cjs' ${CLAUDE_PROJECT_DIR}/.claude/hooks/bash-guard.sh"
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='coder' DENY_GLOBS='tests/* */tests/* docs/spec/* docs/adr/* docs/protocol/* schemas/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='architect' ALLOW_GLOBS='docs/* schemas/* README.md' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='test-author' ALLOW_GLOBS='*/tests/* tests/* packages/hammertime-testkit/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='test-author' EXEMPT_GLOBS='*/tests */tests/* tests tests/* packages/hammertime-testkit packages/hammertime-testkit/*' DENY_GLOBS='packages packages/* services services/* tools tools/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
       }
     ]
   }

@@ -1,23 +1,64 @@
 #!/usr/bin/env bash
 # Generic PreToolUse path guard shared by Hammertime's project subagents
-# (.claude/agents/*.md). A subagent wires this in via its own `hooks:`
-# frontmatter, setting env vars inline on the command line to parametrize
-# the same script per-agent instead of duplicating the logic five times.
+# (.claude/agents/*.md). One hook entry carries one agent's policy, set as
+# env vars inline on the hook's own command line, so the same script is
+# parametrized per-agent instead of duplicating the logic five times. See
+# WIRING below for where that entry goes -- it is not the agent file.
 #
-# Env vars (space-separated glob lists; `[[ str == pattern ]]` semantics,
-# so a bare `*` in a pattern matches across `/` too — "docs/*" matches
-# "docs/spec/hammertime_spec_1.md"):
+# Env vars. The three glob lists are space-separated and use
+# `[[ str == pattern ]]` semantics, so a bare `*` in a pattern matches
+# across `/` too — "docs/*" matches "docs/spec/hammertime_spec_1.md":
 #
-#   EXEMPT_GLOBS  - path matching any of these is always ALLOWED,
-#                   checked before DENY_GLOBS/ALLOW_GLOBS.
-#   DENY_GLOBS    - path matching any of these (and not exempt) is DENIED.
-#   ALLOW_GLOBS   - if set, a path that is not exempt/already-denied must
-#                   match at least one of these or it is DENIED
-#                   (allowlist mode). Leave unset for denylist-only mode.
+#   EXEMPT_GLOBS      - path matching any of these is always ALLOWED,
+#                       checked before DENY_GLOBS/ALLOW_GLOBS.
+#   DENY_GLOBS        - path matching any of these (and not exempt) is
+#                       DENIED.
+#   ALLOW_GLOBS       - if set, a path that is not exempt/already-denied
+#                       must match at least one of these or it is DENIED
+#                       (allowlist mode). Leave unset for denylist-only
+#                       mode.
+#   SCOPE_AGENT_TYPES - agent types this policy applies to, matched
+#                       against the payload's `agent_type`. A list of
+#                       exact names, not globs. Unset or empty polices
+#                       every call that reaches this hook (the historical
+#                       behaviour). Set polices only the listed agents and
+#                       passes every other caller through untouched. See
+#                       WIRING below -- this exists because the hook has
+#                       to be installed session-wide.
 #
 # Reads the PreToolUse JSON payload on stdin (see
 # https://code.claude.com/docs/en/hooks) and checks tool_input.file_path,
 # falling back to tool_input.path (Grep/Glob).
+#
+# WIRING -- read this before believing the guard is doing anything.
+#
+# This hook must be wired in `.claude/settings.json` (or
+# `.claude/settings.local.json`). It must NOT be wired in an agent file's
+# `hooks:` frontmatter: a guard declared there has been observed to
+# silently not fire -- no error, no warning, nothing to notice, so the
+# agent ran completely unfenced (issue #102). The same frontmatter block
+# has also been seen to fire under other conditions, so the mechanism is
+# unreliable rather than reliably broken. That is worse, not better: a
+# policy declared there can look enforced while it is not, and what makes
+# the difference has not been characterised. `.claude/settings.json` is
+# the documented location, and its enforcement has been verified by
+# direct probe -- see also WIRING in bash-guard.sh.
+#
+# Settings-level hooks are session-wide: they fire for every agent and for
+# the top-level session, not only the agent a policy was written for. That
+# is what SCOPE_AGENT_TYPES is for. One entry still carries one policy,
+# because the env vars come from the hook's own command line, so two
+# agents needing different globs need two entries. Two entries whose
+# SCOPE_AGENT_TYPES overlap both run, and the stricter one's denial wins,
+# since any deny is final.
+#
+# The scoping is FAIL-OPEN by design: an absent or unlisted agent_type
+# means "not my business", not "deny" -- a top-level call carries no
+# agent_type at all. It is routing, not a check, so an exit 0 for an
+# out-of-scope caller is not approval, only a statement that this policy
+# did not apply. See "SCOPING IS FAIL-OPEN BY DESIGN" in bash-guard.sh for
+# why a stricter rule would break the session it was installed in without
+# being a boundary for anyone.
 #
 # Unscoped content tools are DENIED for guarded agents. Grep and Glob take
 # an optional `path`; without one they search the whole project, and
@@ -40,6 +81,34 @@ input="$(cat)"
 tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
 file_path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.path // empty')"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
+agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
+
+# Scope routing -- deliberately NOT a check. This hook has to be wired
+# session-wide (see WIRING in the header), so it sees tool calls from
+# callers this policy was never written for. When SCOPE_AGENT_TYPES is
+# set, only the listed agents are policed and everyone else passes
+# through untouched: an absent agent_type (a top-level call carries none)
+# or one that is not on the list means "not my business", not "deny".
+# Unset behaves as it always has and polices every call that reaches this
+# hook, which is what the test suite exercises.
+#
+# This test deliberately sits first, before `guarded` is even worked out,
+# so that an out-of-scope caller costs nothing and cannot be affected by
+# this policy's configuration.
+if [[ -n "${SCOPE_AGENT_TYPES:-}" ]]; then
+  in_scope=0
+  if [[ -n "$agent_type" ]]; then
+    for scoped_agent in $SCOPE_AGENT_TYPES; do
+      if [[ "$agent_type" == "$scoped_agent" ]]; then
+        in_scope=1
+        break
+      fi
+    done
+  fi
+  if (( ! in_scope )); then
+    exit 0
+  fi
+fi
 
 # A guard is in force for this agent if it constrains paths at all.
 guarded=0
