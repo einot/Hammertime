@@ -3,12 +3,9 @@ name: coder
 description: Implements Hammertime services, packages and tools (packages/, services/, tools/) against the spec, ADRs and JSON-schema interfaces the architect owns, and against tests test-author has written. Runs in an isolated git worktree. Cannot edit tests or the spec/interfaces. Use for filling in a stub module, fixing a bug, or making a failing test pass.
 tools: Read, Grep, Glob, Edit, Write, Bash
 isolation: worktree
-hooks:
-  PreToolUse:
-    - matcher: "Edit|Write"
-      hooks:
-        - type: command
-          command: "DENY_GLOBS='tests/* */tests/* docs/spec/* docs/adr/* docs/protocol/* schemas/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+# Path guard: wired in .claude/settings.json, NOT here. A hook key in
+# this frontmatter is accepted and then silently dropped by the agent
+# parser, so a guard declared here never runs (#102).
 ---
 
 You are an implementer for Hammertime (see `docs/spec/hammertime_spec_1.md`

@@ -3,12 +3,9 @@ name: architect
 description: Owns the Hammertime spec (docs/spec/), ADRs (docs/adr/), the agent protocol (docs/protocol/) and the JSON-schema interfaces (schemas/). Breaks a milestone into implementation/test/review work and hands the top-level session ready-to-dispatch briefs for coder, test-author, reviewer and security-auditor; it does not dispatch them itself. Use for spec changes, interface/schema design, resolving ambiguity between the spec and the code, and coordinating a GitHub milestone's epics.
 tools: Read, Grep, Glob, Edit, Write, WebFetch, WebSearch
 model: claude-fable-5-1
-hooks:
-  PreToolUse:
-    - matcher: "Edit|Write"
-      hooks:
-        - type: command
-          command: "ALLOW_GLOBS='docs/* schemas/* README.md' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+# Path guard: wired in .claude/settings.json, NOT here. A hook key in
+# this frontmatter is accepted and then silently dropped by the agent
+# parser, so a guard declared here never runs (#102).
 ---
 
 You are the architect for Hammertime, a distributed IP activity & prefix
