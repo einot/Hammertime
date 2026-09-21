@@ -7,29 +7,32 @@ startup (not per request), and constructs every other process-lifetime
 singleton the request pipeline needs (issue #32): the `AgentRegistry` and
 the `require_agent` dependency built from it, the `RateLimiter`, the
 `DedupStore` (memory or Redis per `IngestSettings.store_kind`), and the bus
-`Producer` (memory or Kafka per `IngestSettings.bus_kind`) wrapped in an
-`ObservationPublisher`. Kafka's producer needs an explicit `start()`/
-`stop()`; the in-memory one needs neither.
+`Producer` (memory or NATS JetStream per `IngestSettings.bus_kind`,
+ADR-0013) wrapped in an `ObservationPublisher`. `NatsBus` needs an explicit
+`start()`/`close()`; the in-memory one needs neither.
 
 This lifespan *is* ingest's readiness (ADR-0009 decision 4): the app is
 ready exactly from the moment it has completed to the moment it starts
 unwinding, which is what `app.state.readiness` records and what
 `/readyz` -- and the 503 gate on the ingestion endpoint -- report. The two
-connections it makes (Redis, Kafka) are retried with backoff under the
+connections it makes (Redis, NATS) are retried with backoff under the
 startup deadline, because `depends_on` in the compose file orders
 container start but not broker readiness (decision 5 step 5). A rejected
-credential is not that kind of failure and fails the start at once.
+credential is not that kind of failure and fails the start at once. A
+`publish` that fails mid-outage (`nats.errors.TimeoutError` or
+`ConnectionClosedError`, ADR-0013 decision 3) propagates out of
+`ObservationPublisher` and is answered 503 by `api/routes.py`; no publish
+is retried here (ADR-0013 Consequences names that as a follow-up).
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from aiokafka.errors import KafkaConnectionError
 from fastapi import FastAPI, Request, Response
-from hammertime.bus.interface import Producer
-from hammertime.bus.kafka import KafkaProducer
+from hammertime.bus.interface import MessageBus, Producer
 from hammertime.bus.memory import InMemoryBus
+from hammertime.bus.nats import TRANSIENT_ERRORS, NatsBus
 from hammertime.core.config.loader import load as load_detection_config
 from hammertime.core.runtime import (
     Readiness,
@@ -69,11 +72,11 @@ _TRANSIENT_STORE_ERRORS: tuple[type[BaseException], ...] = (
     RedisTimeoutError,
 )
 
-#: The bus needs no counterpart to `_PERMANENT_STORE_ERRORS` below:
-#: aiokafka raises its authentication failures (`AuthenticationFailedError`,
-#: `UnsupportedSaslMechanismError`, ...) as plain `KafkaError`s, none of
-#: which is or subclasses `KafkaConnectionError`.
-_TRANSIENT_BUS_ERRORS: tuple[type[BaseException], ...] = (OSError, KafkaConnectionError)
+#: The bus needs no counterpart to `_PERMANENT_STORE_ERRORS` below: its
+#: transient tuple is `hammertime.bus.nats.TRANSIENT_ERRORS` (ADR-0013
+#: decision 3), and nats-py's rejected-credential errors
+#: (`AuthorizationError`, `InvalidUserCredentialsError`) subclass none of
+#: the types in it, so they fail the start on the first attempt as-is.
 
 #: Type alone is not enough on the store side: redis-py reports a rejected
 #: credential as `AuthenticationError`/`AuthorizationError`, both
@@ -144,7 +147,7 @@ def create_app(
     auth_failure_agent_limiter: RateLimiter | None = None,
     observation_limiter: RateLimiter | None = None,
     dedup_store: DedupStore | None = None,
-    bus: InMemoryBus | None = None,
+    bus: MessageBus | None = None,
     agent_slot_salt: bytes | None = None,
     agent_slot_count: int | None = None,
 ) -> FastAPI:
@@ -156,11 +159,13 @@ def create_app(
     environment variables. The keyword-only overrides let a test substitute
     its own `AgentRegistry` (skipping `HAMMERTIME_INGEST_AGENTS_PATH` disk
     access), `RateLimiter`s/`DedupStore` (e.g. built on a shared
-    `ManualClock` for deterministic TTL/refill assertions), and `InMemoryBus`
-    (so the test keeps a reference to read a topic's log back afterwards --
-    `bus.producer()` is what actually gets wired into `ObservationPublisher`,
-    the same relationship `InMemoryBus.consumer(group_id)` has elsewhere in
-    this repo). Any override left `None` falls back to the normal
+    `ManualClock` for deterministic TTL/refill assertions), and `MessageBus`
+    (typically an `InMemoryBus`, so the test keeps a reference to read a
+    topic's log back afterwards -- `bus.producer()` is what actually gets
+    wired into `ObservationPublisher`, the same relationship
+    `InMemoryBus.consumer(group_id)` has elsewhere in this repo). An
+    injected bus is the caller's to start and close; the lifespan neither
+    starts nor closes it. Any override left `None` falls back to the normal
     settings/environment-driven construction below.
 
     `agent_slot_salt`/`agent_slot_count` are forwarded to `require_agent`
@@ -226,13 +231,19 @@ def create_app(
             resolved_dedup_store = MemoryDedupStore()
 
         producer: Producer
-        kafka_producer: KafkaProducer | None = None
+        nats_bus: NatsBus | None = None
         if bus is not None:
             producer = bus.producer()
-        elif resolved_settings.bus_kind == "kafka":
-            kafka_producer = KafkaProducer(bootstrap_servers=resolved_settings.bus_brokers)
-            await connect_with_retry("bus", kafka_producer.start, transient=_TRANSIENT_BUS_ERRORS)
-            producer = kafka_producer
+        elif resolved_settings.bus_kind == "nats":
+            nats_bus = NatsBus(resolved_settings.bus_brokers)
+            # `producer()` is callable before `start()` (ADR-0013 decision
+            # 3, ruling C8): the object uses the connection lazily.
+            producer = nats_bus.producer()
+            # `start()` connects and verifies every registered stream
+            # exists; a missing one is `StreamNotProvisionedError`, in
+            # `TRANSIENT_ERRORS` because the provisioning tool may still be
+            # running (ADR-0013 decision 2).
+            await connect_with_retry("bus", nats_bus.start, transient=TRANSIENT_ERRORS)
         else:
             producer = InMemoryBus().producer()
 
@@ -296,8 +307,8 @@ def create_app(
             # ingestion endpoint) *before* the connections those answers
             # depend on are torn down.
             readiness.mark_stopping()
-            if kafka_producer is not None:
-                await kafka_producer.stop()
+            if nats_bus is not None:
+                await nats_bus.close()
             if redis_client is not None:
                 await redis_client.aclose()
 

@@ -19,8 +19,8 @@ _DEFAULT_MAX_OBSERVATIONS = 10_000
 _DEFAULT_CONFIG_PATH = "./config/detection.v1.json"
 _DEFAULT_RATE_LIMIT_RPS = 50.0
 _DEFAULT_AGENTS_PATH = "./config/agents.v2.json"
-_DEFAULT_BUS_KIND = "kafka"
-_DEFAULT_BUS_BROKERS = "localhost:19092"
+_DEFAULT_BUS_KIND = "nats"
+_DEFAULT_BUS_BROKERS = "nats://localhost:4222"
 _DEFAULT_STORE_KIND = "redis"
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
@@ -38,7 +38,7 @@ _DEFAULT_OBSERVATION_BURST = 10_000
 # --- ADR-0009: process lifecycle (spec section 47) -------------------------
 _DEFAULT_CONFIG_POLL_INTERVAL_S = 1.0
 
-_ALLOWED_BUS_KINDS = frozenset({"kafka", "memory"})
+_ALLOWED_BUS_KINDS = frozenset({"nats", "memory"})
 _ALLOWED_STORE_KINDS = frozenset({"redis", "memory"})
 
 
@@ -63,10 +63,16 @@ class IngestSettings:
     rate_limit_rps: float
     #: HAMMERTIME_INGEST_AGENTS_PATH: the agent registry document.
     agents_path: Path
-    #: HAMMERTIME_BUS_KIND: "kafka" | "memory".
+    #: HAMMERTIME_BUS_KIND: "nats" | "memory" (ADR-0013 decision 10; any
+    #: other value is a `ValueError`, exit 2).
     bus_kind: str
-    #: HAMMERTIME_BUS_BROKERS: bootstrap servers, meaningful only when
-    #: bus_kind == "kafka".
+    #: HAMMERTIME_BUS_BROKERS: comma-separated NATS server URLs
+    #: (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), meaningful
+    #: only when bus_kind == "nats". Not validated here (ADR-0013 assumption
+    #: 15): nats-py parses the value at `connect()`. An entry MAY carry
+    #: userinfo (`user:password@` or `token@`), so no log record carries
+    #: this field verbatim -- the `starting` record names the servers as
+    #: `bus_endpoints` (ADR-0013 Amendment 2, rulings 1-3).
     bus_brokers: str
     #: HAMMERTIME_STORE_KIND: "redis" | "memory".
     store_kind: str

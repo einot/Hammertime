@@ -22,7 +22,9 @@ fan-out), ADR-0008 (observation-scaled rate limiting)
    split message gets its own distinct, deterministic `event_id`).
 4. Publish each envelope to `hammertime.observations.v1`, keyed via
    `topic.key_selector(entry)` -- never a hard-coded `str(entry.ip)` at the
-   call site, even though the two happen to agree.
+   call site, even though the two happen to agree -- and with the
+   envelope's `event_id` as the `message_id`, so the log deduplicates a
+   republished record inside its duplicate window (ADR-0013 decision 4).
 5. Publish all surviving messages concurrently, then `flush()` once for the
    whole batch -- exactly once, even if every entry was dropped as a zero
    delta. Any failure propagates (never swallowed): `202` means every
@@ -144,4 +146,5 @@ class ObservationPublisher:
             _OBSERVATIONS_TOPIC.name,
             _OBSERVATIONS_TOPIC.key_selector(entry),
             encode(envelope),
+            message_id=envelope.event_id,
         )
