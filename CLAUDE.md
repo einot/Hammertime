@@ -144,6 +144,20 @@ an agent's configuration looks like it is blocking legitimate work, say so
 and let the user decide; changing it unasked defeats the point of having
 the constraint.
 
+**Agent guards.** The subagent path and Bash guards live in
+`.claude/settings.json`, scoped per agent with `SCOPE_AGENT_TYPES`, and
+nowhere else. Never declare them in an agent file's `hooks:` frontmatter:
+a guard declared there did not fire in this environment (three probes,
+#102), most likely because project-level frontmatter hooks require the
+workspace trust dialog to have been accepted, which a headless session
+never does. Hook configuration is read from the *main checkout*, not from
+a worktree-isolated agent's checkout -- so a `coder` dispatch is fenced by
+whatever the main checkout's `settings.json` says at that moment, and the
+copy in its worktree is inert. Verify any guard change the only way that
+counts: put it in the main checkout, dispatch a real agent, and have it
+attempt an operation the policy must refuse. `tests/config/` pins the
+wiring, but a passing test is not a fired hook.
+
 **Pre-1.0 exception:** until the first release (1.0) ships, the top-level
 session may finish and merge PRs itself — resolving merge conflicts
 (including regenerating lockfiles with the repo's own tooling, never by
