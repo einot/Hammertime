@@ -32,15 +32,55 @@ services, so this class and `services/aggregator/.../tests/test_config.py`'s
 ASSUMPTIONS for `TestBusKind`: `IngestSettings.bus_kind` / `bus_brokers` are
 the field names `test_pipeline.py::_settings` already constructs; the kind
 is matched as written (no claim about case-insensitivity either way).
+
+`TestStartingRecordCarriesBusEndpoints` covers ADR-0013 Amendment 2 rulings
+2-3 and decision 3's `bus_endpoints` paragraph: the `starting` record "logs
+`bus_endpoints` **in place of** `bus_brokers`", each entry reduced to
+"`<scheme>://` followed by the part of the authority after its **last** `@`"
+so that "nothing to the left of that `@` reaches the output: not a password,
+and not a username either". That is section 47.7's "no record -- of any event
+-- may contain a credential" applied to the userinfo of a bus URL (ruling 2),
+which supersedes ADR-0009 A7's "`bus_brokers` is logged verbatim". The seam
+is the one A7 names for the record's own fields -- `startup_fields()` on the
+object `build_service` returns (`DescribesStartup`) -- and the service is
+built on the memory bus with an injected `InMemoryBus` (ADR-0009 decision 3:
+"when `bus` is given, the service takes ... from it regardless of
+`HAMMERTIME_BUS_KIND`"), because the field is a reduction of the *setting*,
+which `load_settings` stores untouched whatever the bus kind (decision 10,
+assumption 15), so no NATS server is needed to observe it. The class is a
+deliberately diffable copy of the aggregator file's class of the same name.
+
+ASSUMPTIONS for that class:
+
+* **`HAMMERTIME_CONFIG_PATH` is the detection-config key** `load_settings`
+  reads into `detection_config_path` (ADR-0009 decision 6, `.env.example`);
+  it is pointed at the repository's `config/detection.v1.json` the way
+  `test_pipeline.py` resolves it, so `build_service` (which "loads the
+  document", ADR-0009 A5) needs no cwd.
+* **`build_service(settings, *, bus=..., agent_registry=...)`** is ADR-0009
+  decision 3's composition root with ingest's "service-specific extras ...
+  `dedup_store`, `agent_registry` (mirroring `create_app` today)". The
+  registry is injected exactly as `test_routes.py` injects it into
+  `create_app`, so no `agents.v2.json` fixture and no
+  `HAMMERTIME_INGEST_AGENT_TOKEN_KEY` (read "directly by the registry
+  loader", ADR-0009 decision 2) are needed.
+* **`startup_fields()` returns a mapping whose values are JSON-renderable**,
+  which is what a `starting` record requires; `json.dumps(..., default=str)`
+  is used so a `Path`-valued field would still be rendered and scanned
+  rather than fail the test for an unrelated reason.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from hammertime.bus.memory import InMemoryBus
+from hammertime.core.auth.tokens import hash_token
 from hammertime.core.runtime import run_service
+from hammertime.ingest.auth.agents import AgentRecord, AgentRegistry
 from hammertime.ingest.config import load_settings
 from hammertime.ingest.service import build_service
 
@@ -432,6 +472,106 @@ class TestBusKind:
         # value surfaces at `connect()` as `start_failed`, not here.
         for value in ("nats://nats:4222,nats://nats-2:4222", "not a url at all"):
             assert load_settings({"HAMMERTIME_BUS_BROKERS": value}).bus_brokers == value
+
+
+# --------------------------------------------------------------------------
+# ADR-0013 decision 3 `bus_endpoints` / Amendment 2 rulings 2-3; section 47.7
+# --------------------------------------------------------------------------
+
+# One entry in each of the two userinfo forms nats-py reads (Amendment 2
+# ruling 1): `user:password@` and a lone `token@`. Both are legal values of
+# `HAMMERTIME_BUS_BROKERS`, and neither may reach a log record.
+BUS_BROKERS_WITH_USERINFO = "nats://user:s3cret@nats:4222,nats://tok3n@other:4222"
+BUS_ENDPOINTS = ["nats://nats:4222", "nats://other:4222"]
+
+# Decision 3's examples: the password, the token, the username (nats-py reads
+# a lone username as a token, assumption 42) and the `@` that would betray
+# that userinfo was present at all.
+BUS_USERINFO_FRAGMENTS = ("s3cret", "tok3n", "user:", "@")
+
+# The repository's own detection document, resolved as `test_pipeline.py`
+# resolves it.
+_CONFIG_PATH = Path(__file__).parents[6] / "config" / "detection.v1.json"
+
+# ADR-0006: a fixed 32-byte test key and one hashed record, exactly as
+# `test_routes.py` builds its registry -- never a real env var or file.
+_AGENT_TOKEN_KEY = b"0" * 32
+_AGENT_ID = "edge-17"
+_AGENT_TOKEN = "test-token"
+
+
+def _registry() -> AgentRegistry:
+    token_hash = bytes.fromhex(hash_token(_AGENT_TOKEN, key=_AGENT_TOKEN_KEY))
+    return AgentRegistry.from_records(
+        [AgentRecord(agent_id=_AGENT_ID, token_hash=token_hash, rate_limit_rps=None)],
+        key=_AGENT_TOKEN_KEY,
+    )
+
+
+class TestStartingRecordCarriesBusEndpoints:
+    """ADR-0013 Amendment 2 rulings 2-3: the `starting` record "logs
+    `bus_endpoints` **in place of** `bus_brokers`", and "the rendered text of
+    every record ... MUST NOT contain the userinfo of a bus URL"."""
+
+    def _fields(self) -> dict[str, Any]:
+        env = {
+            "HAMMERTIME_STORE_KIND": "memory",
+            "HAMMERTIME_BUS_KIND": "memory",
+            "HAMMERTIME_BUS_BROKERS": BUS_BROKERS_WITH_USERINFO,
+            "HAMMERTIME_CONFIG_PATH": str(_CONFIG_PATH),
+        }
+        settings = load_settings(env)
+        # Decision 10 / assumption 15: the setting itself is untouched -- the
+        # reduction happens at the record, not at `load_settings`.
+        assert settings.bus_brokers == BUS_BROKERS_WITH_USERINFO
+        service = build_service(settings, bus=InMemoryBus(), agent_registry=_registry())
+        fields: dict[str, Any] = dict(service.startup_fields())
+        return fields
+
+    def test_bus_endpoints_is_the_reduced_list(self) -> None:
+        # Decision 3: "`<scheme>://` followed by the part of the authority
+        # after its **last** `@`", one entry per server, in order.
+        fields = self._fields()
+
+        assert fields["bus_endpoints"] == BUS_ENDPOINTS
+
+    def test_bus_brokers_is_no_longer_a_field(self) -> None:
+        # Ruling 3 / assumption 47: "field renamed (`bus_endpoints`) rather
+        # than value replaced under `bus_brokers`", so "no reader mistakes the
+        # field for the configured value". ADR-0009 A7's row is superseded.
+        fields = self._fields()
+
+        assert "bus_brokers" not in fields
+
+    def test_the_field_does_not_depend_on_the_bus_kind(self) -> None:
+        # The service was built on the memory bus and says so; the reduction
+        # of `HAMMERTIME_BUS_BROKERS` is reported regardless.
+        fields = self._fields()
+
+        assert fields["bus_kind"] == "memory"
+        assert fields["bus_endpoints"] == BUS_ENDPOINTS
+
+    @pytest.mark.parametrize(
+        "fragment",
+        BUS_USERINFO_FRAGMENTS,
+        ids=["password", "token", "username", "at-sign"],
+    )
+    def test_the_rendered_fields_carry_no_userinfo(self, fragment: str) -> None:
+        # Ruling 2 / section 47.7: not the password, not the username (a lone
+        # username is a token to nats-py), and no `@` at all -- the `starting`
+        # record is rendered from exactly these fields.
+        rendered = json.dumps(self._fields(), default=str)
+
+        assert fragment not in rendered
+
+    def test_the_whole_configured_value_is_absent(self) -> None:
+        # Decision 3: "no record of any event carries `HAMMERTIME_BUS_BROKERS`
+        # ... verbatim or in any other derived form" that keeps the userinfo.
+        rendered = json.dumps(self._fields(), default=str)
+
+        assert BUS_BROKERS_WITH_USERINFO not in rendered
+        for entry in BUS_BROKERS_WITH_USERINFO.split(","):
+            assert entry not in rendered
 
 
 class TestAKafkaBusKindExitsTwo:
