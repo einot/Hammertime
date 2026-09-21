@@ -1,13 +1,15 @@
 # ADR 0013 — NATS JetStream as the durable event log, with static shard assignment only
 
-Status: accepted 2026-09-21, **pending owner confirmation**. Epic #95's first
-reason for the swap — that Kafka's cold start threatens ADR-0009's 60 s
-startup deadline — was measured on 2026-09-21 and does not hold (see
-Context, prerequisite 5); the epic's own text says the owner "may wish to
-revisit the decision" in that case, and the top-level session is reporting
-it. This ADR is therefore written so that the owner can reject it cheaply:
-nothing outside `docs/` has been changed on its strength, and every
-implementation brief it produces is blocked on that confirmation. Amends
+Status: accepted 2026-09-21, confirmed by the repository owner on
+2026-09-21. Epic #95's first reason for the swap — that Kafka's cold start
+threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
+does not hold (see Context, prerequisite 5); the epic's own text says the
+owner "may wish to revisit the decision" in that case, so the top-level
+session reported the measurement and sought confirmation before any
+implementation brief was dispatched. The owner confirmed the ADR with
+knowledge of prerequisite 5's result ("Confirm ADR-0013, proceed with T1
+and C1"), and it proceeds on the remaining reasons and the design gains
+under Consequences. Amends
 ADR-0001, ADR-0003, ADR-0009, ADR-0010 and ADR-0012 (each carries a dated
 amendment pointing here) and supersedes ADR-0011 decision 1, the callback
 bullets of decision 5, the commit paragraph of decision 6, the mechanism of
@@ -1029,8 +1031,9 @@ not make. Push back on them individually.
 2. **Accepting the swap although its first reason fell away.** Prerequisite
    5 shows Kafka clears the 60 s deadline by a wide margin. This ADR
    proceeds on the remaining reasons and on the design gains under
-   Consequences, and is marked pending owner confirmation so that the
-   owner can reject it before any code changes.
+   Consequences. It was held pending owner confirmation, so that the owner
+   could reject it before any code changes, and the owner confirmed it on
+   2026-09-21 with knowledge of that result (see Status).
 3. **Stream per topic; subjects `<topic>.<partition>`; stream names with
    `-` for `.`.** The alternative — one stream for everything — would make
    one retention policy serve four topics with retentions from one to
