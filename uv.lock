@@ -16,6 +16,7 @@ members = [
     "hammertime-core",
     "hammertime-detector",
     "hammertime-ingest",
+    "hammertime-provision",
     "hammertime-replay",
     "hammertime-store",
     "hammertime-testkit",
@@ -211,6 +212,7 @@ dev = [
     { name = "fakeredis" },
     { name = "hammertime-agent-sim" },
     { name = "hammertime-agent-token" },
+    { name = "hammertime-provision" },
     { name = "hammertime-replay" },
     { name = "hammertime-testkit" },
     { name = "hammertime-trie-inspect" },
@@ -240,6 +242,7 @@ dev = [
     { name = "fakeredis", specifier = ">=2.20" },
     { name = "hammertime-agent-sim", editable = "tools/agent-sim" },
     { name = "hammertime-agent-token", editable = "tools/agent-token" },
+    { name = "hammertime-provision", editable = "tools/provision" },
     { name = "hammertime-replay", editable = "tools/replay" },
     { name = "hammertime-testkit", editable = "packages/hammertime-testkit" },
     { name = "hammertime-trie-inspect", editable = "tools/trie-inspect" },
@@ -368,6 +371,21 @@ requires-dist = [
     { name = "hammertime-store", editable = "packages/hammertime-store" },
     { name = "jsonschema", specifier = ">=4.23" },
     { name = "uvicorn", specifier = ">=0.30" },
+]
+
+[[package]]
+name = "hammertime-provision"
+version = "0.1.0"
+source = { editable = "tools/provision" }
+dependencies = [
+    { name = "hammertime-bus" },
+    { name = "hammertime-core" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hammertime-bus", editable = "packages/hammertime-bus" },
+    { name = "hammertime-core", editable = "packages/hammertime-core" },
 ]
 
 [[package]]

@@ -30,6 +30,7 @@ hammertime-agent-sim = { workspace = true }
 hammertime-agent-token = { workspace = true }
 hammertime-replay = { workspace = true }
 hammertime-trie-inspect = { workspace = true }
+hammertime-provision = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -38,6 +39,7 @@ dev = [
     "hammertime-agent-token",
     "hammertime-replay",
     "hammertime-trie-inspect",
+    "hammertime-provision",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "hypothesis>=6.100",
@@ -71,4 +73,5 @@ mypy_path = [
     "tools/agent-token/src",
     "tools/replay/src",
     "tools/trie-inspect/src",
+    "tools/provision/src",
 ]

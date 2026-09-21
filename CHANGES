@@ -1,3 +1,4 @@
+Add hammertime-provision: a one-shot CLI (--servers, --replicas, --timeout) that creates or reconciles the JetStream stream of every registered topic before the services start; exit 0 when every stream matches, 1 when the servers stay unreachable or a stream conflicts on an immutable field, 2 on invalid arguments
 Reference deployment runs Apache Kafka (KRaft) and Valkey instead of Redpanda and Redis; every image is pinned; Redpanda remains available via deploy/docker-compose.redpanda.yml
 Reject a malformed HAMMERTIME_REDIS_URL at startup as invalid configuration (config_invalid, exit 2) instead of failing inside start() with exit 1; checked only when HAMMERTIME_STORE_KIND=redis
 Add aggregator service: consumes hammertime.observations.v1 per shard, maintains per-IP sliding windows, and emits HotIpAdded/HotIpRemoved with weight in attributes
