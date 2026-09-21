@@ -4,30 +4,45 @@ Spec: section 19 (event boundary), section 32 (replayability), section 33.
 
 The trie is derived state. Everything that reconstructs it flows through this
 package, so the log interface deliberately exposes offsets/sequences rather than
-hiding them.
+hiding them. Two implementations: `InMemoryBus` for tests and `NatsBus` over
+NATS JetStream for the reference deployment (ADR-0013).
 """
 
 from hammertime.bus.interface import (
     AssignmentListener,
     ConsumedMessage,
     Consumer,
+    MessageBus,
     Producer,
 )
-from hammertime.bus.kafka import KafkaConsumer, KafkaProducer
 from hammertime.bus.memory import InMemoryBus, MemoryConsumer, MemoryProducer
-from hammertime.bus.topics import TOPICS, TopicSpec, all_topics
+from hammertime.bus.nats import (
+    TRANSIENT_ERRORS,
+    NatsBus,
+    NatsConsumer,
+    NatsProducer,
+    StreamConfigConflictError,
+    StreamNotProvisionedError,
+)
+from hammertime.bus.topics import TOPICS, TopicSpec, all_topics, partition_for
 
 __all__ = [
     "TOPICS",
+    "TRANSIENT_ERRORS",
     "AssignmentListener",
     "ConsumedMessage",
     "Consumer",
     "InMemoryBus",
-    "KafkaConsumer",
-    "KafkaProducer",
     "MemoryConsumer",
     "MemoryProducer",
+    "MessageBus",
+    "NatsBus",
+    "NatsConsumer",
+    "NatsProducer",
     "Producer",
+    "StreamConfigConflictError",
+    "StreamNotProvisionedError",
     "TopicSpec",
     "all_topics",
+    "partition_for",
 ]

@@ -9,9 +9,11 @@ implementation and a Redis production backend:
 * **Dedup** (spec section 23, ADR-0003): `DedupStore`, `MemoryDedupStore`,
   `RedisDedupStore`, plus the `SequenceKey`/`SequenceWindow` per-agent
   tracking structure `MemoryDedupStore` builds on.
-* **Shard state** (ADR-0011 decision 5): `ShardState`, `ShardStateStore`,
-  `MemoryShardStateStore`, `RedisShardStateStore` -- the durable per-shard
-  HOT set and transition sequence a restarting aggregator inherits.
+* **Shard state** (ADR-0011 decision 5; ADR-0013 decision 7): `ShardState`,
+  `ShardStateStore`, `MemoryShardStateStore`, `RedisShardStateStore` -- the
+  durable per-shard HOT set and transition sequence a restarting aggregator
+  inherits, plus the per-shard lease that detects two members claiming the
+  same shard.
 
 Plus one validator, here because only this package knows what URL a Redis
 backend can be built from (ADR-0009 A12, spec section 47):

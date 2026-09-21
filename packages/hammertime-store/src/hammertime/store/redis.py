@@ -61,6 +61,8 @@ key still existing with `gt` false, the retried `SET NX` correctly no-ops
 against the still-live, already-sufficient TTL.
 """
 
+import math
+
 from hammertime.core.addressing.address import Address
 from hammertime.core.state.enums import IpState
 from hammertime.store.dedup import SequenceKey
@@ -81,12 +83,37 @@ _SEEN_VALUE = b"1"
 #: unrelated key scheme in the same keyspace.
 _KEY_PREFIX = "hammertime:dedup:"
 
-#: Namespaces every key `RedisShardStateStore` writes, one pair per shard:
-#: `hammertime:agg:{shard}:hot` and `hammertime:agg:{shard}:seq`. ADR-0011
-#: names this keyspace explicitly -- the deploy epic's `noeviction`
-#: requirement is written against this prefix, so it is load-bearing beyond
-#: tidiness.
+#: Namespaces every key `RedisShardStateStore` writes, three per shard:
+#: `hammertime:agg:{shard}:hot`, `hammertime:agg:{shard}:seq` (ADR-0011)
+#: and `hammertime:agg:{shard}:owner` (the lease, ADR-0013 decision 7).
+#: ADR-0011 names this keyspace explicitly -- the deploy epic's
+#: `noeviction` requirement is written against this prefix, so it is
+#: load-bearing beyond tidiness.
 _SHARD_KEY_PREFIX = "hammertime:agg:"
+
+#: `acquire_lease` as one atomic server-side step (ADR-0013 decision 7):
+#: grant if no lease exists or the live lease is the caller's own, in which
+#: case the expiry is reset to now + TTL; otherwise return the holder. KEYS[1]
+#: is the owner key, ARGV[1] the caller's member id, ARGV[2] the TTL in whole
+#: seconds. Redis's `GET` returns Lua `false` for a missing key.
+_ACQUIRE_LEASE_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if (not current) or current == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  return nil
+end
+return current
+"""
+
+#: `release_lease`: delete the owner key iff it holds ARGV[1]. Also one step,
+#: so a lease that expired and was retaken between a `GET` and a `DEL` can
+#: never be deleted from under its new holder.
+_RELEASE_LEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+end
+return nil
+"""
 
 #: How many times `RedisShardStateStore.record_transition` re-reads and
 #: retries its WATCH/MULTI/EXEC before giving up. Each attempt loses only
@@ -104,6 +131,11 @@ def _hot_key(shard: int) -> str:
 def _sequence_key(shard: int) -> str:
     """The sequence this shard's next transition will use."""
     return f"{_SHARD_KEY_PREFIX}{shard}:seq"
+
+
+def _owner_key(shard: int) -> str:
+    """The member id currently holding this shard's lease, with the lease's TTL."""
+    return f"{_SHARD_KEY_PREFIX}{shard}:owner"
 
 
 def _as_text(value: bytes | str) -> str:
@@ -216,6 +248,15 @@ class RedisShardStateStore:
     that, precisely because the clamp it mandates is a compare-and-set and
     MULTI/EXEC cannot express one). See its body for why that is a
     WATCH-based optimistic transaction here.
+
+    The lease (`acquire_lease`/`release_lease`, ADR-0013 decision 7) is a
+    third key, `hammertime:agg:{shard}:owner`, holding the member id with
+    the lease's TTL as the key's expiry -- the one key under this prefix
+    that *does* expire, which is its whole point: a crashed member's lease
+    lapses on its own. Both calls are one Lua `EVAL` each, so the
+    compare-and-grant is a single server-side step, as the ADR requires;
+    the TTL is rounded up to whole seconds for `EX`. Running the store
+    against fakeredis therefore needs its Lua extra (`lupa`).
     """
 
     def __init__(self, client: Redis) -> None:
@@ -300,3 +341,14 @@ class RedisShardStateStore:
             f"could not record transition for shard {shard} after "
             f"{_MAX_SEQUENCE_CAS_ATTEMPTS} attempts: {sequence_key} is under contention"
         )
+
+    async def acquire_lease(self, shard: int, owner: str, ttl_seconds: float) -> str | None:
+        if ttl_seconds <= 0:
+            raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds!r}")
+        holder = await self._client.eval(
+            _ACQUIRE_LEASE_SCRIPT, 1, _owner_key(shard), owner, math.ceil(ttl_seconds)
+        )
+        return None if holder is None else _as_text(holder)
+
+    async def release_lease(self, shard: int, owner: str) -> None:
+        await self._client.eval(_RELEASE_LEASE_SCRIPT, 1, _owner_key(shard), owner)

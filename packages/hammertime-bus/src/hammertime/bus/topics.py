@@ -1,6 +1,6 @@
-"""Topic names, partition counts, retention, and key selection per topic.
+"""Topic names, partition counts, retention, key selection and the partition hash.
 
-Spec: section 20, section 33; ADR-0001; ADR-0002
+Spec: section 20, section 33; ADR-0001; ADR-0002; ADR-0013
 
 Retention below, and most of the partition counts, are initial operational
 defaults rather than spec-mandated values; they are expected to be tuned
@@ -11,11 +11,11 @@ per deployment. What IS load-bearing is:
   this string.
 * `OBSERVATIONS.partitions` is *not* one of those free tuning knobs. An
   aggregator shard IS a partition of `hammertime.observations.v1` (epic
-  #7, ADR-0011): `hash(ip) -> shard` is the bus's own key partitioner
-  acting on the per-IP key ingest already publishes, and the aggregator
-  reads an IP's shard off `ConsumedMessage.partition` rather than hashing
-  anything itself. Two consequences, both of which are the reason this
-  number is what it is:
+  #7, ADR-0011): `hash(ip) -> shard` is `partition_for` below, acting on
+  the per-IP key ingest already publishes, and the aggregator reads an
+  IP's shard off `ConsumedMessage.partition` rather than hashing anything
+  itself. Two consequences, both of which are the reason this number is
+  what it is:
     1. It is the hard ceiling on aggregator parallelism. At N partitions,
        replica N+1 gets no assignment and sits idle. 128 buys headroom to
        128 workers for a little per-partition broker overhead.
@@ -35,6 +35,16 @@ per deployment. What IS load-bearing is:
   all three, regardless of any other field on the event.
 * `PREFIX_STATS` is keyed by prefix, not IP: ADR-0001 makes the trie
   service a single writer, so there is nothing to shard by IP there.
+* The hash lives here (ADR-0013 decision 1). On JetStream a partition `p`
+  of topic `T` is the subject `T.<p>`, and the broker routes by subject,
+  not by key -- so someone in this repository has to compute the
+  partition, and every `Producer` implementation does it the same way:
+  `partition_for(key, TOPICS[topic].partitions)`. FNV-1a 32-bit is the
+  algorithm the NATS server's own `{{partition()}}` subject transform uses
+  (ADR-0013 assumption 4), so a deployment that ever wanted a server-side
+  transform to reproduce the mapping could. Every stream, subject and
+  filter name a JetStream deployment needs is derived from `TopicSpec`
+  here, too, so `nats.py` and the provisioner cannot drift apart.
 """
 
 from collections.abc import Callable, Mapping
@@ -49,6 +59,32 @@ from hammertime.core.events.models import (
 )
 
 _ONE_DAY_SECONDS = 24 * 60 * 60
+
+#: FNV-1a 32-bit parameters (Fowler/Noll/Vo; the same constants
+#: `hash/fnv.New32a` uses in Go, which is what the NATS server's subject
+#: transform calls).
+_FNV1A_32_OFFSET_BASIS = 0x811C9DC5
+_FNV1A_32_PRIME = 0x01000193
+_UINT32_MASK = 0xFFFFFFFF
+
+
+def partition_for(key: bytes | str, partitions: int) -> int:
+    """FNV-1a 32-bit over the UTF-8 bytes of `key`, modulo `partitions`.
+
+    ADR-0013 decision 1: the one place the IP -> partition mapping is
+    computed. A `str` key is encoded as UTF-8 first, so `"10.0.0.1"` and
+    `b"10.0.0.1"` land on the same partition. `partitions` must be
+    positive; the result is in `range(partitions)`.
+    """
+    if partitions < 1:
+        raise ValueError(f"partitions must be positive, got {partitions!r}")
+    data = key.encode("utf-8") if isinstance(key, str) else key
+    digest = _FNV1A_32_OFFSET_BASIS
+    for byte in data:
+        digest ^= byte
+        digest = (digest * _FNV1A_32_PRIME) & _UINT32_MASK
+    return digest % partitions
+
 
 #: Events published to the IP-keyed topics (observations, its
 #: reconciliation topic, hot-ip). All three shard the same way (spec
@@ -89,6 +125,31 @@ class TopicSpec:
     #: `publish()` (see `interface.py`).
     key_selector: Callable[[Any], str]
     description: str
+
+    @property
+    def stream_name(self) -> str:
+        """The JetStream stream this topic lives in: the name with `.` -> `-`.
+
+        JetStream stream and consumer names may not contain `.`, `*`, `>`,
+        `/` or `\\` (NATS ADR-6), so the topic name is mapped mechanically
+        (ADR-0013 decision 1): `hammertime.hot-ip.v1` -> `hammertime-hot-ip-v1`.
+        """
+        return self.name.replace(".", "-")
+
+    def subject(self, partition: int) -> str:
+        """The subject partition `partition` of this topic is stored under: `<name>.<p>`.
+
+        Any non-negative partition is a legal subject (a subject that never
+        receives a message is simply empty); a negative one is a `ValueError`.
+        """
+        if partition < 0:
+            raise ValueError(f"partition must be non-negative, got {partition!r}")
+        return f"{self.name}.{partition}"
+
+    @property
+    def subject_filter(self) -> str:
+        """The stream's single subject filter, matching every partition: `<name>.*`."""
+        return f"{self.name}.*"
 
 
 OBSERVATIONS = TopicSpec(
