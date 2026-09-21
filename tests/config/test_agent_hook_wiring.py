@@ -3,21 +3,30 @@
 These are configuration regression tests rather than spec tests. They exist
 because of issue #102: every write-capable subagent (`coder`, `architect`,
 `test-author`) had its guard declared under a `hooks:` key in the agent file's
-own YAML frontmatter, and a guard declared that way has been observed to
-silently not fire -- no error, no warning, nothing to notice. From outside, that
+own YAML frontmatter, and a guard declared that way did not fire in this
+environment. It was probed three times, once with an absolute script path, and
+each time there was no error, no warning, nothing to notice. From outside, that
 is indistinguishable from a guard that runs and allows everything.
 
-The same frontmatter block has also been seen to fire on a later probe, so the
-mechanism is unreliable rather than reliably broken. That is worse, not better:
-a policy declared there can look enforced while it is not, and what makes the
-difference has not been characterised.
+The Claude Code docs do list `hooks` as a supported subagent frontmatter field,
+and say that project-level frontmatter hooks run only once the workspace trust
+dialog has been accepted for the folder. This session has no trust record for
+the project. That is the best-supported explanation, but it has not been
+confirmed directly, and the ban does not rest on it. It rests on the
+consequence: whether a frontmatter guard fires depends on environment state
+that is invisible from the repository, so the same agent file can look enforced
+on one machine and silently do nothing on another. (An earlier probe appeared
+to show the frontmatter block firing; that denial has since been traced to the
+main checkout's `settings.json`, not to the frontmatter.)
 
-`.claude/settings.json` is the documented wiring location, and its enforcement
-has been verified by direct probe, which is why it is the only one permitted
-here. Hooks declared there are *session-wide*, so each policy names the agent(s)
-it applies to with a `SCOPE_AGENT_TYPES='<name>'` assignment on the hook's
-command line; a policy that constrains paths but names no agent would police
-every caller, including the top-level session.
+`.claude/settings.json` is the documented wiring location, and the hooks
+declared there fired in every probe, which is why it is the only one permitted
+here. The CLI reads hook configuration from the main project checkout, not from
+a subagent's worktree, so a worktree's copy of the file is inert. Hooks declared
+there are *session-wide*, so each policy names the agent(s) it applies to with a
+`SCOPE_AGENT_TYPES='<name>'` assignment on the hook's command line; a policy
+that constrains paths but names no agent would police every caller, including
+the top-level session.
 
 Every invariant below is derived by globbing `.claude/agents/*.md` and reading
 `.claude/settings.json`, so a newly added agent that can write or execute fails
@@ -54,13 +63,17 @@ CONSTRAINT_VARS = ("DENY_GLOBS", "ALLOW_GLOBS", "ALLOW_CMDS")
 
 WHY_FRONTMATTER_HOOKS_ARE_BANNED = (
     "A frontmatter 'hooks:' key is not a reliable way to wire a guard. A policy declared "
-    "there has been observed to silently not fire -- no error, no warning, nothing to "
-    "notice (issue #102) -- and has also been seen to fire on a later probe, and what "
-    "makes the difference has not been characterised. An agent configured that way can "
-    "run unfenced while its own file claims it is guarded, which is worse than having no "
-    "guard at all. Declare the policy in .claude/settings.json under hooks.PreToolUse "
-    "instead: that is the documented location, and its enforcement has been verified by "
-    "direct probe. Scope it with SCOPE_AGENT_TYPES='<agent name>' on the hook command line."
+    "there did not fire in this environment -- probed three times, once with an absolute "
+    "script path -- with no error, no warning, nothing to notice (issue #102). The Claude "
+    "Code docs say project-level frontmatter hooks run only once workspace trust has been "
+    "accepted for the folder, which this session has no record of; whether or not that is "
+    "the cause, a frontmatter guard depends on environment state invisible from the "
+    "repository, so it can look enforced on one machine and silently do nothing on another. "
+    "An agent configured that way can run unfenced while its own file claims it is guarded, "
+    "which is worse than having no guard at all. Declare the policy in .claude/settings.json "
+    "under hooks.PreToolUse instead: that is the documented location, and hooks declared "
+    "there fired in every probe. Scope it with SCOPE_AGENT_TYPES='<agent name>' on the hook "
+    "command line."
 )
 
 
