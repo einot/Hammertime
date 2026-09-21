@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Generic PreToolUse Bash guard shared by Hammertime's project subagents
-# (.claude/agents/*.md). This is the Bash counterpart of path-guard.sh: a
-# subagent wires it in via its own `hooks:` frontmatter, setting env vars
-# inline on the command line to parametrize the same script per-agent
-# instead of duplicating the same policy in every agent definition.
+# (.claude/agents/*.md). This is the Bash counterpart of path-guard.sh:
+# each agent's policy is set as env vars inline on the hook's own
+# command line in `.claude/settings.json` (see WIRING below -- not in
+# the agent file), so the same script is parametrized per-agent instead
+# of duplicating the same policy in every agent definition.
 #
 # The guard is DEFAULT-DENY: a command runs only if every command name in
 # it was named by the agent's own allowlist.
@@ -42,12 +43,14 @@
 #
 # This hook must be wired in `.claude/settings.json` or
 # `.claude/settings.local.json`. It must NOT be wired in an agent file's
-# `hooks:` frontmatter. The CLI's markdown-agent parser reads name,
-# description, tools, skills, color and model, and drops `hooks` without
-# complaint, so an agent configured that way runs completely unfenced
-# with no error anywhere. That is not a guess: it was established by
-# experiment after this guard had been reviewed nine times without once
-# being invoked. The smoke test that caught it was the wired
+# `hooks:` frontmatter. A guard declared there did not fire in this
+# environment -- observed three times -- so an agent configured that way
+# ran completely unfenced with no error anywhere. The docs list `hooks`
+# as a supported frontmatter field but require workspace trust for a
+# project-level agent's frontmatter hooks, and this project has no trust
+# record; that is the best-supported explanation and has not been
+# confirmed directly. The guard had been reviewed nine times without
+# once being invoked. The smoke test that caught it was the wired
 # security-auditor successfully running `sed -n 1,2p CHANGES`, with `sed`
 # absent from its ALLOW_CMDS.
 #
@@ -88,17 +91,18 @@
 #
 #   THE GUARD IS INERT UNLESS CONFIGURED, and that is the failure mode
 #   that cost nine rounds. An empty ALLOW_CMDS exits 0. An unmatched
-#   agent_type now exits 0. A hook wired where the parser ignores it
-#   never runs at all. From outside, all three are indistinguishable from
-#   a working guard: the command simply succeeds. Reading the settings
-#   file is not enough either, because it does not tell you the hook was
-#   reached. The only way to know it is live is to run a command that
-#   MUST be denied and look at the refusal: it has to say "Hammertime
-#   bash guard:". If it instead says "Claude Code may only write to files
-#   in the allowed working directories", that is the platform sandbox and
-#   this guard is not running. Do that check after any change to the
-#   wiring, and treat a silent success on a command that should be
-#   refused as evidence the fence is missing rather than as a pass.
+#   agent_type now exits 0. A hook wired in agent frontmatter did not
+#   run at all in this environment (see WIRING). From outside, all three
+#   are indistinguishable from a working guard: the command simply
+#   succeeds. Reading the settings file is not enough either, because it
+#   does not tell you the hook was reached. The only way to know it is
+#   live is to run a command that MUST be denied and look at the
+#   refusal: it has to say "Hammertime bash guard:". If it instead says
+#   "Claude Code may only write to files in the allowed working
+#   directories", that is the platform sandbox and this guard is not
+#   running. Do that check after any change to the wiring, and treat a
+#   silent success on a command that should be refused as evidence the
+#   fence is missing rather than as a pass.
 #
 # What it enforces beyond the name allowlist: the whole command is
 # rejected if it contains redirection, backgrounding, process

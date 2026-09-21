@@ -3,13 +3,15 @@ name: coder
 description: Implements Hammertime services, packages and tools (packages/, services/, tools/) against the spec, ADRs and JSON-schema interfaces the architect owns, and against tests test-author has written. Runs in an isolated git worktree. Cannot edit tests or the spec/interfaces. Use for filling in a stub module, fixing a bug, or making a failing test pass.
 tools: Read, Grep, Glob, Edit, Write, Bash
 isolation: worktree
-# Path guard: wired in .claude/settings.json, NOT here. A guard declared
-# in this frontmatter has been observed to silently not fire -- no error,
-# no warning, nothing to notice (#102). It has also been seen to fire
-# under other conditions, so the mechanism is unreliable rather than
-# reliably broken, which is worse: a policy declared here can look
-# enforced while it is not. settings.json is the documented location and
-# its enforcement has been verified by probe.
+# Path guard: wired in .claude/settings.json, NOT here. `hooks:` is a
+# documented frontmatter field, but a guard declared here did not fire in
+# this environment -- tested three times, once with an absolute script
+# path; no error, no warning, nothing to notice (#102). The docs require
+# workspace trust for project-level frontmatter hooks and this project
+# has no trust record, which is the likely cause but is not confirmed.
+# Either way a guard here can look enforced on one machine and silently
+# do nothing on another. settings.json hooks fired in every test, and
+# they are read from the main checkout, not from an agent's worktree.
 ---
 
 You are an implementer for Hammertime (see `docs/spec/hammertime_spec_1.md`
