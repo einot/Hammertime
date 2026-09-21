@@ -1,7 +1,17 @@
 # ADR 0013 — NATS JetStream as the durable event log, with static shard assignment only
 
 Status: accepted 2026-09-21, confirmed by the repository owner on
-2026-09-21. Epic #95's first reason for the swap — that Kafka's cold start
+2026-09-21; amended 2026-09-21 (see "Amendment 1" at the end — the gaps
+that `coder` (brief C1) and `test-author` (brief T1) each hit while working
+from this ADR independently are ruled: negative `start_offset`, duplicates
+within one `ack()` call, `last_offset` renamed `end_offset` with one meaning
+on both buses, the connection-option mechanism and the `nats_client_error`
+record, a fetch timeout during an outage, `handled_position` on an unheld
+partition and after a commit, `on_assigned(frozenset())`, the settings
+field names, the exact `auto` message, and decision 7's Lua under fakeredis.
+Every edit is in place with a dated note and is listed there; no decision
+changes in substance except decision 9's no-snapshot `start_offset`, which
+was wrong for the memory bus). Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
 owner "may wish to revisit the decision" in that case, so the top-level
@@ -288,7 +298,10 @@ day-one step that runs **before** the services, and it is idempotent:
   compares the mutable fields (`subjects`, `max_age`, `duplicate_window`,
   `max_bytes`, `max_msgs`, `num_replicas`) and calls `update_stream` if
   any differs; a difference in an immutable field (`retention`, `storage`)
-  raises `StreamConfigConflictError` and changes nothing.
+  raises `StreamConfigConflictError` and changes nothing. It inspects every
+  stream in `specs` before it creates or updates any of them, so a conflict
+  on one stream changes nothing on any other either (amended 2026-09-21,
+  Amendment 1 ruling C9).
 * A new CLI, `hammertime-provision` (package `tools/provision`, module
   `hammertime.tools.provision`, docstring `Spec: section 19, section 32,
   section 33`), runs `ensure_streams` over `all_topics()`: `hammertime-provision
@@ -376,6 +389,7 @@ class Consumer(Protocol):
 class MessageBus(Protocol):         # moved here from hammertime.aggregator.worker
     def producer(self) -> Producer: ...
     def consumer(self, group_id: str) -> Consumer: ...
+    async def end_offset(self, topic: str) -> int: ...   # amended 2026-09-21: the log end, see decision 9
 
 def static_partitions(topic: str, partitions: Iterable[int]) -> frozenset[int]: ...   # unchanged (ADR-0011 A3)
 ```
@@ -383,7 +397,8 @@ def static_partitions(topic: str, partitions: Iterable[int]) -> frozenset[int]: 
 Removed: `Consumer.seek`, `Consumer.commit`, `AssignmentListener.on_revoked`.
 Added: `message_id` on `publish`, `start_offset` on `subscribe`,
 `Consumer.ack`, `Consumer.close`, `ConsumedMessage.delivery_count`,
-`MessageBus`, `partition_for` (decision 1).
+`MessageBus` (with `end_offset`, amended 2026-09-21 — it was `last_offset`
+and off the protocol; Amendment 1 ruling C3), `partition_for` (decision 1).
 
 **`Producer.publish(topic, key, value, *, message_id=None)`** appends
 `value` to partition `partition_for(key, TOPICS[topic].partitions)` of
@@ -440,7 +455,20 @@ unspecified) and ends (raises `StopAsyncIteration`) after `close()`.
   longer in the log), no position is kept anywhere, and `ack()` on it is a
   `ValueError`. The trie replays from its snapshot this way (decision 9);
   `tools/replay` will too. A positional subscription may still name
-  `partitions` and a `listener`.
+  `partitions` and a `listener`. `start_offset` MUST be `>= 0`: a negative
+  value is a `ValueError` raised before any broker is contacted and before
+  `listener` is called, on both implementations (amended 2026-09-21,
+  Amendment 1 rulings C7 and T2). `start_offset=0` is the portable "from
+  the first retained message": it is the first index of the memory log,
+  and it is below every JetStream sequence (they start at 1), so
+  `NatsConsumer` passes `opt_start_seq = max(start_offset, 1)`. "Below the
+  first offset" therefore cannot be exercised with a negative number; on
+  `InMemoryBus`, which never discards, it cannot be exercised at all.
+* An unregistered topic is a `KeyError` from `NatsConsumer.subscribe()`
+  (there is no stream to bind a consumer on), raised with the other
+  argument checks before the broker is contacted and before `listener` is
+  called; `MemoryConsumer` subscribes to any topic, which exists from its
+  first publish (amended 2026-09-21, ruling C6).
 
 **`Consumer.ack(messages)`** acknowledges exactly the given messages, each
 of which MUST have been delivered by this consumer instance under its
@@ -450,7 +478,20 @@ already acknowledged, or any message on a positional subscription — is a
 `ValueError` from both implementations, raised before anything is
 acknowledged (the whole iterable is checked first, so a rejected call
 acknowledges nothing). An empty iterable returns normally without touching
-the broker. Acknowledging is what advances the group's position: it is the
+the broker. *(Amended 2026-09-21, Amendment 1 rulings C4, C5 and T1.)* The
+checks are ordered: a closed consumer is a `ValueError` and a positional
+subscription is a `ValueError` whatever the iterable holds, an empty one
+included; only a live durable subscription — or an instance that has not
+subscribed yet, which has delivered nothing and so accepts exactly the
+empty iterable — returns normally on an empty iterable. A message named
+more than once in one call is acknowledged once and is not an error:
+`ConsumedMessage` is a value, the identity of an acknowledgement is
+`(topic, partition, offset)`, and "already acknowledged" means acknowledged
+by an *earlier* call. That is what lets `commit_handled()` (decision 8)
+hand `ack()` the handled list as it is, a `REDELIVERED` copy alongside its
+original, without deduplicating; on `NatsConsumer` the one retained `Msg`
+for that key (the most recent delivery) is acknowledged, and only once, so
+nats.py's `MsgAlreadyAckdError` is never reached. Acknowledging is what advances the group's position: it is the
 only "commit" there is, and it is per message, so a caller acknowledges
 what it has handled and nothing else — which is exactly the requirement of
 ADR-0011 Amendment 6 / A20, now expressed without an offset. `NatsConsumer`
@@ -484,7 +525,17 @@ class NatsBus:                                   # satisfies MessageBus
     async def close(self) -> None                # close every consumer (nak unacked), drain the connection
     def producer(self) -> Producer               # one NatsProducer over the shared connection
     def consumer(self, group_id: str) -> Consumer   # a new NatsConsumer over the shared connection
+    async def end_offset(self, topic: str) -> int   # stream_info(...).state.last_seq + 1 (amended 2026-09-21)
+```
 
+`producer()` and `consumer()` are callable before `start()`: the objects
+they return use the connection lazily and raise `RuntimeError("NatsBus is
+not started")` if used before it is up. This is required, not merely
+allowed — `build_service` assembles the object graph, including the
+worker's producer and consumer, before `run_service` calls `start()`
+(ADR-0009 decision 3); amended 2026-09-21, ruling C8.
+
+```python
 class NatsProducer: ...      # decision 4
 class NatsConsumer: ...      # decision 5
 
@@ -506,13 +557,37 @@ the type-level distinction ADR-0009 A1 had to construct by hand for redis
 and could not construct for aiokafka exists natively here. The reference
 deployment configures no credentials (assumption 13); whoever adds them
 MUST re-read `nats/errors.py` at the pinned version and amend this list.
-The connection is opened with `retry_on_failed_connect=False` (so
-`connect()` fails fast and `connect_with_retry` owns the startup schedule),
-`allow_reconnect=True` and `max_reconnect_attempts=-1` (a mid-run outage is
-reconnected indefinitely; an in-flight `publish` or `fetch` during it
-raises `nats.errors.TimeoutError`, which the calling service treats exactly
-as it treated an aiokafka failure today — ingest answers 503, the
-aggregator's `run()` fails and the process exits 1; assumption 14).
+The connection contract is: the initial `connect()` fails fast, so that
+`connect_with_retry` owns the startup schedule — an unreachable server is
+`NoServersError` within a few seconds, and a rejected credential raises as
+its own type instead of being retried into `NoServersError` — and, once
+connected, the client reconnects to a mid-run outage indefinitely.
+*(Rewritten 2026-09-21, Amendment 1 ruling C1. The original sentence
+named a `retry_on_failed_connect=False` option, which nats-py does not
+have — it is a nats.go option; in nats-py 2.16 the initial connect loop
+and mid-run reconnection are governed by the same
+`allow_reconnect`/`max_reconnect_attempts` pair, so the two halves of the
+contract cannot be expressed in one `connect()` call; Sources.)* The
+mechanism, isolated in `hammertime.bus.nats._connect`:
+`nats.connect(servers, allow_reconnect=False, max_reconnect_attempts=1,
+connect_timeout=2, error_cb=_client_error)`, then on the live client
+`nc.options["allow_reconnect"] = True` and
+`nc.options["max_reconnect_attempts"] = -1`. `Client.options` is a public
+dict that the reconnect path reads at runtime, but it is not documented
+API, so the pin `nats-py>=2.16,<3` is load-bearing and whoever bumps the
+client MUST re-verify those two reads in `nats/aio/client.py` (assumption
+14, as rewritten). What an outage does to in-flight calls: a `publish` or
+an `ack` during it raises `nats.errors.TimeoutError` (or
+`ConnectionClosedError`), which the calling service treats exactly as it
+treated an aiokafka failure — ingest answers 503, the aggregator's `run()`
+fails and the process exits 1; a `fetch` during it times out and is
+re-issued, indistinguishably from an idle partition (decision 5, as
+amended). The client's asynchronous error hook is `_client_error`: one
+`WARNING nats_client_error error=<exception>` line per refused connection
+attempt or client-side error, no traceback. nats-py's default hook logs
+each at `ERROR` with a full traceback under the `nats.aio.client` logger,
+which would bury `connect_with_retry`'s `dependency_unavailable` records
+during a normal startup wait (ruling C2; assumption 29).
 
 **`hammertime.bus.memory`** implements the same contract with one
 partition per topic: `MemoryProducer` appends to partition 0 and
@@ -523,7 +598,10 @@ acknowledged offsets on the bus, and its own delivered-but-unacknowledged
 set on the instance. `InMemoryBus` never redelivers a message to a live
 consumer (no `ack_wait`); `delivery_count` is always 1. It keeps ADR-0011
 assumption 22's limits (single partition; at most one live member per
-group per topic).
+group per topic). `InMemoryBus.end_offset(topic)` is the length of the
+topic's log (`0` for a topic never published to), `async` like
+`NatsBus.end_offset` so that the trie and the detector call it the same
+way on both (amended 2026-09-21, ruling C3; decision 9 defines it).
 
 ### 4. Publishing: every event carries `Nats-Msg-Id = event_id`; ordering is by awaited acknowledgement
 
@@ -604,7 +682,16 @@ after the group, and renaming the group still orphans them (still a
 **Fetching.** `NatsConsumer` runs one fetch loop per durable
 (`fetch(batch, timeout)`, batch and timeout being implementation
 constants, `TimeoutError` on an idle partition being the normal idle path)
-feeding one in-process queue; the iterator yields from the queue. A
+feeding one in-process queue; the iterator yields from the queue. A fetch
+that times out during a broker outage is indistinguishable at the client
+from an idle partition, so it is treated the same way: the loop re-issues
+the pull and the consumer rides the outage out; the iterator raises only
+on a failure that is not a timeout (amended 2026-09-21, Amendment 1
+ruling C3(5.3), superseding the sentence of assumption 14 that had a
+fetch during an outage fail the aggregator's `run()`). A member whose
+shards are idle for the whole outage therefore survives it; one that
+publishes or acknowledges during it fails on that call, exits 1 and is
+restarted by the orchestrator. A
 message is *delivered* when the iterator yields it. The consumer retains
 the nats.py `Msg` for every delivered, unacknowledged message, keyed by
 `(topic, partition, offset)`.
@@ -664,7 +751,13 @@ streams (`JSConsumerPullRequiresAckErr`, Sources).
 * `auto` -> `ValueError` whose message says that shard assignment is
   static since ADR-0013 and names the two accepted forms, so a deployment
   carrying the old default fails loudly with `config_invalid` and exit 2
-  rather than silently claiming nothing.
+  rather than silently claiming nothing. The message (amended 2026-09-21,
+  Amendment 1 ruling T10) is
+  `HAMMERTIME_SHARD_IDS='auto' is not accepted: shard assignment is static since ADR-0013; set it to 'all' or an explicit partition set (e.g. '0', '0-3', '0,2,5-7')`,
+  with the value as given in place of `'auto'` (`'AUTO'` is rejected the
+  same way); it MUST contain the variable name, the word `all`, `ADR-0013`
+  and at least one explicit-set example, and tests pin those four
+  substrings rather than the whole sentence.
 * Set-but-empty or whitespace-only -> `ValueError` (ADR-0011 A3,
   unchanged).
 
@@ -719,7 +812,16 @@ the current value otherwise), TTL in whole seconds rounded up.
 `MemoryShardStateStore` gains an optional `clock: Clock | None = None`
 constructor keyword (default `SystemClock()`, so every existing
 argument-free construction is unchanged) and keeps `{shard: (owner,
-expires_at)}`; an expired entry counts as absent. `load` and
+expires_at)}`; an expired entry counts as absent. A lease is live iff
+`now < expires_at` — at exactly `expires_at` it has expired — on both
+backends (amended 2026-09-21, ruling T11). Running `RedisShardStateStore`
+against fakeredis needs fakeredis's `lua` extra, which pulls `lupa`:
+fakeredis 2.38 without it answers `EVAL` with `unknown command 'eval'`.
+The root `pyproject.toml`'s `dev` group therefore carries `fakeredis[lua]`
+— a Class 2, test-process-only dependency, MIT, recorded in ADR-0012
+Amendment 3 — and the Lua form is kept rather than relaxed to a
+`WATCH`/`MULTI` compare-and-set (amended 2026-09-21, ruling C5.1;
+assumption 30 gives the reasons). `load` and
 `record_transition` are unchanged, and the lease key is separate from the
 HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
 
@@ -728,7 +830,11 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
 * `ShardClaims` is constructed with two new keyword arguments, `member_id:
   str` and `lease_ttl_s: float`. In `on_assigned(partitions)`, for each
   shard in sorted order and **before** `state_store.load(p)`, it calls
-  `acquire_lease(p, member_id, lease_ttl_s)`. A non-`None` result is a
+  `acquire_lease(p, member_id, lease_ttl_s)` — strictly sequentially per
+  shard: acquire `p`, load `p`, build `p`'s window, and only then the next
+  shard's acquire, so a refusal on shard `q` has loaded nothing for `q` and
+  every shard before `q` is leased and windowed at that moment (amended
+  2026-09-21, ruling T6). A non-`None` result is a
   refusal: it logs `ERROR event=shard_owned_elsewhere shard=<p>
   owner=<other> member=<self>`, releases every lease this call acquired
   so far, and raises `hammertime.aggregator.sharding.assignment.ShardOwnedElsewhereError(shard, owner)`.
@@ -798,7 +904,7 @@ class ShardClaims:                                   # satisfies AssignmentListe
     def window(self, shard: int) -> ShardWindow | None: ...
     def windows(self) -> tuple[ShardWindow, ...]: ...
     def adopt_config(self, config: DetectionConfig) -> None: ...   # ADR-0011 A18, unchanged
-    def handled_position(self, shard: int) -> int | None: ...     # one past the last handled offset; None if none
+    def handled_position(self, shard: int) -> int | None: ...     # one past the last handled offset; None if none, or if shard is not held; never reset by a commit (amended 2026-09-21)
     def mark_handled(self, message: ConsumedMessage) -> None: ...  # records the message for the next ack
     async def commit_handled(self) -> None: ...                    # producer.flush(), then consumer.ack(<handled, unacked>)
     async def renew_leases(self) -> None: ...                      # decision 7
@@ -820,7 +926,28 @@ class ShardClaims:                                   # satisfies AssignmentListe
   **only** acknowledgement path: the periodic commit (every
   `HAMMERTIME_AGGREGATOR_COMMIT_INTERVAL_S` of wall time, unchanged) and
   `stop()` both go through it. ADR-0009 decision 7's flush-before-commit
-  rule reads "flush before ack" and is unchanged in substance.
+  rule reads "flush before ack" and is unchanged in substance. The list is
+  handed to `ack()` as it is, in delivery order, a `REDELIVERED` copy
+  alongside its original: `ack()` acknowledges a message named twice once
+  (decision 3, as amended), so `commit_handled()` does not deduplicate
+  (amended 2026-09-21, rulings C5 and T1).
+* **`handled_position(shard)`** returns `None` for a shard this object
+  does not hold, exactly as for a held shard nothing has been handled on:
+  the read surface (`window`, `handled_position`) is total and the write
+  surface (`mark_handled`) raises `KeyError` (amended 2026-09-21, ruling
+  T3). The position belongs to the claim for the life of the process:
+  `commit_handled()` clears the handled *list* and leaves the position
+  where it is — ADR-0003 Amendment 3 item 2 keeps it for the redelivery
+  test, not for any commit — and nothing ever lowers it (ruling T4).
+* **`on_assigned(frozenset())` is a `ValueError`** (amended 2026-09-21,
+  ruling T5). It is unreachable through the bus — `static_partitions`
+  refuses an empty set before the listener is called, and
+  `partitions=None` always resolves to a non-empty set — so only a direct
+  call can reach it; a member holding nothing must not report itself
+  ready, which is ADR-0011 A3's reason for refusing the empty set at the
+  bus, and the direct call is refused for the same reason. The
+  `no_shards_assigned` record that the old empty-assignment path wrote is
+  gone with it (log records bullet).
 * **The requirement of ADR-0011 A20 is preserved without its mechanism.**
   A message is acknowledged iff `handle()` finished with it. The message in
   hand at `stop()` is finished before the final `commit_handled()` (the
@@ -841,7 +968,11 @@ class ShardClaims:                                   # satisfies AssignmentListe
   in hand, `commit_handled()`, `release()`; windows are kept in memory
   (nothing reads them after `stop()` except tests), and the service closes
   the bus (`NatsBus.close()`, which `nak`s and unsubscribes) and the store
-  client afterwards, as today.
+  client afterwards, as today. `stop()` does not call `consumer.close()`
+  itself (amended 2026-09-21, ruling T8): closing is the service's step,
+  after `stop()` has returned, so that the final acknowledgement is sent
+  on a live consumer and the `nak` of whatever was fetched but never
+  yielded follows it.
 * **`REDELIVERED`**, the eighth `ObservationOutcome` (`"redelivered"`),
   ruled in decision 5: after the window lookup (`UNCLAIMED` check) and
   before decoding, `if message.offset < claims.handled_position(partition)`
@@ -876,8 +1007,11 @@ JetStream stream has one sequence across all its subjects, and
 
 * The trie subscribes to `hammertime.hot-ip.v1` **positionally**:
   `subscribe(topic, start_offset=<snapshot.replay_position + 1>)` (or
-  `start_offset=1` with no snapshot), applies messages in the order the
-  iterator yields them, and never acknowledges. There is no
+  `start_offset=0` with no snapshot — corrected 2026-09-21, Amendment 1
+  ruling C7: the original `1` would skip the first message of the memory
+  log, whose offsets start at 0; `0` is below every JetStream sequence and
+  delivers from the first retained message on both), applies messages in
+  the order the iterator yields them, and never acknowledges. There is no
   `hammertime-trie` durable consumer.
 * The snapshot records `replay_position: int` — the `offset` of the last
   hot-ip message applied before the snapshot was taken — as §33's "event
@@ -896,10 +1030,23 @@ JetStream stream has one sequence across all its subjects, and
   then write the final snapshot"; for services with durable subscriptions
   (aggregator, detector) "flush, then acknowledge".
 * Readiness ("replayed to the log end as it stood when `start()` began",
-  ADR-0009 decision 4): the log end is the stream's last sequence, read
-  from `stream_info` at `start()` — the bus exposes it as
-  `NatsBus.last_offset(topic) -> int` / `InMemoryBus.last_offset(topic)`
-  (assumption 20).
+  ADR-0009 decision 4): the log end is read from the bus at `start()` as
+  `await bus.end_offset(topic)` — on `NatsBus`
+  `stream_info(...).state.last_seq + 1`, on `InMemoryBus` the log length.
+  On both it is **the offset the next appended message will receive**
+  (`1` for an empty stream, `0` for an empty memory log), so one readiness
+  test works on both: the service has replayed to the log end once every
+  delivered message with `offset < end_offset` has been applied, i.e. once
+  the last applied offset is `>= end_offset - 1`, or immediately when
+  `end_offset <= start_offset`. *(Renamed from `last_offset` 2026-09-21,
+  Amendment 1 ruling C3(5.2): the original was sync in this ADR and had
+  to be async on NATS, and "the log length" on memory was one past the
+  last offset while `state.last_seq` on NATS was the last offset itself,
+  so a check written as `offset >= last_offset` behaved differently on
+  the two buses. Assumption 20 as rewritten.)* A positional subscription
+  filtered to a subset of partitions cannot use this test — the last
+  message in the stream may be on a subject it does not receive — which
+  is why the trie and the detector subscribe with `partitions=None`.
 * **The detector** uses a durable subscription (`hammertime-detector`,
   `partitions=None`) and acknowledges what it applied, so after a crash
   the log may redeliver a `PrefixStatsChanged` **after** newer stats for
@@ -920,6 +1067,17 @@ JetStream stream has one sequence across all its subjects, and
 | `HAMMERTIME_AGGREGATOR_MEMBER_ID` | — | new; default `socket.gethostname()` (decision 7) |
 | `HAMMERTIME_AGGREGATOR_LEASE_TTL_S` | — | new; default 30 (decision 7) |
 | `HAMMERTIME_AGGREGATOR_COMMIT_INTERVAL_S` | offset-commit cadence | acknowledgement cadence; same default 1.0 |
+
+`AggregatorSettings` field names, for the record (amended 2026-09-21,
+Amendment 1 ruling T9): `bus_kind` and `bus_brokers` (the names
+`IngestSettings` already uses for the same two keys), `shard_ids:
+frozenset[int]`, `member_id: str`, `lease_ttl_s: float`, alongside the
+existing `host`, `port`, `detection_config_path`, `store_kind`,
+`redis_url`, `maintenance_interval_s`, `config_poll_interval_s`,
+`commit_interval_s`, `max_tracked_ips` and `reevaluation_batch`. Error
+precedence between keys in `load_settings` is first-in-load-order, as
+ADR-0009 A12 has it, and is not pinned (ruling T7): a test that expects
+one key's error supplies valid values for every other key.
 
 No key is removed. `.env.example`'s `HAMMERTIME_TOPIC_*` lines remain
 unread dead text (ADR-0010 Consequences). The `CHANGES` lines these imply
@@ -1097,11 +1255,27 @@ not make. Push back on them individually.
 13. **No credentials or TLS in the reference deployment.** As with Kafka
     today. `TRANSIENT_ERRORS` is correct for that configuration; the
     credential rule of ADR-0009 A1 binds whoever adds them.
-14. **Connection options: fail-fast connect, unbounded reconnect.** So
-    that `connect_with_retry` owns the startup schedule and a mid-run
-    outage is survived by the client; the observable behaviour during an
-    outage (a timed-out publish or fetch fails the caller) is unchanged
-    from today.
+14. **Connection options: fail-fast connect, unbounded reconnect, by
+    switching the client's options after the initial connect.**
+    *(Rewritten 2026-09-21, Amendment 1.)* So that `connect_with_retry`
+    owns the startup schedule and a mid-run outage is survived by the
+    client. nats-py has no option that separates the initial attempt from
+    reconnection, so `_connect` connects with `allow_reconnect=False,
+    max_reconnect_attempts=1, connect_timeout=2` and then sets
+    `nc.options["allow_reconnect"] = True` and
+    `nc.options["max_reconnect_attempts"] = -1` on the live client. The
+    observable behaviour during an outage: a timed-out `publish` or `ack`
+    fails the caller (ingest 503; the aggregator exits 1); a timed-out
+    `fetch` is the idle path and is re-issued (decision 5, as amended), so
+    a member with nothing to publish or acknowledge survives the outage.
+    The `options` mutation was verified by `coder` against a real server
+    restart on 2026-09-21; the claim that a rejected credential raises as
+    its own type under these options comes from reading
+    `nats/aio/client.py`, not from a test, and is not load-bearing while
+    assumption 13 holds. Original text: "So that `connect_with_retry` owns
+    the startup schedule and a mid-run outage is survived by the client;
+    the observable behaviour during an outage (a timed-out publish or
+    fetch fails the caller) is unchanged from today."
 15. **`HAMMERTIME_BUS_BROKERS` is not validated by `load_settings`.**
     ADR-0009 A12 left the parallel question open for Kafka; nats.py parses
     URLs at `connect()`, so a malformed one surfaces as `start_failed` and
@@ -1129,11 +1303,22 @@ not make. Push back on them individually.
 19. **No new metric series.** ADR-0011 A13 closes the list at nine; the
     two lease records and `shards_claimed` are enough for an operator, and
     the telemetry epic can add counters when it renders `/metrics`.
-20. **`last_offset(topic)` on the bus objects for readiness.** ADR-0009
+20. **`end_offset(topic)` on `MessageBus` for readiness.** *(Rewritten
+    2026-09-21, Amendment 1; was `last_offset`.)* ADR-0009 decision 4
+    needs "the log end as it stood when `start()` began" for the trie and
+    the detector; the bus is the only party that can read it. It is
+    `async` on both implementations (a broker round trip on NATS), it is
+    on the `MessageBus` protocol so that the trie epic types its bus by
+    the interface rather than as `InMemoryBus | NatsBus`, and it is
+    defined as the offset the next appended message will receive —
+    `state.last_seq + 1` on NATS, the log length on memory — because that
+    is the one number with the same meaning on a 1-based stream and a
+    0-based list. Named here so the trie epic does not invent it. Original
+    text: "`last_offset(topic)` on the bus objects for readiness. ADR-0009
     decision 4 needs "the log end as it stood when `start()` began" for
     the trie and the detector; the bus is the only party that can read it.
     Named here so the trie epic does not invent it; `InMemoryBus`
-    implements it as the log length.
+    implements it as the log length."
 21. **`REDELIVERED` is logged at `WARNING` and not counted.** Same
     reasoning as ADR-0011 A19 for `UNCLAIMED`: it is a delivery event, not
     a content event; the record names the offset and delivery count.
@@ -1190,7 +1375,8 @@ not make. Push back on them individually.
   exception type; a broker that starts in under a second; a compose file
   with one flag line instead of fourteen variables.
 * **Bus package**: `interface.py` per decision 3; `memory.py` reworked
-  (dedup by id, acknowledged sets, positional subscriptions, `close`);
+  (dedup by id, acknowledged sets, positional subscriptions, `close`,
+  `end_offset` — Amendment 1);
   `topics.py` gains `partition_for`, `stream_name`, `subject`,
   `subject_filter`; `nats.py` new; `kafka.py` deleted; `__init__.py`
   re-exports `NatsBus`, `NatsProducer`, `NatsConsumer`, `TRANSIENT_ERRORS`,
@@ -1200,7 +1386,10 @@ not make. Push back on them individually.
   hints; if a `py.typed` marker turns out to be missing at 2.16.0 the
   override is re-pointed rather than dropped).
 * **Store package**: `ShardStateStore.acquire_lease`/`release_lease`
-  (decision 7) on both implementations; `MemoryShardStateStore(clock=...)`.
+  (decision 7) on both implementations; `MemoryShardStateStore(clock=...)`;
+  the root `pyproject.toml` `dev` group carries `fakeredis[lua]` so that
+  the Lua lease runs under fakeredis (Amendment 1; ADR-0012 Amendment 3
+  carries the `lupa` inventory row).
 * **Aggregator**: decision 8. The seven-outcome enum becomes eight. Tests
   written against rebalances (`_FetchGap`, `_GapConsumer`, `_GapBus`,
   `TestAMessageFetchedUnderARevokedClaim`, `TestTheMessageInHandReachesTheNextMember`,
@@ -1413,3 +1602,243 @@ and the client from `nats-io/nats.py`. Where a page was blocked or a path
   `.github/workflows/ci.yml`, `deploy/k8s/README.md`, `docs/runbook.md`,
   `docs/spec/integration-scenarios.md`; the aggregator and bus test files
   named under Consequences.
+
+Read on 2026-09-21 for Amendment 1:
+
+* `https://raw.githubusercontent.com/nats-io/nats.py/main/nats/src/nats/aio/client.py`
+  (summarised by the fetch tool; the `main` branch, not the 2.16.0 tag —
+  assumption 28's caveat applies): `Client.connect()`'s keyword list
+  (`servers`, `error_cb`, ..., `allow_reconnect: bool = True`,
+  `connect_timeout`, `reconnect_time_wait`, `max_reconnect_attempts`,
+  ...) has no `retry_on_failed_connect`; the initial connect loop is
+  `while True: try: await self._select_next_server(); await
+  self._process_connect_init(); ... break; except errors.NoServersError
+  as e: if self.options["max_reconnect_attempts"] < 0: continue;
+  self._err = e; raise e`; `self.options: Dict[str, Any] = {}` is a plain
+  attribute, and the reconnect path reads
+  `self.options["allow_reconnect"]` and
+  `self.options["max_reconnect_attempts"]` at runtime; the default error
+  callback is `_logger.error("nats: encountered error", exc_info=ex)`.
+  Taken from it: ruling C1's mechanism and ruling C2's hook.
+* `https://pypi.org/pypi/fakeredis/json`: version 2.38.0,
+  `license_expression` `BSD-3-Clause`, `provides_extra` includes `lua`,
+  `requires_dist` carries `lupa>=2.1; extra == "lua"`.
+* `https://pypi.org/pypi/lupa/json` and `.../lupa/2.8/json`: version
+  2.8, legacy `license` `"MIT style"`, no `license_expression`,
+  `license_files = ["LICENSE.txt"]`, author Stefan Behnel; wheels
+  `lupa-2.8-cp312-cp312-manylinux2014_x86_64...` and the `aarch64`
+  equivalent are present (uploaded 2026-04-15) and no sdist is listed for
+  2.8. `https://raw.githubusercontent.com/scoder/lupa/master/LICENSE.txt`
+  (summarised): the MIT licence, "Copyright (c) 2010-2017 Stefan Behnel",
+  followed by the MIT licence of the bundled Lua, "Copyright © 1994–2017
+  Lua.org, PUC-Rio". Taken from them: ruling C5.1 and ADR-0012 Amendment
+  3's inventory row.
+* The C1 and T1 reports as relayed by the top-level session (the pytest
+  counts, the fakeredis `unknown command 'eval'` cause, the two gap
+  lists) and the branch's `nats.py`, `memory.py`, `redis.py`,
+  `memory.py` (store), `test_memory_bus.py`, `test_shard_state.py`,
+  `test_sharding.py`, `test_worker.py` and `test_config.py` as read by
+  the architect; the architect did not run the suite.
+
+## Amendment 1 (2026-09-21) — the gaps C1 and T1 hit, ruled
+
+Why: `coder` (brief C1) and `test-author` (brief T1) each worked from this
+ADR without reading the other's output, as the process requires, and each
+resolved a set of under-specified points by its own reading. When T1's
+tests were run against C1's code, 338 passed and 29 failed: 28 because
+decision 7's Lua `EVAL` cannot run under fakeredis without its `lua`
+extra, and 1 because T1 read "below the first offset" as `-1` on the
+0-based memory log while C1 rejects a negative `start_offset`. The coder
+reported nine further points it had ruled on alone and the test-author
+fifteen; several of them are interface questions the next briefs (C2, C3)
+would otherwise inherit unsettled. This amendment rules on every one,
+records the ruling in place, and lists the edits here. Where both readings
+were defensible the tie is broken toward the reading that keeps the two
+implementations interchangeable behind the interface — the property
+ADR-0012 decision 2 item 5(c) makes load-bearing.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Gained the "amended 2026-09-21" clause.
+* **Decision 2, `ensure_streams` bullet.** Appended: "It inspects every
+  stream in `specs` before it creates or updates any of them ...".
+* **Decision 3, interface block.** `MessageBus` gained `async def
+  end_offset(self, topic: str) -> int`; the "Added:" line names it.
+* **Decision 3, `subscribe` bullets.** The `start_offset` bullet gained
+  the negative-value rule and the `start_offset=0` sentence; a new bullet
+  rules the unregistered topic on `NatsConsumer.subscribe()`.
+* **Decision 3, `ack` paragraph.** Appended the check order, the
+  duplicate-within-one-call rule and the "earlier call" reading of
+  "already acknowledged".
+* **Decision 3, `NatsBus` block.** Gained `end_offset`; a new paragraph
+  after it rules `producer()`/`consumer()` before `start()`.
+* **Decision 3, connection paragraph, rewritten.** Was: "The connection
+  is opened with `retry_on_failed_connect=False` (so `connect()` fails
+  fast and `connect_with_retry` owns the startup schedule),
+  `allow_reconnect=True` and `max_reconnect_attempts=-1` (a mid-run
+  outage is reconnected indefinitely; an in-flight `publish` or `fetch`
+  during it raises `nats.errors.TimeoutError`, which the calling service
+  treats exactly as it treated an aiokafka failure today — ingest answers
+  503, the aggregator's `run()` fails and the process exits 1; assumption
+  14)."
+* **Decision 3, `hammertime.bus.memory` paragraph.** Appended the
+  `InMemoryBus.end_offset` sentence.
+* **Decision 5, fetching paragraph.** Appended the outage-timeout rule.
+* **Decision 6, `auto` bullet.** Appended the exact message and the four
+  substrings tests pin.
+* **Decision 7.** The `on_assigned` bullet gained the strictly-sequential
+  per-shard sentence; the store paragraph gained the lease-liveness
+  boundary and the `fakeredis[lua]` sentence.
+* **Decision 8.** The `handled_position` line of the block gained "or if
+  shard is not held; never reset by a commit"; the `commit_handled`
+  bullet gained the no-deduplication sentence; two bullets were added
+  (`handled_position`, `on_assigned(frozenset())`); the `stop()` bullet
+  gained the "does not call `consumer.close()`" sentence.
+* **Decision 9, trie bullet.** Was: "(or `start_offset=1` with no
+  snapshot)". Now `start_offset=0`, with the correction note.
+* **Decision 9, readiness bullet, rewritten.** Was: "the log end is the
+  stream's last sequence, read from `stream_info` at `start()` — the bus
+  exposes it as `NatsBus.last_offset(topic) -> int` /
+  `InMemoryBus.last_offset(topic)` (assumption 20)."
+* **Decision 10.** A paragraph naming the `AggregatorSettings` fields and
+  the unpinned error precedence was inserted before "No key is removed."
+* **Assumptions 14 and 20, rewritten**; each quotes its original text.
+* **Consequences.** The bus bullet names `end_offset`; the store bullet
+  names `fakeredis[lua]`.
+* **Sources.** A dated block for this amendment.
+
+**Rulings.** "C" items are the coder's report, numbered as it numbered
+them ((2).1, (2).4, (5).1-(5).9, written C1, C2, C5.1-C5.9); "T" items
+are the test-author's fifteen.
+
+* **C1 (connect options).** C1's mechanism is right and is now the
+  decision 3 text: fail-fast connect via `allow_reconnect=False,
+  max_reconnect_attempts=1, connect_timeout=2`, then the two `options`
+  keys switched on the live client. The ADR was wrong: no
+  `retry_on_failed_connect` exists in nats-py.
+* **C2 (`nats_client_error`).** Named and kept: `WARNING nats_client_error
+  error=<exception>`, one line, no traceback, installed as `error_cb`.
+* **C5.1 (Lua under fakeredis).** Keep decision 7's Lua; add
+  `fakeredis[lua]` to the `dev` group; `lupa` gets its Class 2 row
+  (ADR-0012 Amendment 3). `WATCH`/`MULTI` was not chosen — assumption 30.
+* **C5.2 (`last_offset`).** Neither reading survives: renamed
+  `end_offset`, `async` on both, on the `MessageBus` protocol, defined as
+  the offset the next appended message will receive (`last_seq + 1` on
+  NATS, the log length on memory). C1's `async` was right; its NATS value
+  (`last_seq`) was off by one against its own memory value.
+* **C5.3 (fetch during an outage).** C1 right: a fetch timeout is always
+  the idle path; the iterator raises only on a non-timeout failure.
+  Assumption 14's "fetch fails the caller" is withdrawn.
+* **C5.4 (`ack([])` precedence).** C1 right: closed -> `ValueError`,
+  positional -> `ValueError`, then empty -> return. Before `subscribe()`
+  an empty iterable returns normally and any message is a `ValueError`.
+* **C5.5 / T1 (duplicates in one `ack()`).** C1 and T1 both right: a
+  message named twice in one call is acknowledged once; "already
+  acknowledged" means by an earlier call; `commit_handled()` does not
+  deduplicate.
+* **C5.6 (unregistered topic on `NatsConsumer.subscribe()`).** C1 right:
+  `KeyError`, before the broker is contacted and before the listener.
+* **C5.7 / T2 (negative `start_offset`).** C1 right: `ValueError` on
+  both; `opt_start_seq = max(start_offset, 1)` on NATS; `start_offset=0`
+  is the portable start. T1's `first.offset - 1` test is withdrawn (it
+  reads the ADR literally, but the literal reading makes `-1` a valid
+  argument on one backend and a meaningless one on the other). Decision
+  9's `start_offset=1` for the no-snapshot trie was a genuine ADR error
+  the same rule exposes and is corrected to `0`.
+* **C5.8 (`producer()`/`consumer()` before `start()`).** C1 right, and
+  required by ADR-0009's object-graph-then-start shape.
+* **C5.9 (`ensure_streams` inspects all first).** C1 right.
+* **T3 (`handled_position` on an unheld partition).** `None`; the read
+  surface is total, the write surface raises.
+* **T4 (`handled_position` after `commit_handled()`).** T1 right: it
+  persists; only the list is cleared.
+* **T5 (`on_assigned(frozenset())`).** `ValueError` (assumption 31).
+* **T6 (acquire/load interleaving).** Strictly sequential per shard:
+  acquire, load, build, then the next shard. T1's weaker assertion is
+  compatible and may stay.
+* **T7 (error precedence in `load_settings`).** Not pinned;
+  first-in-load-order per ADR-0009 A12. T1 right to leave it.
+* **T8 (`stop()` and `consumer.close()`).** T1 right: `stop()` does not
+  close the consumer; the service closes the bus afterwards.
+* **T9 (settings field names).** T1 right: `bus_kind`, `bus_brokers`,
+  `member_id`, `lease_ttl_s`, `maintenance_interval_s`; recorded in
+  decision 10.
+* **T10 (`parse_shard_ids("auto")` message).** Exact text given in
+  decision 6; tests pin `HAMMERTIME_SHARD_IDS`, `all`, `ADR-0013` and one
+  explicit-set example. T1's two substrings were right and remain
+  sufficient; the ADR now also names the other two.
+* **T11 (liveness at exactly `expires_at`).** Expired: live iff `now <
+  expires_at`, both backends. T1 need not pin it.
+* **T12 (real sleeps against fakeredis; `EX ceil`).** Accepted; the
+  precedent is `test_dedup.py`, and `ceil` is decision 7's "rounded up".
+* **T13 (`_TappedBus`/`_PrefetchBus`).** Accepted; that harness shape is
+  what decision 3's `ack()` rule implies for any test that acknowledges.
+* **T14 (`bus._logs` read by test helpers).** Tolerated as the
+  pre-existing pattern; a public read helper on `InMemoryBus` is a
+  candidate follow-up, not required here.
+* **T15 (`:4222` in `_FailingProducer`).** Cosmetic; accepted.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+29. **`nats_client_error` at `WARNING`, one line per event.** It fires
+    once per refused attempt during a startup wait, alongside
+    `connect_with_retry`'s own `dependency_unavailable` record, so a
+    startup wait produces two records per attempt. `DEBUG` would hide the
+    mid-run case (a reconnect attempt during an outage), which has no
+    other record; the duplication at startup is accepted rather than
+    adding logic to tell the two apart.
+30. **Lua kept over `WATCH`/`MULTI`, at the cost of `lupa` in the test
+    process.** `redis.py`'s `record_transition` chose `WATCH` partly to
+    avoid `lupa`; that reason lapses now that `lupa` is present (its
+    other reason, exact `int` comparison above 2**53, still holds for the
+    sequence and does not apply to a string-valued owner key). The lease
+    is kept in Lua because its correctness under contention is the case
+    it exists for (#90, two members racing for one shard) and a single
+    server-side step has no retry loop to reason about; `release_lease`'s
+    "delete iff mine" is the standard scripted idiom; and the cost is one
+    MIT, wheel-only, test-process dependency (no sdist for 2.8 is listed
+    on PyPI, so a platform without a `cp312` manylinux/macOS/Windows
+    wheel cannot install it — CI runners and the reference `python:3.12-slim`
+    build have x86_64 wheels; the service images do not install the
+    `dev` group).
+31. **`on_assigned(frozenset())` is a `ValueError`, not a no-op.** A no-op
+    would let a directly constructed `ShardClaims` hold nothing and sit
+    idle "ready", the state ADR-0011 A3 refuses at the bus; refusing the
+    direct call keeps the two paths consistent. The old code's
+    `no_shards_assigned` warning-and-return was ADR-0011 assumption 21's
+    group-managed steady state, which no longer exists.
+32. **`handled_position(p)` is `None` for an unheld `p`.** Chosen over
+    `KeyError` to match `window(p)`, the other read on the same object,
+    and because the worker only ever asks after the `UNCLAIMED` check.
+33. **`end_offset` as "the next offset", on the protocol.** "Last offset"
+    has no value for an empty log on a 0-based list (`-1` would be a
+    sentinel) and a different one on a 1-based stream (`0`); "next offset"
+    is `0` and `1` respectively and makes the readiness test one
+    inequality on both. Putting it on `MessageBus` widens the protocol by
+    one method; every implementation and test double in the repository
+    subclasses `InMemoryBus`, so nothing else needs to change.
+34. **The exact `auto` message.** The ADR pinned four facts the message
+    must carry; the wording is the architect's, and tests pin substrings
+    so the wording can be polished without a test change.
+35. **Strictly sequential per-shard claiming.** The ADR said acquire
+    before load per shard and sorted order for acquires; batching all
+    acquires then all loads would also satisfy that text. Sequential is
+    chosen because it is what C1 implemented and because it bounds what a
+    refusal has to undo to "the shards before this one".
+36. **A lease expires at exactly `expires_at`.** Matches Redis `EX`
+    semantics and the memory implementation; the boundary is a
+    second-granularity detail no caller depends on.
+37. **A member idle through an outage survives it.** Follows from C5.3;
+    it means a member can be "running" against a dead broker for as long
+    as its shards are idle, with only the store lease renewals proving it
+    alive. ADR-0009's readiness endpoint does not probe the bus
+    connection today; whether it should is left to the telemetry epic.
+38. **`stop()` does not close the consumer.** Decision 8 already implied
+    it; stated so that C2 does not add a `close()` inside `stop()` and
+    break `_TappedBus`-style tests that read the stream after `stop()`.
+39. **Error precedence in `load_settings` stays unpinned.** As ADR-0009
+    A12 chose for ingest.
+40. **T1's harness choices are accepted as test-side judgement**, not
+    interface: `_TappedBus`, `_PrefetchBus`, the `bus._logs` reads and the
+    0.6-1.3 s sleeps against fakeredis. None constrains the code.

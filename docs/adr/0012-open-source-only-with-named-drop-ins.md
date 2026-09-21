@@ -14,7 +14,9 @@ Class 4 inventories are updated — `nats` and `nats-py` in, Apache Kafka,
 Redpanda and `aiokafka` out; assumptions 5 and 14 are superseded. The
 `nats` row's `compliant` is **conditional** on the CNCF/Synadia settlement
 terms being verified against the CNCF announcement, which this environment
-cannot reach).
+cannot reach); amended 2026-09-21 (see "Amendment 3" — `lupa` enters the
+Class 2 inventory through the `fakeredis[lua]` extra that ADR-0013
+Amendment 1 adds to the `dev` group: MIT, test process only).
 
 Scope note: this ADR records a policy the repository owner gave verbatim
 and turns it into a rule that can be checked in review: which licences
@@ -443,7 +445,8 @@ exercise the reference images in CI. Until then the Status column's
 | pytest | 9.1.1 | MIT | no | compliant |
 | pytest-asyncio | 1.4.0 | Apache-2.0 | no | compliant |
 | pytest-benchmark | 5.3.0 | BSD-2-Clause | no | compliant |
-| fakeredis | 2.38.0 | BSD-3-Clause | no | compliant |
+| fakeredis (installed as `fakeredis[lua]` since 2026-09-21, Amendment 3; `dev` group) | 2.38.0 | BSD-3-Clause | no | compliant |
+| lupa (pulled by `fakeredis[lua]` as `lupa>=2.1`; test process only — it exists so the in-process fake can run the Lua `EVAL` of `RedisShardStateStore`'s lease, ADR-0013 decision 7; added 2026-09-21, Amendment 3) | 2.8 on PyPI (the locked version is to be read from `uv.lock` once the C1-followup change lands; the architect has no Bash) | MIT — the legacy `license` field reads `"MIT style"` and there is no `license_expression`; `license_files = ["LICENSE.txt"]`, which carries the MIT notice for Lupa ("Copyright (c) 2010-2017 Stefan Behnel") followed by the MIT licence of the bundled Lua ("Copyright © 1994–2017 Lua.org, PUC-Rio") | no (single maintainer; no paid tier) | compliant (test process only; wheel-only on PyPI for 2.8, see Amendment 3 assumption 2) |
 | types-jsonschema | 4.26.0.20260518 | Apache-2.0 | no | compliant |
 | ruff | 0.16.7 (lock; 0.16.8 on PyPI) | MIT | yes (Astral) — irrelevant under decision 3 | compliant |
 | mypy | 2.3.1 | MIT | no | compliant |
@@ -887,6 +890,25 @@ sources, including the blocked hosts, is in ADR-0013's Sources:
   `www.synadia.com`, `www.linuxfoundation.org`, `lists.cncf.io`,
   `docs.nats.io`, `nats.io`, `nats-io.github.io`, `web.archive.org`.
 
+Read on 2026-09-21 for Amendment 3 (the `lupa` row):
+
+* `https://pypi.org/pypi/fakeredis/json` — version 2.38.0,
+  `license_expression` `BSD-3-Clause`, `provides_extra` `bf, cf, json,
+  lua, probabilistic, valkey, vectorset`, `requires_dist` carries
+  `lupa>=2.1; extra == "lua"`.
+* `https://pypi.org/pypi/lupa/json` — version 2.8, legacy `license`
+  `"MIT style"`, `license_expression` absent, `license_files
+  ["LICENSE.txt"]`, author Stefan Behnel, `requires_python >=3.8`,
+  homepage `https://github.com/scoder/lupa`.
+  `https://pypi.org/pypi/lupa/2.8/json` — wheels
+  `lupa-2.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl`
+  and the `aarch64` equivalent (uploaded 2026-04-15); no sdist listed.
+* `https://raw.githubusercontent.com/scoder/lupa/master/LICENSE.txt`
+  (summarised by the fetch tool; `master`, not the 2.8 tag) — the MIT
+  licence, "Copyright (c) 2010-2017 Stefan Behnel. All rights reserved.",
+  followed by the MIT licence of the bundled Lua, "Copyright © 1994–2017
+  Lua.org, PUC-Rio" (`https://www.lua.org/license.html`).
+
 ## Amendment 1 (2026-09-18) — inventory brought to the post-C1 state; decision 9's override description corrected
 
 Why: decision 6 makes this ADR's inventory the living record and requires
@@ -1185,3 +1207,55 @@ Assumptions made by this amendment (push back individually):
    rule: an ADR is not a user-visible change; a changed reference
    component is, and this one is `BREAKING` because `HAMMERTIME_BUS_KIND`
    and `HAMMERTIME_BUS_BROKERS` change meaning).
+
+## Amendment 3 (2026-09-21) — `lupa`, via `fakeredis[lua]`, enters Class 2 (ADR-0013 Amendment 1)
+
+Why: ADR-0013 decision 7 implements the per-shard lease as one Lua `EVAL`
+per call on `RedisShardStateStore`. fakeredis 2.38 without its `lua`
+extra answers `EVAL` with `unknown command 'eval'`, which is why every
+Redis lease test failed when T1's tests were run against C1's code.
+ADR-0013 Amendment 1 (ruling C5.1) keeps the Lua form and adds
+`fakeredis[lua]` to the root `pyproject.toml`'s `dev` group, which pulls
+`lupa>=2.1`. Decision 6 requires the inventory to be updated in the same
+change set as any dependency change, by architect amendment (assumption
+11); this is that amendment. `lupa` is a Class 2 dependency (the `dev`
+group is in scope by decision 3's first sentence) and is imported into the
+test process, so decision 3 item 2's permissive-or-weak-copyleft rule
+applies; MIT satisfies it.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended the "amended 2026-09-21 (see "Amendment 3"
+  ...)" clause.
+* **Class 2 table, `fakeredis` row.** Was: "| fakeredis | 2.38.0 |
+  BSD-3-Clause | no | compliant |". Now the package cell says it is
+  installed as `fakeredis[lua]` since this amendment; the other cells are
+  unchanged.
+* **Class 2 table, new `lupa` row** after it.
+* **Sources.** A dated block for this amendment.
+
+Assumptions made by this amendment (push back individually):
+
+1. **MIT is taken from `LICENSE.txt` at `master`, not at the 2.8 tag,
+   and from a summarised fetch.** The PyPI legacy field says only "MIT
+   style" and there is no `license_expression`, so the licence file is
+   the evidence; the same tag-versus-branch posture Amendments 1 and 2
+   took for Redpanda and `nats`. The bundled Lua is MIT under its own
+   notice, so the wheel carries two MIT notices and no other licence.
+2. **Wheel-only is acceptable for a test dependency.** PyPI lists no
+   sdist for lupa 2.8, so a platform without a matching wheel cannot
+   install it at all rather than compiling it. CI (`ubuntu-latest`,
+   x86_64, CPython 3.12) and the developer platforms the repository
+   supports have wheels; the service images never install the `dev`
+   group. If a contributor's platform lacks a wheel, the fallback is to
+   pin an older lupa with an sdist, not to relax the lease to
+   `WATCH`/`MULTI`.
+3. **Not single-vendor.** One maintainer, no company, no paid tier;
+   irrelevant under decision 3 in any case.
+4. **The locked version is not recorded here.** The architect cannot run
+   `uv lock`; the `C1-followup` PR's `Licences` line (decision 6) states
+   the version `uv.lock` resolves, and the row's "2.8 on PyPI" is to be
+   replaced by it at the next amendment that touches this table.
+5. **No `CHANGES` entry.** A test-only dependency has no user-visible
+   effect (`CLAUDE.md`'s `CHANGES` rule: dependency bumps with no
+   observable effect are not recorded).
