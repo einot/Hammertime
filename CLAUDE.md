@@ -53,11 +53,12 @@ specifically instead of having to re-derive them from the diff.
 
 ## Supervisor agent
 
-Every dispatch to `coder`, `test-author`, or `architect` (the only
-subagents with write access) must be paired with a `supervisor` review
-before acting on its output (merging, pushing, or handing off to another
-agent). Give `supervisor` exactly two things: the literal instructions
-given to the worker agent, and the worker's own report of what it changed.
+Every dispatch to `coder`, `test-author`, `architect`, or
+`security-auditor` (the subagents that can write or execute) must be
+paired with a `supervisor` review before acting on its output (merging,
+pushing, or handing off to another agent). Give `supervisor` exactly two
+things: the literal instructions given to the worker agent, and the
+worker's own report of what it changed.
 `supervisor` is read-only (Read/Grep/Glob only, no Bash, no Edit/Write, no
 spawning other agents) — it inspects the actual current file contents
 against the task's stated scope and flags anything out of the ordinary:
@@ -87,10 +88,18 @@ user — the session does not get to decide it understood such a finding
 well enough to work past it. That follows from the standing order rather
 than being carved out of it.
 
-`reviewer`/`security-auditor` are themselves read-only and structurally
-incapable of taking an unauthorized action (no write access at all), so
-routine supervisor coverage is scoped to the three agents that can write;
-extend it to every dispatch if asked.
+`reviewer` is read-only and structurally incapable of taking an
+unauthorized action — no Edit, no Write, no Bash — so routine supervisor
+coverage excludes it. Extend coverage to every dispatch if asked.
+
+`security-auditor` was exempt on the same grounds until it gained a Bash
+tool, fenced to read-only inspection commands by
+`.claude/hooks/bash-guard.sh`. A fence is not the same guarantee as not
+having the tool: the exemption rested on there being nothing to fence,
+and that is no longer true. It is therefore paired like the agents that
+can write. This is deliberately the cautious reading — the fence is
+default-deny and carefully written, but it is a shell script, and the
+cost of pairing is one extra read-only review per security audit.
 
 Subagents do not dispatch other subagents. `architect` has no `Agent`
 tool: it settles the interface, writes ready-to-dispatch briefs, and hands
