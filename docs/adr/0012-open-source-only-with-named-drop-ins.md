@@ -5,7 +5,16 @@ end — the Class 1 inventory and the Class 4 pinning summary are brought to
 the state of the compose change brief C1 produced, decision 9's description
 of the override file is corrected in place, and the Context and
 Consequences statements that the two breaches are live gain dated notes.
-No decision changes in substance).
+No decision changes in substance); amended 2026-09-21 (see "Amendment 2"
+— under ADR-0013 the reference event log is NATS JetStream: decision 2
+gains item 5, under which a wire-protocol-unique, foundation-governed
+component confined behind one in-repo interface may be the reference with
+no drop-in; decision 9 is rewritten in place; the Class 1, Class 2 and
+Class 4 inventories are updated — `nats` and `nats-py` in, Apache Kafka,
+Redpanda and `aiokafka` out; assumptions 5 and 14 are superseded. The
+`nats` row's `compliant` is **conditional** on the CNCF/Synadia settlement
+terms being verified against the CNCF announcement, which this environment
+cannot reach).
 
 Scope note: this ADR records a policy the repository owner gave verbatim
 and turns it into a rule that can be checked in review: which licences
@@ -141,6 +150,23 @@ the reference deployment runs that is not built from this repository.
    definition), never data, ordering or a service's ability to start. Every
    such exception is listed by name in the inventory with the reason. Today
    the list is Grafana OSS (decision 8).
+5. *(Added 2026-09-21, Amendment 2.)* A component whose wire protocol has
+   no second implementation MAY be the reference with no drop-in named,
+   when **all** of the following hold: (a) it is open source (item 1);
+   (b) it is foundation-governed — its licence and trademarks are held by
+   a foundation, so that no single vendor can relicense it, which is
+   definition 1's single-vendor test coming out negative — and the fact is
+   verified against a primary source or, until it can be, recorded as an
+   assumption with the verdict marked conditional; (c) every use of it in
+   this repository is confined behind one in-repo interface that has an
+   in-process implementation the whole test suite runs against, so that
+   replacing it is a bounded change to one package and to `deploy/`,
+   never to the services — a code-level exit rather than a deployment-level
+   drop-in, named in the ADR that adopts the component. Under item 5 "no
+   drop-in" is a recorded cost in the inventory, not a breach. If (b)
+   turns out false, the component is single-vendor with a paid tier and
+   no drop-in: non-compliant under items 1-2, and decision 7 applies.
+   Today the list is NATS JetStream (decision 9, ADR-0013).
 
 Strong-copyleft licences (GPL, AGPL) are acceptable in this class. The
 services connect to these components over a network protocol; they do not
@@ -269,44 +295,56 @@ a drop-in. Note that `deploy/grafana/README.md` describes a
 `hammertime.json` that does not exist yet and no Grafana service is in the
 compose file; the ruling applies when it is added.
 
-### 9. Reference broker: Apache Kafka; Redpanda a documented substitute
+### 9. Reference event log: NATS JetStream, with no drop-in, under decision 2 item 5
 
-The reference broker is **Apache Kafka** (Apache-2.0, ASF), run from the
-foundation's own image `apache/kafka`, pinned to a 4.x release, in KRaft
-combined mode (one container acting as broker and controller; Kafka 4.0
-removed ZooKeeper). The compose service is named `broker` and the
-application services reach it as `broker:9092`, so `HAMMERTIME_BUS_BROKERS`
-is the same under every broker.
+> Rewritten in place 2026-09-21 (ADR-0013; Amendment 2). The previous text
+> of this decision — Apache Kafka as the reference broker with Redpanda as
+> a documented, deployment-only substitute — is quoted in full under
+> Amendment 2. It held from 2026-09-18 to 2026-09-21 and was never started
+> on any host (inventory preamble).
 
-Redpanda is kept as a **documented substitute**, not removed: an override
-file `deploy/docker-compose.redpanda.yml` redefines only the `broker`
-service (image `redpandadata/redpanda:v26.2.3`; `environment: !reset {}`
-so that none of the reference's `KAFKA_*` variables reach it; its
-`redpanda start` command; no healthcheck today, because healthchecks are
-ADR-0009 decision 10's and #17's — when #17 adds a broker healthcheck the
-override must carry a Redpanda-appropriate one of its own, since `!reset`
-covers only `environment` and the Kafka probe would otherwise be inherited).
-Starting the stack with both files is the drop-in demonstration — the diff between the two brokers is confined to
-that file, and nothing under `packages/`, `services/`, `tools/` or `.env*`
-differs. The broker-backed integration suite (#52) runs against the
-reference (Kafka). Running it against the override is not required by
-this ADR; if a later change makes Redpanda-specific behaviour matter
-(ADR-0001 Amendment 1 notes that its per-partition ordering is asserted of
-Redpanda only via protocol compatibility), that is when the override earns
-a CI run.
+The reference event log is **NATS JetStream**: the NATS server
+(Apache-2.0; `nats-io/nats-server`), run from the Docker Official Image
+`nats`, pinned to `2.15.0-alpine`, with `-js -sd /data -m 8222`. The compose
+service is named `nats`; the application services reach it as
+`nats://nats:4222` (`HAMMERTIME_BUS_BROKERS`), and its monitoring endpoint
+`http://nats:8222/healthz?js-enabled-only=true` is the healthcheck. The
+Python client is `nats-py` (Apache-2.0; `nats-io/nats.py`), which replaces
+`aiokafka` in `packages/hammertime-bus`. Streams are created by
+`hammertime-provision` before the services start (ADR-0013 decision 2).
 
-Consequences for earlier text: ADR-0001 Amendment 1's Redpanda bullet
-("the reference deployment's broker is Redpanda, and the citation above is
-Kafka's") is resolved in Kafka's favour once the compose change lands — the
-citation and the deployment then agree. ADR-0009 decision 10 names `rpk
-cluster health` as the broker healthcheck; under Kafka that becomes the
-Kafka CLI's own probe (e.g. `kafka-broker-api-versions.sh
---bootstrap-server localhost:9092`). Neither ADR is edited here.
+**There is no drop-in.** No second implementation of the NATS wire
+protocol and JetStream API exists, so the drop-in rule of decision 2 item
+2 cannot be met and item 3's "documented substitute" has nothing to name.
+NATS is nevertheless the reference under decision 2 item 5, on three
+grounds, each of which the inventory row records:
 
-> Amended 2026-09-18: the override paragraph above originally said the
-> override carried "its own healthcheck", which contradicted brief C1's
-> "Do not: add healthchecks" and the file as landed. Corrected in place;
-> see Amendment 1.
+1. It is open source: the server and the client are Apache-2.0
+   (verified from `LICENSE` and PyPI metadata; Sources).
+2. It is foundation-governed. The server's README states it is a CNCF
+   project (verified). That its trademarks are held by the Linux
+   Foundation, its domain and repositories sit with CNCF, and the 2025
+   proposal to relicense under BUSL was withdrawn, is **not yet verified
+   from a primary source** — the CNCF announcement is unreachable from
+   this environment — and is recorded as ADR-0013 assumption 1. **The
+   `compliant` verdict for `nats` is conditional on that verification.**
+   Should it fail, NATS is a single-vendor component (Synadia sells a
+   commercial tier) with no drop-in, non-compliant under items 1-2, and
+   decision 7's pre-1.0 remediation — replace before 1.0 — applies.
+3. It is confined. Every use of NATS in this repository is behind
+   `hammertime.bus` (`interface.py`), which `memory.py` implements in
+   process for every unit test; the services depend only on the
+   interface. The exit, should one be needed, is a new `hammertime.bus`
+   backend plus `deploy/` — the shape ADR-0013 itself takes to move off
+   Kafka — and no service source file. That is the code-level exit item 5
+   asks the adopting ADR to name.
+
+Consequences for earlier text: ADR-0001 Amendment 1's Redpanda bullet and
+its Kafka ordering citation are superseded by ADR-0001 Amendment 2;
+ADR-0009 decision 10's healthcheck names are corrected by ADR-0009
+Amendment 4. `deploy/docker-compose.redpanda.yml` is deleted by the change
+that implements ADR-0013; until then it is dead configuration for a broker
+the services no longer speak to.
 
 ### 10. Reference store: Valkey; Redis 8 (AGPLv3) and Redis 7.2 as alternatives
 
@@ -369,12 +407,18 @@ runtime proof, and the broker-backed integration suite (#52) is what will
 exercise the reference images in CI. Until then the Status column's
 `compliant` is a licence-and-pin statement, not a "has run" statement.
 
-### Class 1 — runtime infrastructure (`deploy/docker-compose.yml` and the `deploy/docker-compose.redpanda.yml` override)
+> Amended 2026-09-21 (Amendment 2): the tables below describe the
+> deployment ADR-0013 decision 11 specifies; the rows are written as
+> "to be deployed by the ADR-0013 change" until it lands, and the `nats`
+> row's status is conditional as decision 9 says.
+
+### Class 1 — runtime infrastructure (`deploy/docker-compose.yml`)
 
 | Component | Image as deployed | Licence | Single-vendor, paid tier | Drop-in | Status | Pin | Verified |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Redpanda | `redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml` line 4; override only, applied with a second `-f`) | BUSL-1.1, change to Apache-2.0 four years after each release; enterprise features separately licensed | yes (Redpanda Data: Enterprise, Cloud) | Apache Kafka (the reference) | substitute (decision 9): not OSI, so never the reference; kept as a pinned, deployment-only override | `major.minor.patch` | licence: `licenses/bsl.md` on the `dev` branch — the source repository returns 404 for every path at tag `v26.2.3`, so the licence is **not** verified at the pinned tag; tag: yes (Docker Hub, newest `vXX.Y.Z`); runtime: not exercised (`docker compose config` only) |
-| Apache Kafka (reference, decision 9) | `apache/kafka:4.3.1` (`deploy/docker-compose.yml` line 8; single-node KRaft combined mode) | Apache-2.0 | no (ASF) | n/a; Redpanda is the substitute | compliant | `major.minor.patch` | licence: yes (`LICENSE` at tag `4.3.1`; Docker Hub publisher = The Apache Software Foundation); tag: yes (newest non-rc 4.x on Docker Hub); runtime: not exercised — `docker compose config` plus a match of the `KAFKA_*` set against the ASF's own single-node example for 4.3.1; pending first `make up` / #52 |
+| NATS server with JetStream (reference, decision 9; ADR-0013) | `nats:2.15.0-alpine` (to be deployed by the ADR-0013 change as service `nats`, `-js -sd /data -m 8222`; linux/amd64 digest `sha256:eda962d67930eda338222072d9a9f3818855d922ad224c399b0b01d251e9b91b`) | Apache-2.0 | no, **assumed**: CNCF project (README verified); trademarks with the Linux Foundation and the BUSL relicensing withdrawn per the May 2025 CNCF/Synadia settlement, **not primary-verified** (ADR-0013 assumption 1); Synadia sells a commercial tier | none exists (no second implementation of the wire protocol); admitted under decision 2 item 5 — exit is a new `hammertime.bus` backend plus `deploy/` | **compliant, conditional** on the settlement terms being verified against `https://www.cncf.io/announcements/2025/05/01/cncf-and-synadia-align-on-securing-the-future-of-the-nats-io-project/`; `non-compliant` under decision 7 if they are not | `major.minor.patch` | licence: yes (`nats-io/nats-server` `main` `LICENSE`, Apache-2.0, read 2026-09-21; not read at tag `v2.15.0`); tag: yes (Docker Hub v2 API, pushed 2026-09-18); runtime: not exercised in this repository — nats-server 2.15.0 *built from source* was run for ADR-0013's measurements, not the image |
+| Apache Kafka | not deployed since 2026-09-21 (was `apache/kafka:4.3.1` as service `broker`, 2026-09-18 to 2026-09-21; replaced by NATS JetStream under decision 9 as rewritten) | Apache-2.0 | no (ASF) | n/a | replaced (decision 9) | n/a (not deployed) | licence: yes (`LICENSE` at tag `4.3.1`), kept for the record; runtime: never started from the image; a bare-JVM 4.3.1 was measured for ADR-0013 (cold start 5.1-5.8 s) |
+| Redpanda | not deployed since 2026-09-21 (was the `deploy/docker-compose.redpanda.yml` override, `redpandadata/redpanda:v26.2.3`; the file is deleted by the ADR-0013 change) | BUSL-1.1, change to Apache-2.0 four years after each release | yes (Redpanda Data: Enterprise, Cloud) | n/a | removed (decision 9; ADR-0013 removes the broker drop-in altogether) | n/a (not deployed) | licence: `licenses/bsl.md` on the `dev` branch only (404 at the tag), kept for the record; runtime: never started |
 | Redis | not deployed since 2026-09-18 (was `redis:7-alpine`, resolving to 7.4.11-alpine; replaced by Valkey under decision 10) | RSALv2 OR SSPLv1 (7.4.x–7.8.x); BSD-3-Clause up to 7.2.x; RSALv2 OR SSPLv1 OR AGPLv3 from 8.0 | yes (Redis Ltd: Enterprise, Cloud) | Valkey | replaced (decision 10); Redis 8.x under AGPLv3 remains the recorded drop-in for Valkey in the other direction | n/a (not deployed) | licence: yes (branch `LICENSE.txt`/`COPYING`; Docker Hub tag map), kept for the record |
 | Valkey (reference, decision 10) | `valkey/valkey:9.1.2-alpine` (`deploy/docker-compose.yml` line 30; `--maxmemory-policy noeviction`) | BSD-3-Clause | no (Linux Foundation) | Redis 8.x under AGPLv3; Redis 7.2 | compliant | `major.minor.patch` | licence: yes (`COPYING` at tag `9.1.2`; Docker Hub publisher = Valkey community); tag: yes (newest stable on Docker Hub); runtime: not exercised (`docker compose config` only; pending first `make up` / #52) |
 | Prometheus | `prom/prometheus:v3.14.0` (`deploy/docker-compose.yml` line 69) | Apache-2.0 | no (CNCF) | n/a | compliant | `major.minor.patch` | licence: yes (`LICENSE` at tag `v3.14.0`); tag: yes (newest non-rc on Docker Hub); runtime: not exercised (`docker compose config` only) |
@@ -385,7 +429,8 @@ exercise the reference images in CI. Until then the Status column's
 
 | Package | Version | Licence (PyPI `license_expression` / `license`) | Maintainer with paid tier | Status |
 | --- | --- | --- | --- | --- |
-| aiokafka | 0.14.0 | Apache-2.0 | no | compliant |
+| nats-py (replaces aiokafka, 2026-09-21; to be added to `packages/hammertime-bus/pyproject.toml` by the ADR-0013 change) | 2.16.0 on PyPI | Apache-2.0 — carried in `license_expression` and `license_files=["LICENSE"]`; the legacy `license` field is `null`, so a tool reading only that field reports "no licence" | no (NATS project; same governance caveat as the Class 1 `nats` row) | compliant (licence unconditional; governance conditional as above) |
+| aiokafka | removed 2026-09-21 (was 0.14.0) | Apache-2.0 | no | removed (ADR-0013) |
 | fastapi | 0.141.1 | MIT | no | compliant |
 | uvicorn | 0.53.0 | BSD-3-Clause | no | compliant |
 | jsonschema | 4.26.0 | MIT | no | compliant |
@@ -422,11 +467,14 @@ not itemised here; decision 3 item 4 audits them at release time.
 
 As of Amendment 1 every image reference in `deploy/` and every `Dockerfile`
 `FROM` line is pinned; no action remains open under decision 5 item 2.
+Amendment 2 (2026-09-21) replaces the two broker rows with the `nats` row
+the ADR-0013 change will land; the provisioner image it adds
+(`tools/provision/Dockerfile`) builds `FROM python:3.12-slim` like the
+service images.
 
 | Reference | Pinned? | Action |
 | --- | --- | --- |
-| `apache/kafka:4.3.1` (`deploy/docker-compose.yml`) | `major.minor.patch` | done — replaced `redpandadata/redpanda:latest` as the reference (decision 9) |
-| `redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml`) | `major.minor.patch` | done — substitute override (decision 9) |
+| `nats:2.15.0-alpine` (`deploy/docker-compose.yml`, by the ADR-0013 change) | `major.minor.patch` | replaces `apache/kafka:4.3.1` as the reference event log (decision 9 as rewritten); `deploy/docker-compose.redpanda.yml` deleted |
 | `valkey/valkey:9.1.2-alpine` (`deploy/docker-compose.yml`) | `major.minor.patch` | done — replaced `redis:7-alpine` (decision 10) |
 | `prom/prometheus:v3.14.0` (`deploy/docker-compose.yml`) | `major.minor.patch` | done |
 | `python:3.12-slim` × 4 (`services/*/Dockerfile`) | `major.minor` | none |
@@ -466,7 +514,9 @@ earlier ADRs do not make. Push back on them individually.
 5. **Redpanda is kept as an override rather than deleted.** The owner named
    it; a developer who wants its faster cold start can have it with one
    extra `-f`. Cost: a second file to keep pinned. Push back if one broker
-   is simpler.
+   is simpler. *(Superseded 2026-09-21, Amendment 2: the override is deleted
+   with the broker it substituted for; there is one event log and no
+   substitute.)*
 6. **`major.minor` is the pinning floor; exact patch recommended.** An
    exact patch pin is safest but turns every security release into a PR.
    `major.minor` held the line in the only licence change that has
@@ -520,7 +570,11 @@ earlier ADRs do not make. Push back on them individually.
     chose 60 s "to cover Redpanda's cold start in CI comfortably"; Kafka in
     KRaft combined mode is assumed to start within that on a CI runner. If
     #52 finds otherwise, the deadline is ADR-0009's to amend, not this
-    ADR's.
+    ADR's. *(Measured 2026-09-21, no longer an assumption: 5.1-5.8 s from
+    `kafka-storage format` to "Kafka Server started", bare JVM on a 4
+    vCPU host, three cold runs — ADR-0013 Context, prerequisite 5. The
+    claim held; it is superseded only because Kafka is no longer
+    deployed, Amendment 2.)*
 15. **Kafka versions.** "A 4.x release" is required rather than a specific
     patch because Docker Hub's `apache/kafka` page lists only `latest` by
     name; ADR-0001 Amendment 1 cites 4.3.1's documentation, so 4.3.1 is
@@ -539,6 +593,14 @@ earlier ADRs do not make. Push back on them individually.
 > the "today" and "with the compose PR" statements in this section
 > describe the pre-change state. Runtime is still unexercised (see the
 > inventory preamble).
+
+> Amended 2026-09-21 (Amendment 2): the first, fourth and sixth bullets
+> below (Kafka heavier than Redpanda; two compose files; the topic
+> auto-creation gap) are superseded by ADR-0013 — one event log, one
+> compose file, and streams provisioned explicitly before the services
+> start. The "earlier ADRs mention the old images" bullet is now
+> discharged by ADR-0001 Amendment 2 and ADR-0009 Amendment 4. The
+> remaining bullets stand.
 
 * **Apache Kafka is heavier than Redpanda.** A JVM broker image several
   times Redpanda's size and a slower cold start, paid on every `make up`
@@ -804,6 +866,27 @@ by the architect rather than taken from the C1 report):
 * `deploy/docker-compose.yml` lines 8, 30, 69 and
   `deploy/docker-compose.redpanda.yml` line 4 (image references as landed).
 
+Read on 2026-09-21 for Amendment 2 (the NATS rows); the full set of NATS
+sources, including the blocked hosts, is in ADR-0013's Sources:
+
+* `https://raw.githubusercontent.com/nats-io/nats-server/main/LICENSE` —
+  "Apache License / Version 2.0, January 2004" (the `main` branch; the
+  `v2.15.0` tag was not fetched).
+* `https://raw.githubusercontent.com/nats-io/nats-server/main/README.md`
+  line 5 (top-level session, 2026-09-21) — "NATS is part of the Cloud
+  Native Computing Foundation ([CNCF](https://cncf.io))".
+* `https://pypi.org/pypi/nats-py/json` — version 2.16.0,
+  `license_expression` "Apache-2.0", `license_files` `["LICENSE"]`,
+  `license` `null` (top-level session's direct read; the architect's
+  summarised fetch agreed on the expression and files).
+* `https://hub.docker.com/v2/repositories/library/nats/tags/2.15.0-alpine`
+  — pushed 2026-09-18T01:57:51Z, 11 481 954 bytes, linux/amd64 digest
+  `sha256:eda962d67930eda338222072d9a9f3818855d922ad224c399b0b01d251e9b91b`.
+* `https://www.cncf.io/announcements/2025/05/01/cncf-and-synadia-align-on-securing-the-future-of-the-nats-io-project/`
+  — **EGRESS_BLOCKED** from this environment; not read. Also blocked:
+  `www.synadia.com`, `www.linuxfoundation.org`, `lists.cncf.io`,
+  `docs.nats.io`, `nats.io`, `nats-io.github.io`, `web.archive.org`.
+
 ## Amendment 1 (2026-09-18) — inventory brought to the post-C1 state; decision 9's override description corrected
 
 Why: decision 6 makes this ADR's inventory the living record and requires
@@ -966,3 +1049,139 @@ spec or an earlier ADR; push back individually):
    The images' licences are verified; what is unverified is that the
    compose files start. That belongs to #52 and the first `make up`, and is
    recorded per row rather than by demoting `compliant`.
+
+## Amendment 2 (2026-09-21) — NATS JetStream as the reference event log; a rule for a component with no drop-in (ADR-0013)
+
+Why: ADR-0013 replaces Apache Kafka with NATS JetStream. NATS has no
+wire-compatible second implementation, so the drop-in rule of decision 2
+item 2 cannot be met, and item 4's exception — scoped to components whose
+loss costs "only an operator convenience ... never data, ordering or a
+service's ability to start" — is the opposite of what an event log is. The
+owner's direction quoted in Context uses "Redpanda and Kafka" as its
+exemplar, so adopting NATS needs a rule, not a table edit: decision 2
+gains item 5. Decision 9 is rewritten in place (the Kafka text is quoted
+below), the inventory is updated, and two assumptions are superseded. The
+compliance verdict for `nats` is **conditional**: the governance facts item
+5(b) requires could not be primary-verified from this environment
+(ADR-0013 Context, prerequisite 3), and this amendment says so in the
+Status line, in decision 9, and in the inventory row rather than
+presenting an unverified fact as a verified one.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended the "amended 2026-09-21" clause.
+* **Decision 2, new item 5.** Added after item 4; items 1-4 unchanged.
+* **Decision 9, rewritten in place** under a new heading with a dated
+  blockquote. The superseded text in full:
+
+  > ### 9. Reference broker: Apache Kafka; Redpanda a documented substitute
+  >
+  > The reference broker is **Apache Kafka** (Apache-2.0, ASF), run from the
+  > foundation's own image `apache/kafka`, pinned to a 4.x release, in KRaft
+  > combined mode (one container acting as broker and controller; Kafka 4.0
+  > removed ZooKeeper). The compose service is named `broker` and the
+  > application services reach it as `broker:9092`, so `HAMMERTIME_BUS_BROKERS`
+  > is the same under every broker.
+  >
+  > Redpanda is kept as a **documented substitute**, not removed: an override
+  > file `deploy/docker-compose.redpanda.yml` redefines only the `broker`
+  > service (image `redpandadata/redpanda:v26.2.3`; `environment: !reset {}`
+  > so that none of the reference's `KAFKA_*` variables reach it; its
+  > `redpanda start` command; no healthcheck today, because healthchecks are
+  > ADR-0009 decision 10's and #17's — when #17 adds a broker healthcheck the
+  > override must carry a Redpanda-appropriate one of its own, since `!reset`
+  > covers only `environment` and the Kafka probe would otherwise be inherited).
+  > Starting the stack with both files is the drop-in demonstration — the diff between the two brokers is confined to
+  > that file, and nothing under `packages/`, `services/`, `tools/` or `.env*`
+  > differs. The broker-backed integration suite (#52) runs against the
+  > reference (Kafka). Running it against the override is not required by
+  > this ADR; if a later change makes Redpanda-specific behaviour matter
+  > (ADR-0001 Amendment 1 notes that its per-partition ordering is asserted of
+  > Redpanda only via protocol compatibility), that is when the override earns
+  > a CI run.
+  >
+  > Consequences for earlier text: ADR-0001 Amendment 1's Redpanda bullet
+  > ("the reference deployment's broker is Redpanda, and the citation above is
+  > Kafka's") is resolved in Kafka's favour once the compose change lands — the
+  > citation and the deployment then agree. ADR-0009 decision 10 names `rpk
+  > cluster health` as the broker healthcheck; under Kafka that becomes the
+  > Kafka CLI's own probe (e.g. `kafka-broker-api-versions.sh
+  > --bootstrap-server localhost:9092`). Neither ADR is edited here.
+  >
+  > > Amended 2026-09-18: the override paragraph above originally said the
+  > > override carried "its own healthcheck", which contradicted brief C1's
+  > > "Do not: add healthchecks" and the file as landed. Corrected in place;
+  > > see Amendment 1.
+
+* **Inventory, a dated blockquote before the Class 1 heading**, and the
+  Class 1 heading — was "(`deploy/docker-compose.yml` and the
+  `deploy/docker-compose.redpanda.yml` override)", now
+  "(`deploy/docker-compose.yml`)".
+* **Class 1 table.** The Redpanda and Apache Kafka rows are replaced by
+  "not deployed since 2026-09-21" rows in the shape Amendment 1 gave the
+  Redis row, and a NATS row is added first. Superseded rows: Redpanda —
+  "`redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml`
+  line 4; override only, applied with a second `-f`) | BUSL-1.1, change to
+  Apache-2.0 four years after each release; enterprise features separately
+  licensed | yes (Redpanda Data: Enterprise, Cloud) | Apache Kafka (the
+  reference) | substitute (decision 9): not OSI, so never the reference;
+  kept as a pinned, deployment-only override | `major.minor.patch` |
+  licence: `licenses/bsl.md` on the `dev` branch — the source repository
+  returns 404 for every path at tag `v26.2.3`, so the licence is **not**
+  verified at the pinned tag; tag: yes (Docker Hub, newest `vXX.Y.Z`);
+  runtime: not exercised (`docker compose config` only)". Apache Kafka —
+  "`apache/kafka:4.3.1` (`deploy/docker-compose.yml` line 8; single-node
+  KRaft combined mode) | Apache-2.0 | no (ASF) | n/a; Redpanda is the
+  substitute | compliant | `major.minor.patch` | licence: yes (`LICENSE`
+  at tag `4.3.1`; Docker Hub publisher = The Apache Software Foundation);
+  tag: yes (newest non-rc 4.x on Docker Hub); runtime: not exercised —
+  `docker compose config` plus a match of the `KAFKA_*` set against the
+  ASF's own single-node example for 4.3.1; pending first `make up` / #52".
+  The Redis, Valkey, Prometheus, Grafana and CPython rows are unchanged.
+* **Class 2 table.** The `aiokafka` row — was "aiokafka | 0.14.0 |
+  Apache-2.0 | no | compliant" — becomes a "removed 2026-09-21" row, and a
+  `nats-py` row precedes it with the `license`-is-`null` note the epic
+  asked for.
+* **Class 4 table and its preamble sentence.** The `apache/kafka:4.3.1`
+  and `redpandadata/redpanda:v26.2.3` rows — "done — replaced
+  `redpandadata/redpanda:latest` as the reference (decision 9)" and "done
+  — substitute override (decision 9)" — are replaced by one
+  `nats:2.15.0-alpine` row; a sentence names the provisioner image's base.
+* **Assumptions 5 and 14** gained a trailing parenthetical each (5
+  superseded; 14 measured and moot). Their original text is unchanged.
+* **Consequences, a second dated blockquote** naming the superseded
+  bullets.
+* **Sources, a dated block** for this amendment.
+
+Decision 7 item 1's worked example still reads "the broker image and the
+store image (decisions 9 and 10)"; as Amendment 1 said, its "current" is
+anchored by the acceptance date and it is left as written. Decision 2
+item 4's "Today the list is Grafana OSS" is likewise anchored and stands;
+item 5 has its own "Today the list is NATS JetStream".
+
+Assumptions made by this amendment (push back individually):
+
+1. **Item 5's three conditions are the right shape for the rule.** They
+   are written so that Kafka would also have satisfied them (Apache-2.0,
+   ASF, confined behind `hammertime.bus`) — which is the test that the
+   rule is not special pleading for NATS — while Redpanda would not
+   (BUSL), and Grafana would not (not confined behind an interface with
+   an in-process double). The owner's "there is always a free open source
+   drop-in" is read as a rule against vendor lock-in; item 5 keeps that
+   purpose by requiring foundation governance and a bounded code exit
+   where a wire drop-in cannot exist.
+2. **"Conditional compliant" as a status.** The legend's five values plus
+   Amendment 1's "substitute" do not cover "compliant if a governance fact
+   holds"; the row spells the condition and the consequence rather than
+   inventing a seventh value.
+3. **The `nats` licence is verified at `main`, not at `v2.15.0`.** Same
+   posture Amendment 1 took for Redpanda; a tag read is a follow-up for
+   whoever can reach it.
+4. **`nats-py`'s governance caveat is the server's.** The client is a
+   NATS-project repository; if the settlement terms fail, both rows move
+   together.
+5. **No `CHANGES` entry for this amendment**; the deployment change that
+   implements ADR-0013 carries the `BREAKING` broker line (assumption 16's
+   rule: an ADR is not a user-visible change; a changed reference
+   component is, and this one is `BREAKING` because `HAMMERTIME_BUS_KIND`
+   and `HAMMERTIME_BUS_BROKERS` change meaning).

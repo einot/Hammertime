@@ -1,7 +1,12 @@
 # ADR 0001 — One logical trie owner, four deployable services
 
 Status: accepted; amended 2026-09-18 (Amendment 1: the consistency model
-under which many aggregator shards feed the one logical trie — §21, §22)
+under which many aggregator shards feed the one logical trie — §21, §22);
+amended 2026-09-21 (Amendment 2: the event log is NATS JetStream and shard
+assignment is static — clauses 1, 3 and 6 of Amendment 1's model, its
+"not promised" list and four of its assumptions are superseded by ADR-0013;
+the original text is kept in place with dated notes, and Amendment 2 at the
+end states each replacement)
 
 ## Context
 
@@ -123,6 +128,19 @@ above are unchanged.
    positions, so the message in hand at a revocation reaches the next
    owner).
 
+> Amended 2026-09-21 (ADR-0013; Amendment 2 below): clauses 1, 3 and 6 are
+> superseded. Clause 1: there is no `auto` mode and no consumer group;
+> ownership is the static `HAMMERTIME_SHARD_IDS` set, disjointness is
+> still an operator invariant, but a violation is now **detected and
+> refused** by a per-shard lease in the state store (ADR-0013 decision 7).
+> Clause 3: the ordering guarantee rests on the JetStream stream sequence
+> and the emitter's awaited acknowledgement, not on Kafka partitions
+> (ADR-0013 decision 4). Clause 6: there are no rebalances; at an
+> operator-driven handover a member acknowledges only what it handled and
+> negatively acknowledges what it fetched and did not handle, so nothing
+> is lost or double-counted (ADR-0013 decision 8). Clauses 2, 4 and 5 stand
+> as written ("rebalance time" in clause 5 now means handover time).
+
 **What is deliberately not promised.** Strong consistency between
 `GET /ip/{addr}` and `GET /prefix/{cidr}`; agreement at any instant between a
 prefix's `hot_count` and the union of the aggregators' HOT sets; any bound on
@@ -135,6 +153,17 @@ members — disjointness is the operator's to keep (clause 1); a dense
 `sequence` per shard (clause 2); that every recorded transition is published
 (clause 3); exactly-once delivery of a transition record to the hot-ip topic
 (clause 5; ADR-0003 Amendment 2).
+
+> Amended 2026-09-21 (ADR-0013): two items of that list have moved.
+> Detection of overlapping static `HAMMERTIME_SHARD_IDS` sets **is** now
+> promised (a second live owner of a shard fails to start; a member whose
+> lease lapses stops — ADR-0013 decision 7). Fencing of a zombie owner is
+> promised in that narrow form only: a member acts on a shard for at most
+> one maintenance interval after its lease has lapsed, and the store still
+> carries no fencing token on `record_transition`. Exactly-once transport
+> of a transition record is still not promised, but a retried record is
+> now deduplicated by the log inside its duplicate window (ADR-0013
+> decision 4). The rest of the list stands.
 
 **Relation to Option B.** Clauses 2-6 are the contract Option B would have to
 preserve: per-shard tries could each hold a prefix of their own IPs'
@@ -261,3 +290,109 @@ Assumptions (each a judgment call, push back individually):
   cross-family.
 * **No CHANGES entry.** This amendment states shipped and already-decided
   behaviour; it changes nothing observable.
+
+> Amended 2026-09-21 (ADR-0013; Amendment 2 below): the first, second,
+> third and fourth assumptions above — the Kafka per-partition ordering
+> citation, the Redpanda-versus-Kafka broker note, the aiokafka
+> `DefaultPartitioner` argument, and "disjoint static shard sets are an
+> operator invariant, not enforced" — describe the Kafka-backed design and
+> are superseded; Amendment 2 states what replaces each. The remaining
+> assumptions stand.
+
+## Amendment 2 (2026-09-21) — the model under NATS JetStream and static shard assignment (ADR-0013)
+
+Why: ADR-0013 replaces Apache Kafka with NATS JetStream as the durable
+event log and drops group-managed (`auto`) shard assignment. Amendment 1
+drew every clause of the consistency model from a decision in force, and
+four of those decisions were Kafka's: the consumer group protocol as the
+ownership mechanism (clause 1), Kafka's per-partition log order as the
+basis of clause 3, aiokafka's partitioner as the basis of "deterministic
+shard assignment", and the absence of any overlap detection in static mode
+(clause 1, the "not promised" list, and the fourth assumption). This
+amendment records what each becomes. Decision and Consequences above are
+unchanged; the model is still "eventually consistent across IPs, ordered
+per IP", and the per-IP identity rule (clause 2) is untouched.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Gained the "amended 2026-09-21" clause.
+* **After clause 6, a dated blockquote** summarising the replacements
+  below. No clause's text was edited.
+* **After the "not promised" paragraph, a dated blockquote** stating that
+  detection of overlapping sets and a narrow fencing are now promised.
+* **After the Assumptions list, a dated blockquote** naming the four
+  superseded assumptions.
+
+The replacements:
+
+1. **Clause 1** — was: "Single ownership is guaranteed only in `auto`
+   mode, by the consumer group protocol. In static mode
+   (`HAMMERTIME_SHARD_IDS=<set>`, `KafkaConsumer` calls `assign()` with no
+   coordination) it is an **operator invariant, unenforced**: the static
+   sets of all members of a deployment MUST be pairwise disjoint, and
+   ADR-0011 decision 1 already forbids mixing static and group-managed
+   members. Two members that violate either rule are two live owners of one
+   shard: both load the same `next_sequence` and publish under the same
+   `agent_id`, so different transitions get identical `event_id`s. The
+   design does not detect this, and does not fence a worker that keeps
+   acting after losing a partition (ADR-0011 A2 records that gap)." Now:
+   an IP's shard is `partition_for(str(ip), 128)` (ADR-0013 decision 1),
+   the subject `hammertime.observations.v1.<p>`; ownership is the static
+   set in `HAMMERTIME_SHARD_IDS` (required; `all` or a set; ADR-0013
+   decision 6); the sets of a deployment's members MUST be pairwise
+   disjoint, and a violation is detected: before claiming a shard a member
+   takes the shard's lease in the state store under its `member_id`, a
+   refused lease fails the start with `shard_owned_elsewhere` and exit 1,
+   the lease is renewed every maintenance interval, and a member whose
+   lease has lapsed to another owner stops with `shard_lease_lost` and exit
+   1 (ADR-0013 decision 7). The two-owners hazard therefore lasts at most
+   one maintenance interval past a lapsed lease; the store still carries no
+   fencing token on `record_transition`.
+2. **Clause 3** — the sentence "so they land in one partition of that
+   topic in publish order, and the single-writer trie (this ADR) applies
+   each partition in log order" is now: all of an IP's transitions are
+   published to `hammertime.hot-ip.v1.<partition_for(ip, 32)>` on one
+   stream whose sequence is monotonic across every subject; the emitter
+   awaits each publish's acknowledgement before the next (ADR-0011
+   decision 4 step 4), so an IP's transitions carry strictly increasing
+   stream sequences in emission order; the trie applies the stream in
+   sequence order from its snapshot's `replay_position` (ADR-0013
+   decision 9). Everything the clause says about prefixes, gaps and holes
+   is unchanged.
+3. **Clause 6** — was: "no double count and no loss at a rebalance. ADR-0003
+   Amendment 2 (every redelivery lands in a window that never counted it)
+   and ADR-0011 A20 (a member commits only handled positions, so the
+   message in hand at a revocation reaches the next owner)." Now: no double
+   count and no loss at a handover. A member acknowledges exactly the
+   messages it has handled (ADR-0013 decision 8); a message it fetched and
+   did not handle is negatively acknowledged when its consumer closes and
+   is redelivered to the next owner at once; a copy the log redelivers of
+   a message the member already handled under its current claim is
+   recognised by its offset and acknowledged without being applied
+   (ADR-0013 decision 5, `REDELIVERED`; ADR-0003 Amendment 3).
+4. **Assumptions.** The Kafka ordering citation is replaced by ADR-0013
+   decision 4's argument (one stream sequence; awaited acknowledgement; no
+   client-internals reasoning needed). The Redpanda bullet is moot: the
+   reference deployment runs `nats:2.15.0-alpine` and there is no
+   substitute broker (ADR-0012 Amendment 2). The `DefaultPartitioner`
+   bullet is replaced by `hammertime.bus.topics.partition_for` (FNV-1a
+   32-bit over the UTF-8 key, modulo the count — ADR-0013 decision 1,
+   assumption 4), which is deterministic by construction and testable in
+   process. The "not enforced" bullet is replaced by decision 7's lease;
+   the cost of a violation is now "refused at start, or stopped within one
+   maintenance interval" rather than "colliding `event_id`s indefinitely".
+
+Assumptions made by this amendment (push back individually):
+
+* **Clause 5's "rebalance time" is read as handover time** — the interval
+  between one member's `stop()` releasing a shard and another's `start()`
+  claiming it — rather than being reworded in place. The bound it gives
+  (`window_seconds` plus that interval plus one maintenance interval) is
+  unchanged in form.
+* **The narrow fencing is stated as a promise.** It is a consequence of
+  ADR-0013 decision 7 rather than a new mechanism here; listing it under
+  "promised" with its bound is judged more useful than leaving "fencing
+  of a zombie owner" in the "not promised" list unqualified.
+* **No CHANGES entry.** The observable changes (required
+  `HAMMERTIME_SHARD_IDS`, the lease records) are ADR-0013's and are
+  recorded by the change that implements it.

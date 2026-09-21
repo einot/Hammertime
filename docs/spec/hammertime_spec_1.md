@@ -929,14 +929,17 @@ IP
 
 This minimizes distributed coordination for individual IP state.
 
-> ADR-0011: a shard is a partition of `hammertime.observations.v1`.
-> `hash(IP) -> shard` is the bus's key partitioner acting on the per-IP key
-> ingest publishes under (ADR-0004); the aggregator computes no IP hash of
-> its own. Ownership is the `hammertime-aggregator` consumer group's partition
-> assignment (ADR-0009 decision 9), delivered through the bus's assignment
-> listener; `HAMMERTIME_SHARD_IDS=auto` lets the group coordinator assign,
-> an explicit set pins a member to those partitions (an explicitly empty set
-> is a configuration error, ADR-0011 Amendment 1). The sliding counters are
+> ADR-0011, as superseded in part by ADR-0013: a shard is a partition of
+> `hammertime.observations.v1` — the event-log subject
+> `hammertime.observations.v1.<shard>`. `hash(IP) -> shard` is
+> `hammertime.bus.topics.partition_for` acting on the per-IP key ingest
+> publishes under (ADR-0004), applied by the bus's producer; the aggregator
+> computes no IP hash of its own. Ownership is static: `HAMMERTIME_SHARD_IDS`
+> (required; `all` or an explicit set, disjoint across members) names the
+> partitions a member owns, delivered through the bus's assignment listener,
+> and a member that finds one of its shards leased to another live member
+> refuses to start (ADR-0013 decisions 6 and 7; an explicitly empty set is
+> a configuration error, ADR-0011 Amendment 1). The sliding counters are
 > process-local; the set of HOT IPs per shard is kept in a durable state
 > store and inherited on claim, so a restart or handover never leaves the
 > trie holding an IP no owner remembers. Because the partitioner maps an IP
@@ -1054,20 +1057,23 @@ The system SHOULD expose timestamps/version numbers for derived classifications 
 > of applied hot-ip events; the detector reports that counter as carried on
 > the newest `PrefixStatsChanged` it applied) and `config_version`
 > (`docs/protocol/read-api-v1.md`; ADR-0010 decision 4). A shard handover
-> may delay a demotion by up to `window_seconds` plus the rebalance time
+> may delay a demotion by up to `window_seconds` plus the handover time
 > plus one maintenance interval, and may replay a `HotIpAdded` for an IP the
 > trie already holds, a `HotIpRemoved` for one it does not, or a
 > same-`event_id` duplicate from a producer retry; all are no-ops for the
 > trie (§11, §46.5; ADR-0003 Amendment 2). Observations are consumed
 > at-least-once with no double count (ADR-0003 Amendment 2) and none lost at
-> a rebalance (ADR-0011 Amendment 6, A20). Not promised: strong consistency
-> between `GET /ip` and `GET /prefix`, a bound on the catch-up lag, a dense
-> `sequence`, exactly-once transport of a transition record, fencing of a
-> worker that acts after losing its shard (ADR-0011 Amendment 1, A2),
-> detection of overlapping static `HAMMERTIME_SHARD_IDS` sets — in static
-> mode disjointness across members is an unenforced operator invariant — or
-> any guarantee across a change of the observations topic's partition count
-> (A1).
+> a handover (ADR-0013 decision 8). Overlapping static `HAMMERTIME_SHARD_IDS`
+> sets are detected — a second live owner of a shard refuses to start, and
+> a member whose shard lease lapses stops — so disjointness across members
+> is an operator invariant that is checked, not merely assumed (ADR-0013
+> decision 7). Not promised: strong consistency between `GET /ip` and
+> `GET /prefix`, a bound on the catch-up lag, a dense `sequence`,
+> exactly-once transport of a transition record (a retry inside the log's
+> duplicate window is deduplicated, one outside it is not), fencing of a
+> worker beyond one maintenance interval after it has lost its shard
+> (ADR-0011 Amendment 1, A2; ADR-0013 decision 7), or any guarantee across
+> a change of the observations topic's partition count (A1).
 
 ---
 
@@ -1159,13 +1165,12 @@ Events older than the accepted lateness horizon MAY be dropped, corrected, or se
 > and never silently dropped. A message whose `window_seconds` exceeds the
 > configured window is diverted too (ADR-0010 decision 6). Only a message
 > that fails decoding or the ADR-0004 one-IP-per-message invariant is
-> dropped, with a log record. A message a member fetches for a partition it
-> does not hold — a rebalance can revoke one between fetch and handling — is
-> not applied, diverted or counted by that member: it is logged and skipped,
-> and it is not lost, because a member only ever commits the position after
-> the last message it handled, never the position after the last message it
-> fetched; the partition's next owner therefore resumes at or before it and
-> handles it (ADR-0011 Amendment 5, A19; Amendment 6, A20).
+> dropped, with a log record. A message a member holds for a partition it
+> does not own is not applied, diverted or counted by that member: it is
+> logged and skipped, and it is not lost, because a member only ever
+> acknowledges messages it has handled, never one it has merely fetched;
+> the partition's next owner is therefore delivered it and handles it
+> (ADR-0011 Amendment 5, A19; ADR-0013 decision 8).
 
 ---
 
@@ -1558,7 +1563,10 @@ After loading a snapshot, events after its sequence number are replayed.
 > ADR-0009 / Section 47.2: the trie service is not *ready* — and answers 503 on
 > its read API — until that replay has reached the end of the log as it stood
 > when the process started. On shutdown it writes a final snapshot after
-> committing its consumer position (Section 47.4).
+> flushing its producer (Section 47.4). The "event sequence number" a
+> snapshot records is the event log's stream sequence of the last applied
+> event, one integer for the whole log (ADR-0013 decision 9; ADR-0010
+> Amendment 1).
 
 ---
 
@@ -2388,9 +2396,11 @@ The fundamental trie operation is only 32 steps for IPv4, so the likely bottlene
 > ADR-0012: every component the reference deployment runs, imports or
 > builds with is under an OSI-approved licence, and any single-vendor
 > component with a paid tier has a named, exercised open-source drop-in.
-> The durable event log (item 12) is Apache Kafka in the reference
-> deployment, with Redpanda as a documented deployment-only substitute;
-> the dedup and shard-state store is Valkey. Every container image is
+> The durable event log (item 12) is NATS JetStream in the reference
+> deployment (ADR-0013), which has no wire-compatible substitute and is
+> admitted under ADR-0012 decision 2 item 5 (foundation-governed; confined
+> behind `hammertime.bus`); the dedup and shard-state store is Valkey.
+> Every container image is
 > pinned to at least `major.minor`. The licence inventory and the rule a
 > dependency-changing PR must satisfy are in that ADR.
 
@@ -2795,7 +2805,8 @@ instance of a class the connecting code names as transient for that
 dependency, with `OSError` (connection refused/reset, timeout) as the floor
 every dependency shares; a client library's own connection-error classes are
 added per dependency (ingest: `redis.exceptions.ConnectionError`/`TimeoutError`
-for the store, `aiokafka.errors.KafkaConnectionError` for the bus).
+for the store, `hammertime.bus.nats.TRANSIENT_ERRORS` for the bus — ADR-0013
+decision 3).
 Connectivity is what is retried — a refused, reset or timed-out connection,
 a dependency still loading, and a hostname that does not resolve yet. A
 credential the dependency rejects MUST NOT be retried: it fails the start on

@@ -1,7 +1,14 @@
 # ADR 0011 — Aggregator: process-local window store, durable per-shard HOT set, partition-as-shard claims, and config re-evaluation
 
-Status: accepted; amended 2026-09-17 six times (see "Amendment 1" through
-"Amendment 6" at the end. Amendment 6 closes an at-least-once gap at
+Status: accepted; **partly superseded 2026-09-21 by ADR-0013** (Amendment
+7 at the end: the event log is NATS JetStream and shard assignment is
+static, so decision 1, the callback and commit bullets of decision 5, the
+commit paragraph of decision 6, the mechanism of Amendment 6 / A20, the
+`no_shards_assigned`/`shard_revoked` records of decision 8, decision 9's
+`HAMMERTIME_SHARD_IDS` line, and assumptions 1, 2, 21 and 22 are superseded
+— each is marked in place by a dated note and its original text is kept for
+the record; ADR-0013 carries the replacement text); amended 2026-09-17 six
+times (see "Amendment 1" through "Amendment 6" at the end. Amendment 6 closes an at-least-once gap at
 revocation: every commit covers only messages the worker has handled, the
 bus `Consumer.commit` takes explicit offsets, and a message fetched under a
 claim that has since been revoked is left in the log for the partition's
@@ -87,6 +94,24 @@ must say what happens to such an observation rather than let it vanish.
 ## Decision
 
 ### 1. A shard is a partition of `hammertime.observations.v1`; a claim is the consumer group's assignment
+
+> Superseded 2026-09-21 by ADR-0013 decisions 1, 3, 6 and 7 (Amendment 7).
+> What stands: a shard is a partition of `hammertime.observations.v1`,
+> the partition count is the shard count and a deployment constant, and
+> `ConsumedMessage.partition` is how the aggregator learns an IP's shard.
+> What changes: a partition is the JetStream subject
+> `hammertime.observations.v1.<p>`; the hash is
+> `hammertime.bus.topics.partition_for` (FNV-1a 32-bit over the key), in
+> this repository, applied by every producer; there is no consumer group,
+> no `auto` mode and no rebalance — `HAMMERTIME_SHARD_IDS` is required
+> (`all` or a set within `0..127`) and members' sets MUST be disjoint,
+> which a per-shard lease in the state store enforces; the bus interface
+> in the code block below is replaced by ADR-0013 decision 3
+> (`AssignmentListener` keeps only `on_assigned`; `commit(offsets)` and
+> `seek()` are gone; `ack(messages)`, `close()`, `start_offset` and
+> `message_id` are added); `InMemoryBus` keeps one partition per topic and
+> `partitions=None` on it means `{0}`. The text below is retained as the
+> record of the Kafka-backed design.
 
 `hash(IP) -> shard` (§20) is realised by the bus: ingest publishes each
 observation keyed by its IP (ADR-0004), the producer's key partitioner maps
@@ -462,6 +487,23 @@ back to this same member, because the copy fetched under the old claim is
 survives is the HOT set (decision 5), which is idempotent under
 redelivery: an IP the store already has as HOT is not re-announced.
 
+> Amended 2026-09-21 (ADR-0013 decisions 5 and 8; Amendment 7). The
+> `UNCLAIMED` paragraph's second condition — "or if the claim it holds is
+> not the one the message was fetched under" — is removed: a claim is
+> never replaced while the process lives, so the fetch-step capture and
+> the identity comparison go. `UNCLAIMED` remains for a message on a
+> partition this member holds no window for (now reachable only through
+> a direct `handle()` call). A new outcome precedes step 1: `REDELIVERED`
+> — the log has handed this member a message with `offset` below the
+> claim's handled position, i.e. one it already handled under this claim
+> and had not yet acknowledged when `ack_wait` expired; it is logged at
+> `WARNING event=redelivered_observation` with topic, partition, offset
+> and `delivery_count`, marked handled so it is acknowledged, and not
+> decoded, classified, diverted or counted (ADR-0003 Amendment 3). The
+> at-least-once paragraph's "including a handover back to this same
+> member" clause is likewise moot; the rest of it stands with
+> "handover" for "rebalance".
+
 ### 4. Transitions: one call site for `evaluate_ip_state`, persist before publish, `weight` from core
 
 ```python
@@ -600,6 +642,21 @@ class ShardClaims:                                   # satisfies AssignmentListe
     async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None: ...
 ```
 
+> Superseded in part 2026-09-21 by ADR-0013 decisions 7 and 8 (Amendment
+> 7). The `ShardClaims` surface is now the block in ADR-0013 decision 8:
+> the constructor gains `member_id` and `lease_ttl_s`; `on_revoked` is
+> removed (static assignment has no revocation; a shard changes hands by
+> `stop()` on one member and `start()` on another); `mark_handled(message)`
+> records the message for the next acknowledgement and raises the handled
+> position; `commit_handled()` takes no argument and is `producer.flush()`
+> then `consumer.ack(<handled, unacknowledged>)`; `handled_position(shard)`,
+> `renew_leases()` and `release()` are added. `on_assigned` first takes
+> each shard's lease (a refusal raises `ShardOwnedElsewhereError`, exit 1)
+> and then does what the bullet below says. The warm-up bullet stands. The
+> readiness bullet's empty-assignment case cannot occur (a static set is
+> never empty); `no_shards_assigned` is retired. The `on_revoked`,
+> `mark_handled` and `commit_handled` bullets below are the Kafka-era text.
+
 * **`on_assigned(p)`** for each new partition: `state = await
   state_store.load(p)`; construct `ShardWindow(shard=p, config=<in force>,
   clock, inherited_hot=state.hot_ips, next_sequence=state.next_sequence,
@@ -699,6 +756,18 @@ just before `stop()` took the lock — is never covered by it and is
 redelivered to whichever member next holds the partition (A20).
 The interval is an I/O cadence, not domain time: it is measured on the wall
 clock even when the service clock is a `ManualClock`.
+
+> Superseded in part 2026-09-21 by ADR-0013 decision 8 (Amendment 7).
+> "The consumer position is committed" reads "the handled messages are
+> acknowledged": every `HAMMERTIME_AGGREGATOR_COMMIT_INTERVAL_S` of wall
+> time and at shutdown — there is no `on_revoked` point — always after
+> `producer.flush()`, through `ShardClaims.commit_handled()`, which
+> acknowledges exactly the messages `handle()` finished and never one
+> merely fetched. `run_maintenance()` gains a first step before the three
+> listed: `claims.renew_leases()` (ADR-0013 decision 7). `stop()` is: stop
+> fetching, finish the message in hand, `commit_handled()`, `release()`
+> the leases; the service then closes the bus (which negatively
+> acknowledges anything fetched and unhandled) and the store.
 
 `stop()` follows ADR-0009 decision 7: stop fetching, finish the in-flight
 message, flush, commit, close bus and store clients. No state-store write
@@ -816,6 +885,13 @@ ADR-0009 A7 — A12), `malformed_observation`, `unclaimed_partition`
 (`topic`, `partition`, `offset`; `WARNING`, no counter — A19),
 `store_over_capacity`.
 
+> Amended 2026-09-21 (ADR-0013 decisions 7 and 8; Amendment 7):
+> `shard_revoked` and `no_shards_assigned` are retired; added are
+> `redelivered_observation` (`topic`, `partition`, `offset`,
+> `delivery_count`; `WARNING`, no counter), `shard_owned_elsewhere` and
+> `shard_lease_lost` (`shard`, `owner`, `member`; `ERROR`, no counter).
+> The nine metric series and their labels are unchanged.
+
 ### 9. Settings and module layout
 
 `hammertime.aggregator.config.load_settings(env)` -> `AggregatorSettings`
@@ -829,6 +905,19 @@ ADR-0009 A7 — A12), `malformed_observation`, `unclaimed_partition`
 `HAMMERTIME_AGGREGATOR_REEVALUATION_BATCH` (1000). Shard-id parsing lives in
 `config.py` as `parse_shard_ids(text) -> frozenset[int] | None` (`None` for
 `auto`).
+
+> Amended 2026-09-21 (ADR-0013 decisions 6, 7 and 10; Amendment 7):
+> `HAMMERTIME_SHARD_IDS` is required, `all` | set within `0..127`, and
+> `auto` is rejected; `parse_shard_ids` returns the explicit full set for
+> `all` and never `None`. Two keys
+> are added: `HAMMERTIME_AGGREGATOR_MEMBER_ID` (default the hostname) and
+> `HAMMERTIME_AGGREGATOR_LEASE_TTL_S` (default 30, must exceed the
+> maintenance interval). `HAMMERTIME_BUS_KIND` is `nats` | `memory`. In the
+> layout, `sharding/assignment.py`'s line reads per ADR-0013 decision 8's
+> block (no `on_revoked`; `handled_position`, `renew_leases`, `release`;
+> `commit_handled()` without arguments), `lateness.py` gains
+> `REDELIVERED`, and `service.py` uses `hammertime.bus.nats.NatsBus`
+> instead of a `_KafkaBus` adapter.
 
 ```text
 services/aggregator/src/hammertime/aggregator/
@@ -860,6 +949,16 @@ in-repo IP hash (decision 1).
 
 Each of these is a judgment call not dictated by the epics, the spec or a
 prior ADR. Push back on them individually.
+
+> Amended 2026-09-21 (ADR-0013; Amendment 7): assumptions 1 (no in-repo
+> hash), 2 (`auto` as default; static retained), 21 (empty assignment is
+> ready) and 22 (`InMemoryBus` single-partition, single-member) are
+> superseded — 1 by ADR-0013 decision 1's `partition_for`, 2 by decision
+> 6's required static set, 21 by the impossibility of an empty static set,
+> 22 in its second half only (the memory bus stays single-partition; its
+> single-member limit remains, and it now models acknowledgements and
+> positional replay). Assumption 15 (commit every 1 s) stands as the
+> acknowledgement cadence.
 
 1. **Shard = partition; no in-repo hash function.** §20 says "consistent
    hashing: hash(IP) -> shard" and epic #7 asks for "bounded key movement
@@ -2906,6 +3005,18 @@ against `MALFORMED`); the C5 landing brief should carry both.
 
 ## Amendment 6 (2026-09-17) — every commit covers only handled messages; `Consumer.commit` takes explicit offsets; a message fetched under a revoked claim is left for the next owner
 
+> Superseded in mechanism 2026-09-21 by ADR-0013 decisions 3, 5 and 8
+> (Amendment 7). The **requirement** A20 established — a member never
+> commits (now: acknowledges) a message it has not handled, so the message
+> in hand at a handover reaches the next owner — is preserved verbatim.
+> The mechanism (`Consumer.commit(offsets)`, the handled position as an
+> offset to commit, the fetch-step window capture and the claim-identity
+> comparison, and the `on_revoked` commit point) is replaced by per-message
+> acknowledgement of exactly the handled messages, negative
+> acknowledgement of fetched-unhandled messages at `close()`, and the
+> absence of any revocation. The text below is the Kafka-era ruling and
+> its evidence, kept for the record.
+
 Why: Amendment 5's A19 pinned what a member does with a message fetched
 for a partition it no longer holds (`UNCLAIMED`, uncounted) and, in its
 last assumption, deliberately declined to say whether the partition's next
@@ -3058,6 +3169,15 @@ Python API addition to an in-repo package — not a wire format, schema,
 config key or default.
 
 ### A20. Every commit names the handled position explicitly; the bus `commit` takes offsets; a message fetched under a revoked claim is `UNCLAIMED` even if the same member re-claims the partition
+
+> Superseded in mechanism 2026-09-21 (see the note at the head of
+> Amendment 6 and Amendment 7). Ruling part 1 (`commit(offsets)`) is
+> replaced by `Consumer.ack(messages)`; part 2 (the handled position as a
+> commit value) survives as `ShardClaims.handled_position` used only to
+> recognise a redelivery; part 3 (fetch-step capture, claim identity) is
+> removed; part 4 (§24's note) is reworded by ADR-0013. The "Shipped code"
+> and "Shipped tests" lists below describe the Kafka-era landing and are
+> not instructions for the ADR-0013 briefs.
 
 **Classification: (a) for the requirement, missed by decision 5's own
 wording; (b) for the mechanism, ruled now.** That the aggregator consumes
@@ -3434,3 +3554,78 @@ change imports the new signature; the aggregator `coder` and
 new worker tests fail against the old commit), rebased onto the bus
 change. Nothing in this amendment blocks A18's or A19's landing items,
 which remain as Amendment 5 lists them.
+
+## Amendment 7 (2026-09-21) — supersession by ADR-0013: NATS JetStream, static shard assignment, acknowledgements instead of offset commits
+
+Why: epic #95 replaces Apache Kafka with NATS JetStream as the event log
+and drops group-managed shard assignment. ADR-0013 is the design; this
+amendment records what it supersedes here and marks each place with a
+dated note, following this ADR's convention that a reader of a decision
+sees the rule now in force. Unlike Amendments 1-6 it does **not** rewrite
+the decision bodies: the superseded text is long, is the only record of
+the Kafka-era design and its evidence, and the replacement text lives in
+one place (ADR-0013 decisions 1, 3, 5, 6, 7, 8 and 10) so that there is
+one authority rather than two copies. Every edit outside this section is
+therefore an inserted, dated blockquote; nothing below the notes was
+changed, so "the superseded wording" is in each case the paragraph the
+note precedes or follows, and is not requoted.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "partly superseded 2026-09-21 by ADR-0013"
+  clause listing the superseded items.
+* **Decision 1, a blockquote after the heading.** Decision 1 in full is
+  superseded: the hash is in-repo (`partition_for`), a partition is a
+  subject, there is no consumer group or `auto` mode, the bus interface
+  block is replaced by ADR-0013 decision 3. What stands is stated in the
+  note (shard = partition; the count is a deployment constant;
+  `ConsumedMessage.partition` is the shard id).
+* **Decision 3, a blockquote after its last paragraph.** The `UNCLAIMED`
+  paragraph's claim-identity condition is removed; `REDELIVERED` is added
+  as the eighth outcome, checked before decoding (ADR-0013 decision 8;
+  ADR-0003 Amendment 3).
+* **Decision 5, a blockquote after the `ShardClaims` code block.** The
+  surface is ADR-0013 decision 8's; `on_revoked` is removed; leases are
+  taken in `on_assigned`; `mark_handled`/`commit_handled` are
+  acknowledgement-based; `no_shards_assigned` is retired.
+* **Decision 6, a blockquote after the commit paragraph.** Commits are
+  acknowledgements; two commit points (periodic, shutdown), not three;
+  `renew_leases()` precedes the sweep; `stop()` releases the leases.
+* **Decision 8, a blockquote after the log-events sentence.** Records
+  retired and added. The metric series are unchanged.
+* **Decision 9, a blockquote after the `parse_shard_ids` sentence.** The
+  settings keys and the module layout lines that change.
+* **Assumptions, a blockquote after the preamble.** Assumptions 1, 2, 21
+  and 22 (second half) superseded.
+* **Amendment 6, a blockquote after its heading; A20, a blockquote after
+  its heading.** The requirement stands; the mechanism is replaced; the
+  landing lists are not instructions for the new briefs.
+
+What is **not** superseded, stated so nobody has to infer it: decision 2
+(the window store) in full; decision 3's outcomes and steps other than the
+two changes above; decision 4 (transitions, identity, persist-before-
+publish) in full — `publish` now carries `message_id=envelope.event_id`,
+which changes nothing about steps 1-5; decision 5's warm-up rule and
+`adopt_config`; decision 6's maintenance order and cadence; decision 7 in
+full; decision 8's series; Amendments 1 (A1's count and constancy; A2's
+clamp; A3's empty-set rule), 2, 3, 4 and 5 (A18; A19's `UNCLAIMED` record
+and no-counter rule). A1's open item "a static id outside `0..127` is not
+ruled on here" is closed by ADR-0013 decision 6 (rejected at
+`load_settings`). A2's "keeping a shard single-owner is the consumer group
+protocol's job" is now "is the operator's, checked by the lease of
+ADR-0013 decision 7".
+
+Assumptions made by this amendment (push back individually):
+
+* **Notes in place rather than rewritten bodies.** The convention this ADR
+  set (rewrite in place, quote the old wording in the amendment) was made
+  for corrections of a few sentences. A supersession of a whole decision
+  by another ADR is better served by one authoritative text plus pointers;
+  the cost is that a reader of decision 1 must follow the note. Push back
+  if a rewritten decision 1 is preferred; it would duplicate ADR-0013
+  decisions 1, 3 and 6.
+* **The Kafka-era landing lists in A20 are left in place**, marked as not
+  instructions. Deleting them would remove the evidence trail for why the
+  handled-position requirement exists.
+* **No CHANGES entry**: ADR-0013's implementing change carries every
+  observable line.
