@@ -17,8 +17,12 @@ which recomputes `hot_count` bottom-up and reports the first divergent node.
 Recovery is a snapshot reload plus replay (§33), not a manual patch.
 
 ### `observation_to_hot_transition_latency` climbing
-Aggregator lag. Check consumer group lag per shard before scaling; a single hot
-shard usually means a hash-skewed prefix, not global overload.
+Aggregator lag. Check `num_pending` on each shard's durable consumer (one per
+`(group, partition)`, ADR-0013 decision 5) before re-sharding; a single hot
+shard usually means a hash-skewed prefix, not global overload. Shard assignment
+is static (`HAMMERTIME_SHARD_IDS`), so relief is a change to the members' sets,
+not another replica. A shard no member's set covers shows as a durable, or a
+subject, whose backlog only grows.
 
 ### Trie service restart
 Loads the newest snapshot, then replays `hammertime.hot-ip.v1` from the

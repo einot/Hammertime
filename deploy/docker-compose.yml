@@ -1,28 +1,26 @@
 name: hammertime
 
+# Reference stack (ADR-0013 decision 11). Start order is enforced by
+# depends_on conditions: nats healthy -> provision completed -> services;
+# `make up` passes --wait so a crash-looping service fails the command
+# instead of leaving a dead container behind (ADR-0009 decision 10).
 services:
-  # Reference broker (ADR-0012 decision 9): Apache Kafka, single-node KRaft
-  # combined mode. Redpanda is the documented substitute; see
-  # docker-compose.redpanda.yml.
-  broker:
-    image: apache/kafka:4.3.1
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENERS: CONTROLLER://:29093,PLAINTEXT://:9092,PLAINTEXT_HOST://:19092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092,PLAINTEXT_HOST://localhost:19092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
-      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
-      CLUSTER_ID: SDU4XwcQSUW58J1LCtxq_w
-    ports: ["19092:19092"]
+  # Reference event log (ADR-0012 decision 9, ADR-0013): NATS JetStream,
+  # single server, file storage under a named volume. Docker Official Image;
+  # linux/amd64 digest of the 2.15.0-alpine tag on 2026-09-21:
+  # sha256:eda962d67930eda338222072d9a9f3818855d922ad224c399b0b01d251e9b91b.
+  # The -alpine variant carries the shell and wget the healthcheck needs;
+  # the scratch-based nats:2.15.0 does not (ADR-0013 assumption 11).
+  nats:
+    image: nats:2.15.0-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes: ["nats-data:/data"]
+    ports: ["4222:4222", "8222:8222"]
+    healthcheck:
+      # 200 only once JetStream is enabled and serving (js-enabled-only).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 2s
+      retries: 15
 
   # Reference store (ADR-0012 decision 10): Valkey. noeviction is required by
   # ADR-0011 for the hammertime:agg:* and hammertime:dedup:* keyspaces.
@@ -30,40 +28,91 @@ services:
     image: valkey/valkey:9.1.2-alpine
     command: ["valkey-server", "--maxmemory-policy", "noeviction"]
     ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      retries: 15
 
+  # One-shot stream provisioning (ADR-0013 decision 2): JetStream does not
+  # create streams on publish, so every registered topic's stream is created
+  # or reconciled here before any service starts. Idempotent; exit 0 when
+  # every stream matches, 1 when nats stays unreachable or a stream conflicts
+  # on an immutable field, 2 on invalid arguments. Reads only
+  # HAMMERTIME_LOG_LEVEL from the env file; the servers are a CLI flag.
+  provision:
+    build: { context: .., dockerfile: tools/provision/Dockerfile }
+    env_file: ../.env.example
+    command: ["--servers", "nats://nats:4222"]
+    restart: "no"
+    depends_on:
+      nats: { condition: service_healthy }
+
+  # Application services. Each probes its own GET /readyz (ADR-0009 decision
+  # 10) with the stdlib, since python:3.12-slim ships neither curl nor wget;
+  # urlopen raises on the 503 a not-yet-ready service answers. 30 x 2 s is the
+  # 60 s HAMMERTIME_STARTUP_TIMEOUT_S a service may spend retrying a
+  # dependency before it gives up.
   ingest:
     build: { context: .., dockerfile: services/ingest/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: broker:9092
+      HAMMERTIME_BUS_BROKERS: nats://nats:4222
       HAMMERTIME_REDIS_URL: redis://valkey:6379/0
     ports: ["8080:8080"]
-    depends_on: [broker, valkey]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=2)"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      provision: { condition: service_completed_successfully }
+      valkey: { condition: service_healthy }
 
+  # Single member owning every shard (ADR-0013 decision 6). A scaled
+  # deployment gives each member a disjoint HAMMERTIME_SHARD_IDS set whose
+  # union is 0-127; the per-shard lease (decision 7), keyed by the container
+  # name by default, refuses a second owner.
   aggregator:
     build: { context: .., dockerfile: services/aggregator/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: broker:9092
+      HAMMERTIME_BUS_BROKERS: nats://nats:4222
       HAMMERTIME_REDIS_URL: redis://valkey:6379/0
-    depends_on: [broker, valkey]
+      HAMMERTIME_SHARD_IDS: all
+    ports: ["8083:8083"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/readyz', timeout=2)"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      provision: { condition: service_completed_successfully }
+      valkey: { condition: service_healthy }
 
   trie:
     build: { context: .., dockerfile: services/trie/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: broker:9092
+      HAMMERTIME_BUS_BROKERS: nats://nats:4222
     ports: ["8081:8081"]
     volumes: ["trie-snapshots:/snapshots"]
-    depends_on: [broker]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/readyz', timeout=2)"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      provision: { condition: service_completed_successfully }
 
   detector:
     build: { context: .., dockerfile: services/detector/Dockerfile }
     env_file: ../.env.example
     environment:
-      HAMMERTIME_BUS_BROKERS: broker:9092
+      HAMMERTIME_BUS_BROKERS: nats://nats:4222
     ports: ["8082:8082"]
-    depends_on: [broker]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/readyz', timeout=2)"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      provision: { condition: service_completed_successfully }
 
   prometheus:
     image: prom/prometheus:v3.14.0
@@ -71,4 +120,5 @@ services:
     ports: ["9090:9090"]
 
 volumes:
+  nats-data:
   trie-snapshots:
