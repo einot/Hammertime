@@ -42,14 +42,21 @@ jobs:
       # disable cannot quietly outlive its reason.
       - name: Guard - re-enable the integration job once tests exist
         run: |
+          probe="$RUNNER_TEMP/integration-guard-collect.log"
           set +e
-          uv run pytest tests/integration tests/e2e --collect-only -q >/dev/null 2>&1
+          uv run pytest tests/integration tests/e2e --collect-only -q >"$probe" 2>&1
           rc=$?
           set -e
-          if [ "$rc" -ne 5 ]; then
+          if [ "$rc" -eq 0 ]; then
             echo "::error::tests/integration and/or tests/e2e now collect tests (pytest exit $rc, expected 5)."
             echo "::error::Re-enable the 'integration' job in .github/workflows/ci.yml by removing 'if: false',"
             echo "::error::add --wait to its 'docker compose up' step, then delete this guard. See issue #52."
+            exit 1
+          elif [ "$rc" -ne 5 ]; then
+            echo "::error::Collecting tests/integration and tests/e2e failed (pytest exit $rc; 5 means the directories are still empty, 0 means tests now exist)."
+            echo "::error::This is NOT necessarily the signal to re-enable the 'integration' job -- do not remove its 'if: false' on the strength of this alone."
+            echo "::error::Likely a collection error (syntax error or bad import) under tests/integration or tests/e2e, or a broken environment. Captured output:"
+            cat "$probe"
             exit 1
           fi
 
