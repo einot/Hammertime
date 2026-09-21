@@ -34,15 +34,31 @@
 #
 # This hook must be wired in `.claude/settings.json` (or
 # `.claude/settings.local.json`). It must NOT be wired in an agent file's
-# `hooks:` frontmatter: a guard declared there has been observed to
-# silently not fire -- no error, no warning, nothing to notice, so the
-# agent ran completely unfenced (issue #102). The same frontmatter block
-# has also been seen to fire under other conditions, so the mechanism is
-# unreliable rather than reliably broken. That is worse, not better: a
-# policy declared there can look enforced while it is not, and what makes
-# the difference has not been characterised. `.claude/settings.json` is
-# the documented location, and its enforcement has been verified by
-# direct probe -- see also WIRING in bash-guard.sh.
+# `hooks:` frontmatter. `hooks:` is a documented frontmatter field, but
+# a guard declared there did not fire in this environment: tested
+# three times, including with an absolute script path -- no error, no
+# warning, nothing to notice, so the agent ran completely unfenced
+# (issue #102). The best-supported explanation is the documented
+# requirement that a project-level agent's frontmatter hooks run only
+# once the workspace trust dialog has been accepted for the folder
+# containing the agent file; this session has no trust record for the
+# project. That has not been confirmed directly. Either way the
+# consequence is the same: whether a frontmatter guard fires depends on
+# environment state that is invisible from the repository, so it can
+# look enforced on one machine and silently do nothing on another.
+# `.claude/settings.json` hooks fired in every test -- see also WIRING
+# in bash-guard.sh.
+#
+# WHERE THE CONFIGURATION IS READ FROM. Hook configuration is read from
+# the main project checkout, not from a subagent's worktree. A
+# worktree-isolated agent is fenced by whatever the main checkout's
+# `.claude/settings.json` contains at dispatch time; the copy in its
+# worktree is inert. So to test a policy change, the change must be in
+# the main checkout, and a probe dispatched right after editing tests
+# the edited policy -- not whatever the worktree has checked out.
+# Established by experiment: with the policy removed from the main
+# checkout only, while the worktree copy still carried it, the write
+# was not denied (issue #102).
 #
 # Settings-level hooks are session-wide: they fire for every agent and for
 # the top-level session, not only the agent a policy was written for. That
