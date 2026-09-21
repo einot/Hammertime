@@ -4,7 +4,9 @@ Spec: section 19 (event boundary), section 32 (replayability), section 33.
 
 The trie is derived state. Everything that reconstructs it flows through this
 package, so the log interface deliberately exposes offsets/sequences rather than
-hiding them. Two implementations: `InMemoryBus` for tests and `NatsBus` over
+hiding them -- including `MessageBus.end_offset(topic)`, the offset the next
+appended message will receive, which readiness reads at `start()` (ADR-0013
+decision 9). Two implementations: `InMemoryBus` for tests and `NatsBus` over
 NATS JetStream for the reference deployment (ADR-0013).
 """
 

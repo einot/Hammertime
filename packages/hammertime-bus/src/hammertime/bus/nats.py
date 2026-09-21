@@ -27,6 +27,9 @@ The mapping, from ADR-0013 decisions 1, 2, 4 and 5:
   not acknowledged. A positional subscription is an ordered ephemeral
   consumer starting at `start_offset`, which nats-py recreates by itself on
   a sequence gap or a missed heartbeat.
+* `NatsBus.end_offset(topic)` is `stream_info(...).state.last_seq + 1`: the
+  offset the next appended message will receive, the readiness number of
+  decision 9, `1` for an empty stream.
 """
 
 import asyncio
@@ -232,12 +235,15 @@ async def ensure_streams(
 
 
 async def _client_error(error: Exception) -> None:
-    """nats-py's asynchronous error hook: one line, no traceback.
+    """nats-py's asynchronous error hook: one `WARNING nats_client_error` line, no traceback.
 
-    The client's default handler logs every refused connection attempt as an
-    ERROR with a full traceback, which would bury the
-    `dependency_unavailable` records `connect_with_retry` writes during a
-    normal startup wait; the exception itself still reaches the caller.
+    Installed as `error_cb` by `_connect`; the record is `nats_client_error
+    error=<exception>`, one per refused connection attempt or client-side
+    error (ADR-0013 decision 3, assumption 29). The client's default handler
+    logs every refused connection attempt as an ERROR with a full traceback,
+    which would bury the `dependency_unavailable` records
+    `connect_with_retry` writes during a normal startup wait; the exception
+    itself still reaches the caller.
     """
     logger.warning("nats_client_error error=%s", error)
 
@@ -340,14 +346,17 @@ class NatsBus:
         self._consumers.append(consumer)
         return consumer
 
-    async def last_offset(self, topic: str) -> int:
-        """The stream's last sequence: the log end for readiness (ADR-0013 assumption 20).
+    async def end_offset(self, topic: str) -> int:
+        """The offset the next appended message will receive: `state.last_seq + 1`.
 
-        `0` for an empty stream. An unregistered topic is a `KeyError`.
+        `1` for an empty stream (sequences start at 1), so it is the same
+        readiness number `InMemoryBus` gives as its log length (ADR-0013
+        decision 9, assumption 20). An unregistered topic is a `KeyError`;
+        before `start()` it is `RuntimeError("NatsBus is not started")`.
         """
         spec = TOPICS[topic]
         info = await self._require_js().stream_info(spec.stream_name)
-        return info.state.last_seq
+        return info.state.last_seq + 1
 
     def _require_js(self) -> JetStreamContext:
         if self._js is None:

@@ -21,7 +21,10 @@ What it models, per ADR-0013 decision 3 (`hammertime.bus.memory`):
   what `ack()` checks against;
 * no redelivery to a live consumer (there is no `ack_wait`), so
   `delivery_count` is always 1; and at most one live member per group per
-  topic (ADR-0011 assumption 22, unchanged).
+  topic (ADR-0011 assumption 22, unchanged);
+* `end_offset(topic)`, the offset the next appended message will receive,
+  is the log length (`0` for a topic never published to), the same
+  readiness number `NatsBus` derives from `last_seq + 1` (decision 9).
 """
 
 import asyncio
@@ -72,12 +75,15 @@ class InMemoryBus:
         """A new consumer view onto this bus as a member of `group_id`."""
         return MemoryConsumer(self, group_id)
 
-    async def last_offset(self, topic: str) -> int:
-        """The log end for readiness (ADR-0013 assumption 20): the log length.
+    async def end_offset(self, topic: str) -> int:
+        """The offset the next appended message will receive: the log length.
 
-        `async` so that the trie and detector call it the same way on
+        `0` for a topic never published to (ADR-0013 decision 9, assumption
+        20). `async` so that the trie and detector call it the same way on
         `NatsBus`, where it is a round trip to the broker.
         """
+        # A `defaultdict` read: an unknown topic gets an empty log entry,
+        # which is exactly what its first publish or subscribe would create.
         return len(self._logs[topic])
 
     async def _append(

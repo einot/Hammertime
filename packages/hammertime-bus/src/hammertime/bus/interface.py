@@ -183,7 +183,19 @@ class Consumer(Protocol):
         whose `offset >= start_offset` (at the first retained message if that
         sequence is no longer in the log), no position is kept anywhere, and
         `ack()` on it is a `ValueError` (spec section 32, section 33: the
-        trie replays from its snapshot this way).
+        trie replays from its snapshot this way). `start_offset` MUST be
+        `>= 0`: a negative value is a `ValueError` raised before any broker
+        is contacted and before `listener` is called, on both
+        implementations. `start_offset=0` is the portable "from the first
+        retained message": it is the first index of the memory log and it
+        is below every JetStream sequence (they start at 1), so
+        `NatsConsumer` starts at `max(start_offset, 1)`.
+
+        An unregistered topic is a `KeyError` from `NatsConsumer` (there is
+        no stream to bind a consumer on), raised with the other argument
+        checks before the broker is contacted and before `listener` is
+        called; `MemoryConsumer` subscribes to any topic, which exists from
+        its first publish.
         """
         ...
 
@@ -197,9 +209,20 @@ class Consumer(Protocol):
         subscription, or any call after `close()` -- is a `ValueError`,
         raised before anything is acknowledged (the whole iterable is checked
         first). An empty iterable returns normally without touching the
-        broker. A caller acknowledges what it has handled and nothing else
-        (ADR-0011 A20's requirement, now per message). On `NatsConsumer` an
-        `ack()` that has returned is durable (the server confirmed each ack).
+        broker.
+
+        The checks are ordered: a closed consumer is a `ValueError`, then a
+        positional subscription is a `ValueError`, whatever the iterable
+        holds -- an empty one included; only after those does an empty
+        iterable return normally. An instance that has not subscribed yet
+        has delivered nothing, so it accepts exactly the empty iterable. A
+        message named more than once in one call is acknowledged once and
+        is not an error: `ConsumedMessage` is a value, the identity of an
+        acknowledgement is `(topic, partition, offset)`, and "already
+        acknowledged" means acknowledged by an *earlier* call. A caller
+        acknowledges what it has handled and nothing else (ADR-0011 A20's
+        requirement, now per message). On `NatsConsumer` an `ack()` that
+        has returned is durable (the server confirmed each ack).
         """
         ...
 
@@ -222,9 +245,30 @@ class MessageBus(Protocol):
 
     `InMemoryBus` and `NatsBus` both satisfy it, so a service's object graph
     is identical either way (ADR-0009 decision 3). Moved here from
-    `hammertime.aggregator.worker` by ADR-0013 decision 3.
+    `hammertime.aggregator.worker` by ADR-0013 decision 3, which also puts
+    `end_offset` here so that the trie and the detector type their bus by
+    the interface rather than as `InMemoryBus | NatsBus`.
     """
 
     def producer(self) -> Producer: ...
 
     def consumer(self, group_id: str) -> Consumer: ...
+
+    async def end_offset(self, topic: str) -> int:
+        """The log end of `topic`: the offset the next appended message will receive.
+
+        `1` for an empty JetStream stream (`state.last_seq + 1`), `0` for an
+        empty memory log (the log length) -- the one number with the same
+        meaning on a 1-based stream and a 0-based list (ADR-0013 decision 9,
+        assumptions 20 and 33). It is what ADR-0009 decision 4's readiness
+        ("replayed to the log end as it stood when `start()` began") reads
+        at `start()`: the service has replayed to the log end once every
+        delivered message with `offset < end_offset` has been applied, i.e.
+        once the last applied offset is `>= end_offset - 1`, or immediately
+        when `end_offset <= start_offset`. A positional subscription
+        filtered to a subset of partitions cannot use this test (the last
+        message in the stream may be on a subject it does not receive), so
+        the trie and the detector subscribe with `partitions=None`. `async`
+        on every implementation: on `NatsBus` it is a broker round trip.
+        """
+        ...

@@ -289,14 +289,14 @@ class RedisShardStateStore:
         # step. A plain MULTI/EXEC cannot express that: its queued commands
         # are sent before any of them run, so none of them can read `:seq`
         # and decide whether to write it. Hence WATCH-based optimistic
-        # concurrency -- `EVAL` would do too, and A2 permits it, but it
-        # would cost a Lua runtime (`lupa`) in the test environment purely
-        # so the in-process fake can emulate server-side scripting.
-        #
-        # The comparison stays in Python on exact `int`s, which is better
-        # than the Lua alternative rather than a concession: `sequence` is
-        # bounded by 2**63-1, and Lua numbers are doubles that silently
-        # lose integer precision above 2**53.
+        # concurrency. `EVAL` would do too, and A2 permits it -- the Lua
+        # runtime (`lupa`) is present in the test environment for the
+        # lease scripts below (ADR-0013 decision 7) -- but WATCH is kept
+        # here for a reason that has not lapsed: the comparison stays in
+        # Python on exact `int`s. `sequence` is bounded by 2**63-1, and
+        # Lua numbers are doubles that silently lose integer precision
+        # above 2**53 (ADR-0013 assumption 30). The lease's owner key is
+        # a string, so that concern does not apply to it.
         async with self._client.pipeline(transaction=True) as pipe:
             for _ in range(_MAX_SEQUENCE_CAS_ATTEMPTS):
                 try:
