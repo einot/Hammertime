@@ -20,7 +20,12 @@ is `hammertime.bus.nats.TRANSIENT_ERRORS`; each is noted in place);
 amended 2026-09-21 (see "Amendment 5" — A7's `starting` record carries
 `bus_endpoints`, the reduced form of `HAMMERTIME_BUS_BROKERS`, in place of
 `bus_brokers`, and A7's no-credential rule covers the userinfo of a bus URL;
-both are pointer edits recording ADR-0013 Amendment 2, noted in place)
+both are pointer edits recording ADR-0013 Amendment 2, noted in place);
+amended 2026-09-22 (see "Amendment 6" — A12's "nothing is ruled about
+`HAMMERTIME_BUS_BROKERS`" bullet gains a pointer: the key is validated in
+`load_settings` under ADR-0013 Amendment 4 ruling S2, and only when the bus
+kind is `nats`, on this item's own "ignored, not rejected, under `memory`"
+model, under ADR-0013 Amendment 5 ruling 5; a pointer edit, noted in place)
 
 Scope note: this ADR defines what a Hammertime service *process* is — how it
 starts, becomes ready, is observed, stops, and what it exits with — and the
@@ -1632,7 +1637,15 @@ Assumptions (push back individually):
   unparsed, but aiokafka does not parse it at construction, so the same
   defect does not arise in the same way; whether a malformed broker list
   should be rejected by `load_settings` is a separate question, named in
-  the hand-off report and not settled here.
+  the hand-off report and not settled here. *Settled since 2026-09-22
+  (Amendment 6, a pointer): under ADR-0013 the key is a list of NATS
+  URLs, nats-py parses each at `connect()` with the same `.port` hazard,
+  and ADR-0013 Amendment 4 ruling S2 has `load_settings` check every entry
+  with `hammertime.bus.validate_bus_url` — `config_invalid`, exit 2, a
+  message naming the variable and the entry's position and nothing of
+  the value; ADR-0013 Amendment 5 ruling 5 gates that check on
+  `HAMMERTIME_BUS_KIND=nats`, this item's "ignored, not rejected, under
+  `memory`" rule applied to the parallel key.*
 * *Nothing is ruled about the `startup_fields` redaction itself.* Its
   `hostname:port/path` rendering (`None` for a URL with no port, no
   hostname for `unix://`) and its duplication across two services are
@@ -1768,3 +1781,37 @@ Assumptions made by this amendment (push back individually):
   `bus_endpoints` (bus URLs without userinfo) in the `starting` record in
   place of `bus_brokers`") is ADR-0013 Amendment 2 ruling 4's and is
   written by whichever of C2/C3 landed first.
+
+## Amendment 6 (2026-09-22) — A12's open question about `HAMMERTIME_BUS_BROKERS` is answered elsewhere (ADR-0013 Amendments 4 and 5)
+
+Why: A12 (Amendment 3) ruled `HAMMERTIME_REDIS_URL`'s validation and
+recorded, as its own assumption, that "nothing is ruled about
+`HAMMERTIME_BUS_BROKERS`" — the parallel question was "named in the
+hand-off report and not settled here". It has since been settled twice
+without a pointer back: ADR-0013 Amendment 4 ruling S2 validates every
+entry of the key in `load_settings` through `hammertime.bus.validate_bus_url`
+(exit 2, `config_invalid`, nothing of the value in the message), and
+ADR-0013 Amendment 5 ruling 5 gates that check on `HAMMERTIME_BUS_KIND=nats`
+by explicit appeal to A12's "ignored, not rejected, under `memory`"
+model. A reader of A12 should not be left with an open question that is
+closed. One pointer edit, noted in place; nothing in this ADR is
+re-decided.
+
+Every edit outside this section, with the superseded wording kept in
+place:
+
+* **Status line.** Appended the "amended 2026-09-22 (see "Amendment 6"
+  ...)" clause.
+* **A12, the "*Nothing is ruled about `HAMMERTIME_BUS_BROKERS`.*"
+  bullet.** Its text is unchanged and an italic "Settled since
+  2026-09-22" note follows it, naming the two ADR-0013 rulings.
+
+Assumptions made by this amendment (push back individually):
+
+* **A pointer, not a re-ruling.** The validator, its message shape and
+  the gate are ADR-0013's decisions; this ADR only stops saying the
+  question is open. If ADR-0013 changes them again, that note is the
+  place to update, not A12.
+* **No CHANGES entry from this ADR.** ADR-0013 Amendment 5 records that
+  its rulings imply none and raises, as a question for the session, the
+  one line the validation itself might deserve.

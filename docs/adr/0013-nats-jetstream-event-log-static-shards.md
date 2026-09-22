@@ -38,7 +38,21 @@ fault ruling is reaffirmed with the replacement-id consequence stated;
 failing `stop()`; `bus_endpoints` renders an entry with an `@` outside its
 authority as `<unparseable>`; the `uv` image is pinned in all five
 Dockerfiles; the Redis lease tests widen their TTL to 2 s. Assumption 54
-is closed). Epic #95's first reason for the swap — that Kafka's cold start
+is closed); amended a fifth time 2026-09-22 (see "Amendment 5" — the R2
+review's four low findings and the C7 coder's flags are ruled:
+`on_assigned` skips a shard only when this member holds both its lease and
+its window, so a shard left leased-but-unwindowed by a `load()` fault is
+claimed to completion on a later call and Amendment 3 ruling (d) stands;
+`run()` re-raises a stream failure that completes in the same wake-up as
+the stop signal instead of swallowing it; the bus-password guidance is
+corrected — nats-py does not percent-decode userinfo, so the reserved
+characters are to be avoided, not encoded, and only an unencoded `/`, `?`
+or `#` is refused at startup; the broker-list split is the public
+`hammertime.bus.split_bus_servers`; `HAMMERTIME_BUS_BROKERS` is validated
+only under `bus_kind=nats`, the `validate_redis_url` precedent; rule (iii)
+of `validate_bus_url` governs over "no value that connected before is
+refused now", which is qualified; the two stale test names are ruled).
+Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
 owner "may wish to revisit the decision" in that case, so the top-level
@@ -381,7 +395,9 @@ day-one step that runs **before** the services, and it is idempotent:
   `nats.js.errors.ServiceUnavailableError` — a server whose JetStream is
   not yet serving is "unreachable" for provisioning), `DEFAULT_REPLICAS =
   1` and `DEFAULT_TIMEOUT_S = 60.0`. `--servers` is comma-separated,
-  entries stripped, empties dropped, at least one required; `--replicas`
+  entries stripped, empties dropped (*the split is
+  `hammertime.bus.split_bus_servers`, amended 2026-09-22, Amendment 5
+  ruling 4*), at least one required; `--replicas`
   MUST be a positive integer and `--timeout` a positive number; an invalid
   invocation is argparse's `SystemExit(2)`, and an invalid
   `HAMMERTIME_LOG_LEVEL` is a `config_invalid` record and a returned 2.
@@ -652,14 +668,20 @@ def bus_endpoints(servers: str | Iterable[str]) -> list[str]:   # added 2026-09-
 
 def validate_bus_url(url: str) -> None:   # added 2026-09-22, Amendment 4 ruling S2
     """ValueError, naming nothing of `url`, if nats-py's own parse of it would fail or echo it."""
+
+def split_bus_servers(servers: str) -> list[str]:   # added 2026-09-22, Amendment 5 ruling 4
+    """`HAMMERTIME_BUS_BROKERS` / `--servers` -> entries: split on `,`, each stripped, empties dropped."""
 ```
 
 **`bus_endpoints(servers)`** *(added 2026-09-21, Amendment 2)* is the one
 reduction of a server list to something a log record may carry, and it is
 re-exported from `hammertime.bus`. A `str` argument is split exactly as
 `NatsBus.__init__` splits `HAMMERTIME_BUS_BROKERS` — on `,`, entries
-stripped, empties dropped — and an iterable is taken entry by entry, each
-stripped. *One result element per input element (amended 2026-09-21,
+stripped, empties dropped; *that split is the public
+`hammertime.bus.split_bus_servers` since 2026-09-22 (Amendment 5 ruling
+4), the one definition `NatsBus.__init__`, `bus_endpoints`, both
+services' `load_settings` and the provisioning tool all call* — and an
+iterable is taken entry by entry, each stripped. *One result element per input element (amended 2026-09-21,
 Amendment 3 ruling (b)): an iterable entry that is empty after stripping
 is not dropped — it takes the `nats://` prefix like any other scheme-less
 entry and renders as `nats://`, the scheme over an empty authority —
@@ -730,7 +752,11 @@ nats-py does (an entry containing `://` as given; otherwise
 an `@` is left outside the authority (the case above); the message names
 none of the entry's text. `load_settings` in the aggregator and in ingest
 calls it for every entry of `HAMMERTIME_BUS_BROKERS` (split as
-`NatsBus.__init__` splits it) and turns a refusal into a `ValueError`
+`NatsBus.__init__` splits it) *when `bus_kind` is `nats` (amended
+2026-09-22, Amendment 5 ruling 5: under `memory` the value is never
+interpreted, so a set-but-malformed one is ignored, not rejected — ADR-0009
+A12's rule for `HAMMERTIME_REDIS_URL` under `store_kind=memory`, applied to
+the parallel key)* and turns a refusal into a `ValueError`
 naming the variable and the entry's position, so the process exits 2
 with `config_invalid` before nats-py sees the value — the store side's
 `validate_redis_url` shape, which ADR-0009 A12 chose for the same `.port`
@@ -741,9 +767,31 @@ re-raises it `from None`, so that a parse failure the validator did not
 anticipate still logs nats-py's fixed text and no chained token.
 Assumption 15's "not validated by `load_settings`" is superseded; the
 validator checks only what nats-py's own parse would refuse plus (iii),
-so no value that connected before is refused now. Whether nats-py
-percent-decodes userinfo is not verified here; the operator guidance is
-to keep `/`, `?`, `#` and `@` out of bus passwords.*
+so no value that connected before is refused now — *with one deliberate
+exception, which governs (qualified 2026-09-22, Amendment 5 ruling 6):
+rule (iii) refuses a value nats-py would accept, such as
+`nats://user:pass@host:4222/a@b` (nats-py ignores the path), because an
+`@` outside the authority is the signature of an unencoded password
+separator that (ii) does not catch when the authority happens to parse —
+`nats://user:4222/ss@nats:4222` has host `user`, port `4222` and half a
+password in its path, and `bus_endpoints` would render its username and
+password fragment as an endpoint. Rule (iii) is the rule; the sentence is
+read with that exception.* *Whether nats-py percent-decodes userinfo was
+not verified when this paragraph was written; it is now (2026-09-22,
+Amendment 5 ruling 3, read from `main` under assumption 28's caveat):
+`_parse_server_uri` is `urlparse` and the CONNECT options read
+`uri.username` and `uri.password` as they are, and `client.py` calls no
+`unquote`, so a percent-encoded reserved character is sent literally and
+the credential does not match. The operator guidance is therefore to keep
+`/`, `?`, `#` and `@` out of bus passwords, not to percent-encode them. Of
+the four, an unencoded `/`, `?` or `#` is refused at startup with exit 2
+(it ends the authority and trips (ii) or (iii)); an `@` is accepted — the
+last `@` is the boundary for CPython's `urlsplit` and so for nats-py's
+`urlparse` alike, and `validate_bus_url` adds no rule of its own
+(assumption 74) — and stays in the guidance only as caution.
+`.env.example` states the refusal for the three and the guidance for all
+four, and the validator's fixed message advises keeping the four out of
+the password rather than encoding them.*
 
 `producer()` and `consumer()` are callable before `start()`: the objects
 they return use the connection lazily and raise `RuntimeError("NatsBus is
@@ -1116,7 +1164,23 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   Reachable only by a direct call after `stop()` — `worker.start()`
   subscribes once — but a member must never report a shard as held
   (`shards`, `window()`) on the strength of a window alone while another
-  member may hold the lease.*
+  member may hold the lease.* *Corrected 2026-09-22 (Amendment 5 ruling
+  1, on the R2 review's finding 1): the test is the lease **and** the
+  window — a claim is both, and `on_assigned` skips a shard only when this
+  member holds its lease and has its window. The lease-only test opened
+  the mirror hole: Amendment 3 ruling (d) leaves a shard whose `load()`
+  raised in the held set with no window, and a later `on_assigned` naming
+  it would have skipped it for ever — lease renewed each sweep, `window()`
+  `None`, every message on it `UNCLAIMED`, never acknowledged, redelivered
+  each `ack_wait`. Such a shard is claimed to completion exactly as an
+  unleased one is claimed: `acquire_lease` is called again (a renewal of
+  this member's own lease, or a refusal if the lease lapsed meanwhile and
+  another member took it — which skipping the acquire would miss), the
+  state is loaded, the window built, `shard_claimed` logged; it counts
+  among the shards the call claimed, so a refusal later in the same call
+  rolls it back with the others. Ruling (d) is unchanged: the faulting
+  call itself still releases nothing. Reachable only by a direct second
+  call, since the normal path exits 1 after the fault.*
 * `ShardClaims.renew_leases()` calls `acquire_lease` for every held shard;
   `AggregatorWorker.run_maintenance()` calls it **first**, before the
   expiry sweep, under the worker lock, so a member that has lost a shard
@@ -1285,7 +1349,16 @@ class ShardClaims:                                   # satisfies AssignmentListe
   skipped, so the `commit_handled()` inside `stop()` is the last
   acknowledgement this worker sends; and `run()`, on a wake-up in which
   the stop signal and a received message are both complete, returns
-  without handing the message to `handle()`. The message in hand — one
+  without handing the message to `handle()`. *A receive that completed
+  with an exception in that wake-up — the iterator raising a non-timeout
+  stream failure (decision 5, as amended) — is re-raised out of `run()`
+  as itself, not discarded (amended 2026-09-22, Amendment 5 ruling 2):
+  assumption 82 sanctions dropping the message, which the next member is
+  delivered again, and not the error, which nothing redelivers.
+  `AggregatorService.run()` collects it as it collects any failure of the
+  consume task (ruling R7), and `run_exited` names it, exit 1 — a process
+  that lost its transport while stopping is not reported as a clean
+  stop.* The message in hand — one
   whose `_handle` holds the lock when the flag is set — is finished and
   covered by the final commit, as before; one merely waiting for the lock
   is not in hand and takes the `UNCLAIMED` path. `stop()` itself runs its
@@ -1401,7 +1474,7 @@ JetStream stream has one sequence across all its subjects, and
 | key | before | now |
 | --- | --- | --- |
 | `HAMMERTIME_BUS_KIND` | `kafka` (default) or `memory` | `nats` (default) or `memory`; `kafka` is a `ValueError` (exit 2) |
-| `HAMMERTIME_BUS_BROKERS` | Kafka bootstrap list, default `localhost:19092` | comma-separated NATS server URLs (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), default `nats://localhost:4222`; not validated by `load_settings` (unchanged posture; ADR-0009 A12's last assumption; assumption 15) — *superseded 2026-09-22 (Amendment 4 ruling S2): every entry is checked by `hammertime.bus.nats.validate_bus_url` in `load_settings`, and an entry nats-py's own parse would refuse is a `ValueError` naming the variable and the entry's position, `config_invalid`, exit 2*. *Amended 2026-09-21 (Amendment 2): an entry MAY carry userinfo in the two forms nats-py reads — `nats://user:password@host:4222` and `nats://token@host:4222` — and so may `hammertime-provision --servers`; the value is passed to `nats.connect` as given, and no log record of any service or tool carries it: records name the servers only as `bus_endpoints = bus_endpoints(value)` (decision 3). This extends spec §47.7's "no record may contain a credential" to the userinfo of a bus URL and supersedes ADR-0009 A7's "`bus_brokers` is logged verbatim", which was written for Kafka's `host:port` bootstrap list.* |
+| `HAMMERTIME_BUS_BROKERS` | Kafka bootstrap list, default `localhost:19092` | comma-separated NATS server URLs (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), default `nats://localhost:4222`; not validated by `load_settings` (unchanged posture; ADR-0009 A12's last assumption; assumption 15) — *superseded 2026-09-22 (Amendment 4 ruling S2): every entry is checked by `hammertime.bus.nats.validate_bus_url` in `load_settings`, and an entry nats-py's own parse would refuse is a `ValueError` naming the variable and the entry's position, `config_invalid`, exit 2* *(when `bus_kind` is `nats`; under `memory` the value is ignored, not rejected — amended 2026-09-22, Amendment 5 ruling 5)*. *Amended 2026-09-21 (Amendment 2): an entry MAY carry userinfo in the two forms nats-py reads — `nats://user:password@host:4222` and `nats://token@host:4222` — and so may `hammertime-provision --servers`; the value is passed to `nats.connect` as given, and no log record of any service or tool carries it: records name the servers only as `bus_endpoints = bus_endpoints(value)` (decision 3). This extends spec §47.7's "no record may contain a credential" to the userinfo of a bus URL and supersedes ADR-0009 A7's "`bus_brokers` is logged verbatim", which was written for Kafka's `host:port` bootstrap list.* |
 | `HAMMERTIME_SHARD_IDS` | `auto` (default) or a set | **required**; `all` or a set within `0..127`; `auto` rejected (decision 6) |
 | `HAMMERTIME_AGGREGATOR_MEMBER_ID` | — | new; default `socket.gethostname()` (decision 7) |
 | `HAMMERTIME_AGGREGATOR_LEASE_TTL_S` | — | new; default 30 (decision 7) |
@@ -3069,7 +3142,9 @@ continues the ADR's list):
     on `NatsConsumer`, and delivered-unacknowledged on `MemoryConsumer`;
     either way the next member applies it once. Handling it after the
     final commit is the defect; handling it before would need `stop()` to
-    wait for a message that may never come.
+    wait for a message that may never come. *Narrowed 2026-09-22
+    (Amendment 5 ruling 2): the skip drops the message only; a receive
+    that completed with an exception is re-raised out of `run()`.*
 
 Read on 2026-09-22 for Amendment 4:
 
@@ -3149,4 +3224,378 @@ Read on 2026-09-22 for Amendment 4:
   (`_FakeEnsureStreams`); the aggregator tests' harness classes
   (`_TappedBus`, `_Feed`, `_Members`, `_PrefetchBus`); ADR-0012 decisions
   5 and 6 and its Class 2/4 tables; the R1 and S1 reports as relayed by
+  the top-level session.
+
+## Amendment 5 (2026-09-22) — the R2 review's four findings and the C7 coder's flags, ruled
+
+Why: the `reviewer` (report R2, branch `claude/gallant-pasteur-fkehtc` at
+b56ea5c) returned four low findings against the C7 fix pass and verdicts
+on the coder's eight flags; the `security-auditor` (report S2, same
+commit) returned no findings and confirmed all four S1 findings closed.
+Two of the four findings are defects this ADR's text let through (a
+mirror hole opened by ruling R6; a swallowed exception in the branch
+ruling R2 added), one is a documentation line that overstated a refusal,
+and one is an interface question — a private name imported across
+packages — that decision 3's published surface owns. Three coder flags
+need a one-line ruling each (the `bus_kind` gate, a tension inside this
+ADR's own text, two stale test names). Each is ruled below, in place with
+a dated italic note where a decision's text changes. In checking the
+`.env.example` line the architect also verified, from nats-py's source,
+that the client does not percent-decode userinfo, so the "percent-encode
+them" advice that `.env.example` and the validator's hint text carried —
+advice this ADR never gave; its guidance was "keep them out" — is
+corrected in the same ruling. Nothing here changes a decision in
+substance.
+
+Every edit outside this section, with the superseded wording quoted or
+the insertion point named:
+
+* **Status line.** Gained the "amended a fifth time 2026-09-22" clause.
+* **Decision 2, CLI bullet.** "entries stripped, empties dropped" gained
+  the italic parenthesis naming `split_bus_servers` (ruling 4).
+* **Decision 3, `hammertime.bus.nats` block.** Gained `split_bus_servers`
+  after `validate_bus_url` (ruling 4).
+* **Decision 3, `bus_endpoints` paragraph.** "on `,`, entries stripped,
+  empties dropped — and an iterable" gained the italic "that split is the
+  public `hammertime.bus.split_bus_servers` ..." clause (ruling 4).
+* **Decision 3, validator paragraph.** "calls it for every entry of
+  `HAMMERTIME_BUS_BROKERS` (split as `NatsBus.__init__` splits it) and
+  turns a refusal" gained the italic "when `bus_kind` is `nats` ..."
+  clause (ruling 5). Its last two sentences — "so no value that connected
+  before is refused now. Whether nats-py percent-decodes userinfo is not
+  verified here; the operator guidance is to keep `/`, `?`, `#` and `@`
+  out of bus passwords." — gained the italic exception (ruling 6) and the
+  italic verification-and-guidance paragraph (ruling 3) in their place;
+  the first sentence's words are unchanged and the second is quoted
+  inside the note.
+* **Decision 7, `on_assigned` bullet.** Appended the italic "Corrected
+  2026-09-22 (Amendment 5 ruling 1 ...)" text after the R6 sentence.
+* **Decision 8, `stop()` bullet.** After "returns without handing the
+  message to `handle()`." the italic "A receive that completed with an
+  exception in that wake-up ..." text (ruling 2).
+* **Decision 10, `HAMMERTIME_BUS_BROKERS` row.** The superseded clause
+  gained the italic "(when `bus_kind` is `nats` ...)" parenthesis (ruling
+  5).
+* **Assumption 82.** Appended the italic "Narrowed" note (ruling 2).
+* **Outside this file** (same change set): ADR-0009 gains Amendment 6 —
+  a dated pointer at A12's "*Nothing is ruled about
+  `HAMMERTIME_BUS_BROKERS`.*" bullet, recording that ADR-0013 Amendment 4
+  ruling S2 and this amendment's ruling 5 now rule it, on A12's own
+  "ignored, not rejected, under `memory`" model — and its status line.
+  `docs/spec/README.md` is unchanged: `split_bus_servers` lives in the
+  `nats.py` the §47 row already maps, and no section moves. The spec is
+  unchanged: §47.1 step 3's "a connection URL the client library would
+  refuse" already describes the validator, and the `memory` gate is the
+  same reading ADR-0009 A12 gave it for the store.
+
+**Rulings.** Numbered 1-7; the brief's items in its order (R2-1 to R2-4,
+then the three coder flags).
+
+1. **R2-1 (`on_assigned` skips a leased-but-unwindowed shard for ever) —
+   real, fixed here; the skip test becomes lease-and-window; ruling (d)
+   stands.** Ruling R6 replaced "skip if windowed" with "skip if leased",
+   which closed the windowed-but-unleased hole after `release()` and
+   opened its mirror: Amendment 3 ruling (d) deliberately keeps the
+   failing shard's lease when `load()` raises, so a shard can be leased
+   with no window, and a second `on_assigned` naming it skipped it —
+   `renew_leases()` kept the lease, `window(k)` stayed `None`, every
+   message on `k` was `UNCLAIMED` and never acknowledged, and JetStream
+   redelivered each after `ack_wait`, indefinitely. Of the reviewer's two
+   fixes, releasing the failed shard's lease before propagating was
+   rejected: it reverses ruling (d), whose reasoning holds — the
+   realistic cause of a `load()` fault is an unreachable store, against
+   which a `release_lease` inside the call fails too and adds a second
+   failure to report — and it would change `TestAFaultingLoadInsideOnAssigned`,
+   which pins "releases no lease inside the call". The other closes the
+   hole without touching (d): `on_assigned` skips a shard only when this
+   member holds its lease **and** has its window. A claim is a lease
+   plus a window; anything less is claimed — afresh after a `release()`
+   (R6), to completion after a fault (this ruling) — by the one path
+   every claim takes: acquire, load, build. The re-acquire on a shard
+   this member already leases is a renewal (`acquire_lease` grants "iff
+   no live lease exists or the live lease is owner's own"), and it is
+   kept rather than skipped because the lease may have lapsed between
+   the fault and the second call; if another member took it, the acquire
+   refuses and the member exits 1 with `shard_owned_elsewhere`, which is
+   right, and which skipping the acquire would have missed. Decision 7's
+   R6 text is corrected in place. Still reachable only by a direct
+   second call (assumptions 83-85). One code change (brief C8) and one
+   test class (brief T8).
+2. **R2-2 (a stream failure completing in the same wake-up as the stop
+   signal is swallowed) — real, fixed here; it propagates.** The branch
+   ruling R2 added called `receive_task.exception()` to mark the outcome
+   retrieved and discarded whatever it was; assumption 82 sanctions
+   dropping the *message* — it was yielded, so `close()` naks it and the
+   next member applies it once — and says nothing about an *error*,
+   which nothing redelivers. The reviewer's scenario: a `_pump_pull` dies
+   on a non-timeout broker error, `_consume` raises it out of `anext`,
+   `receive_task` completes with it in the wake-up that also carries the
+   stop signal, and `run()` returns normally, so `AggregatorService.run()`
+   collects no failure and `run_exited` reports a clean stop for a
+   process that lost its transport. Ruled: `run()` re-raises the
+   receive's exception, as itself; the service collects it (ruling R7)
+   and the process exits 1 with `run_exited` naming it. Widening
+   assumption 82 to cover the error was rejected: the asymmetry is
+   principled (a message is redelivered, an error is not) and the
+   alternative reading makes `run_exited` lie in exactly the case the R7
+   ruling exists to make truthful. The coder's two-line estimate is
+   accepted (assumptions 86-87). One code change (C8), one test (T8).
+3. **R2-3 (`.env.example` says an unencoded `@` is refused with exit 2)
+   — overstated; corrected, and the "percent-encode" advice with it.**
+   `validate_bus_url` accepts `nats://user:p@ss@nats:4222`: `urlsplit`
+   keeps the whole `user:p@ss@nats:4222` as the authority (no `@` ends
+   it — only `/`, `?` and `#` do), `.port` is `4222`, and the userinfo
+   split is `rpartition('@')` in CPython and, since nats-py's parse is
+   `urlparse`, in nats-py too; `bus_endpoints` renders `nats://nats:4222`
+   by the same last-`@` rule. So the refusal is real for `/`, `?` and `#`
+   (each ends the authority and trips (ii) or (iii)) and not for `@`,
+   exactly as the reviewer read it, and the ADR's own text had `@` as
+   guidance, not refusal. While confirming that the architect read
+   nats-py's `client.py` (Sources): it never calls `unquote`, and the
+   CONNECT options take `uri.username` and `uri.password` as parsed, so
+   the "(percent-encode them)" that `.env.example` and the validator's
+   hint text added — neither is in this ADR, whose guidance was "keep
+   them out" — would have an operator send `p%2Fss` as the literal
+   password and fail authentication with no hint why. Ruled:
+   `.env.example` says a bus password must not contain `/`, `?`, `#` or
+   `@`, that nats-py sends userinfo as written (no percent-decoding, so
+   encoding does not help), and that an entry whose password carries an
+   unencoded `/`, `?` or `#` is refused at startup with exit 2; the
+   validator's fixed message becomes
+   `not a valid NATS server URL (keep '/', '?', '#' and '@' out of the password: nats-py does not percent-decode it)`,
+   fixed text that still names nothing of the entry and is pinned by no
+   test (the tests pin only that no fragment of the entry is echoed). The
+   decision 3 paragraph records the verification (assumptions 88-90).
+   Two file edits (C8), no test change beyond T8's docstring quote.
+4. **R2-4 / coder flag 3 (`_split_servers` imported across packages;
+   the provisioner open-codes the same split) — real; the split becomes
+   public.** `hammertime.bus.nats` gains `split_bus_servers(servers:
+   str) -> list[str]` — on `,`, each entry stripped, empties dropped; the
+   rule this ADR ties to `NatsBus.__init__` — re-exported from
+   `hammertime.bus` and listed in decision 3's block. It is the one
+   definition: `NatsBus.__init__`, `bus_endpoints`'s `str` form, both
+   services' `load_settings` and the provisioner's `--servers` type
+   function call it, and `_split_servers` goes (no alias: an underscore
+   name carries no compatibility promise and both importers move in the
+   same change). The per-entry validation loop stays at each call site:
+   its error type differs per site (a `ValueError` naming the variable in
+   the services, an `argparse.ArgumentTypeError` in the tool) and each
+   site's message is pinned by its own tests; a combined
+   `validate_bus_servers` was considered and not chosen (assumption 91).
+   Three call-site edits plus the rename (C8); pinned examples for the
+   helper and its re-export (T8).
+5. **Coder flag 2 (`_validate_bus_brokers` runs whatever `bus_kind` is)
+   — gated on `bus_kind == "nats"`.** The Amendment 4 text said "calls it
+   for every entry" without a gate and the code followed it literally;
+   the reviewer and the auditor both accepted the unconditional form.
+   But the same text chose "the store side's `validate_redis_url` shape,
+   which ADR-0009 A12 chose for the same `.port` hazard", and that shape
+   is gated: A12 rules `HAMMERTIME_REDIS_URL` "ignored, not rejected,
+   under `memory`" because "the alternative would be consistent with
+   'refuse the silent misconfiguration' but would refuse a working one".
+   The parallel case is a memory-bus instance (the in-process test
+   shape, a developer's local run) that inherits a stale
+   `HAMMERTIME_BUS_BROKERS` from a `.env` and exits 2 for a value it
+   would never read. Nothing is lost by gating: under `memory` the value
+   reaches neither nats-py nor a record verbatim — the `starting` record
+   still logs `bus_endpoints(value)`, which never raises and renders an
+   entry it cannot parse as `<unparseable>` (assumption 93). Ruled: one
+   `if bus_kind == "nats":` in each service, mirroring the `store_kind`
+   gate beside it; decision 3 and decision 10 say so; ADR-0009 A12's
+   "nothing is ruled about `HAMMERTIME_BUS_BROKERS`" bullet gains its
+   pointer. Two one-line edits (C8); one test per service (T8).
+6. **Coder flag 6, second half (rule (iii) versus "no value that
+   connected before is refused now") — rule (iii) governs; the sentence
+   is qualified.** The tension is real and was in this ADR's text, not
+   the code: (iii) refuses `nats://user:pass@host:4222/a@b`, which
+   nats-py accepts because it ignores the path. It is kept because (ii)
+   alone misses the case (iii) exists for — a password separator that
+   leaves an authority which *parses*: `nats://user:4222/ss@nats:4222`
+   has host `user` and port `4222`, nats-py would try to connect to a
+   host named `user`, and `bus_endpoints` would log `nats://user:4222`,
+   a username and a password fragment. An `@` outside the authority has
+   no meaning in a NATS URL; refusing it costs a value nobody has reason
+   to write and closes a leak. The sentence now reads "no value that
+   connected before is refused now — with one deliberate exception,
+   which governs", and the validator's docstring says the same (C8);
+   `test_endpoints.py`'s class docstring, which quotes the sentence,
+   quotes the qualified form (T8).
+7. **Coder flag 4 (two test names assert the superseded "not validated"
+   posture) — renamed; exact text ruled so both files stay diffable
+   copies.** In both `services/ingest/.../tests/test_config.py` and
+   `services/aggregator/.../tests/test_config.py`,
+   `TestBusKind.test_the_brokers_value_is_stored_untouched_and_not_validated`
+   becomes `test_a_value_every_entry_of_which_nats_py_accepts_is_stored_as_given`,
+   its comment "Assumption 15: 'not validated by `load_settings`'; a
+   malformed value surfaces at `connect()` as `start_failed`, not here."
+   becomes "Decision 10 as superseded (Amendment 4 ruling S2): every
+   entry is checked by `validate_bus_url`, which refuses only what
+   nats-py's own parse would refuse plus an `@` outside the authority
+   (assumption 74). Both values pass — `not a url at all` is
+   `nats://not a url at all` to nats-py, an authority with no port — and
+   the value is stored as given, unsplit, for `NatsBus` to split.", and
+   the two module docstrings stop saying the key is "not validated by
+   `load_settings`" (assumption 15) and instead say that it was until
+   Amendment 4 ruling S2 superseded that, that the superseded name is
+   gone, and that the "no value that connected before is refused now"
+   sentence they quote carries Amendment 5 ruling 6's exception. The
+   test's two values stay: they pin that the validator adds no grammar of
+   Hammertime's own, which is a real property (assumption 74), and the
+   default `bus_kind` is `nats`, so the validator does run on them. No
+   code change; brief T8 carries the exact text.
+
+No `CHANGES` line follows from rulings 1-7: rulings 1 and 2 are
+reachable only by a direct call or during a deliberate stop on a branch
+whose transport has never been observable; rulings 3, 4, 6 and 7 change
+documentation, a helper's name and test names; ruling 5 narrows a check
+that has not reached `master`. Whether the validation itself — a
+malformed `HAMMERTIME_BUS_BROKERS` entry now exiting 2 with
+`config_invalid` where `master` exits 1 at `connect()` — deserves the
+line `HAMMERTIME_REDIS_URL` got ("Reject a malformed HAMMERTIME_REDIS_URL
+at startup ...") is a question Amendment 4 answered "no" for the branch as
+a whole, on the ground that nothing on it has reached `master`; the key
+itself predates the branch, so that ground is weaker here than for the
+transport. The architect is not sure it qualifies and, per `CLAUDE.md`,
+writes no speculative entry; the question is raised in the hand-off
+report for the session.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+83. **Lease-and-window as the skip test, rather than a release inside
+    the faulting call.** Ruling 1's reasons: it keeps ruling (d) and its
+    test intact, and it makes the skip rule a positive statement of what
+    a claim is (a lease and a window) instead of a choice between two
+    proxies for it.
+84. **A leased-but-unwindowed shard is re-acquired, not merely loaded.**
+    One code path for every claim, and the acquire is what notices a
+    lease that lapsed and moved between the fault and the second call.
+    The cost is one store round trip on a path only a direct caller
+    reaches.
+85. **The re-acquired shard is rolled back with the others on a later
+    refusal in the same call.** The member held its lease before the
+    call, so releasing it is a change; but a member refused a shard must
+    hold nothing while another member holds it (decision 7), and a
+    failed-start member is exiting anyway. The alternative — remembering
+    which shards were "already leased" so as to leave them — adds
+    bookkeeping to a path nothing production reaches.
+86. **The stream failure propagates as itself, and the process exits 1
+    although the stop was deliberate.** A stop that coincided with a
+    transport loss is a failed stop: the final `commit_handled()` very
+    likely failed on the same outage, and even when it did not, the
+    operator should learn that the fetch loop died. The alternative — a
+    clean exit 0 with the failure in no record — is the reviewer's
+    finding.
+87. **The receive task has either a message or an exception, never
+    both**, so re-raising the exception and dropping the message are
+    the two arms of one branch; `_receive` maps `StopAsyncIteration` to
+    `None` before either, so a normally ended iterator still returns
+    normally.
+88. **nats-py's non-decoding of userinfo is read from `main`, not the
+    pinned 2.16.0** (assumption 28's caveat). If 2.16.0 did percent-decode,
+    the guidance "keep the characters out" would be over-cautious and
+    never unsafe; the reverse advice, had it stood, would be unsafe if
+    `main` is right, which is why the conservative reading is recorded.
+89. **An `@` in a password stays in the guidance although it is
+    accepted.** `validate_bus_url` refuses it in no form (assumption 74:
+    no rule of Hammertime's own), and CPython and nats-py agree on the
+    last `@`; it stays listed because a client that takes the first `@`
+    as the boundary is conceivable — the architect's recollection is that
+    RFC 3986's `userinfo` production admits no unencoded `@`, so a
+    grammar-strict parser is entitled to stop at the first one, but this
+    is **from recall and not verified**: `www.rfc-editor.org`,
+    `datatracker.ietf.org` and `www.ietf.org` are all blocked from this
+    environment (Sources) — and an operator moving the value to another
+    client should not be surprised. It is caution, not a refusal, and
+    `.env.example` says which.
+90. **The validator's fixed message is reworded without a test change.**
+    No test pins the text; they pin that no fragment of the entry is in
+    it. The new text contains none of the fragments any test uses
+    (`usr7`, `svc7`, `s3cr`, `et@`, `s3cret`, `::1`, `nats:4222`,
+    `s3cr/et`, `tok3n`, `user:`), which the architect checked by reading
+    the test constants; the coder re-checks by running the gate.
+91. **`split_bus_servers` splits only; the validation loop stays at each
+    call site.** A combined `validate_bus_servers(servers) -> list[str]`
+    raising `entry {i} is ...` was considered: it would collapse three
+    five-line loops into one, but the sites differ in error type and
+    each message shape is pinned by that site's tests, so the saving is
+    small and the churn is not. The name follows `bus_endpoints` and
+    `validate_bus_url` (a `bus_` word in a package whose namespace is
+    already `hammertime.bus`, for grep-ability across the services).
+92. **`_split_servers` is removed, not aliased.** Both importers move in
+    the same change set; an alias would keep the private name alive for
+    nothing.
+93. **Under `bus_kind=memory` an unvalidated value reaches no record
+    verbatim**, because the only record that names the servers carries
+    `bus_endpoints(value)`, which never raises and renders an entry it
+    cannot parse as `<unparseable>` (decision 3). If a future record
+    logged the value another way, ruling 2 of Amendment 2 binds it
+    regardless of the gate.
+94. **The gate's position in load order is not pinned** (ruling T7
+    stands): a test that expects the gate supplies valid values for every
+    other key, as the existing `TestBusBrokersAreValidated` tests do.
+95. **The renamed test keeps `not a url at all` as a value.** It is not a
+    URL in any everyday sense and it is accepted, which is precisely
+    assumption 74's "no host or port grammar of Hammertime's own"; the
+    name now says what the test shows. The two files' stale docstring
+    sentence about needles `pa`, `ss` and `user` (the constants use
+    `usr7`, `s3cr`, `et@`, `s3cr/et`) is left to the test-author's
+    judgement and is not required by any ruling here.
+96. **No `CHANGES` line, and the S2 validation line left as a question.**
+    `CLAUDE.md`: "If you are unsure whether a change qualifies, it does
+    not. Say so in your report rather than writing a speculative entry."
+
+Read on 2026-09-22 for Amendment 5:
+
+* `https://raw.githubusercontent.com/nats-io/nats.py/main/nats/src/nats/aio/client.py`
+  (summarised by the fetch tool; `main`, not the 2.16.0 tag — assumption
+  28's caveat): no call to `unquote`, `unquote_plus` or any
+  percent-decoding on a server URL's username or password anywhere in
+  the file; `_parse_server_uri` keeps an entry containing `nats://`,
+  `tls://`, `ws://` or `wss://` as given, prefixes `nats://` to one
+  containing `:`, renders a bare host as `nats://<host>:4222`, calls
+  `urlparse(normalized)`, appends `:4222` when `uri.port is None` and the
+  scheme is not `ws`/`wss`, wraps a `ValueError` as `errors.Error("nats:
+  invalid connect url option")`, and raises `errors.Error("nats: invalid
+  hostname in connect url")` when `uri.hostname` is `None` or `"none"`;
+  the CONNECT options are built as `if self._current_server.uri.password
+  is None: options["auth_token"] = self._current_server.uri.username`
+  else `options["user"] = ...uri.username; options["pass"] =
+  ...uri.password`. Taken from it: ruling 3 (no percent-decoding; the
+  last-`@` boundary is CPython's, which nats-py inherits through
+  `urlparse`).
+* Blocked: `https://www.rfc-editor.org/rfc/rfc3986.txt`,
+  `https://datatracker.ietf.org/doc/html/rfc3986` and
+  `https://www.ietf.org/rfc/rfc3986.txt` (`EGRESS_BLOCKED`, all three);
+  assumption 89's statement about RFC 3986's `userinfo` grammar is
+  therefore from recall and is marked so.
+* Repository facts: `services/aggregator/src/hammertime/aggregator/sharding/assignment.py`
+  (`on_assigned`: `if shard in self._leased: continue`; `self._leased.add(shard)`
+  before `await self._state_store.load(shard)`; the refusal rollback over
+  `claimed`); `worker.py` (`run()`: `if stop_task in done: ... else:
+  receive_task.exception(); return`; `_receive` mapping
+  `StopAsyncIteration` to `None`); `packages/hammertime-bus/src/hammertime/bus/nats.py`
+  (`_split_servers`; `bus_endpoints` and `NatsBus.__init__` calling it;
+  `_INVALID_BUS_URL`'s "(percent-encode '/', '?', '#' and '@' inside a
+  password)"; `validate_bus_url`'s "a value that connected before is not
+  refused now"; `_consume` raising `_Failed.error`) and `__init__.py`
+  (`__all__`); `services/ingest/src/hammertime/ingest/config.py` and
+  `services/aggregator/src/hammertime/aggregator/config.py` (`from
+  hammertime.bus.nats import _split_servers, validate_bus_url`;
+  `_validate_bus_brokers` called unconditionally after `bus_kind`;
+  `validate_redis_url` under `if store_kind == "redis":`);
+  `tools/provision/src/hammertime/tools/provision/__main__.py`
+  (`_server_urls`'s open-coded split); `.env.example` lines 17-24;
+  `services/aggregator/src/hammertime/aggregator/service.py`
+  (`startup_fields` logging `bus_endpoints(self._settings.bus_brokers)`
+  whatever the kind); the test constants named in assumption 90
+  (`test_endpoints.py` `REFUSED_URL_FRAGMENTS`, both services'
+  `BROKERS_REFUSED_FRAGMENTS`, the tool's `_UNPARSEABLE_NEEDLES` and
+  `_SECRET_NEEDLES`) and the test classes the briefs name
+  (`TestAFaultingLoadInsideOnAssigned`, `TestReclaimingAShardAfterStop`,
+  `TestAMessageThatCompletesWithTheStopSignal`, `TestSplitting`,
+  `TestValidateBusUrl`, `TestBusKind`, `TestBusBrokersAreValidated`,
+  `TestRedisUrlValidation`); ADR-0009 A12 (the "ignored, not rejected,
+  under `memory`" bullet and the "nothing is ruled about
+  `HAMMERTIME_BUS_BROKERS`" bullet); the R2 and S2 reports as relayed by
   the top-level session.
