@@ -31,8 +31,10 @@ that ADR's text alone:
   `test_sharding.py::TestParseShardIds`'s.
 * Decision 10's table: `HAMMERTIME_BUS_KIND` is "`nats` (default) or
   `memory`; `kafka` is a `ValueError` (exit 2)"; `HAMMERTIME_BUS_BROKERS`
-  defaults to `nats://localhost:4222` and is "not validated by
-  `load_settings`" (assumption 15).
+  defaults to `nats://localhost:4222`. That row also said the value was "not
+  validated by `load_settings`" (assumption 15) -- it was, until Amendment 4
+  ruling S2 (2026-09-22) superseded assumption 15 and made every entry a
+  `validate_bus_url` check, which `TestBusBrokersAreValidated` below covers.
 * Decision 7: "`HAMMERTIME_AGGREGATOR_MEMBER_ID` (default
   `socket.gethostname()`; set-but-empty is a `ValueError`) and
   `HAMMERTIME_AGGREGATOR_LEASE_TTL_S` (default 30; a positive number that
@@ -83,14 +85,24 @@ ingest calls it for every entry of `HAMMERTIME_BUS_BROKERS` (split as
 `NatsBus.__init__` splits it) and turns a refusal into a `ValueError` naming
 the variable and the entry's position, so the process exits 2 with
 `config_invalid` before nats-py sees the value -- the store side's
-`validate_redis_url` shape". Assumption 15 ("not validated") is superseded;
-`test_the_brokers_value_is_stored_untouched_and_not_validated` above stays
-as it is because both of its values are still accepted ("no value that
-connected before is refused now"). Error precedence between this key and
-others is not pinned (ruling T7): every test here supplies valid values for
-every other key. The needles `pa`, `ss` and `user` are the dispatch brief's;
-they exclude ordinary words such as "parse" and "address" from the message,
-which must therefore name the variable and the position and nothing more.
+`validate_redis_url` shape"; and, since 2026-09-22 (Amendment 5 ruling 5),
+only "when `bus_kind` is `nats` ...: under `memory` the value is never
+interpreted, so a set-but-malformed one is ignored, not rejected", which
+`test_a_refused_entry_is_ignored_not_rejected_under_memory` covers.
+Assumption 15 ("not validated") is superseded, and with it the name that
+asserted it: `TestBusKind`'s
+`test_the_brokers_value_is_stored_untouched_and_not_validated` is
+`test_a_value_every_entry_of_which_nats_py_accepts_is_stored_as_given` since
+2026-09-22 (Amendment 5 ruling 7). It keeps its two values, which are still
+accepted -- "no value that connected before is refused now -- with one
+deliberate exception, which governs: rule (iii) refuses a value nats-py would
+accept, such as `nats://user:pass@host:4222/a@b`" (Amendment 5 ruling 6).
+Error precedence between this key and others is not pinned (ruling T7): every
+test here supplies valid values for every other key. The needles `usr7`,
+`s3cr`, `et@` and `s3cr/et` are the constants `BROKERS_REFUSED_FRAGMENTS`
+holds; none of them is a substring of ordinary English such as "parse" or
+"address", so a message that carries one carries a fragment of the entry, and
+the rejection must name the variable and the position and nothing more.
 
 `TestStartingRecordCarriesBusEndpoints` covers ADR-0013 Amendment 2 rulings
 2-3 and decision 3's `bus_endpoints` paragraph: the `starting` record "logs
@@ -487,9 +499,13 @@ class TestBusKind:
     def test_the_brokers_default_is_a_nats_url(self) -> None:
         assert load_settings(_env()).bus_brokers == DEFAULT_BUS_BROKERS
 
-    def test_the_brokers_value_is_stored_untouched_and_not_validated(self) -> None:
-        # Assumption 15: "not validated by `load_settings`"; a malformed
-        # value surfaces at `connect()` as `start_failed`, not here.
+    def test_a_value_every_entry_of_which_nats_py_accepts_is_stored_as_given(self) -> None:
+        # Decision 10 as superseded (Amendment 4 ruling S2): every entry is
+        # checked by `validate_bus_url`, which refuses only what nats-py's own
+        # parse would refuse plus an `@` outside the authority (assumption 74).
+        # Both values pass -- `not a url at all` is `nats://not a url at all`
+        # to nats-py, an authority with no port -- and the value is stored as
+        # given, unsplit, for `NatsBus` to split.
         for value in ("nats://nats:4222,nats://nats-2:4222", "not a url at all"):
             assert load_settings(_env(HAMMERTIME_BUS_BROKERS=value)).bus_brokers == value
 
@@ -598,6 +614,29 @@ class TestBusBrokersAreValidated:
         env = _env(HAMMERTIME_STORE_KIND="memory", HAMMERTIME_BUS_BROKERS=value)
 
         assert load_settings(env).bus_brokers == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [BROKERS_WITH_A_SLASH_IN_THE_PASSWORD, BROKERS_WITH_AN_UNBALANCED_BRACKET],
+        ids=["slash-in-password", "unbalanced-bracket"],
+    )
+    def test_a_refused_entry_is_ignored_not_rejected_under_memory(self, value: str) -> None:
+        # Decision 3 as amended (Amendment 5 ruling 5): `load_settings` checks
+        # the entries "when `bus_kind` is `nats` ...: under `memory` the value
+        # is never interpreted, so a set-but-malformed one is ignored, not
+        # rejected -- ADR-0009 A12's rule for `HAMMERTIME_REDIS_URL` under
+        # `store_kind=memory`, applied to the parallel key". Decision 10 says
+        # the same in its row: "under `memory` the value is ignored, not
+        # rejected".
+        env = _env(
+            HAMMERTIME_STORE_KIND="memory",
+            HAMMERTIME_BUS_KIND="memory",
+            HAMMERTIME_BUS_BROKERS=value,
+        )
+
+        settings = load_settings(env)
+
+        assert settings.bus_brokers == value
 
 
 class TestAMalformedBusBrokersExitsTwo:

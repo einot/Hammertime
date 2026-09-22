@@ -153,8 +153,8 @@ the meaning of the assertions:
     records itself in the trace and raises. That is the case R4's `finally`
     exists for, and the trace shows the release following the failed ack.
 
-Amendment 3 (2026-09-21) and Amendment 4 (2026-09-22) rulings pinned here,
-each by the class named after it:
+Amendment 3 (2026-09-21), Amendment 4 (2026-09-22) and Amendment 5
+(2026-09-22) rulings pinned here, each by the class named after it:
 
 * Ruling (c): "after `stop()`, `run_maintenance()` returns normally without
   renewing, sweeping, emitting or writing" (assumption 53: a silent no-op,
@@ -180,12 +180,22 @@ each by the class named after it:
   `run_maintenance()` and `apply_config()` return without renewing,
   sweeping, re-evaluating, emitting or writing (`apply_config()` leaves the
   worker's `config` as it was ...)" -- `TestNothingActsOnAShardAfterStop`.
-* Ruling R6: "Which shards `on_assigned` skips ...: a shard is skipped only
-  while this member holds its lease -- the held-lease set is the test, not
-  the windows. A shard whose window survived a `release()` but whose lease
-  is gone is claimed afresh: lease acquired, state loaded, a new window
-  built in place of the old one; its handled position is kept" --
-  `TestReclaimingAShardAfterStop`.
+* Ruling R6 as corrected by Amendment 5 ruling 1: "the test is the lease
+  **and** the window -- a claim is both, and `on_assigned` skips a shard only
+  when this member holds its lease and has its window". R6's own case is
+  unchanged: "A shard whose window survived a `release()` but whose lease is
+  gone is claimed afresh: lease acquired, state loaded, a new window built in
+  place of the old one; its handled position is kept" --
+  `TestReclaimingAShardAfterStop`. The mirror case the correction closes is a
+  shard ruling (d) left leased with no window: "Such a shard is claimed to
+  completion exactly as an unleased one is claimed: `acquire_lease` is called
+  again (a renewal of this member's own lease, or a refusal if the lease
+  lapsed meanwhile and another member took it -- which skipping the acquire
+  would miss), the state is loaded, the window built, `shard_claimed` logged;
+  it counts among the shards the call claimed, so a refusal later in the same
+  call rolls it back with the others. Ruling (d) is unchanged: the faulting
+  call itself still releases nothing." --
+  `TestALeasedButUnwindowedShardIsClaimedToCompletion`.
 * Ruling R4: "`stop()` itself runs its sequence once: under the lock,
   `commit_handled()` inside a `try` whose `finally` is `release()`, so the
   leases are released even when the final acknowledgement fails -- the
@@ -2868,6 +2878,150 @@ class TestReclaimingAShardAfterStop:
             await worker.claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
 
         assert await store.acquire_lease(0, MEMBER_C, 1.0) == OTHER_MEMBER
+
+
+class TestALeasedButUnwindowedShardIsClaimedToCompletion:
+    """ADR-0013 decision 7 as corrected (Amendment 5 ruling 1): "`on_assigned` skips
+    a shard only when this member holds its lease and has its window ... Such a
+    shard is claimed to completion exactly as an unleased one is claimed:
+    `acquire_lease` is called again (a renewal of this member's own lease, or a
+    refusal if the lease lapsed meanwhile and another member took it -- which
+    skipping the acquire would miss), the state is loaded, the window built,
+    `shard_claimed` logged; it counts among the shards the call claimed, so a
+    refusal later in the same call rolls it back with the others. Ruling (d) is
+    unchanged: the faulting call itself still releases nothing."
+
+    The shard that is leased with no window is the one Amendment 3 ruling (d)
+    leaves behind, built exactly as `TestAFaultingLoadInsideOnAssigned` builds
+    it: shards `{0, 1}` over `_AnyPartitionsBus` (ASSUMPTION 11) with `load(1)`
+    raising `_StoreDown` inside `start()`, after which `heal()` lets the store
+    answer again. The second `on_assigned` is the direct call the ruling says
+    is the only way to reach the case ("Reachable only by a direct second
+    call, since the normal path exits 1 after the fault"). Ruling (d) itself
+    stays pinned, unmodified, by that class's
+    `test_no_lease_is_released_inside_the_call_and_both_stay_held`.
+
+    The `shard_claimed` and `shard_owned_elsewhere` records are not asserted,
+    for the reason the module docstring gives for every log record; the
+    refusal's owner is asserted where it is observable, on the store.
+    """
+
+    def _assigned(self, *shards: int) -> frozenset[tuple[str, int]]:
+        """Decision 3's `partitions` argument for `shards`, on the observations topic."""
+
+        return frozenset((OBSERVATIONS_TOPIC, shard) for shard in shards)
+
+    async def _faulted(
+        self, clock: ManualClock, store: _FaultingLoadStore, *, shard_ids: frozenset[int]
+    ) -> AggregatorWorker:
+        """A worker whose `start()` raised on shard 1's `load()`.
+
+        Ruling (d)'s state afterwards: shard 0 leased and windowed, shard 1
+        leased with no window, and every shard after 1 never reached -- "a
+        refusal on shard `q` has loaded nothing for `q`" applies to the fault
+        the same way, since the acquires are strictly sequential (decision 7,
+        ruling T6).
+        """
+
+        worker = AggregatorWorker(
+            bus=_AnyPartitionsBus(),
+            state_store=store,
+            clock=clock,
+            config=DEFAULTS,
+            metrics=AggregatorMetrics(),
+            shard_ids=shard_ids,
+            member_id=MEMBER_A,
+            lease_ttl_s=LEASE_TTL_SECONDS,
+        )
+        with pytest.raises(_StoreDown):
+            await worker.start()
+        assert worker.window(0) is not None
+        assert worker.window(1) is None
+        return worker
+
+    async def test_the_shard_is_acquired_again_and_loaded_while_the_windowed_one_is_skipped(
+        self,
+    ) -> None:
+        # "`acquire_lease` is called again ..., the state is loaded, the window
+        # built": for shard 1 only. Shard 0 is a lease *and* a window, so it is
+        # skipped and nothing for it reaches the store in this call.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = await self._faulted(clock, store, shard_ids=frozenset({0, 1}))
+        store.heal()
+        store.clear()
+
+        await worker.claims.on_assigned(self._assigned(0, 1))
+
+        sequence = [call[:2] for call in store.calls if call[0] in ("acquire_lease", "load")]
+        assert sequence == [("acquire_lease", 1), ("load", 1)]
+        assert ("acquire_lease", 1, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert worker.window(1) is not None
+        assert worker.window(0) is not None
+        assert worker.shards == frozenset({0, 1})
+
+    async def test_renew_leases_afterwards_renews_both_shards(self) -> None:
+        # The claim is complete on both shards, so the renewal of decision 7 --
+        # `acquire_lease` for every held shard -- covers both and raises
+        # nothing; neither shard is loaded again.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = await self._faulted(clock, store, shard_ids=frozenset({0, 1}))
+        store.heal()
+        await worker.claims.on_assigned(self._assigned(0, 1))
+        store.clear()
+
+        await worker.claims.renew_leases()
+
+        assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert ("acquire_lease", 1, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert ("load", 0) not in store.calls
+        assert ("load", 1) not in store.calls
+        assert worker.shards == frozenset({0, 1})
+
+    async def test_the_re_acquire_notices_a_lease_that_lapsed_and_moved(self) -> None:
+        # "a refusal if the lease lapsed meanwhile and another member took it
+        # -- which skipping the acquire would miss": the lease lapses after
+        # `lease_ttl_s` (ruling (d)) and another member takes it before the
+        # second call.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = await self._faulted(clock, store, shard_ids=frozenset({0, 1}))
+        store.heal()
+        clock.advance(int(LEASE_TTL_SECONDS) + 1)
+        assert await store.acquire_lease(1, OTHER_MEMBER, LONG_LEASE_SECONDS) is None
+
+        with pytest.raises(ShardOwnedElsewhereError):
+            await worker.claims.on_assigned(self._assigned(0, 1))
+
+        # ASSUMPTION 3: the error is asserted by type; "naming the other
+        # member" is asserted where it is observable -- the lease is still
+        # theirs, and this member holds no window for the shard.
+        assert await store.acquire_lease(1, MEMBER_C, 1.0) == OTHER_MEMBER
+        assert worker.window(1) is None
+        assert 1 not in worker.shards
+
+    async def test_a_refusal_later_in_the_same_call_rolls_the_re_claimed_shard_back(self) -> None:
+        # "it counts among the shards the call claimed, so a refusal later in
+        # the same call rolls it back with the others" (assumption 85). Shard 2
+        # was never reached by the failed `start()`, so another member may hold
+        # it; the refusal on 2 releases the lease the call re-took on 1, even
+        # though this member held that one before the call.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = await self._faulted(clock, store, shard_ids=frozenset({0, 1, 2}))
+        store.heal()
+        assert await store.acquire_lease(2, OTHER_MEMBER, LONG_LEASE_SECONDS) is None
+        store.clear()
+
+        with pytest.raises(ShardOwnedElsewhereError):
+            await worker.claims.on_assigned(self._assigned(0, 1, 2))
+
+        assert ("release_lease", 1, MEMBER_A) in store.calls
+        assert worker.window(1) is None
+        assert 1 not in worker.shards
+        # Released for anyone: the other member can take shard 1 at once.
+        assert await store.acquire_lease(1, OTHER_MEMBER, LONG_LEASE_SECONDS) is None
 
 
 class TestStopRunsOnceAndReleasesInAFinally:

@@ -53,6 +53,27 @@ paragraph, each pinned by the class named after it:
   text", and "no value that connected before is refused now"
   (`TestValidateBusUrl`).
 
+Amendment 5 (2026-09-22) added one helper to decision 3's block and qualified
+one sentence of the validator paragraph:
+
+* Ruling 4: `split_bus_servers(servers: str) -> list[str]` -- "on `,`, each
+  entry stripped, empties dropped; the rule this ADR ties to
+  `NatsBus.__init__` -- re-exported from `hammertime.bus` and listed in
+  decision 3's block. It is the one definition: `NatsBus.__init__`,
+  `bus_endpoints`'s `str` form, both services' `load_settings` and the
+  provisioner's `--servers` type function call it" (`TestSplitBusServers`,
+  and `TestReExport` for the re-export).
+* Ruling 6: "no value that connected before is refused now" is qualified --
+  "with one deliberate exception, which governs ...: rule (iii) refuses a
+  value nats-py would accept, such as `nats://user:pass@host:4222/a@b`
+  (nats-py ignores the path)" (`TestValidateBusUrl`).
+
+Assumption for `TestReExport`'s `__all__` case: the ADR says only
+"re-exported from `hammertime.bus`" and never names `__all__`; that the three
+helpers are in the package's public list is this test's reading of "public".
+A missing `__all__` would be a gap in `hammertime.bus.__init__`, not a
+property of any one of the three.
+
 Needle note for the `/`, `?`, `#` cases of `test_no_userinfo_fragment_survives`:
 the ruled rendering `<unparseable>` itself contains the substring `pa`, so the
 password is looked for as its whole split halves (`pa/ss`, `pa?ss`, `pa#ss`)
@@ -61,10 +82,12 @@ and as `ss`, never as the bare `pa` that the fixed string would always match.
 
 from __future__ import annotations
 
+import hammertime.bus
 import pytest
 from hammertime.bus import bus_endpoints as reexported_bus_endpoints
+from hammertime.bus import split_bus_servers as reexported_split_bus_servers
 from hammertime.bus import validate_bus_url as reexported_validate_bus_url
-from hammertime.bus.nats import bus_endpoints, validate_bus_url
+from hammertime.bus.nats import bus_endpoints, split_bus_servers, validate_bus_url
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -133,6 +156,16 @@ REFUSED_URL_ECHO_PAIRS: list[tuple[str, str]] = [
     (url, fragment) for url in REFUSED_URLS for fragment in REFUSED_URL_FRAGMENTS if fragment in url
 ]
 
+# Decision 3 as amended 2026-09-22 (Amendment 5 ruling 4): the `str` form's
+# split, on its own. The first is the ADR's own list example, whose entries are
+# *not* reduced here -- this is the split, not `bus_endpoints`.
+SPLIT_EXAMPLES: list[tuple[str, list[str]]] = [
+    ("nats://a:4222, nats://u:p@b:4222,", ["nats://a:4222", "nats://u:p@b:4222"]),
+    ("", []),
+    (" , ,", []),
+    ("  nats://nats:4222 \t", ["nats://nats:4222"]),
+]
+
 
 class TestReExport:
     def test_hammertime_bus_re_exports_the_same_function(self) -> None:
@@ -143,6 +176,19 @@ class TestReExport:
         # Ruling S2: "`validate_bus_url(url: str) -> None`, re-exported from
         # `hammertime.bus`".
         assert reexported_validate_bus_url is validate_bus_url
+
+    def test_hammertime_bus_re_exports_split_bus_servers_too(self) -> None:
+        # Ruling 4: "re-exported from `hammertime.bus`" and "the one
+        # definition" -- `hammertime.bus.split_bus_servers` (the left-hand
+        # alias) is `hammertime.bus.nats.split_bus_servers` (the right-hand
+        # one), the same object and not two copies of the same three-line rule.
+        assert reexported_split_bus_servers is split_bus_servers
+
+    @pytest.mark.parametrize("name", ["bus_endpoints", "validate_bus_url", "split_bus_servers"])
+    def test_the_re_exported_helper_is_a_public_name_of_the_package(self, name: str) -> None:
+        # The module docstring's assumption: "re-exported from
+        # `hammertime.bus`" is read as being in the package's public list.
+        assert name in hammertime.bus.__all__
 
 
 class TestPinnedExamples:
@@ -251,6 +297,45 @@ class TestSplitting:
         assert bus_endpoints(" , ,") == []
 
 
+class TestSplitBusServers:
+    """Decision 3 as amended (Amendment 5 ruling 4): "`hammertime.bus.nats` gains
+    `split_bus_servers(servers: str) -> list[str]` -- on `,`, each entry stripped,
+    empties dropped; the rule this ADR ties to `NatsBus.__init__` -- re-exported
+    from `hammertime.bus` and listed in decision 3's block", with the docstring
+    of that block: "`HAMMERTIME_BUS_BROKERS` / `--servers` -> entries: split on
+    `,`, each stripped, empties dropped". The `bus_endpoints` paragraph makes it
+    the one definition: "that split is the public `hammertime.bus.split_bus_servers`
+    ..., the one definition `NatsBus.__init__`, `bus_endpoints`, both services'
+    `load_settings` and the provisioning tool all call"."""
+
+    @pytest.mark.parametrize(("servers", "expected"), SPLIT_EXAMPLES)
+    def test_example(self, servers: str, expected: list[str]) -> None:
+        assert split_bus_servers(servers) == expected
+
+    def test_the_split_does_not_reduce_an_entry(self) -> None:
+        # It splits and nothing else: this is not `bus_endpoints`, and the
+        # entries are what `NatsBus.__init__` hands `nats.connect` "as given"
+        # (decision 2), userinfo included.
+        assert split_bus_servers("nats://a:4222, nats://u:p@b:4222,") == [
+            "nats://a:4222",
+            "nats://u:p@b:4222",
+        ]
+
+    def test_the_result_is_a_list_of_strings(self) -> None:
+        result = split_bus_servers("nats://a:4222,nats://b:4222")
+
+        assert isinstance(result, list)
+        assert all(isinstance(entry, str) for entry in result)
+
+    @pytest.mark.parametrize(("servers", "expected"), SPLIT_EXAMPLES)
+    def test_bus_endpoints_agrees_with_the_split(self, servers: str, expected: list[str]) -> None:
+        # "the one definition ... `bus_endpoints` ... all call": the `str` form
+        # of `bus_endpoints` is this split followed by the per-entry reduction,
+        # so the two agree entry for entry.
+        assert bus_endpoints(servers) == bus_endpoints(split_bus_servers(servers))
+        assert len(bus_endpoints(servers)) == len(expected)
+
+
 class TestNoUserinfoInTheResult:
     """Ruling 2: the rendered text "MUST NOT contain the userinfo of a bus URL";
 
@@ -319,8 +404,13 @@ class TestValidateBusUrl:
     (ii) `SplitResult.port` raises -- the very cast nats-py performs -- or (iii)
     an `@` is left outside the authority ...; the message names none of the
     entry's text." "The validator checks only what nats-py's own parse would
-    refuse plus (iii), so no value that connected before is refused now."
-    Assumption 74."""
+    refuse plus (iii), so no value that connected before is refused now -- with
+    one deliberate exception, which governs (qualified 2026-09-22, Amendment 5
+    ruling 6): rule (iii) refuses a value nats-py would accept, such as
+    `nats://user:pass@host:4222/a@b` (nats-py ignores the path), because an `@`
+    outside the authority is the signature of an unencoded password separator
+    that (ii) does not catch when the authority happens to parse ... Rule (iii)
+    is the rule; the sentence is read with that exception." Assumption 74."""
 
     @pytest.mark.parametrize("url", ACCEPTED_URLS)
     def test_a_url_that_connected_before_is_accepted(self, url: str) -> None:
@@ -360,6 +450,11 @@ class TestValidateBusUrl:
             "nats://user:pa#ss@nats:4222",
             "nats://user:p@/ss@nats:4222",
             "nats://svc:pa@x/ss@nats:4222",
+            # Amendment 5 ruling 6's own example: the deliberate exception to
+            # "no value that connected before is refused now". Its authority
+            # parses and nats-py ignores the path, so only (iii) refuses it --
+            # and (iii) governs.
+            "nats://user:pass@host:4222/a@b",
         ],
     )
     def test_an_at_sign_outside_the_authority_is_refused(self, url: str) -> None:

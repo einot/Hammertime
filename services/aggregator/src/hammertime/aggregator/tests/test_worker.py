@@ -100,7 +100,10 @@ three are shared with `test_sharding.py` and `test_reevaluate.py`:
    closes the bus ... afterwards"); `_drain` cancels the consume loop after
    `stop()` as teardown hygiene, never as part of an assertion.
 8. **A message that completes in the same wake-up as the stop signal**
-   (ADR-0013 decision 8 as amended 2026-09-22, Amendment 4 ruling R2:
+   (ADR-0013 decision 8 as amended 2026-09-22, Amendment 4 ruling R2, with
+   assumption 82 narrowed the same day by Amendment 5 ruling 2 -- "the skip
+   drops the message only; a receive that completed with an exception is
+   re-raised out of `run()`", which is ASSUMPTION 9 below:
    "`run()`, on a wake-up in which the stop signal and a received message are
    both complete, returns without handing the message to `handle()`";
    assumption 82: the message "was yielded, so it is retained and naked at
@@ -118,6 +121,26 @@ three are shared with `test_sharding.py` and `test_reevaluate.py`:
    that arrives during or after `stop()` is never applied, is never marked
    handled, and is handed to the next consumer of the group
    (`TestAMessageThatCompletesWithTheStopSignal`).
+9. **A stream failure that completes in the same wake-up as the stop signal**
+   (ADR-0013 decision 8 as amended 2026-09-22, Amendment 5 ruling 2: "A
+   receive that completed with an exception in that wake-up -- the iterator
+   raising a non-timeout stream failure (decision 5, as amended) -- is
+   re-raised out of `run()` as itself, not discarded ...: assumption 82
+   sanctions dropping the message, which the next member is delivered again,
+   and not the error, which nothing redelivers") is modelled by
+   `_StreamFailureBus`: the worker's subscription is held behind an
+   `asyncio.Event` and, once the gate is set, raises `_StreamDown` instead of
+   yielding -- a test-owned class standing for the broker error decision 5
+   lets out of the iterator, so the assertion is on that exception's identity
+   and not on a nats-py type. As in ASSUMPTION 8 the gate is set with no
+   `await` between it and `worker.stop()`, and whether `run()` observes both
+   completions in one `asyncio.wait` return or in two consecutive ones is not
+   controllable from a test; what is asserted holds either way: an error the
+   iterator raises during or after `stop()` reaches `run()`'s caller as itself
+   and is never swallowed, while `stop()` returns normally and releases the
+   leases (`TestAStreamFailureThatCompletesWithTheStopSignal`). The
+   `run_exited` record and exit 1 that ruling 2 also names are `run_service`'s
+   and `AggregatorService.run()`'s, not this worker's.
 
 NOT asserted here, and why:
 
@@ -592,6 +615,89 @@ class _GatedBus(InMemoryBus):
             return inner
         self._gated_once = True
         return _GatedConsumer(inner, self.gate)
+
+
+class _StreamDown(Exception):
+    """The non-timeout stream failure ADR-0013 decision 5 lets out of the iterator.
+
+    A test-owned class (ASSUMPTION 9): what ruling 2 is about is that the
+    exception reaches `run()`'s caller as itself, which is asserted by
+    identity rather than against any nats-py type.
+    """
+
+
+class _FailingStream:
+    """An `AsyncIterator[ConsumedMessage]` that raises `error` once `gate` is set.
+
+    It yields nothing at all: the one thing it ever produces is the failure.
+    """
+
+    def __init__(self, gate: asyncio.Event, error: _StreamDown) -> None:
+        self._gate = gate
+        self._error = error
+
+    def __aiter__(self) -> AsyncIterator[ConsumedMessage]:
+        return self
+
+    async def __anext__(self) -> ConsumedMessage:
+        await self._gate.wait()
+        raise self._error
+
+
+class _StreamFailureConsumer:
+    """A `Consumer` whose subscription is a `_FailingStream` (ASSUMPTION 9).
+
+    The inner `MemoryConsumer` is subscribed as usual -- so the listener is
+    awaited before `subscribe()` returns and `ack()`/`close()` behave as they
+    always do -- and only the iterator handed back is replaced.
+    """
+
+    def __init__(self, inner: Consumer, gate: asyncio.Event, error: _StreamDown) -> None:
+        self._inner = inner
+        self._gate = gate
+        self._error = error
+
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+        start_offset: int | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        await self._inner.subscribe(
+            topic, partitions=partitions, listener=listener, start_offset=start_offset
+        )
+        return _FailingStream(self._gate, self._error)
+
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        await self._inner.ack(messages)
+
+    async def close(self) -> None:
+        self._gate.set()
+        await self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _StreamFailureBus(InMemoryBus):
+    """An `InMemoryBus` whose *first* consumer -- the worker's own -- fails instead of
+    yielding once the gate is set (ASSUMPTION 9); every later consumer is a plain
+    `MemoryConsumer`, as in `_GatedBus`. `error` is the one instance it raises."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.error = _StreamDown("the fetch loop lost the stream")
+        self._failing_once = False
+
+    def consumer(self, *args: Any, **kwargs: Any) -> Any:
+        inner = super().consumer(*args, **kwargs)
+        if self._failing_once:
+            return inner
+        self._failing_once = True
+        return _StreamFailureConsumer(inner, self.gate, self.error)
 
 
 class TestAnAppliedObservation:
@@ -1748,3 +1854,83 @@ class TestAMessageThatCompletesWithTheStopSignal:
         next_owner = bus.consumer(GROUP)
         message = await _take_one(await next_owner.subscribe(OBSERVATIONS_TOPIC))
         assert message.key == str(IP_A).encode()
+
+
+class TestAStreamFailureThatCompletesWithTheStopSignal:
+    """ADR-0013 decision 8 as amended (Amendment 5 ruling 2): "A receive that completed
+    with an exception in that wake-up -- the iterator raising a non-timeout stream
+    failure (decision 5, as amended) -- is re-raised out of `run()` as itself, not
+    discarded ...: assumption 82 sanctions dropping the message, which the next
+    member is delivered again, and not the error, which nothing redelivers.
+    `AggregatorService.run()` collects it as it collects any failure of the consume
+    task (ruling R7), and `run_exited` names it, exit 1 -- a process that lost its
+    transport while stopping is not reported as a clean stop."
+
+    ASSUMPTION 9 (module docstring) explains the `_StreamFailureBus` shape and why
+    the invariant asserted is the one that holds whichever way the wake-ups fall.
+    The `run_exited` record and the exit status belong to `AggregatorService.run()`
+    and `run_service`; what is observable here is that `run()` hands its caller the
+    exception itself while `stop()` still finishes its own sequence.
+    """
+
+    async def _stop_into_a_stream_failure(
+        self,
+    ) -> tuple[AggregatorWorker, _StreamFailureBus, asyncio.Task[None], MemoryShardStateStore]:
+        """Start, put one message in the log, then open the gate and `stop()`."""
+
+        clock = ManualClock(initial=BASE)
+        bus = _StreamFailureBus()
+        metrics = AggregatorMetrics()
+        state_store = MemoryShardStateStore()
+        worker = _worker(bus=bus, clock=clock, metrics=metrics, state_store=state_store)
+        await worker.start()
+        task = asyncio.create_task(worker.run())
+        for _ in range(20):  # let `run()` reach its receive and block behind the gate
+            await asyncio.sleep(0)
+        # A message sits in the log throughout, so "nothing was applied" is not
+        # vacuous: this iterator fails instead of ever yielding it.
+        await bus.producer().publish(
+            OBSERVATIONS_TOPIC,
+            key=str(IP_A),
+            value=_observation(IP_A, 1200, window_start=BASE),
+            message_id="m-a",
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not task.done()
+
+        # The gate opens and `stop()` begins with no `await` between the two:
+        # the receive completes -- with the failure -- on the first wake-up
+        # that follows, the one that also carries the stop signal.
+        bus.gate.set()
+        await worker.stop()
+        await _yield_until(task.done)
+        return worker, bus, task, state_store
+
+    async def test_run_ends_with_the_stream_failure_itself(self) -> None:
+        # "re-raised out of `run()` as itself, not discarded": the task neither
+        # returns normally (which is what swallowing it looked like) nor is
+        # cancelled, and the exception is the very instance the iterator raised
+        # -- not a wrapper around it.
+        _stopped, bus, task, _state_store = await self._stop_into_a_stream_failure()
+
+        assert task.done()
+        assert not task.cancelled()
+        failure = task.exception()
+        assert failure is bus.error
+        assert isinstance(failure, _StreamDown)
+
+    async def test_nothing_was_applied_or_marked_and_stop_released_the_leases(self) -> None:
+        # Assumption 82 as narrowed: the message is dropped unhandled -- never
+        # applied, never marked, nothing emitted -- and `stop()` itself returns
+        # normally, having released the lease in its `finally` (ruling R4), so
+        # the next member can take the shard at once.
+        worker, bus, task, state_store = await self._stop_into_a_stream_failure()
+        assert task.exception() is bus.error
+
+        window = _window_of(worker)
+        assert window.is_tracked(IP_A) is False
+        assert window.tracked_count == 0
+        assert worker.claims.handled_position(0) is None
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert await state_store.acquire_lease(0, MEMBER_B, 1.0) is None
