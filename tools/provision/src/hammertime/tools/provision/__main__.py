@@ -54,6 +54,7 @@ from hammertime.bus.nats import (
     StreamConfigConflictError,
     bus_endpoints,
     ensure_streams,
+    split_bus_servers,
     validate_bus_url,
 )
 from hammertime.bus.topics import all_topics
@@ -109,7 +110,7 @@ def _positive_float(raw: str) -> float:
 
 
 def _server_urls(raw: str) -> list[str]:
-    urls = [url.strip() for url in raw.split(",") if url.strip()]
+    urls = split_bus_servers(raw)
     if not urls:
         raise argparse.ArgumentTypeError("expected at least one NATS URL")
     for index, url in enumerate(urls):

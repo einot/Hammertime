@@ -308,8 +308,15 @@ async def _close_quietly(nc: NATS) -> None:
         await nc.close()
 
 
-def _split_servers(servers: str) -> list[str]:
-    """`HAMMERTIME_BUS_BROKERS` -> entries: split on `,`, stripped, empties dropped."""
+def split_bus_servers(servers: str) -> list[str]:
+    """`HAMMERTIME_BUS_BROKERS` -> entries: split on `,`, stripped, empties dropped.
+
+    The one definition of how `HAMMERTIME_BUS_BROKERS` and the
+    provisioner's `--servers` are split (ADR-0013 decision 3 as amended by
+    Amendment 5 ruling 4): `NatsBus.__init__`, `bus_endpoints`'s `str`
+    form, both services' `load_settings` and the provisioner's argument
+    type function all call this and nothing splits such a value itself.
+    """
     return [url.strip() for url in servers.split(",") if url.strip()]
 
 
@@ -347,7 +354,9 @@ def bus_endpoints(servers: str | Iterable[str]) -> list[str]:
     raises a `ValueError` that echoes the text it could not parse, which
     is exactly what must not reach a log line.
     """
-    entries = _split_servers(servers) if isinstance(servers, str) else [s.strip() for s in servers]
+    entries = (
+        split_bus_servers(servers) if isinstance(servers, str) else [s.strip() for s in servers]
+    )
     endpoints: list[str] = []
     for entry in entries:
         url = entry if "://" in entry else f"nats://{entry}"
@@ -370,7 +379,8 @@ def _at_outside_authority(parts: SplitResult) -> bool:
 
 #: `validate_bus_url`'s message: fixed text, nothing of the URL in it.
 _INVALID_BUS_URL = (
-    "not a valid NATS server URL (percent-encode '/', '?', '#' and '@' inside a password)"
+    "not a valid NATS server URL (keep '/', '?', '#' and '@' out of the password: "
+    "nats-py does not percent-decode it)"
 )
 
 
@@ -385,10 +395,17 @@ def validate_bus_url(url: str) -> None:
     could not cast and rides into `start_failed` as the `__context__` of
     nats-py's fixed-text `Error` -- or (iii) an `@` is left outside the
     authority (`bus_endpoints`'s rule). No host or port grammar of
-    Hammertime's own is added (assumption 74): a value that connected
-    before is not refused now. The message contains none of the entry's
-    text, so `load_settings` and the provisioner can name the variable and
-    the entry's position and nothing else.
+    Hammertime's own is added (assumption 74): no value that connected
+    before is refused now -- with one deliberate exception, which governs
+    (Amendment 5 ruling 6). Rule (iii) refuses
+    `nats://user:pass@host:4222/a@b`, which nats-py accepts because it
+    ignores the path; that is on purpose, because (ii) alone misses the
+    case (iii) exists for -- a password separator leaving an authority
+    that parses (`nats://user:4222/ss@nats:4222` has host `user` and port
+    `4222`), where a username and a fragment of the password would reach a
+    log line. The message contains none of the entry's text, so
+    `load_settings` and the provisioner can name the variable and the
+    entry's position and nothing else.
     """
     normalized = url if "://" in url else f"nats://{url}"
     try:
@@ -415,7 +432,7 @@ class NatsBus:
     """
 
     def __init__(self, servers: str) -> None:
-        urls = _split_servers(servers)
+        urls = split_bus_servers(servers)
         if not urls:
             raise ValueError("NatsBus needs at least one server URL, got an empty list")
         self._servers = urls

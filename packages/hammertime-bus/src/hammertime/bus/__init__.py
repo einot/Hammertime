@@ -26,6 +26,7 @@ from hammertime.bus.nats import (
     StreamConfigConflictError,
     StreamNotProvisionedError,
     bus_endpoints,
+    split_bus_servers,
     validate_bus_url,
 )
 from hammertime.bus.topics import TOPICS, TopicSpec, all_topics, partition_for
@@ -50,5 +51,6 @@ __all__ = [
     "all_topics",
     "bus_endpoints",
     "partition_for",
+    "split_bus_servers",
     "validate_bus_url",
 ]

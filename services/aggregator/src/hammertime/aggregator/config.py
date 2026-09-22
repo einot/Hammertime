@@ -29,7 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from hammertime.bus.nats import _split_servers, validate_bus_url
+from hammertime.bus.nats import split_bus_servers, validate_bus_url
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.store import validate_redis_url
 
@@ -78,8 +78,10 @@ class AggregatorSettings:
     bus_kind: str
     #: HAMMERTIME_BUS_BROKERS: comma-separated NATS server URLs, meaningful
     #: only when bus_kind == "nats". Every entry is checked by
-    #: `load_settings` with `hammertime.bus.nats.validate_bus_url` (ADR-0013
-    #: Amendment 4 ruling S2) -- the dataclass itself does not validate. An
+    #: `load_settings` with `hammertime.bus.nats.validate_bus_url`, and that
+    #: check runs when bus_kind == "nats" and not otherwise (ADR-0013
+    #: Amendment 4 ruling S2, gated by Amendment 5 ruling 5) -- the
+    #: dataclass itself does not validate at all. An
     #: entry may carry userinfo, so no log record carries the value itself
     #: -- `bus_endpoints()` reduces it (Amendment 2).
     bus_brokers: str
@@ -222,7 +224,14 @@ def load_settings(env: Mapping[str, str] | None = None) -> AggregatorSettings:
         allowed=_ALLOWED_BUS_KINDS,
     )
     bus_brokers = source.get(_BUS_BROKERS_KEY, _DEFAULT_BUS_BROKERS)
-    _validate_bus_brokers(bus_brokers)
+    if bus_kind == "nats":
+        # ADR-0013 Amendment 4 ruling S2 as gated by Amendment 5 ruling 5:
+        # an entry nats-py's own parse would refuse is invalid
+        # configuration, so it must fail here (config_invalid, exit 2)
+        # rather than inside connect(). Under memory the value is never
+        # interpreted, so a set-but-malformed one is ignored, not rejected
+        # (ADR-0009 A12).
+        _validate_bus_brokers(bus_brokers)
     return AggregatorSettings(
         host=host,
         port=port,
@@ -268,7 +277,7 @@ def _validate_bus_brokers(value: str) -> None:
     rather than reaching nats-py, whose parse failure chains a `ValueError`
     that repeats the token it could not cast (assumption 46, closed).
     """
-    for index, entry in enumerate(_split_servers(value)):
+    for index, entry in enumerate(split_bus_servers(value)):
         try:
             validate_bus_url(entry)
         except ValueError as exc:

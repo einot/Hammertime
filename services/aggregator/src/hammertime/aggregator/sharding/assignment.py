@@ -267,11 +267,21 @@ class ShardClaims:
         the bus, which refuses an empty static set before calling the
         listener, and a member holding nothing must not report itself ready.
 
-        A shard is skipped only while this member holds its lease -- the
-        held-lease set is the test, not the windows (ADR-0013 decision 7 as
-        amended by Amendment 4 ruling R6). A shard whose window survived a
-        `release()` but whose lease is gone is claimed afresh: lease
-        acquired, state loaded, a new window built in place of the old one
+        A shard is skipped only while this member holds its lease **and**
+        has its window: a claim is a lease plus a window, and anything less
+        is claimed by the one path every claim takes (ADR-0013 decision 7 as
+        amended by Amendment 4 ruling R6 and corrected by Amendment 5 ruling
+        1). So a shard left leased but unwindowed by a `load()` that raised
+        (Amendment 3 ruling (d) keeps that lease) is claimed to completion
+        here, rather than skipped for ever with no window. The re-acquire on
+        a shard this member already leases is a renewal -- `acquire_lease`
+        grants iff no live lease exists or the live one is the owner's own
+        -- and it is kept rather than skipped because the lease may have
+        lapsed and moved between the fault and this call, in which case the
+        acquire refuses and the member exits 1 with `shard_owned_elsewhere`
+        (assumption 84). A shard whose window survived a `release()` but
+        whose lease is gone is claimed afresh: lease acquired, state
+        loaded, a new window built in place of the old one
         (its counters are stale and its inherited set is not the store's
         current HOT set; assumption 70); its handled position is kept, as
         nothing ever lowers it.
@@ -282,7 +292,7 @@ class ShardClaims:
             )
         claimed: list[int] = []
         for _topic, shard in sorted(partitions):
-            if shard in self._leased:
+            if shard in self._leased and shard in self._windows:
                 continue
             owner = await self._state_store.acquire_lease(shard, self._member_id, self._lease_ttl_s)
             if owner is not None:

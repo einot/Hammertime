@@ -176,6 +176,12 @@ class AggregatorWorker:
         yielded, so the consumer's `close()` hands it to the next member
         (ADR-0013 decision 8 as amended by Amendment 4 ruling R2, assumption
         82). Handling it here would put it after the final commit.
+
+        That skip drops the *message* only. A receive that completed with an
+        *exception* in the same wake-up is re-raised as itself (Amendment 5
+        ruling 2; assumption 82 as narrowed): a message is redelivered, an
+        error is not, so swallowing it would let `run_exited` report a clean
+        stop for a process that lost its transport.
         """
         stream = self._stream
         if stream is None:
@@ -191,10 +197,15 @@ class AggregatorWorker:
                     if not receive_task.done():
                         await _cancel(receive_task)
                     else:
-                        # Completed in the same wake-up: mark its outcome
-                        # retrieved so asyncio does not report an
+                        # Completed in the same wake-up: its message is
+                        # dropped (close() hands it to the next member), but
+                        # an exception is re-raised -- nothing redelivers an
+                        # error (Amendment 5 ruling 2). Reading it also marks
+                        # the outcome retrieved, so asyncio reports no
                         # unretrieved exception at teardown.
-                        receive_task.exception()
+                        exc = receive_task.exception()
+                        if exc is not None:
+                            raise exc
                     return
                 message = receive_task.result()
                 if message is None:
