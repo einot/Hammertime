@@ -350,7 +350,12 @@ The replacements:
    lease has lapsed to another owner stops with `shard_lease_lost` and exit
    1 (ADR-0013 decision 7). The two-owners hazard therefore lasts at most
    one maintenance interval past a lapsed lease; the store still carries no
-   fencing token on `record_transition`.
+   fencing token on `record_transition`. *Since 2026-09-22 (ADR-0013
+   Amendment 6) the lease is taken under the process's token rather than
+   the bare `member_id`, so a second live process sharing a `member_id` is
+   refused as well, and "the two-owners hazard therefore lasts at most one
+   maintenance interval past a lapsed lease" holds for that case too
+   (Amendment 3).*
 2. **Clause 3** — the sentence "so they land in one partition of that
    topic in publish order, and the single-writer trie (this ADR) applies
    each partition in log order" is now: all of an IP's transitions are
@@ -418,14 +423,20 @@ that died without releasing), and the compose file refuses `--scale` by
 re-decided.
 
 Every edit outside this section: none to the clauses themselves. Item 1
-of Amendment 2 is read with this sentence appended to its "Now:" text —
-*since 2026-09-22 (ADR-0013 Amendment 6) the lease is taken under the
+of Amendment 2 carries this sentence at the end of its "Now:" text —
+*Since 2026-09-22 (ADR-0013 Amendment 6) the lease is taken under the
 process's token rather than the bare `member_id`, so a second live
 process sharing a `member_id` is refused as well, and "the two-owners
 hazard therefore lasts at most one maintenance interval past a lapsed
-lease" holds for that case too.* The "promised" blockquote after the "not
-promised" paragraph is unchanged in wording: "a second live owner of a
-shard fails to start" already covers a same-id owner, now that it does.
+lease" holds for that case too (Amendment 3).* *(Corrected 2026-09-22,
+ADR-0013 Amendment 7 ruling 1: the sentence was promised by this
+amendment and by ADR-0013 Amendment 6's edit list but was not inserted at
+item 1, so "One pointer, in place" above was false when it was written;
+the R9 review found it missing and it is in place as of Amendment 7's
+change set. Nothing else here changed.)* The "promised" blockquote after
+the "not promised" paragraph is unchanged in wording: "a second live
+owner of a shard fails to start" already covers a same-id owner, now that
+it does.
 
 Assumptions made by this amendment (push back individually):
 

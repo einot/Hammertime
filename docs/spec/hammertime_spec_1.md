@@ -938,9 +938,15 @@ This minimizes distributed coordination for individual IP state.
 > (required; `all` or an explicit set, disjoint across members) names the
 > partitions a member owns, delivered through the bus's assignment listener,
 > and a member that finds one of its shards leased to another live member
-> (another process under the same member id included, the lease naming
-> the process — ADR-0013 Amendment 6) refuses to start (ADR-0013
-> decisions 6 and 7; an explicitly empty set is a configuration error,
+> refuses to start. Since 2026-09-22 the lease value names the *process*,
+> not just the member (ADR-0013 Amendment 6), so a shard still held under
+> this member's own id by a different process is detected too; that case
+> is waited out rather than refused outright, because the holder may be a
+> predecessor that died without releasing its leases. The member retries
+> inside its startup deadline, claims the shard as soon as the lease
+> lapses, and fails the start only if the holder is still renewing when
+> that deadline expires (ADR-0013 decisions 6 and 7, and Amendment 6
+> rulings 2 and 3; an explicitly empty set is a configuration error,
 > ADR-0011 Amendment 1). The sliding counters are
 > process-local; the set of HOT IPs per shard is kept in a durable state
 > store and inherited on claim, so a restart or handover never leaves the

@@ -45,7 +45,7 @@ Section index used throughout the code:
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` |
 | 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013` |
-| 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py` incl. `partition_for`), `packages/hammertime-store` (`ShardStateStore`, incl. the shard lease), `services/ingest/publisher.py`, `docs/adr/0001` (Amendments 1, 2), `docs/adr/0004`, `docs/adr/0011`, `docs/adr/0013` (decisions 1, 6, 7) |
+| 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py` incl. `partition_for`), `packages/hammertime-store` (`ShardStateStore`, incl. the shard lease), `services/ingest/publisher.py`, `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0004`, `docs/adr/0011`, `docs/adr/0013` (decisions 1, 6, 7) |
 | 22 | Consistency model | `docs/adr/0001` (Amendments 1, 2), `docs/adr/0003` (Amendments 2, 3), `docs/adr/0011` (decisions 4, 5), `docs/adr/0013` (decisions 4, 5, 7, 8), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
 | 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `services/aggregator/worker.py`, `core/time/buckets.py`, `docs/adr/0002` (Amendment 1), `docs/adr/0011` |
