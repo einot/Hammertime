@@ -161,9 +161,18 @@ class AggregatorService:
         out on ADR-0009 A1's schedule -- each attempt a fresh `subscribe()`,
         each refusal a `dependency_unavailable` record -- and its shards are
         claimed the moment its leases lapse, within
-        `HAMMERTIME_AGGREGATOR_LEASE_TTL_S`. A live twin never lets go: the
-        startup deadline expires, the last `ShardHeldBySameMemberError` is
-        re-raised, and the process exits 1 with `start_failed`.
+        `HAMMERTIME_AGGREGATOR_LEASE_TTL_S`. A live twin never lets go: under
+        `run_service` the start is over within `HAMMERTIME_STARTUP_TIMEOUT_S`
+        of entry here, and the process exits 1 with `start_failed`. Which of
+        ADR-0009 A1's two forms that record takes -- `reason=startup_timeout`
+        from the outer `wait_for`, or `error=` naming the
+        `ShardHeldBySameMemberError` this coroutine re-raises when
+        `connect_with_retry` runs out of budget -- is unspecified, and nothing
+        may depend on it (ADR-0013 Amendment 8 ruling 1); the diagnosis is in
+        the `shard_held_by_same_member` and `dependency_unavailable
+        dependency=shard_leases` records either way. A caller that awaits
+        `start()` directly has no outer deadline and gets the re-raised
+        `ShardHeldBySameMemberError`.
         """
         if self._transport is not None:
             await connect_with_retry(
