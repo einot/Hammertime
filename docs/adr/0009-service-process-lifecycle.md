@@ -16,7 +16,11 @@ NATS JetStream: decision 9's group names become durable-consumer names and
 members are told apart by their static shard sets, decision 10's broker
 healthcheck is the NATS `/healthz` endpoint, the 60 s startup deadline is
 kept on a measured rather than assumed basis, and A1's bus transient tuple
-is `hammertime.bus.nats.TRANSIENT_ERRORS`; each is noted in place)
+is `hammertime.bus.nats.TRANSIENT_ERRORS`; each is noted in place);
+amended 2026-09-21 (see "Amendment 5" — A7's `starting` record carries
+`bus_endpoints`, the reduced form of `HAMMERTIME_BUS_BROKERS`, in place of
+`bus_brokers`, and A7's no-credential rule covers the userinfo of a bus URL;
+both are pointer edits recording ADR-0013 Amendment 2, noted in place)
 
 Scope note: this ADR defines what a Hammertime service *process* is — how it
 starts, becomes ready, is observed, stops, and what it exits with — and the
@@ -935,7 +939,7 @@ implementation's additional ones after; a field in brackets is conditional):
 | event | level | fields |
 | --- | --- | --- |
 | `config_invalid` | error | `error` |
-| `starting` | info | `version` (from `importlib.metadata.version("hammertime-<name>")`) plus whatever `DescribesStartup.startup_fields()` returns — ingest: `bus_kind`, `bus_brokers`, `store_kind`, `config_path`, `config_version`, `bind`, [`store_endpoint` = `host:port/db` of `HAMMERTIME_REDIS_URL`, redis only] |
+| `starting` | info | `version` (from `importlib.metadata.version("hammertime-<name>")`) plus whatever `DescribesStartup.startup_fields()` returns — ingest: `bus_kind`, `bus_endpoints` (= `hammertime.bus.nats.bus_endpoints(HAMMERTIME_BUS_BROKERS)`, scheme and host[:port] only; was `bus_brokers` verbatim until 2026-09-21 — Amendment 5, ADR-0013 Amendment 2 ruling 3), `store_kind`, `config_path`, `config_version`, `bind`, [`store_endpoint` = `host:port/db` of `HAMMERTIME_REDIS_URL`, redis only] |
 | `dependency_unavailable` | warning | `dependency`, `attempt`, `error`, `retry_in_s` |
 | `start_failed` | error | either `reason="startup_timeout"`, `timeout_s` (outer deadline) or `error`, `exception` (any exception from `start()`, including the last transient error re-raised by A1 step 4) |
 | `ready` | info | `startup_seconds` |
@@ -956,8 +960,21 @@ text of every record — not just `starting` — MUST NOT contain the value of
 `HAMMERTIME_INGEST_AGENT_TOKEN_KEY`, any agent bearer token, or the userinfo
 component of `HAMMERTIME_REDIS_URL`. `startup_fields()` implementations MUST
 therefore never return a settings object or a URL wholesale; ingest reduces
-the Redis URL to `store_endpoint`. `bus_brokers` is logged verbatim (broker
-addresses are not secrets, decision 5 step 3).
+the Redis URL to `store_endpoint`.
+
+> Amended 2026-09-21 (ADR-0013 Amendment 2 ruling 3; Amendment 5): the
+> sentence that ended the paragraph above — "`bus_brokers` is logged
+> verbatim (broker addresses are not secrets, decision 5 step 3)." — is
+> superseded and removed. It was written for Kafka's `host:port` bootstrap
+> list; a NATS URL may carry `user:password@` or `token@` in its userinfo
+> (ADR-0013 decision 10, as amended), so the `starting` record carries
+> `bus_endpoints = hammertime.bus.nats.bus_endpoints(HAMMERTIME_BUS_BROKERS)`
+> — `<scheme>://<host>[:<port>]` per entry, userinfo dropped, never raising
+> — in place of `bus_brokers`, and the rule above reads with "or of
+> `HAMMERTIME_BUS_BROKERS`" after "the userinfo component of
+> `HAMMERTIME_REDIS_URL`". Only the log field is renamed: the settings
+> field keeps its name `bus_brokers` (ADR-0013 decision 10, Amendment 1
+> ruling T9).
 
 Test seams, in order of preference:
 
@@ -1697,3 +1714,57 @@ Assumptions made by this amendment (push back individually):
   literal rewrite of the bullet list is preferred.
 * **No CHANGES entry**: the deployment and configuration changes are
   ADR-0013's.
+
+## Amendment 5 (2026-09-21) — the `starting` record carries `bus_endpoints`, not `bus_brokers` (ADR-0013 Amendment 2)
+
+Why: ADR-0013 Amendment 2 ruled that `HAMMERTIME_BUS_BROKERS` may carry
+userinfo (`nats://user:password@host:4222`, `nats://token@host:4222`) and
+that no log record of any service or tool may contain it, reducing the
+value through `hammertime.bus.nats.bus_endpoints` and logging the result as
+`bus_endpoints`. A7 said the opposite — "`bus_brokers` is logged verbatim
+(broker addresses are not secrets)" — for the Kafka bootstrap list it was
+written against, and Amendment 2 named that row and that sentence as
+"needing a dated pointer in a later dispatch". This is that dispatch: two
+pointer edits, both noted in place, following Amendment 4's convention.
+Nothing else in this ADR changes; the decision (no credential in any
+record) is ADR-0013 Amendment 2 ruling 2's, not re-decided here.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended the "amended 2026-09-21 (see "Amendment 5"
+  ...)" clause.
+* **A7, the `starting` row of the events table.** Was: "ingest:
+  `bus_kind`, `bus_brokers`, `store_kind`, `config_path`,
+  `config_version`, `bind`, [...]". Now `bus_endpoints` with a dated
+  parenthesis giving the value (`bus_endpoints(HAMMERTIME_BUS_BROKERS)`,
+  scheme and host[:port] only) and the field it replaces.
+* **A7, the no-credential paragraph.** Its last sentence — "`bus_brokers`
+  is logged verbatim (broker addresses are not secrets, decision 5 step
+  3)." — is removed, and a dated blockquote after the paragraph quotes it,
+  gives the replacement and extends the rule's enumeration ("or of
+  `HAMMERTIME_BUS_BROKERS`").
+
+Touched nowhere else, and why: Amendment 3's sentence "the `bus_brokers`
+field carries the parallel 'meaningful only when bus_kind == kafka'" is
+about the *settings* field, which keeps its name (ADR-0013 decision 10 and
+Amendment 1 ruling T9; the kind is `nats` now), and is left as the history
+of that decision; decision 5 step 3 itself names no field, so it is not
+edited. The aggregator's own `startup_fields()` (`shard_ids`, `member_id`,
+`bus_endpoints`) is not added to the row: the row records ingest's fields,
+as it says, and ADR-0013 decisions 6-7 and Amendment 2 ruling 4 record the
+aggregator's. Spec §47.7's matching sentence is edited in the same change
+set (listed in ADR-0013 Amendment 3).
+
+Assumptions made by this amendment (push back individually):
+
+* **The row keeps listing only ingest's fields**, as the original did,
+  rather than becoming a per-service table. ADR-0013 records the
+  aggregator's; a per-service table is a later tidy-up if anyone wants it.
+* **The rule's extension is phrased as a variable, not a URL grammar.** "Or
+  of `HAMMERTIME_BUS_BROKERS`" binds every entry of the comma-separated
+  value, whatever scheme it uses (`nats://`, `tls://`, `ws://`, `wss://`
+  or scheme-less), because `bus_endpoints` treats them all alike.
+* **No CHANGES entry from this ADR.** The one line for the rename ("Log
+  `bus_endpoints` (bus URLs without userinfo) in the `starting` record in
+  place of `bus_brokers`") is ADR-0013 Amendment 2 ruling 4's and is
+  written by whichever of C2/C3 landed first.

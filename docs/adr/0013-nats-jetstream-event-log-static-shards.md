@@ -15,7 +15,15 @@ was wrong for the memory bus); amended again 2026-09-21 (see "Amendment
 2" — bus URLs may carry userinfo and no log record may carry it, reduced
 by `hammertime.bus.nats.bus_endpoints` and logged as `bus_endpoints`; the
 provisioning tool's records and test seams are pinned; assumption 30's
-"no sdist for lupa 2.8" is corrected). Epic #95's first reason for the swap — that Kafka's cold start
+"no sdist for lupa 2.8" is corrected); amended a third time 2026-09-21
+(see "Amendment 3" — four points the C2 and T1-followup workers ruled on
+alone are ruled: `ack([])` on a consumer closed before it ever subscribed
+is a `ValueError`; `bus_endpoints` on an iterable is one-in-one-out, an
+empty entry included; the held-lease set is kept apart from the windows
+across `stop()` and a `run_maintenance()` after `stop()` does nothing; a
+`load()` failure inside `on_assigned` needs no rollback. The pointer edits
+Amendment 2 left pending — ADR-0009 A7, spec §47.7,
+`integration-scenarios.md` §7 — are made in the same change set). Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
 owner "may wish to revisit the decision" in that case, so the top-level
@@ -529,7 +537,12 @@ by an *earlier* call. That is what lets `commit_handled()` (decision 8)
 hand `ack()` the handled list as it is, a `REDELIVERED` copy alongside its
 original, without deduplicating; on `NatsConsumer` the one retained `Msg`
 for that key (the most recent delivery) is acknowledged, and only once, so
-nats.py's `MsgAlreadyAckdError` is never reached. Acknowledging is what advances the group's position: it is the
+nats.py's `MsgAlreadyAckdError` is never reached. *Closed is checked first
+and is absorbing (amended 2026-09-21, Amendment 3 ruling (a)): an instance
+whose `close()` ran before it ever subscribed is a closed consumer, not a
+not-yet-subscribed one, and `ack()` on it is a `ValueError` for any
+iterable, the empty one included; the not-yet-subscribed clause above
+describes an instance that is neither closed nor subscribed.* Acknowledging is what advances the group's position: it is the
 only "commit" there is, and it is per message, so a caller acknowledges
 what it has handled and nothing else — which is exactly the requirement of
 ADR-0011 Amendment 6 / A20, now expressed without an offset. `NatsConsumer`
@@ -574,7 +587,13 @@ reduction of a server list to something a log record may carry, and it is
 re-exported from `hammertime.bus`. A `str` argument is split exactly as
 `NatsBus.__init__` splits `HAMMERTIME_BUS_BROKERS` — on `,`, entries
 stripped, empties dropped — and an iterable is taken entry by entry, each
-stripped. An entry containing no `://` is read as `nats://<entry>` first
+stripped. *One result element per input element (amended 2026-09-21,
+Amendment 3 ruling (b)): an iterable entry that is empty after stripping
+is not dropped — it takes the `nats://` prefix like any other scheme-less
+entry and renders as `nats://`, the scheme over an empty authority —
+because only the `str` form's split is Hammertime's own; a caller that
+passes a list has already decided what its entries are, and the record
+shows as many endpoints as the caller passed.* An entry containing no `://` is read as `nats://<entry>` first
 (nats-py's own normalisation of a scheme-less server: Sources, Amendment
 2). Each entry is then `urlsplit`, and the result is `<scheme>://` followed
 by the part of the authority after its **last** `@` — the whole authority
@@ -916,7 +935,15 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   and out of `service.start()`; it is not in any transient tuple, so
   `run_service` logs `start_failed` and the process exits **1** (ADR-0009
   decision 8: a runtime failure after connections were made, not a
-  configuration error the settings could have caught).
+  configuration error the settings could have caught). *A `load()` that
+  raises inside this call is a fault, not a refusal (amended 2026-09-21,
+  Amendment 3 ruling (d)): `ShardClaims` logs nothing, releases no lease
+  inside the call, and lets the exception propagate the same way, to exit
+  1. The leases the call acquired — the failed shard's included, since it
+  was acquired before its `load()` — stay in the held set, so `release()`
+  drops them when `run_service` calls `stop()` on the failed start
+  (ADR-0009 A7's `stop_failed` path), and they lapse after `lease_ttl_s`
+  when the store cannot be reached for that either.*
 * `ShardClaims.renew_leases()` calls `acquire_lease` for every held shard;
   `AggregatorWorker.run_maintenance()` calls it **first**, before the
   expiry sweep, under the worker lock, so a member that has lost a shard
@@ -929,7 +956,10 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   member acts on a shard only while it holds the lease, checked every
   maintenance interval; the store itself still carries no fencing token on
   `record_transition`, so a transition emitted inside one interval after
-  the lease lapsed is not fenced (assumption 18).
+  the lease lapsed is not fenced (assumption 18). *After `stop()` has
+  released the leases, `run_maintenance()` renews nothing and sweeps
+  nothing: it returns normally without touching the store, the windows or
+  the producer (amended 2026-09-21, Amendment 3 ruling (c)).*
 * `ShardClaims.release()` calls `release_lease` for every held shard;
   `AggregatorWorker.stop()` calls it after the final flush-and-ack
   (decision 8), so a clean stop hands the shards over immediately. A
@@ -938,6 +968,12 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   name; a Kubernetes StatefulSet gives a pod the same ordinal name)
   reacquires at once, and one with a different id waits at most
   `lease_ttl_s`, crash-looping with `shard_owned_elsewhere` until then.
+  *`release()` empties the set of shards whose lease this member holds and
+  leaves the windows where they are; `ShardClaims` keeps that set apart
+  from its windows for exactly this reason, `renew_leases()` renews only
+  what the set holds, and the set covers every lease an `on_assigned` call
+  acquired whether or not the call completed (amended 2026-09-21,
+  Amendment 3 rulings (c) and (d)).*
 
 **Configuration.** `HAMMERTIME_AGGREGATOR_MEMBER_ID` (default
 `socket.gethostname()`; set-but-empty is a `ValueError`) and
@@ -1040,7 +1076,11 @@ class ShardClaims:                                   # satisfies AssignmentListe
   way a shard changes hands is a `stop()` on one member and a `start()` on
   another. `AggregatorWorker.stop()` is: stop fetching, finish the message
   in hand, `commit_handled()`, `release()`; windows are kept in memory
-  (nothing reads them after `stop()` except tests), and the service closes
+  (nothing reads them after `stop()` except tests) but the leases are not
+  — `release()` empties the held-lease set, which `ShardClaims` keeps
+  apart from its windows, and a `run_maintenance()` that runs after
+  `stop()` re-takes nothing and sweeps nothing (amended 2026-09-21,
+  Amendment 3 ruling (c)) — and the service closes
   the bus (`NatsBus.close()`, which `nak`s and unsubscribes) and the store
   client afterwards, as today. `stop()` does not call `consumer.close()`
   itself (amended 2026-09-21, ruling T8): closing is the service's step,
@@ -2139,3 +2179,247 @@ Read on 2026-09-21 for Amendment 2:
   time); `tools/agent-token/src/hammertime/tools/agent_token/tests/test_cli.py`
   (the tools' test layout); ADR-0009 A7 (the `starting` row and the
   verbatim sentence), A12 item 4 (the `.port` hazard); spec §47.7.
+
+## Amendment 3 (2026-09-21) — four points the workers ruled on alone after Amendment 2; the pending pointer edits
+
+Why: the C2 (aggregator) and T1-followup (bus tests) dispatches each
+resolved a point this ADR under-specified, by their own reading, and the
+top-level session brought the four to the architect for a ruling rather
+than let them stand as implementation facts. The same change set makes
+the three pointer edits Amendment 2 listed as "not edited, and needing a
+dated pointer in a later dispatch": ADR-0009 A7, spec §47.7 and
+`docs/spec/integration-scenarios.md` §7. Two of the four rulings confirm
+the worker's reading (a, b); one confirms it and closes the residual it
+left open, which is a two-line change in the worker (c); one confirms it
+and records the mechanism it silently relied on (d). C2's judgement 1 is
+confirmed as well. No decision changes in substance.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Gained the "amended a third time 2026-09-21" clause.
+* **Decision 3, `ack` paragraph.** Appended the italic "Closed is checked
+  first and is absorbing" sentence after "`MsgAlreadyAckdError` is never
+  reached." Nothing before it changed.
+* **Decision 3, `bus_endpoints` paragraph.** Appended the italic "One
+  result element per input element" sentence after "each stripped."
+* **Decision 7, `on_assigned` bullet.** Appended the italic "A `load()`
+  that raises inside this call is a fault, not a refusal" sentence.
+* **Decision 7, `renew_leases` bullet.** Appended the italic "After
+  `stop()` has released the leases, `run_maintenance()` renews nothing and
+  sweeps nothing" sentence.
+* **Decision 7, `release()` bullet.** Appended the italic "`release()`
+  empties the set of shards whose lease this member holds" sentence.
+* **Decision 8, `stop()` bullet.** Was: "windows are kept in memory
+  (nothing reads them after `stop()` except tests), and the service closes
+  the bus". Now the parenthesis is followed by "but the leases are not —
+  `release()` empties the held-lease set ... re-takes nothing and sweeps
+  nothing (amended 2026-09-21, Amendment 3 ruling (c)) — and the service
+  closes the bus".
+* **Outside this file** (same change set):
+  * ADR-0009 gains Amendment 5, which edits its status line, A7's
+    `starting` row (`bus_brokers` -> `bus_endpoints`, with the value and
+    the date in a parenthesis) and A7's no-credential paragraph (the
+    sentence "`bus_brokers` is logged verbatim (broker addresses are not
+    secrets, decision 5 step 3)." removed and quoted in a dated blockquote
+    that extends the rule to `HAMMERTIME_BUS_BROKERS`). Amendment 2's
+    pending item is closed.
+  * Spec §47.7, one sentence. Was: "No record — of any event — may contain
+    a credential: not the agent token key, not a bearer token, not the
+    userinfo of a store URL." Now continues ", and not the userinfo of a
+    bus URL — the `starting` record and the provisioning tool carry
+    `bus_endpoints`, the reduction that drops it, in place of the
+    configured value (amended 2026-09-21; ADR-0013 Amendment 2 ruling 2)."
+  * `docs/spec/integration-scenarios.md` §7, two bullets, wording only.
+    The first bullet's "Kafka, Redis and the compose stack" is now "NATS
+    JetStream, Valkey and the compose stack". The second bullet, which
+    described a coordinator-driven handover (member A fetches, "the group
+    rebalances", "the revoke driven directly", "resuming at the committed
+    handled position", `TestAMessageFetchedUnderARevokedClaim`, "the test
+    brief M4 dispatches", "aiokafka accepts `commit(offsets)` inside
+    `on_partitions_revoked`", "a reassigned partition's fetch resumes from
+    the committed offset on a *live* consumer, and the rebalance ordering
+    itself", "disabled pending #26", "M4's closure"), now describes the
+    same scenario in this ADR's terms: A is stopped and B started with A's
+    shard; `stop()` is the final flush-and-acknowledge then the lease
+    release; the next owner takes the leases and is delivered what was
+    never acknowledged; the memory-bus tests are named by their present
+    class names (`TestHandledMessagesAreAcknowledgedAtShutdown`,
+    `TestTheMessageInTheQueueReachesTheNextMember`,
+    `TestHandoverBetweenTwoMembers`); the broker-only facts are the `nak`
+    from `close()`, the `<group>-<shard>` durable resuming at its
+    acknowledged position under the next member, and `ack_wait`
+    redelivery (`REDELIVERED`); the CI pointer is #52 (per `CLAUDE.md`
+    "Disabled CI coverage"). The guarantee the scenario proves — the
+    `HotIpAdded` is emitted exactly once across the handover — is
+    unchanged; no scenario is added or removed.
+
+**Rulings.** Lettered as the top-level session put them.
+
+* **(a) `ack([])` on a consumer whose `close()` ran before it subscribed:
+  `ValueError`.** Decision 3's `ack` paragraph gives the checks in order
+  — closed, positional, then the iterable — and "closed" is the first;
+  the "not-yet-subscribed" clause is the description of the fourth state
+  an instance can be in (neither closed nor subscribed), not a second
+  rule competing with the first. `close()` is terminal ("After `close()`,
+  `ack()` is a `ValueError`" is unconditional) and is explicitly "safe
+  before `subscribe()`", so an instance can reach closed without ever
+  subscribing, and it is then closed. Both implementations already test
+  `_closed` before anything else (`memory.py`, `nats.py`), so no code
+  changes. No test pins the case today; one may be added (brief below,
+  optional).
+* **(b) `bus_endpoints` on an iterable: one result element per input
+  element, an empty entry rendering as `nats://`.** Confirmed as the
+  intended reading. "Taken entry by entry, each stripped" was written to
+  contrast with the `str` form's "empties dropped": the `str` split is
+  Hammertime's own (it mirrors `NatsBus.__init__`), so Hammertime decides
+  what an entry is; a list is the caller's, and the reduction reports one
+  endpoint per entry the caller passed — which is also assumption 44's
+  argument for `<unparseable>` ("the entry count is still visible"). An
+  empty entry gets the `nats://` prefix like any scheme-less entry and
+  `urlsplit("nats://")` yields scheme `nats` and an empty authority, so
+  the element is the string `nats://`; nothing of the entry is echoed
+  because there is nothing to echo. `test_endpoints.py`'s property test
+  (one element for any `[s]`) and `nats.py`'s `[s.strip() for s in
+  servers]` are both correct as they stand; no test and no line change.
+* **(c) The held-lease set is tracked apart from the windows; a
+  `run_maintenance()` after `stop()` re-takes nothing — and, ruled here,
+  sweeps nothing.** C2's separation is the intended behaviour and is now
+  in decisions 7 and 8: windows survive `stop()` (decision 8 already said
+  nothing reads them afterwards except tests), leases do not, and
+  `renew_leases()` renews only the set `release()` emptied. The residual
+  C2 left is the rest of the sweep: `run_maintenance()` after `stop()`
+  would still run `expire_due()`, `finish_warmup_if_due()` and
+  `evict_due()` over the surviving windows and could emit a
+  `HotIpRemoved` and write `record_transition` for a shard whose lease
+  this member no longer holds — after the next owner may have loaded that
+  shard's HOT set. Decision 7's rule is that "a member acts on a shard
+  only while it holds the lease"; a sweep after release breaks it. Ruled:
+  after `stop()`, `run_maintenance()` returns normally without renewing,
+  sweeping, emitting or writing. In `run_service` the case is unreachable
+  — the service's maintenance loop checks the stop flag before every
+  sweep, and a sweep already queued on the worker lock ahead of `stop()`
+  runs before the release — so this binds direct callers (tests, the
+  integration harness's `advance()`), and the guard lives in the worker
+  rather than in an argument about lock order. One code change (brief
+  C6 below) and one test (brief T4 below). Not a `CHANGES` entry: nothing
+  an operator can observe changes.
+* **(d) A `load()` failure inside `on_assigned` needs no rollback.**
+  Confirmed, with the mechanism recorded. A refusal is a *decision* —
+  another live member holds the shard, and this member must hold nothing
+  while it does, so the rollback matters; a `load()` failure is a *fault*
+  whose realistic cause (the store unreachable, ADR-0011 assumption 7)
+  would make the rollback's `release_lease` calls fail too, so a rollback
+  there adds a second failure to report and no guarantee. The leases are
+  this member's own; nobody is wronged by their being held for the
+  moments until the process exits. What actually clears them: the
+  exception propagates out of `subscribe()` and `start()`; `run_service`
+  logs `start_failed` and calls `stop()` on the failed start (ADR-0009
+  A7's `stop_failed` path), which is `worker.stop()`: `commit_handled()`
+  (a flush that is a no-op and an `ack(())` that returns normally on a
+  consumer whose `subscribe()` raised — decision 3 leaves it "as if
+  `subscribe()` had never been called") and then `release()`, which drops
+  every shard in the held set — the failed shard's included, because C2
+  adds to the set before it loads. If the store answers, the leases are
+  released at once; if it does not, `stop_failed` is logged and they
+  lapse after `lease_ttl_s`, exactly as after a crash. A replacement with
+  the same `member_id` reacquires either way. No code change; a test to
+  pin the mechanism (brief T5 below).
+* **C2 judgement 1, confirmed.** `shard_owned_elsewhere` and
+  `shard_lease_lost` are logged by `ShardClaims`, where the refusal is
+  detected, as decision 7 says ("it logs `ERROR event=...`" under the
+  `on_assigned` and `renew_leases` bullets); the service logs
+  `start_failed`/`run_exited` from the propagated exception and nothing
+  more.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+51. **Closed absorbs not-yet-subscribed rather than the reverse.** The
+    alternative — a never-subscribed instance stays "empty" after
+    `close()` and accepts `ack([])` — would make `close()` non-terminal
+    for one state only, and would need both implementations to keep a
+    "was ever subscribed" bit that nothing else reads. The order decision
+    3 already gave is the tie-breaker.
+52. **An empty iterable entry renders as `nats://` rather than being
+    dropped or rendered `<unparseable>`.** It is not unparseable
+    (`urlsplit` accepts it), and dropping it would make the iterable form
+    second-guess its caller; `nats://` is honest — an entry with no host —
+    and echoes nothing. No caller in this repository passes an empty
+    entry: the tool's argparse and `NatsBus.__init__` both drop empties
+    before any list exists.
+53. **`run_maintenance()` after `stop()` is a silent no-op rather than an
+    error.** Raising would turn a benign teardown race in a test harness
+    into a failure and would give `stop()` a new post-condition; the
+    integration harness's `advance()` never runs after teardown, but a
+    unit test that calls `run_maintenance()` after `stop()` to prove
+    nothing happens must be able to. The guard is the worker's own stop
+    flag, checked under the lock, so it costs one branch.
+54. **`apply_config()` after `stop()` is not ruled.** The same principle
+    would make the re-evaluation pass a no-op after `stop()`. It is
+    unreachable through the service (`stop()` stops the poller before the
+    worker) and reachable only by a direct `reload_config()` call after
+    `stop()`; it is listed as an open question rather than widened into
+    this ruling, because a direct caller of `apply_config()` after `stop()`
+    in a test may be asserting the pass's arithmetic on the surviving
+    windows on purpose.
+55. **No rollback on a `load()` fault, relying on `run_service`'s
+    `stop()`-on-failed-start.** If a future runner stopped calling
+    `stop()` after a failed `start()`, the leases would lapse after
+    `lease_ttl_s` instead of being released at once — the crash outcome,
+    still bounded. The dependency on ADR-0009's `_stop_quietly` is named
+    here so that a change to it re-reads this ruling.
+56. **`worker.stop()` after a failed `start()` acknowledges nothing and
+    cannot raise from the bus.** `commit_handled()` hands `ack()` an empty
+    tuple on a consumer that is neither closed nor subscribed, which
+    decision 3 (as amended by ruling (a)) says returns normally; the flush
+    is a no-op on both producers. If a later bus implementation made
+    `ack([])` reach the broker, the failed-start path would need a guard.
+57. **The `integration-scenarios.md` §7 rewording keeps the scenario's
+    guarantee and changes the list of broker-only facts.** A mechanism
+    swap necessarily changes what "only a broker can show"; the three
+    facts now listed are the ones decision 5 and decision 8 rest on
+    (`nak` on `close()`, durable position by name, `ack_wait`
+    redelivery). Whether a #90 overlap refusal against a real store, or
+    an `ack_wait` redelivery, deserves a scenario of its own is raised as
+    an open question, not decided.
+58. **The `#26` -> `#52` pointer in that bullet is a factual update, not a
+    model change.** `CLAUDE.md` "Disabled CI coverage" records that #52
+    carries the remaining work; the scenario document is not an ADR, so
+    the "historical record" reason for leaving `#26` in ADRs does not
+    apply to it.
+
+Read on 2026-09-21 for Amendment 3 (repository facts only; no external
+source was consulted):
+
+* `packages/hammertime-bus/src/hammertime/bus/memory.py` (`MemoryConsumer.ack`:
+  `_closed` then `_positional` then the empty check; `close()` idempotent,
+  `_positional` initially `False`; `MemoryProducer.flush` a no-op) and
+  `nats.py` (`NatsConsumer.ack`/`close()` in the same order; `bus_endpoints`
+  lines 292-323: `[s.strip() for s in servers]` for an iterable, the
+  `nats://` prefix for an entry without `://`, `urlsplit` per entry,
+  `UNPARSEABLE_ENDPOINT`; `NatsProducer.flush` a no-op).
+* `packages/hammertime-bus/src/hammertime/bus/tests/test_endpoints.py`
+  (the docstring's stated assumption and
+  `test_a_single_list_entry_never_raises_and_yields_one_element`) and
+  `test_memory_bus.py` (`TestAckPrecedence`: the five existing cases; none
+  closes before subscribing).
+* `services/aggregator/src/hammertime/aggregator/sharding/assignment.py`
+  (`_leased` kept apart from `_windows` with C2's comment; `on_assigned`
+  adds to `_leased` before `load()` and rolls back on a refusal only;
+  `release()` empties `_leased`; `renew_leases()` iterates `_leased`;
+  the two `ERROR` records logged there), `worker.py` (`start()`,
+  `stop()`, `run_maintenance()` — no stop-flag check today —
+  `_flush_and_ack()`), `service.py` (`start()`, `stop()` calling
+  `worker.stop()` unconditionally, `_maintenance_loop()` checking
+  `_stopping` before each sweep, `_close_clients()`), and the aggregator
+  tests (`TestHandoverBetweenTwoMembers`, `TestRenewingLeases`,
+  `TestHandledMessagesAreAcknowledgedAtShutdown`,
+  `TestTheMessageInTheQueueReachesTheNextMember`; no test calls
+  `run_maintenance()` after `stop()` or makes `load()` raise).
+* `packages/hammertime-core/src/hammertime/core/runtime.py`
+  (`run_service`: `_stop_quietly(service)` after a failed `start()`,
+  logging `stop_failed` at `WARNING` if `stop()` raises).
+* `CLAUDE.md` "Disabled CI coverage" (#52), `docs/spec/README.md` (the
+  §47 row already maps `bus_endpoints`; no mapping change needed),
+  ADR-0009 A7 and Amendment 4, spec §47.7,
+  `docs/spec/integration-scenarios.md` §7.

@@ -2921,4 +2921,7 @@ A7; the ones every service MUST emit are `config_invalid`, `starting`,
 `dependency_unavailable`, `start_failed`, `ready`, `run_exited`, `stopping`,
 `shutdown_timeout`, `config_rejected` and `config_applied`. No record — of any
 event — may contain a credential: not the agent token key, not a bearer token,
-not the userinfo of a store URL.
+not the userinfo of a store URL, and not the userinfo of a bus URL — the
+`starting` record and the provisioning tool carry `bus_endpoints`, the
+reduction that drops it, in place of the configured value (amended
+2026-09-21; ADR-0013 Amendment 2 ruling 2).

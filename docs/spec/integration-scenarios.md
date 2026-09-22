@@ -349,28 +349,35 @@ specific; decay below threshold clears it without a rescan.
 
 ## 7. What is deliberately not covered here
 
-* Kafka, Redis and the compose stack. A `HAMMERTIME_TEST_STACK=compose`
+* NATS JetStream, Valkey and the compose stack. A `HAMMERTIME_TEST_STACK=compose`
   driver that points the same harness surface at `localhost:8080-8083` is a
   natural follow-up once `deploy/docker-compose.yml` mounts the config file
   and `ci.yml` sets the variable; it is not part of #26.
-* **A coordinator-driven aggregator shard handover** (ADR-0011 Amendment 6,
-  A20, "what cannot be tested today"): two members of `hammertime-aggregator`
-  on a real broker, member A fetches an observation, the group rebalances,
+* **An aggregator shard handover on a real broker** (ADR-0013 decisions 5,
+  7 and 8; ADR-0011 Amendment 7 records what of A20's "what cannot be
+  tested today" stands; reworded 2026-09-21, ADR-0013 Amendment 3): two
+  members of `hammertime-aggregator` against a real JetStream server, each
+  with its own static `HAMMERTIME_SHARD_IDS`; member A fetches an
+  observation, member A is stopped and member B started with A's shard,
   member B applies it and the `HotIpAdded` is emitted exactly once. The
   in-process half of this — two workers over one `InMemoryBus` and one
-  `MemoryShardStateStore`, the revoke driven directly, the next owner
-  constructed afterwards and resuming at the committed handled position —
-  is unit-testable on the memory bus: the single-member ordering is already
-  in `services/aggregator/.../tests/test_worker.py`
-  (`TestAMessageFetchedUnderARevokedClaim`) and the two-worker handover is
-  the test brief M4 dispatches for `test_sharding.py`. What only a broker
-  can show is that aiokafka
-  accepts `commit(offsets)` inside `on_partitions_revoked`, that a
-  reassigned partition's fetch resumes from the committed offset on a
-  *live* consumer, and the rebalance ordering itself. That scenario needs
-  the compose-backed driver above and the `integration` CI job (disabled
-  pending #26, `CLAUDE.md` "Disabled CI coverage"); it is recorded here so
-  that M4's closure does not read as covering it.
+  `MemoryShardStateStore`, `stop()` on the first (the final
+  flush-and-acknowledge, then its shard leases released), the next owner
+  constructed afterwards, taking the leases and delivered every message the
+  first never acknowledged — is unit-testable on the memory bus: the
+  single-member ordering is in `services/aggregator/.../tests/test_worker.py`
+  (`TestHandledMessagesAreAcknowledgedAtShutdown`,
+  `TestTheMessageInTheQueueReachesTheNextMember`) and the two-worker
+  handover in `test_sharding.py` (`TestHandoverBetweenTwoMembers`). What
+  only a broker can show is that the `nak` sent by `close()` returns a
+  fetched-but-unhandled message to the shard's durable without waiting out
+  `ack_wait`, that the durable named `<group>-<shard>` resumes at its
+  acknowledged position when the next member binds it, and the `ack_wait`
+  redelivery of a stalled member's message to that same live consumer
+  (decision 8's `REDELIVERED`). That scenario needs the compose-backed
+  driver above and the `integration` CI job (disabled pending #52,
+  `CLAUDE.md` "Disabled CI coverage"); it is recorded here so that the
+  memory-bus tests' closure does not read as covering it.
 * Throttling, auth failures, schema rejection — `services/ingest`'s own tests.
 * Trie invariants under random streams — `tests/property/test_trie_properties.py`.
 * Metrics content (§37) — the telemetry epic; only the endpoints' existence
