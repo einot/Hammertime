@@ -15,7 +15,9 @@ services:
     image: nats:2.15.0-alpine
     command: ["-js", "-sd", "/data", "-m", "8222"]
     volumes: ["nats-data:/data"]
-    ports: ["4222:4222", "8222:8222"]
+    # Loopback only, no auth (ADR-0013 assumption 13): anything reaching 4222 or
+    # 8222 is trusted; a non-local deployment MUST add NATS `authorization`.
+    ports: ["127.0.0.1:4222:4222", "127.0.0.1:8222:8222"]
     healthcheck:
       # 200 only once JetStream is enabled and serving (js-enabled-only).
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
@@ -27,7 +29,9 @@ services:
   valkey:
     image: valkey/valkey:9.1.2-alpine
     command: ["valkey-server", "--maxmemory-policy", "noeviction"]
-    ports: ["6379:6379"]
+    # Loopback only, no auth (ADR-0013 assumption 13): anything reaching 6379 is
+    # trusted; a non-local deployment MUST add Valkey `requirepass`.
+    ports: ["127.0.0.1:6379:6379"]
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 2s
@@ -69,8 +73,11 @@ services:
 
   # Single member owning every shard (ADR-0013 decision 6). A scaled
   # deployment gives each member a disjoint HAMMERTIME_SHARD_IDS set whose
-  # union is 0-127; the per-shard lease (decision 7), keyed by the container
-  # name by default, refuses a second owner.
+  # union is 0-127; the per-shard lease (decision 7) refuses a second owner.
+  # The lease is keyed by HAMMERTIME_AGGREGATOR_MEMBER_ID, whose default is
+  # the hostname -- under compose the container ID, which a recreated
+  # container loses and would then wait out the lease TTL -- so it is set
+  # explicitly here (decision 11, Amendment 4 ruling N).
   aggregator:
     build: { context: .., dockerfile: services/aggregator/Dockerfile }
     env_file: ../.env.example
@@ -78,6 +85,7 @@ services:
       HAMMERTIME_BUS_BROKERS: nats://nats:4222
       HAMMERTIME_REDIS_URL: redis://valkey:6379/0
       HAMMERTIME_SHARD_IDS: all
+      HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0
     ports: ["8083:8083"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/readyz', timeout=2)"]

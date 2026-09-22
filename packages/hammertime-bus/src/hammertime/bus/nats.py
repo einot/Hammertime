@@ -3,9 +3,13 @@
 Spec: section 19, section 20, section 32, section 33
 
 Structural implementations of `hammertime.bus.interface.Producer`/`Consumer`
-/`MessageBus` on top of nats-py (ADR-0013). Exercising this against a real
-server is the integration job's business; there are no unit tests here by
-design, the same posture the Kafka transport had.
+/`MessageBus` on top of nats-py (ADR-0013). Exercising `NatsBus`,
+`NatsProducer` and `NatsConsumer` against a real server is the integration
+job's business; there are no unit tests for those three classes by design,
+the same posture the Kafka transport had. The pure helpers --
+`stream_config_for`, `ensure_streams` (over a three-method fake),
+`bus_endpoints` and `validate_bus_url` -- are unit-tested (ADR-0013
+Amendment 4 ruling R3).
 
 The mapping, from ADR-0013 decisions 1, 2, 4 and 5:
 
@@ -23,17 +27,31 @@ The mapping, from ADR-0013 decisions 1, 2, 4 and 5:
   `PubAck`.
 * A durable subscription is one pull consumer per partition, named
   `<group>-<p>` (or `<group>` for the whole topic), with explicit acks;
-  progress is per-message `ack_sync`, `close()` naks what was delivered and
-  not acknowledged. A positional subscription is an ordered ephemeral
-  consumer starting at `start_offset`, which nats-py recreates by itself on
-  a sequence gap or a missed heartbeat.
+  progress is per-message `ack_sync`, `close()` naks every `Msg` a fetch
+  loop received and did not acknowledge -- yielded, queued, or the unqueued
+  remainder of a cancelled batch. What it cannot reach is a message the
+  server delivered against the last outstanding pull that never reached the
+  loop; at most `FETCH_BATCH` per durable, those surface at the next
+  consumer after `ack_wait` (a recorded residual, ADR-0013 decision 3 as
+  amended by Amendment 4 ruling R1). A positional subscription is an
+  ordered ephemeral consumer starting at `start_offset`, which nats-py
+  recreates by itself on a sequence gap or a missed heartbeat.
+* On the way out of the queue a `Msg` whose subject's last token is not a
+  partition (`TopicSpec.partition_of`), or whose `Hammertime-Key` hashes to
+  a different partition than its subject names, is malformed at the
+  transport: logged as `malformed_subject`, terminated on a durable and
+  skipped on a positional subscription, never yielded (decision 5 as
+  amended by Amendment 4 rulings S3 and S4).
 * `NatsBus.end_offset(topic)` is `stream_info(...).state.last_seq + 1`: the
   offset the next appended message will receive, the readiness number of
   decision 9, `1` for an empty stream.
 * `bus_endpoints(servers)` is the spec section 47.7 reduction for bus URLs:
   the only form in which a log record may name the servers (ADR-0013
   Amendment 2), since a NATS URL may carry a password or token in its
-  userinfo.
+  userinfo. `validate_bus_url(url)` is what `load_settings` and the
+  provisioner call per entry, so a URL nats-py's own parse would refuse --
+  echoing part of it in a chained `ValueError` -- never reaches nats-py or
+  a record (Amendment 4 ruling S2).
 """
 
 import asyncio
@@ -43,7 +61,7 @@ from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 import nats
 import nats.errors
@@ -262,13 +280,24 @@ async def _connect(servers: list[str]) -> NATS:
     itself rather than being retried), and the reconnection options that the
     client reads at runtime are switched over once the connection is up.
     """
-    nc = await nats.connect(
-        servers=servers,
-        allow_reconnect=False,
-        max_reconnect_attempts=_INITIAL_CONNECT_ATTEMPTS,
-        connect_timeout=CONNECT_TIMEOUT_S,
-        error_cb=_client_error,
-    )
+    try:
+        nc = await nats.connect(
+            servers=servers,
+            allow_reconnect=False,
+            max_reconnect_attempts=_INITIAL_CONNECT_ATTEMPTS,
+            connect_timeout=CONNECT_TIMEOUT_S,
+            error_cb=_client_error,
+        )
+    except nats.errors.Error as exc:
+        if isinstance(exc.__context__, ValueError):
+            # nats-py wraps its URL parse failure in a fixed-text `Error`
+            # without `from None`, so the `ValueError` -- whose text echoes
+            # the token it could not cast, possibly a password fragment --
+            # rides along as `__context__` and `start_failed`'s traceback
+            # would print it. Drop the chain (ADR-0013 Amendment 4 ruling
+            # S2, assumption 74); `validate_bus_url` is the first line.
+            raise exc from None
+        raise
     nc.options["allow_reconnect"] = True
     nc.options["max_reconnect_attempts"] = -1
     return nc
@@ -305,7 +334,15 @@ def bus_endpoints(servers: str | Iterable[str]) -> list[str]:
     the output (a lone username is a token to nats-py; assumption 42).
 
     Never raises: an entry `urlsplit` refuses (an unbalanced `[`) is the
-    fixed string `<unparseable>` (assumption 44). `SplitResult.port`,
+    fixed string `<unparseable>` (assumption 44), and so is an entry in
+    which `urlsplit` leaves an `@` in the path, query or fragment, whatever
+    its authority holds (Amendment 4 rulings R8 and S2, assumption 72):
+    `urlsplit` ends the authority at the first `/`, `?` or `#`, so a
+    userinfo carrying one of them unencoded (`nats://user:pa/ss@nats:4222`)
+    puts its `@` -- and a fragment of the password -- outside the authority,
+    where the last-`@` rule cannot see it. An `@` there has no meaning in a
+    NATS URL; it is the signature of exactly that mistake, and a malformed
+    value is not an input a redaction can be trusted on. `SplitResult.port`,
     `.hostname`, `.username` and `.password` are never consulted -- `.port`
     raises a `ValueError` that echoes the text it could not parse, which
     is exactly what must not reach a log line.
@@ -319,8 +356,49 @@ def bus_endpoints(servers: str | Iterable[str]) -> list[str]:
         except ValueError:
             endpoints.append(UNPARSEABLE_ENDPOINT)
             continue
+        if _at_outside_authority(parts):
+            endpoints.append(UNPARSEABLE_ENDPOINT)
+            continue
         endpoints.append(f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}")
     return endpoints
+
+
+def _at_outside_authority(parts: SplitResult) -> bool:
+    """True when `urlsplit` left an `@` in the path, query or fragment."""
+    return "@" in parts.path or "@" in parts.query or "@" in parts.fragment
+
+
+#: `validate_bus_url`'s message: fixed text, nothing of the URL in it.
+_INVALID_BUS_URL = (
+    "not a valid NATS server URL (percent-encode '/', '?', '#' and '@' inside a password)"
+)
+
+
+def validate_bus_url(url: str) -> None:
+    """`ValueError`, naming nothing of `url`, if nats-py's own parse of it would fail or echo it.
+
+    ADR-0013 decision 3 as amended by Amendment 4 ruling S2. The entry is
+    normalised as nats-py normalises a server (one containing `://` as
+    given; otherwise `nats://<entry>`) and refused when (i) `urlsplit`
+    refuses it, (ii) `SplitResult.port` raises -- the very cast nats-py
+    performs in `_parse_server_uri`, whose `ValueError` echoes the token it
+    could not cast and rides into `start_failed` as the `__context__` of
+    nats-py's fixed-text `Error` -- or (iii) an `@` is left outside the
+    authority (`bus_endpoints`'s rule). No host or port grammar of
+    Hammertime's own is added (assumption 74): a value that connected
+    before is not refused now. The message contains none of the entry's
+    text, so `load_settings` and the provisioner can name the variable and
+    the entry's position and nothing else.
+    """
+    normalized = url if "://" in url else f"nats://{url}"
+    try:
+        parts = urlsplit(normalized)
+        _ = parts.port
+    except ValueError:
+        # The `.port` message repeats the text it could not cast.
+        raise ValueError(_INVALID_BUS_URL) from None
+    if _at_outside_authority(parts):
+        raise ValueError(_INVALID_BUS_URL)
 
 
 class NatsBus:
@@ -328,7 +406,9 @@ class NatsBus:
 
     `servers` is `HAMMERTIME_BUS_BROKERS`: comma-separated NATS URLs
     (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), not validated
-    here -- nats-py parses them at `connect()` (ADR-0013 assumption 15).
+    here -- `load_settings` checks each entry with `validate_bus_url`
+    before this is built (ADR-0013 Amendment 4 ruling S2), and nats-py
+    parses them again at `connect()`.
     `producer()` and `consumer()` may be called before `start()`; the
     objects they return use the connection lazily and raise `RuntimeError`
     if used before it is up.
@@ -484,6 +564,11 @@ class NatsConsumer:
         self._pull_subs: list[JetStreamContext.PullSubscription] = []
         self._push_sub: JetStreamContext.PushSubscription | None = None
         self._retained: dict[tuple[str, int, int], Msg] = {}
+        # The unqueued remainder of every batch a cancelled `_pump_pull` was
+        # still queueing, for `close()` to nak (ADR-0013 Amendment 4 ruling
+        # R1, assumption 59). Each `Msg` is in exactly one of: yielded and
+        # retained, queued, or here.
+        self._unqueued: list[Msg] = []
 
     async def subscribe(
         self,
@@ -615,7 +700,13 @@ class NatsConsumer:
             self._pumps.append(asyncio.create_task(self._pump_push(self._push_sub)))
 
     async def _pump_pull(self, sub: JetStreamContext.PullSubscription) -> None:
-        """One durable's fetch loop: lingering pulls into the shared queue, in order."""
+        """One durable's fetch loop: lingering pulls into the shared queue, in order.
+
+        Cancelled mid-batch, it hands the not-yet-queued remainder to
+        `close()` through `_unqueued`: a `Msg` whose `put` was interrupted
+        is in the remainder, one whose `put` returned is in the queue, never
+        both (ADR-0013 decision 3 as amended by Amendment 4 ruling R1).
+        """
         try:
             while True:
                 try:
@@ -624,8 +715,14 @@ class NatsConsumer:
                     # Idle partition (or a broker outage the client is
                     # riding out); re-issue the pull.
                     continue
-                for msg in batch:
-                    await self._queue.put(msg)
+                queued = 0
+                try:
+                    for msg in batch:
+                        await self._queue.put(msg)
+                        queued += 1
+                except asyncio.CancelledError:
+                    self._unqueued.extend(batch[queued:])
+                    raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -648,26 +745,51 @@ class NatsConsumer:
             await self._queue.put(_Failed(exc))
 
     async def _consume(self) -> AsyncIterator[ConsumedMessage]:
+        assert self._topic is not None
+        spec = TOPICS[self._topic]
         while True:
             item = await self._queue.get()
             if isinstance(item, _Closed):
                 return
             if isinstance(item, _Failed):
                 raise item.error
-            message = self._to_consumed(item)
+            partition = spec.partition_of(item.subject)
+            reason = _malformed_reason(spec, item, partition)
+            if partition is None or reason is not None:
+                await self._discard_malformed(item, reason or "not-a-partition")
+                continue
+            message = self._to_consumed(item, partition)
             if not self._positional:
                 self._retained[(message.topic, message.partition, message.offset)] = item
             yield message
 
-    def _to_consumed(self, msg: Msg) -> ConsumedMessage:
+    async def _discard_malformed(self, msg: Msg, reason: str) -> None:
+        """Log `malformed_subject` (no key, no payload); term on a durable, skip on positional.
+
+        `+TERM` is the server's word for "will not be processed": the
+        durable never redelivers it, so a poison subject cannot crash-loop a
+        whole-topic durable or a positional replay (ADR-0013 Amendment 4
+        assumption 77). Nothing can be sent on a positional subscription
+        (`ack_policy none`), so the message is simply skipped.
+        """
+        logger.warning(
+            "malformed_subject subject=%s stream_seq=%d reason=%s",
+            msg.subject,
+            msg.metadata.sequence.stream,
+            reason,
+        )
+        if not self._positional:
+            with contextlib.suppress(nats.errors.Error, OSError):
+                await msg.term()
+
+    def _to_consumed(self, msg: Msg, partition: int) -> ConsumedMessage:
         assert self._topic is not None
-        _, _, suffix = msg.subject.rpartition(".")
         metadata = msg.metadata
         headers = msg.headers or {}
         key_text = headers.get(KEY_HEADER)
         return ConsumedMessage(
             topic=self._topic,
-            partition=int(suffix),
+            partition=partition,
             offset=metadata.sequence.stream,
             key=None if key_text is None else key_text.encode("utf-8"),
             value=msg.data,
@@ -707,12 +829,21 @@ class NatsConsumer:
             del self._retained[key]
 
     async def close(self) -> None:
-        """Stop fetching, nak what was fetched and not acknowledged, unsubscribe.
+        """Stop fetching, nak what reached the fetch loops and was not acknowledged, unsubscribe.
 
-        Idempotent and safe before `subscribe()`. Every message this
-        instance fetched -- yielded and unacknowledged, or still queued and
-        never yielded -- is negatively acknowledged so the next consumer for
-        the group receives it without waiting for `ack_wait`.
+        Idempotent and safe before `subscribe()`. Every nats-py `Msg` a
+        fetch loop received -- yielded and unacknowledged (retained), still
+        queued and never yielded, or the unqueued remainder of the batch a
+        loop was queueing when it was cancelled -- is negatively
+        acknowledged once, after unsubscribing and before the final flush,
+        so the next consumer for the group receives it without waiting for
+        `ack_wait`. What this cannot reach is a message the server delivered
+        against the loop's last outstanding pull that never reached the
+        loop: in flight, or in nats-py's private per-subscription pending
+        queue, which only a further `fetch()` drains. Those -- at most
+        `FETCH_BATCH` per durable, since one pull asks for at most that many
+        -- surface at the next consumer after `ack_wait` (ADR-0013 decision
+        3 as amended by Amendment 4 ruling R1; a recorded residual).
         """
         if self._closed:
             return
@@ -730,6 +861,7 @@ class NatsConsumer:
                 break
             if isinstance(item, Msg):
                 queued.append(item)
+        unqueued, self._unqueued = self._unqueued, []
         retained, self._retained = self._retained, {}
         # Unsubscribe first, and round-trip a flush, so the server has
         # dropped this instance's outstanding pull requests before the naks
@@ -739,7 +871,7 @@ class NatsConsumer:
         nc = self._bus._connection()
         if self._subscribed and not self._positional:
             await self._flush_quietly(nc)
-            for msg in [*queued, *retained.values()]:
+            for msg in [*queued, *unqueued, *retained.values()]:
                 with contextlib.suppress(nats.errors.Error, OSError):
                     await msg.nak()
             await self._flush_quietly(nc)
@@ -760,6 +892,28 @@ class NatsConsumer:
         if push_sub is not None:
             with contextlib.suppress(nats.errors.Error, OSError):
                 await push_sub.unsubscribe()
+
+
+def _malformed_reason(spec: TopicSpec, msg: Msg, partition: int | None) -> str | None:
+    """Decision 5's two transport invariants, checked on the way out of the queue.
+
+    The subject's last token must be a partition (`TopicSpec.partition_of`
+    gave `partition`), and a message carrying the key header must sit under
+    the partition its key hashes to -- `NatsProducer` computed the subject
+    from the key, so a message stored under another partition's subject
+    would be applied by that partition's owner and one IP would be owned by
+    two shards (spec section 20). A message without the header is left to
+    the consumer's own checks (ADR-0013 Amendment 4 rulings S3 and S4,
+    assumption 79). Returns the `malformed_subject` reason, or None.
+    """
+    if partition is None:
+        return "not-a-partition"
+    key_text = (msg.headers or {}).get(KEY_HEADER)
+    if key_text is None:
+        return None
+    if partition_for(key_text.encode("utf-8"), spec.partitions) != partition:
+        return "partition-mismatch"
+    return None
 
 
 #: Editable consumer fields whose drift from the declared configuration is

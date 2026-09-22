@@ -25,6 +25,11 @@ The `--servers` value may carry userinfo (`nats://user:password@host:4222`,
 appears in a log record. The `provision_failed` records name the servers
 only as `bus_endpoints = hammertime.bus.nats.bus_endpoints(servers)` --
 scheme and host, userinfo dropped (ADR-0013 Amendment 2; spec section 47.7).
+Every entry is checked with `hammertime.bus.nats.validate_bus_url` before
+anything is connected (ADR-0013 Amendment 4 ruling S2): an entry it refuses
+is an argparse error -- `SystemExit(2)`, a message naming the entry's
+position and not its text -- so a URL nats-py could not parse never reaches
+nats-py or a record.
 
 Nothing here knows a stream's configuration: that is
 `hammertime.bus.nats.stream_config_for`, so this tool and the services'
@@ -49,6 +54,7 @@ from hammertime.bus.nats import (
     StreamConfigConflictError,
     bus_endpoints,
     ensure_streams,
+    validate_bus_url,
 )
 from hammertime.bus.topics import all_topics
 from hammertime.core.runtime import (
@@ -106,6 +112,13 @@ def _server_urls(raw: str) -> list[str]:
     urls = [url.strip() for url in raw.split(",") if url.strip()]
     if not urls:
         raise argparse.ArgumentTypeError("expected at least one NATS URL")
+    for index, url in enumerate(urls):
+        try:
+            validate_bus_url(url)
+        except ValueError as exc:
+            # The position only: the entry may carry a password, and
+            # argparse prints this message to stderr as it is.
+            raise argparse.ArgumentTypeError(f"entry {index} is {exc}") from None
     return urls
 
 

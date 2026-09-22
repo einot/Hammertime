@@ -146,6 +146,28 @@ class TopicSpec:
             raise ValueError(f"partition must be non-negative, got {partition!r}")
         return f"{self.name}.{partition}"
 
+    def partition_of(self, subject: str) -> int | None:
+        """The partition `subject` names, or None unless it is `self.subject(p)` for some `p >= 0`.
+
+        The inverse of `subject()` (ADR-0013 decision 1 as amended by
+        Amendment 4 ruling S3). Only the canonical decimal form is a
+        partition: `<name>.7` is `7`, while `<name>.07`, `<name>.-1`,
+        `<name>.x`, `<name>.7.8` and `<name>` alone are all `None`, because
+        `subject()` never produces them and a non-canonical token is not one
+        of ours (assumption 78). `NatsConsumer` reads a delivered message's
+        partition with this, and a `None` is a malformed message at the
+        transport (decision 5). Whether `p` is below `partitions` is not
+        checked: any non-negative partition is a legal subject.
+        """
+        prefix, separator, token = subject.rpartition(".")
+        if not separator or prefix != self.name or not token.isdigit():
+            return None
+        try:
+            partition = int(token)
+        except ValueError:
+            return None
+        return partition if self.subject(partition) == subject else None
+
     @property
     def subject_filter(self) -> str:
         """The stream's single subject filter, matching every partition: `<name>.*`."""

@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from hammertime.bus.nats import _split_servers, validate_bus_url
 from hammertime.bus.topics import OBSERVATIONS
 from hammertime.store import validate_redis_url
 
@@ -54,6 +55,7 @@ _DEFAULT_MAX_TRACKED_IPS = 1_000_000
 _DEFAULT_REEVALUATION_BATCH = 1000
 _DEFAULT_LEASE_TTL_S = 30.0
 
+_BUS_BROKERS_KEY = "HAMMERTIME_BUS_BROKERS"
 _SHARD_IDS_KEY = "HAMMERTIME_SHARD_IDS"
 _MEMBER_ID_KEY = "HAMMERTIME_AGGREGATOR_MEMBER_ID"
 _LEASE_TTL_KEY = "HAMMERTIME_AGGREGATOR_LEASE_TTL_S"
@@ -75,9 +77,11 @@ class AggregatorSettings:
     #: HAMMERTIME_BUS_KIND: "nats" | "memory".
     bus_kind: str
     #: HAMMERTIME_BUS_BROKERS: comma-separated NATS server URLs, meaningful
-    #: only when bus_kind == "nats" and not validated here (ADR-0013
-    #: assumption 15). An entry may carry userinfo, so no log record carries
-    #: the value itself -- `bus_endpoints()` reduces it (Amendment 2).
+    #: only when bus_kind == "nats". Every entry is checked by
+    #: `load_settings` with `hammertime.bus.nats.validate_bus_url` (ADR-0013
+    #: Amendment 4 ruling S2) -- the dataclass itself does not validate. An
+    #: entry may carry userinfo, so no log record carries the value itself
+    #: -- `bus_endpoints()` reduces it (Amendment 2).
     bus_brokers: str
     #: HAMMERTIME_STORE_KIND: "redis" | "memory".
     store_kind: str
@@ -212,16 +216,19 @@ def load_settings(env: Mapping[str, str] | None = None) -> AggregatorSettings:
             f"{_LEASE_TTL_KEY} must exceed {_MAINTENANCE_INTERVAL_KEY} "
             f"({maintenance_interval_s}), got {lease_ttl_s}"
         )
+    bus_kind = _parse_choice(
+        "HAMMERTIME_BUS_KIND",
+        source.get("HAMMERTIME_BUS_KIND", _DEFAULT_BUS_KIND),
+        allowed=_ALLOWED_BUS_KINDS,
+    )
+    bus_brokers = source.get(_BUS_BROKERS_KEY, _DEFAULT_BUS_BROKERS)
+    _validate_bus_brokers(bus_brokers)
     return AggregatorSettings(
         host=host,
         port=port,
         detection_config_path=Path(source.get("HAMMERTIME_CONFIG_PATH", _DEFAULT_CONFIG_PATH)),
-        bus_kind=_parse_choice(
-            "HAMMERTIME_BUS_KIND",
-            source.get("HAMMERTIME_BUS_KIND", _DEFAULT_BUS_KIND),
-            allowed=_ALLOWED_BUS_KINDS,
-        ),
-        bus_brokers=source.get("HAMMERTIME_BUS_BROKERS", _DEFAULT_BUS_BROKERS),
+        bus_kind=bus_kind,
+        bus_brokers=bus_brokers,
         store_kind=store_kind,
         redis_url=redis_url,
         # A set-but-empty value reaches the parser, which rejects it (item A3).
@@ -248,6 +255,24 @@ def load_settings(env: Mapping[str, str] | None = None) -> AggregatorSettings:
             ),
         ),
     )
+
+
+def _validate_bus_brokers(value: str) -> None:
+    """Refuse an entry nats-py's own parse would refuse, naming its position only.
+
+    ADR-0013 decision 3 as amended by Amendment 4 ruling S2: the value is
+    split as `NatsBus.__init__` splits it (on `,`, stripped, empties
+    dropped) and every entry goes through `validate_bus_url`, whose message
+    carries none of the entry's text -- an entry may hold a password, and a
+    `config_invalid` record must not echo it. So the process exits 2 here
+    rather than reaching nats-py, whose parse failure chains a `ValueError`
+    that repeats the token it could not cast (assumption 46, closed).
+    """
+    for index, entry in enumerate(_split_servers(value)):
+        try:
+            validate_bus_url(entry)
+        except ValueError as exc:
+            raise ValueError(f"{_BUS_BROKERS_KEY}: entry {index} is {exc}") from None
 
 
 def _parse_member_id(value: str | None) -> str:

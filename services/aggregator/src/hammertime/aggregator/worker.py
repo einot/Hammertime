@@ -124,6 +124,9 @@ class AggregatorWorker:
         metrics.bind_windows(self._claims.windows)
         self._lock = asyncio.Lock()
         self._stopping = asyncio.Event()
+        # `stop()` runs its sequence once; a later call takes the lock and
+        # returns (ADR-0013 decision 8 as amended by Amendment 4 ruling R4).
+        self._stopped = False
         self._stream: AsyncIterator[ConsumedMessage] | None = None
         self._last_commit = monotonic()
 
@@ -166,7 +169,14 @@ class AggregatorWorker:
         )
 
     async def run(self) -> None:
-        """Consume until `stop()`; the in-flight message is always finished."""
+        """Consume until `stop()`; the in-flight message is always finished.
+
+        On a wake-up in which the stop signal and a received message are
+        both complete, the message is not handed to `handle()`: it was
+        yielded, so the consumer's `close()` hands it to the next member
+        (ADR-0013 decision 8 as amended by Amendment 4 ruling R2, assumption
+        82). Handling it here would put it after the final commit.
+        """
         stream = self._stream
         if stream is None:
             raise RuntimeError("start() must run before run()")
@@ -177,8 +187,14 @@ class AggregatorWorker:
                 done, _pending = await asyncio.wait(
                     {receive_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
                 )
-                if receive_task not in done:
-                    await _cancel(receive_task)
+                if stop_task in done:
+                    if not receive_task.done():
+                        await _cancel(receive_task)
+                    else:
+                        # Completed in the same wake-up: mark its outcome
+                        # retrieved so asyncio does not report an
+                        # unretrieved exception at teardown.
+                        receive_task.exception()
                     return
                 message = receive_task.result()
                 if message is None:
@@ -197,12 +213,33 @@ class AggregatorWorker:
         consumer is *not* closed here: closing is the service's step after
         `stop()` returns, so the final acknowledgement goes out on a live
         consumer and the `nak` of whatever was fetched but never yielded
-        follows it. Idempotent, and safe before `start()`.
+        follows it.
+
+        `stop()`'s order is total (Amendment 4 rulings R2 and R4): from the
+        moment the stop flag is set, every path that could act on a shard --
+        `handle()`, `run_maintenance()`, `apply_config()`, the periodic
+        commit -- checks it under the lock and stands down, so the
+        `commit_handled()` here is the last acknowledgement this worker
+        sends. The message in hand (a `_handle` holding the lock when the
+        flag is set) is finished and covered by it; one merely waiting for
+        the lock is not in hand and takes the `UNCLAIMED` path. The sequence
+        runs once, with `release()` in a `finally` so the leases are freed
+        even when the final acknowledgement fails (the exception propagates
+        after the release); a later call -- the runner's `_stop_quietly`
+        after a crash exit, by which time the bus is closed and `ack(())`
+        would raise -- takes the lock and returns without touching the bus
+        or the store. That is what "idempotent" means for it. Safe before
+        `start()`.
         """
         self._stopping.set()
         async with self._lock:
-            await self._flush_and_ack()
-            await self._claims.release()
+            if self._stopped:
+                return
+            try:
+                await self._flush_and_ack()
+            finally:
+                self._stopped = True
+                await self._claims.release()
 
     # --- AssignmentListener (delegated to ShardClaims under the lock) ---------
 
@@ -213,8 +250,24 @@ class AggregatorWorker:
     # --- the three coroutines the periodic loops and the tests share ---------
 
     async def handle(self, message: ConsumedMessage) -> ObservationOutcome:
-        """Apply one consumed message; decision 3's outcomes, plus `REDELIVERED`."""
+        """Apply one consumed message; decision 3's outcomes, plus `REDELIVERED`.
+
+        After `stop()` has begun the outcome is `UNCLAIMED` whatever the
+        partition (ADR-0013 decision 8 as amended by Amendment 4 ruling R2):
+        the member holds no lease, so every partition is one it must not act
+        on. Not decoded, not applied, not emitted, not marked handled -- the
+        message stays unacknowledged and `close()` hands it to the next
+        member.
+        """
         async with self._lock:
+            if self._stopping.is_set():
+                logger.warning(
+                    "unclaimed_partition topic=%s partition=%d offset=%d",
+                    message.topic,
+                    message.partition,
+                    message.offset,
+                )
+                return ObservationOutcome.UNCLAIMED
             return await self._handle(message)
 
     async def run_maintenance(self) -> None:
@@ -225,8 +278,14 @@ class AggregatorWorker:
         and the sweep never runs). Decision 6's order after that is
         normative: expiring before evaluating is what turns an expired count
         into a `HotIpRemoved` in the same sweep.
+
+        After `stop()` has begun this renews nothing and sweeps nothing: it
+        returns without touching the store, the windows or the producer
+        (Amendment 3 ruling (c); Amendment 4 ruling R2).
         """
         async with self._lock:
+            if self._stopping.is_set():
+                return
             await self._claims.renew_leases()
             for window in self._claims.windows():
                 for change in window.expire_due():
@@ -257,8 +316,14 @@ class AggregatorWorker:
 
         Under the lock, so no observation is processed mid-pass and no event
         can carry the new version before the pass (spec section 47.3).
+
+        After `stop()` has begun it is a total no-op: the worker's `config`
+        is left as it was and no `config_reevaluated` is logged (Amendment 4
+        ruling R2, assumption 63).
         """
         async with self._lock:
+            if self._stopping.is_set():
+                return
             windows = self._claims.windows()
             for window in windows:
                 window.apply_config(config)
@@ -437,6 +502,10 @@ class AggregatorWorker:
         if now - self._last_commit < self._commit_interval_s:
             return
         async with self._lock:
+            if self._stopping.is_set():
+                # The commit inside `stop()` is the last acknowledgement
+                # this worker sends (Amendment 4 ruling R2, assumption 66).
+                return
             await self._flush_and_ack()
 
     async def _flush_and_ack(self) -> None:

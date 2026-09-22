@@ -266,6 +266,15 @@ class ShardClaims:
         An empty set is a `ValueError` (ruling T5): it is unreachable through
         the bus, which refuses an empty static set before calling the
         listener, and a member holding nothing must not report itself ready.
+
+        A shard is skipped only while this member holds its lease -- the
+        held-lease set is the test, not the windows (ADR-0013 decision 7 as
+        amended by Amendment 4 ruling R6). A shard whose window survived a
+        `release()` but whose lease is gone is claimed afresh: lease
+        acquired, state loaded, a new window built in place of the old one
+        (its counters are stale and its inherited set is not the store's
+        current HOT set; assumption 70); its handled position is kept, as
+        nothing ever lowers it.
         """
         if not partitions:
             raise ValueError(
@@ -273,7 +282,7 @@ class ShardClaims:
             )
         claimed: list[int] = []
         for _topic, shard in sorted(partitions):
-            if shard in self._windows:
+            if shard in self._leased:
                 continue
             owner = await self._state_store.acquire_lease(shard, self._member_id, self._lease_ttl_s)
             if owner is not None:

@@ -153,7 +153,17 @@ class AggregatorService:
         self._readiness.mark_ready()
 
     async def run(self) -> None:
-        """Serve the admin endpoints, consume, sweep and poll until `stop()`."""
+        """Serve the admin endpoints, consume, sweep and poll until `stop()`.
+
+        Reports what stopped it (ADR-0013 decision 8 as amended by Amendment
+        4 ruling R7; ADR-0009 decision 5 step 7): the exceptions of the
+        tasks that completed are collected first, then `stop()` is called
+        inside a `try` that logs `stop_failed` and appends its exception to
+        the same list, then the remaining tasks are gathered, the clients
+        closed and the first collected exception raised -- so `run_exited`
+        names the failure that stopped the service, and a `stop()` failing
+        on the same outage is reported only when nothing failed before it.
+        """
         if self._stopping.is_set():
             # stop() ran before run() got scheduled: nothing left to serve.
             return
@@ -179,13 +189,18 @@ class AggregatorService:
         failures: list[BaseException] = []
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            # Whichever of the four returned first, the rest come down with
-            # it: a worker that stopped consuming is not a service that can
-            # keep answering (decision 5 step 7).
-            await self.stop()
             failures.extend(
                 error for error in (task.exception() for task in done) if error is not None
             )
+            # Whichever of the four returned first, the rest come down with
+            # it: a worker that stopped consuming is not a service that can
+            # keep answering (decision 5 step 7). A `stop()` that fails must
+            # not mask what stopped the service (ruling R7, assumption 71).
+            try:
+                await self.stop()
+            except Exception as exc:
+                self._log.warning("stop_failed", error=str(exc))
+                failures.append(exc)
             for result in await asyncio.gather(*pending, return_exceptions=True):
                 if isinstance(result, BaseException):
                     failures.append(result)
