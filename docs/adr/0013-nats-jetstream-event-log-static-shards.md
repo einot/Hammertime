@@ -70,6 +70,15 @@ assumption 99's legacy-value guarantee is qualified for a `member_id`
 containing `/`, assumption 102's "shares the startup deadline" is
 corrected to the per-call clock ADR-0009 A1 already rules, and the
 `NatsConsumer` re-subscribe path is recorded as untested under #52. No
+decision changes in substance and no code behaviour changes); amended an
+eighth time 2026-09-22 (see "Amendment 8" — the R10 review of Amendment 7:
+Amendment 7's own correction of assumption 102 is corrected, because
+`connect_with_retry` gives up one backoff delay before its own deadline, so
+the live-twin case produces whichever of ADR-0009 A1's two `start_failed`
+records wins a race A1 rules unspecified; the same over-determined claim is
+qualified where it also stands, in Amendment 6 ruling 2(c) and in decision
+7's `on_assigned` bullet; `AggregatorService.start()`'s docstring is brief
+C11's to fix; `docs/spec/README.md`'s §22 row gains ADR-0001 Amendment 3. No
 decision changes in substance and no code behaviour changes).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
@@ -1238,6 +1247,18 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   another member is not retried. The same-instance re-acquire of the
   previous sentence is unaffected: it passes the same token and is a
   renewal.*
+  *Qualified 2026-09-22 (Amendment 8 ruling 2): "the deadline expires" is
+  loose, and nothing may be read into which deadline it is.
+  `connect_with_retry` stops one backoff delay short of its own deadline
+  (ADR-0009 A1 step 4) while `run_service`'s outer `asyncio.wait_for` fires
+  at the full `HAMMERTIME_STARTUP_TIMEOUT_S`, so either can end the wait —
+  and therefore `start_failed` carries either `reason=startup_timeout` or
+  an `error=` naming the last `ShardHeldBySameMemberError`. A1 rules that
+  race unspecified. What holds in both cases: the wait is over within
+  `HAMMERTIME_STARTUP_TIMEOUT_S` of `start()` being entered, the exit code
+  is 1, and the `shard_held_by_same_member` and `dependency_unavailable
+  dependency=shard_leases` records that carry the diagnosis are already in
+  the log.*
 * `ShardClaims.renew_leases()` calls `acquire_lease` for every held shard;
   `AggregatorWorker.run_maintenance()` calls it **first**, before the
   expiry sweep, under the worker lock, so a member that has lost a shard
@@ -3883,6 +3904,16 @@ the insertion point named:
    `shard_claimed`, and becomes ready without a process exit. A live twin
    never lets go: the deadline expires, the last `ShardHeldBySameMemberError`
    is re-raised, `run_service` logs `start_failed` and the process exits 1.
+   *Qualified 2026-09-22 (Amendment 8 ruling 2): that sentence names one of
+   two possible endings as the ending. `connect_with_retry` re-raises one
+   backoff delay before its own deadline (ADR-0009 A1 step 4) and
+   `run_service`'s outer `asyncio.wait_for` fires at the full
+   `HAMMERTIME_STARTUP_TIMEOUT_S`, so a live twin ends the start with
+   `start_failed` carrying either the re-raised error or
+   `reason=startup_timeout` — A1 rules which one unspecified, and the
+   ADR-0009 record table's `start_failed` row admits both. The exit code is
+   1 and the diagnosis is in the preceding `shard_held_by_same_member` and
+   `dependency_unavailable dependency=shard_leases` records either way.*
    A refusal by another member is not in the transient tuple and exits 1
    at once, as today. `AggregatorService.__init__` gains `sleep` and
    `monotonic` keywords (defaults `asyncio.sleep`, `time.monotonic`)
@@ -4132,6 +4163,29 @@ continues the ADR's list):
      the startup timeout; no shipped entry point does — `__main__` goes
      through `run_service`, and `build_service`'s injected-transport shape
      is for tests — so nothing is changed in the code for it (ruling 5).*
+     *Corrected again 2026-09-22 (Amendment 8 ruling 1, on the R10 review's
+     finding 1): the note above is right that each call starts its own
+     clock and wrong about what the log then shows. `connect_with_retry`
+     gives up one backoff delay **before** its own deadline — `if remaining
+     <= delay: raise`, which is ADR-0009 A1 step 4's "the sleep that would
+     overrun the deadline is never started" — so on the default schedule it
+     re-raises at the first refusal with under 5 s of its own budget left,
+     about 57.5 s after its first attempt if the attempts themselves cost
+     nothing, while the outer `asyncio.wait_for` fires a full 60 s after
+     `start()` was entered. Which record appears therefore turns on how
+     long the `bus` and `store` legs took: under about 2.5 s between them
+     and the re-raise wins, over it and the outer wait does. That is
+     exactly the race ADR-0009 A1 declines to specify ("Which deadline
+     fires first is unspecified ... either can win ... a test must not
+     depend on which"), and A1's `start_failed` row admits both shapes. So
+     neither this assumption nor Amendment 7's note may name one: what is
+     guaranteed is that `start()` is bounded by the outer wait at
+     `HAMMERTIME_STARTUP_TIMEOUT_S` from its entry, that the process exits
+     1 with a `start_failed` record, and that the diagnosis is in the
+     `shard_held_by_same_member` and `dependency_unavailable
+     dependency=shard_leases` records that precede it in either case. An
+     operator greps for those two, not for a particular `start_failed`
+     field (`docs/runbook.md`'s lease entry already reads that way).*
 103. **`instance_id` joins the aggregator's `starting` record.** ADR-0009
      A7's row lists ingest's fields only (its Amendment 5 assumption), and
      this ADR records the aggregator's, so no ADR-0009 edit follows.
@@ -4467,7 +4521,16 @@ Every edit outside this section, with the insertion point named:
    `ShardHeldBySameMemberError`; the `shard_held_by_same_member` and
    `dependency_unavailable dependency=shard_leases` records are in the log
    in either case, so what the outer deadline costs is the `error=` field
-   of one record, not the diagnosis. A caller driving `start()` directly
+   of one record, not the diagnosis. *Corrected 2026-09-22 (Amendment 8
+   ruling 1): the clause from "but its record is" to "not the diagnosis"
+   is wrong to name a record at all, and wrong in the direction it names —
+   `connect_with_retry` gives up one backoff delay before its own deadline
+   (ADR-0009 A1 step 4), so with a bus and store that answer quickly it is
+   the re-raise that reaches `run_service` first. Either can win, A1 rules
+   which unspecified, and assumption 102 above carries the corrected text.
+   The rest of this ruling — the per-call clock, `run_service`'s
+   `wait_for` as the containment of `start()` as a whole, and the decision
+   to change no code (assumptions 117 and 118) — stands.* A caller driving `start()` directly
    has no outer deadline and could wait three times the timeout; no
    shipped entry point does that — `__main__` goes through `run_service`
    and `build_service`'s injected-transport shape is for tests — so it is
@@ -4604,3 +4667,256 @@ the "Which deadline fires first is unspecified" assumption);
 and the architect's brief for this ruling, both as relayed by the
 top-level session. The gate was reported green by the session (1947
 passed, 8 skipped; ruff, ruff format, mypy clean) and was not run here.
+
+## Amendment 8 (2026-09-22) — the R10 review of Amendment 7: a correction that over-determined the outcome, and the places the opposite claim still stood
+
+Why: Amendment 7 ruling 5 corrected assumption 102's "shares the startup
+deadline" — rightly — and then said what the live-twin case logs:
+`start_failed reason=startup_timeout` from `run_service`'s outer wait,
+"not the re-raised last `ShardHeldBySameMemberError`". That is wrong twice
+over. It is wrong as a prediction, because `connect_with_retry` gives up
+one backoff delay before its own deadline, so with a bus and store that
+answer quickly the re-raise is what normally reaches `run_service` first;
+and it is wrong in kind, because ADR-0009 A1 — the ruling Amendment 7
+cited as governing — says in terms that *which deadline fires first is
+unspecified* and that a test must not depend on it. The R10 review found
+it, the top-level session verified the give-up condition in
+`runtime.py`, and this amendment rules the text. It also rules the other
+places the same over-determined claim stands (in the other direction) and
+the one index row Amendment 7's sync left behind. Nothing about the
+mechanism changes, and no store, bus or aggregator code change follows;
+one docstring is corrected through a `coder` brief, since it is not this
+ADR's to edit.
+
+The arithmetic, for the record, using the shipped defaults and ignoring
+what the attempts themselves cost. `connect_with_retry` sets `deadline =
+monotonic() + 60` on entry and, after each refusal, re-raises when
+`deadline - monotonic() <= delay`, where `delay` is the sleep it would
+take next (0.5 doubling to a 5 s cap). With sleeps 0.5, 1, 2, 4, 5, 5,
+... the attempts fall at 0, 0.5, 1.5, 3.5, 7.5, 12.5, ... and the first
+one with 5 s or less of budget left is at 57.5 s: the helper re-raises
+there, 2.5 s before its own deadline. `run_service`'s
+`asyncio.wait_for(service.start(), 60)` fires 60 s after `start()` was
+entered, and the `shard_leases` call is the third of three, so it starts
+its clock after the `bus` and `store` legs have returned. The inner
+re-raise therefore wins whenever those two legs together take less than
+about 2.5 s, and the outer wait wins when they take longer. Both are exit
+1 with a `start_failed` record; A1 rules the race unspecified, and
+ADR-0009's log-record table already admits both shapes of the record.
+
+Every edit outside this section, with the insertion point named:
+
+* **Status line.** Gained the "amended an eighth time 2026-09-22" clause.
+* **Assumption 102.** Appended the italic correction of Amendment 7's own
+  note (ruling 1). This is the site that carries the settled text.
+* **Amendment 7 ruling 5.** Appended the italic correction of its
+  "but its record is ..." clause (ruling 1). The R10 review named
+  assumption 102 and three other sites but not this one; it is the same
+  sentence and is corrected with them.
+* **Amendment 6 ruling 2(c).** Appended the italic qualification of "the
+  deadline expires, the last `ShardHeldBySameMemberError` is re-raised,
+  `run_service` logs `start_failed`" (ruling 2).
+* **Decision 7, the `on_assigned` bullet.** Appended the italic
+  qualification of "the deadline expires, and the process exits 1 with
+  `start_failed`" (ruling 2).
+* **Outside this file** (same change set): `docs/spec/README.md`'s §22 row
+  cites `docs/adr/0001` as "(Amendments 1, 2, 3)" where it said
+  "(Amendments 1, 2)" (ruling 3). Nothing else outside this file changes:
+  `AggregatorService.start()`'s docstring is brief C11's (ruling 2),
+  `docs/spec/hammertime_spec_1.md` §20, `docs/runbook.md`, `CHANGES` and
+  every test are unchanged, each for a reason given in the ruling that
+  looked at it.
+
+**Rulings.** Numbered 1-4: the text of the correction, the other sites
+that carry the claim, the index row, then `CHANGES`.
+
+1. **The outcome is one of two records and nothing may depend on which.**
+   The correct text — now at assumption 102, and the text any other site
+   is measured against — says only what is guaranteed: a live twin that
+   keeps renewing ends the start within `HAMMERTIME_STARTUP_TIMEOUT_S` of
+   `start()` being entered, the process exits 1, a `start_failed` record
+   is logged, and the diagnosis is in the `shard_held_by_same_member`
+   (WARNING, one per refused attempt) and `dependency_unavailable
+   dependency=shard_leases` records that precede it in either case.
+   Whether that `start_failed` carries `reason=startup_timeout` and
+   `timeout_s` from `run_service`'s outer `asyncio.wait_for`, or `error=`
+   naming the re-raised `ShardHeldBySameMemberError`, is the race ADR-0009
+   A1 declines to specify. Amendment 7's correction named the second as
+   impossible when it is the one that normally happens; the original
+   assumption 102 named it as certain when the outer wait can take it.
+   Both over-determined the same sentence in opposite directions, and the
+   fix for both is to stop at the guarantee. A caller that drives
+   `start()` directly — no shipped entry point does; `__main__` goes
+   through `run_service` — has no outer wait at all, and what it sees is
+   the re-raised `ShardHeldBySameMemberError`, which is
+   `connect_with_retry`'s own documented contract (A1 step 4) and not a
+   fact about the race. *Rejected, with what each costs.* **Make the
+   outcome determinate in the code** (pass `timeout_s` to the
+   `shard_leases` call, or thread one deadline through `start()`): it
+   would buy a greppable record and a testable outcome, at the price of
+   the aggregator having a startup mechanism neither ADR-0009 A1 nor
+   `IngestService` has — Amendment 7 assumption 117 weighed and refused
+   this, and nothing in R10 changes that; if a later epic wants a
+   determinate record it belongs in ADR-0009, applied to every service at
+   once. **Say "normally the re-raise" and leave it there**: true today
+   and false the first time a deployment's NATS handshake is slow, which
+   is precisely the reading A1 forbids.
+2. **The same claim at three other sites: two ADR sites are qualified
+   here, the docstring goes to `coder`, and four more sites that R10 did
+   not name are ruled unchanged.** The test applied to each is whether it
+   names one of the two `start_failed` shapes as *the* shape.
+   * *Amendment 6 ruling 2(c)* said "the deadline expires, the last
+     `ShardHeldBySameMemberError` is re-raised, `run_service` logs
+     `start_failed` and the process exits 1". It names one shape;
+     qualified in place.
+   * *Decision 7's `on_assigned` bullet* says only "a live twin's never
+     lapse, the deadline expires, and the process exits 1 with
+     `start_failed`" — it names no shape, so R10's "the identical claim"
+     overstates what is there. It is still qualified, for the weaker
+     defect: "the deadline expires" invites the inference that there is
+     one deadline and that it is reached, when the helper stops short of
+     its own and `run_service`'s is a different instant. This bullet is
+     the canonical statement a reader reaches first, which is why it is
+     worth the note rather than being left as merely under-determined.
+   * *`AggregatorService.start()`'s docstring*, in the aggregator's
+     `service.py`, ends "the startup deadline
+     expires, the last `ShardHeldBySameMemberError` is re-raised, and the
+     process exits 1 with `start_failed`". It names one shape and is
+     corrected, but this ADR may not edit code: brief C11 carries the
+     exact replacement.
+   * *Unchanged, with the reason.* Spec §20's note ("fails the start only
+     if the holder is still renewing when that deadline expires") and
+     `docs/runbook.md`'s lease entry ("the wait ends at
+     `HAMMERTIME_STARTUP_TIMEOUT_S` with `start_failed` and exit 1") name
+     no shape and describe the bound, which is what each register needs;
+     decision 7's "Failure shape, summarised" italic says "or
+     `start_failed` and exit 1 at the startup deadline while a live twin
+     keeps renewing", likewise. And the aggregator's own
+     `test_service.py` quotes ruling 2(c) in its module docstring but
+     elides the clause corrected here — its quotation ends at "is
+     re-raised ..." — while the comment in
+     `test_a_live_twin_is_retried_until_the_startup_deadline_and_then_raises`
+     already draws the right line ("what `start()` owes the runner is the
+     last `ShardHeldBySameMemberError`"), which is `start()`'s own
+     contract and not the race. No test changes, and no `test-author`
+     brief follows from this amendment (assumption 126).
+3. **`docs/spec/README.md`'s §22 row gains ADR-0001 Amendment 3, for the
+   reason the §20/21 row did.** Amendment 3's only content edit is the
+   sentence inside Amendment 2 item 1 — the replacement of clause 1, which
+   is the single-ownership clause §22's note draws on when it says
+   overlapping static sets are detected because "a second live owner of a
+   shard refuses to start". A same-member second process is now such an
+   owner, so the amendment bears on §22 exactly as it bears on §20.
+   Amendment 7 assumption 121 gave no reason for stopping at the §20/21
+   row and there was none; R10 is right that the judgment was not
+   reviewable as written. §22's own text is unchanged: "a second live
+   owner of a shard refuses to start" stays true of the live twin, which
+   fails its start after the wait (ADR-0001 Amendment 3 makes the same
+   point about its own "promised" blockquote).
+4. **`CHANGES` is unchanged.** Every edit here and in brief C11 brings a
+   document or a docstring into line with behaviour that already ships and
+   is not altered. No feature, default, config key, wire format or event
+   schema moves, and an operator has nothing to do differently; `CLAUDE.md`
+   lists docstring and documentation edits with no observable effect among
+   the things not to record. The two lines Amendment 6 ruling 6 specified
+   stay as they are and still describe what ships.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+123. **An amendment section, not a bare dated note.** A dated note inside
+     assumption 102's dated note, with no section stating the ruling,
+     would leave the settled answer readable only by reconstructing two
+     superseded claims; and the change set spans five sites in this file
+     (the status line, assumption 102, Amendment 7 ruling 5, Amendment 6
+     ruling 2(c) and decision 7's `on_assigned` bullet) plus one index
+     row, which is what an amendment section is for. The cost
+     is an eighth clause on an already long status line and a third
+     layer of note at assumption 102. Amendment 7 assumption 114's
+     convention — superseded text kept in place with a dated note, never
+     rewritten — is followed rather than reopened.
+124. **The 57.5 s and 2.5 s figures are an illustration, not a
+     guarantee.** They assume the shipped defaults (60 s startup timeout,
+     0.5 s doubling to a 5 s cap) and attempts that cost nothing; a real attempt
+     is a full `subscribe()` with store round trips, so the attempt times
+     drift later and the crossover moves. They are stated because "one
+     backoff delay early" is too abstract to check, and they are stated
+     as arithmetic a reader can redo, not as a bound anything may rely
+     on. Nothing in ruling 1 depends on the numbers.
+125. **The test for which sites needed an edit is "does it name one of
+     the two `start_failed` shapes as the shape".** Chosen rather than
+     "does it mention the deadline", which would have pulled in the spec,
+     the runbook and two more italics in decision 7 for no gain and
+     would have put log-record detail into a normative spec section that
+     Amendment 7 assumption 115 deliberately kept free of it. Decision
+     7's `on_assigned` bullet is edited despite failing this test, for
+     the reason ruling 2 gives; that is the one judgment call in the set.
+126. **No test changes and no `test-author` brief.** Read before ruling:
+     `test_a_live_twin_is_retried_until_the_startup_deadline_and_then_raises`
+     calls `service.start()` directly, so no outer `wait_for` exists in
+     it and `pytest.raises(ShardHeldBySameMemberError)` is an assertion
+     about `connect_with_retry`'s contract, not about the race. Its
+     docstring quotation elides the corrected clause. So no test asserts
+     which deadline wins, and A1 says none may — if a later test wants to
+     cover the `run_service` path, it must assert exit 1 and the two
+     preceding records, never the `start_failed` fields.
+127. **The §22 row gains ADR-0001's amendment only.** ADR-0013's own
+     Amendment 6 also bears on that sentence, but the row cites this ADR
+     by decision ("decisions 4, 5, 7, 8") as the §20/21 row does
+     ("decisions 1, 6, 7"), and decision 7 is already cited; adding
+     amendment numbers to the ADR-0013 citation would be a new convention
+     for that column, applied to one row. Left for whoever decides the
+     column should cite amendments throughout.
+128. **Brief C11 is the whole of the code change, and it is a docstring.**
+     `AggregatorService.start()`'s signature and body stand as they are;
+     nothing about the wait, the transient tuple or the order of the three
+     `connect_with_retry` calls moves. If a reviewer reads the replacement
+     as changing behaviour, that is a finding, not an intended effect.
+129. **Whether #90 can now close is the session's call, not this ADR's.**
+     The architect has no GitHub access and has not read the issue; what
+     this amendment can say is that after C11 lands, no document or
+     docstring in the repository states a same-member outcome this
+     amendment contradicts, which was the residual R10 named. The #52
+     case recorded by Amendment 7 assumption 120 (the `NatsConsumer`
+     re-subscribe path) is still owed to that issue and is not this
+     round's to add.
+
+Read on 2026-09-22 for Amendment 8: no external sources, and none were
+fetched. Nothing ruled here turns on how an external system behaves — the
+whole of it is this repository's own code and its own ADRs. Where an
+earlier amendment's Compose, Kubernetes or NATS citations are relied on,
+they are relied on unchanged and were not re-fetched.
+
+Repository facts checked for this amendment, each opened and read in the
+working tree of `claude/gallant-pasteur-fkehtc` (reported tip 7a6d775; the
+architect has no shell and did not verify the hash, the tree state or the
+gate):
+`packages/hammertime-core/src/hammertime/core/runtime.py` —
+`connect_with_retry`'s `deadline = monotonic() + (startup_timeout_s() if
+timeout_s is None else timeout_s)` on entry, its `if remaining <= delay:
+raise` after the `dependency_unavailable` record, `RETRY_INITIAL_DELAY_S =
+0.5` and `RETRY_MAX_DELAY_S = 5.0`, `startup_timeout_s()` reading
+`os.environ`, `DEFAULT_STARTUP_TIMEOUT_S = 60.0`, and `_supervise`'s
+`asyncio.wait_for(service.start(), startup_timeout)` with its `except
+TimeoutError` logging `start_failed reason=startup_timeout timeout_s=` and
+its `except Exception` logging `start_failed error= exc_info=True`;
+`services/aggregator/src/hammertime/aggregator/service.py` — `start()`'s
+docstring and its three `connect_with_retry` calls in the order `bus`,
+`store`, `shard_leases`, none passing `timeout_s`;
+`services/aggregator/src/hammertime/aggregator/__main__.py` (`main()` goes
+through `run_service` with no `env=`);
+`services/aggregator/src/hammertime/aggregator/tests/test_service.py` —
+the module docstring's quotation of ruling 2(c) and
+`TestStartWaitsOutAHolderOfTheSameMember`'s three tests;
+`docs/adr/0009-service-process-lifecycle.md` — A1's "The schedule,
+exactly" steps 1-5, the "Which deadline fires first is unspecified"
+assumption, and the log-record table's `start_failed` row;
+`docs/adr/0013-...` — decision 7's `on_assigned` bullet, its
+Configuration and "Failure shape, summarised" italics, Amendment 6 ruling
+2(c), Amendment 7 in full and assumptions 99-122;
+`docs/adr/0001-single-logical-trie.md` — the status line, Amendment 2 item
+1 with the inserted sentence, and Amendment 3;
+`docs/spec/hammertime_spec_1.md` §20 and §22; `docs/spec/README.md`'s §20/21
+and §22 rows; `docs/runbook.md`'s "Aggregator will not start" entry; and
+the R10 review report and this round's brief, both as relayed by the
+top-level session.
