@@ -34,13 +34,37 @@ the iterable form only says "each stripped").
 Assumption: the single-entry property test reads "an iterable is taken entry
 by entry" as one result element per input element, so `bus_endpoints([s])`
 has length 1 for any `s`; the element's *value* is not asserted there.
+
+Amendment 4 (2026-09-22) added two italic paragraphs after the `bus_endpoints`
+paragraph, each pinned by the class named after it:
+
+* "An `@` outside the authority" (rulings R8 and S2): "an entry in which
+  `urlsplit` leaves an `@` in the path, query or fragment is rendered as the
+  fixed string `<unparseable>`, whatever its authority holds", with five
+  "Additional examples, which tests pin" and "The seven examples above are
+  unchanged" (`TestAtSignOutsideTheAuthority`; `PINNED_EXAMPLES` is untouched).
+* "The same URL reaches a record by a second path, closed by
+  `validate_bus_url`" (ruling S2): "`validate_bus_url(url: str) -> None`,
+  re-exported from `hammertime.bus`, which normalises the entry as nats-py
+  does (an entry containing `://` as given; otherwise `nats://<entry>`) and
+  raises `ValueError` when (i) `urlsplit` refuses it, (ii) `SplitResult.port`
+  raises -- the very cast nats-py performs -- or (iii) an `@` is left outside
+  the authority (the case above); the message names none of the entry's
+  text", and "no value that connected before is refused now"
+  (`TestValidateBusUrl`).
+
+Needle note for the `/`, `?`, `#` cases of `test_no_userinfo_fragment_survives`:
+the ruled rendering `<unparseable>` itself contains the substring `pa`, so the
+password is looked for as its whole split halves (`pa/ss`, `pa?ss`, `pa#ss`)
+and as `ss`, never as the bare `pa` that the fixed string would always match.
 """
 
 from __future__ import annotations
 
 import pytest
 from hammertime.bus import bus_endpoints as reexported_bus_endpoints
-from hammertime.bus.nats import bus_endpoints
+from hammertime.bus import validate_bus_url as reexported_validate_bus_url
+from hammertime.bus.nats import bus_endpoints, validate_bus_url
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -55,11 +79,70 @@ PINNED_EXAMPLES: list[tuple[str, list[str]]] = [
     ("nats://[::1", ["<unparseable>"]),
 ]
 
+# Decision 3 as amended 2026-09-22 (Amendment 4 rulings R8 and S2), "Additional
+# examples, which tests pin", in the ADR's order. "The seven examples above are
+# unchanged."
+AMENDMENT_4_EXAMPLES: list[tuple[str, list[str]]] = [
+    ("nats://user:pa/ss@nats:4222", ["<unparseable>"]),
+    ("nats://user:pa?ss@nats:4222", ["<unparseable>"]),
+    ("nats://user:pa#ss@nats:4222", ["<unparseable>"]),
+    ("nats://user:p@/ss@nats:4222", ["<unparseable>"]),
+    ("nats://nats:4222/", ["nats://nats:4222"]),
+]
+
+# `validate_bus_url` (Amendment 4 ruling S2): "no value that connected before
+# is refused now" -- every single-entry input of the seven pinned examples,
+# plus a bare scheme-less host, which nats-py normalises to `nats://nats`.
+ACCEPTED_URLS: list[str] = [
+    "nats://nats:4222",
+    "nats://user:s3cret@nats:4222",
+    "nats://s3cret-token@nats:4222",
+    "tls://user:s3cret@[::1]:4222/?x=1",
+    "user:s3cret@nats:4222",
+    "nats",
+]
+
+# The three refusals of ruling S2: (i) `urlsplit` refuses it; (ii)
+# `SplitResult.port` raises; (iii) an `@` is left outside the authority. The
+# userinfo tokens (`usr7`, `svc7`, `s3cr`, `et@`, `s3cret`) are chosen so that
+# none is a substring of the fixed refusal text or of ordinary English.
+REFUSED_URLS: list[str] = [
+    "nats://[::1",
+    "nats://usr7:s3cr/et@nats:4222",
+    "nats://usr7:s3cr?et@nats:4222",
+    "nats://usr7:s3cr#et@nats:4222",
+    "nats://usr7:s3cr@/et@nats:4222",
+    "nats://usr7:s3cret/0",
+    "nats://svc7:s3cr@x/et@nats:4222",
+]
+
+# Every token of the refused entries above that a message must not echo -- the
+# username, each half of the password, the whole password, the host: "the
+# message names none of the entry's text". Paired below with only the entries
+# that actually contain them: a needle absent from the entry proves nothing.
+REFUSED_URL_FRAGMENTS: tuple[str, ...] = (
+    "usr7",
+    "svc7",
+    "s3cr",
+    "et@",
+    "s3cret",
+    "::1",
+    "nats:4222",
+)
+REFUSED_URL_ECHO_PAIRS: list[tuple[str, str]] = [
+    (url, fragment) for url in REFUSED_URLS for fragment in REFUSED_URL_FRAGMENTS if fragment in url
+]
+
 
 class TestReExport:
     def test_hammertime_bus_re_exports_the_same_function(self) -> None:
         # Decision 3: "it is re-exported from `hammertime.bus`".
         assert reexported_bus_endpoints is bus_endpoints
+
+    def test_hammertime_bus_re_exports_validate_bus_url_too(self) -> None:
+        # Ruling S2: "`validate_bus_url(url: str) -> None`, re-exported from
+        # `hammertime.bus`".
+        assert reexported_validate_bus_url is validate_bus_url
 
 
 class TestPinnedExamples:
@@ -76,6 +159,57 @@ class TestPinnedExamples:
         assert bus_endpoints(["nats://[::1", "nats://user:s3cret@[::1"]) == [
             "<unparseable>",
             "<unparseable>",
+        ]
+
+
+class TestAtSignOutsideTheAuthority:
+    """Decision 3 as amended (Amendment 4 rulings R8 and S2): "`urlsplit` ends the
+    authority at the first `/`, `?` or `#` after the `//` ..., so a userinfo
+    containing one of them unencoded leaves its `@` -- and a fragment of the
+    password -- outside the authority, where the last-`@` rule cannot see it".
+    "Ruled: an entry in which `urlsplit` leaves an `@` in the path, query or
+    fragment is rendered as the fixed string `<unparseable>`, whatever its
+    authority holds." Assumption 72."""
+
+    @pytest.mark.parametrize(("servers", "expected"), AMENDMENT_4_EXAMPLES)
+    def test_additional_example(self, servers: str, expected: list[str]) -> None:
+        # The five "Additional examples, which tests pin", each exact.
+        assert bus_endpoints(servers) == expected
+
+    def test_the_seven_original_examples_are_unchanged(self) -> None:
+        # "The seven examples above are unchanged."
+        for servers, expected in PINNED_EXAMPLES:
+            assert bus_endpoints(servers) == expected
+
+    def test_an_at_sign_inside_and_outside_the_authority_is_unparseable(self) -> None:
+        # Assumption 72: "an entry with an `@` inside the authority *and* one
+        # outside (`nats://user:p@/ss@nats:4222`) is `<unparseable>` too,
+        # although the last-`@` rule alone would render `nats://` for it,
+        # because the outside `@` is the signal".
+        assert bus_endpoints("nats://user:p@/ss@nats:4222") == ["<unparseable>"]
+        assert bus_endpoints("nats://user:p@/ss@nats:4222") != ["nats://"]
+
+    def test_a_path_without_an_at_sign_is_merely_dropped(self) -> None:
+        # "`nats://nats:4222/` -> `nats://nats:4222` (a path without an `@` is
+        # still merely dropped)".
+        assert bus_endpoints("nats://nats:4222/") == ["nats://nats:4222"]
+        assert bus_endpoints("nats://nats:4222/some/path?x=1#frag") == ["nats://nats:4222"]
+
+    def test_the_rendering_carries_nothing_of_the_entry(self) -> None:
+        # "rendered as the fixed string `<unparseable>`, whatever its
+        # authority holds": neither the authority (`user:pa`, which the rule
+        # as written would have rendered) nor the host after the stray `@`.
+        rendered = bus_endpoints("nats://user:pa/ss@nats:4222")
+
+        assert rendered == ["<unparseable>"]
+        assert "user" not in rendered[0]
+        assert "nats:4222" not in rendered[0]
+
+    def test_a_list_entry_is_ruled_the_same_way(self) -> None:
+        # One `<unparseable>` per bad entry, alongside a good one.
+        assert bus_endpoints(["nats://user:pa?ss@nats:4222", "nats://a:4222"]) == [
+            "<unparseable>",
+            "nats://a:4222",
         ]
 
 
@@ -142,6 +276,25 @@ class TestNoUserinfoInTheResult:
                 ("u:p", "p", "@"),
                 id="list-with-password-p",
             ),
+            # Amendment 4 ruling R8: the password split by `urlsplit` at an
+            # unencoded `/`, `?` or `#`. The bare `pa` is not a needle here
+            # because the ruled rendering `<unparseable>` contains it (module
+            # docstring); the halves around the separator, `ss` and `user` are.
+            pytest.param(
+                "nats://user:pa/ss@nats:4222",
+                ("pa/ss", "ss", "user", "@"),
+                id="slash-in-password",
+            ),
+            pytest.param(
+                "nats://user:pa?ss@nats:4222",
+                ("pa?ss", "ss", "user", "@"),
+                id="question-mark-in-password",
+            ),
+            pytest.param(
+                "nats://user:pa#ss@nats:4222",
+                ("pa#ss", "ss", "user", "@"),
+                id="hash-in-password",
+            ),
         ],
     )
     def test_no_userinfo_fragment_survives(self, servers: str, needles: tuple[str, ...]) -> None:
@@ -154,6 +307,87 @@ class TestNoUserinfoInTheResult:
         # "the part of the authority after its **last** `@`": an `@` inside the
         # password does not move the boundary left.
         assert bus_endpoints("nats://user:p@ss@nats:4222") == ["nats://nats:4222"]
+
+
+class TestValidateBusUrl:
+    """Decision 3 as amended (Amendment 4 ruling S2): "The same URL reaches a record
+    by a second path, closed by `validate_bus_url`" -- nats-py's own parse of
+    `nats://user:pa/ss@nats:4222` raises a `ValueError` echoing the port token,
+    chained into `start_failed`. "So `hammertime.bus.nats` gains
+    `validate_bus_url(url: str) -> None` ... which normalises the entry as
+    nats-py does ... and raises `ValueError` when (i) `urlsplit` refuses it,
+    (ii) `SplitResult.port` raises -- the very cast nats-py performs -- or (iii)
+    an `@` is left outside the authority ...; the message names none of the
+    entry's text." "The validator checks only what nats-py's own parse would
+    refuse plus (iii), so no value that connected before is refused now."
+    Assumption 74."""
+
+    @pytest.mark.parametrize("url", ACCEPTED_URLS)
+    def test_a_url_that_connected_before_is_accepted(self, url: str) -> None:
+        # `validate_bus_url` is declared `-> None`: "accepted" is exactly that
+        # the call raises nothing (its result is not bound or compared).
+        validate_bus_url(url)
+
+    def test_a_scheme_less_entry_is_normalised_as_nats_py_does(self) -> None:
+        # "an entry containing `://` as given; otherwise `nats://<entry>`":
+        # `user:s3cret@nats:4222` is read as `nats://user:s3cret@nats:4222`,
+        # whose port is `4222`, and is accepted -- not read as scheme `user`.
+        validate_bus_url("user:s3cret@nats:4222")
+        validate_bus_url("nats:4222")
+
+    @pytest.mark.parametrize("url", REFUSED_URLS)
+    def test_a_url_nats_py_would_refuse_or_echo_is_a_value_error(self, url: str) -> None:
+        with pytest.raises(ValueError):
+            validate_bus_url(url)
+
+    def test_an_unbalanced_bracket_is_refused(self) -> None:
+        # (i) "`urlsplit` refuses it" -- `ValueError: Invalid IPv6 URL`.
+        with pytest.raises(ValueError):
+            validate_bus_url("nats://[::1")
+
+    def test_a_port_that_is_not_an_integer_is_refused(self) -> None:
+        # (ii) "`SplitResult.port` raises -- the very cast nats-py performs":
+        # the ADR-0009 A12 item 4 hazard, `redis://user:secret/0`, in its NATS
+        # form. There is no stray `@` here, so only the port cast can refuse it.
+        with pytest.raises(ValueError):
+            validate_bus_url("nats://user:secret/0")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "nats://user:pa/ss@nats:4222",
+            "nats://user:pa?ss@nats:4222",
+            "nats://user:pa#ss@nats:4222",
+            "nats://user:p@/ss@nats:4222",
+            "nats://svc:pa@x/ss@nats:4222",
+        ],
+    )
+    def test_an_at_sign_outside_the_authority_is_refused(self, url: str) -> None:
+        # (iii) "an `@` is left outside the authority (the case above)" -- the
+        # R8 signature, refused before nats-py can echo anything of it.
+        with pytest.raises(ValueError):
+            validate_bus_url(url)
+
+    @pytest.mark.parametrize(("url", "fragment"), REFUSED_URL_ECHO_PAIRS)
+    def test_the_message_names_none_of_the_entrys_text(self, url: str, fragment: str) -> None:
+        # "the message names none of the entry's text": not the username, not
+        # the password or any half of it, not the host, not the whole value.
+        assert fragment in url  # a needle absent from the entry would prove nothing
+        with pytest.raises(ValueError) as excinfo:
+            validate_bus_url(url)
+
+        message = str(excinfo.value)
+        assert fragment not in message, f"{fragment!r} echoed in {message!r}"
+        assert url not in message
+
+    def test_the_message_does_not_echo_the_port_token(self) -> None:
+        # The chained text ruling S2 exists to keep out of `start_failed`:
+        # `"Port could not be cast to integer value as 's3cr'"`.
+        with pytest.raises(ValueError) as excinfo:
+            validate_bus_url("nats://usr7:s3cr/et@nats:4222")
+
+        assert "'s3cr'" not in str(excinfo.value)
+        assert "s3cr" not in str(excinfo.value)
 
 
 # --- never raises (decision 3: "The function never raises") ---------------------------

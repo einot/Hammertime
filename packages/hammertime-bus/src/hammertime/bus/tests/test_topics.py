@@ -64,6 +64,21 @@ below), written from that decision's text alone:
   table are therefore now pinned literals too -- the presence-by-substring
   tests above are kept as they were because they still hold, and the
   literal table is asserted alongside them rather than instead of them.
+* `TopicSpec.partition_of(subject: str) -> int | None` (added 2026-09-22,
+  Amendment 4 ruling S3; `TestPartitionOf` below): "`p` when `subject ==
+  self.subject(p)` for some `p >= 0` -- the canonical decimal form, so
+  `<name>.7` is `7` and `<name>.07`, `<name>.-1`, `<name>.x`, `<name>.7.8`
+  and `<name>` are all `None` -- and nothing else; it is what `NatsConsumer`
+  uses to read a delivered message's partition from its subject, and a
+  `None` is a malformed message at the transport (decision 5, as amended)".
+  Assumption 78: "Only the canonical decimal token is a partition; `07` and
+  `+7` are not, although `int()` accepts them, because `subject(p)` never
+  produces them ... Whether the parsed partition is below the topic's count
+  is not checked, as decision 3 says `NatsConsumer` accepts any
+  non-negative partition." Decision 5 (as amended) says only "the pure
+  helpers (`partition_of`, `partition_for`) are unit-tested; the
+  term-and-continue path is the integration job's (#52)", so nothing here
+  touches a consumer.
 """
 
 from __future__ import annotations
@@ -74,6 +89,8 @@ import pytest
 from hammertime.bus.topics import TOPICS, partition_for
 from hammertime.core.addressing.address import Address
 from hammertime.core.events.models import HotIpAdded, HotIpRemoved, Observation, PrefixStatsChanged
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 HOT_IP_TOPIC = "hammertime.hot-ip.v1"
 
@@ -354,3 +371,143 @@ class TestJetStreamNaming:
 
     def test_stream_names_are_distinct(self) -> None:
         assert len({TOPICS[name].stream_name for name, _, _ in STREAM_TABLE}) == len(STREAM_TABLE)
+
+
+class TestPartitionOf:
+    """ADR-0013 decision 1 as amended (Amendment 4 ruling S3): `partition_of(subject)`
+    is "`p` when `subject == self.subject(p)` for some `p >= 0` -- the canonical
+    decimal form ... -- and nothing else"."""
+
+    @pytest.mark.parametrize(("name", "stream_name", "partitions"), STREAM_TABLE)
+    def test_every_partition_of_the_topic_round_trips(
+        self, name: str, stream_name: str, partitions: int
+    ) -> None:
+        spec = TOPICS[name]
+
+        for p in range(partitions):
+            assert spec.partition_of(spec.subject(p)) == p
+
+    @pytest.mark.parametrize(("name", "stream_name", "partitions"), STREAM_TABLE)
+    def test_a_partition_beyond_the_topics_count_still_parses(
+        self, name: str, stream_name: str, partitions: int
+    ) -> None:
+        # Assumption 78: "Whether the parsed partition is below the topic's
+        # count is not checked, as decision 3 says `NatsConsumer` accepts any
+        # non-negative partition" -- `subject(999)` is a subject `subject_filter`
+        # admits, and its partition is 999.
+        spec = TOPICS[name]
+
+        assert spec.partition_of(spec.subject(partitions)) == partitions
+        assert spec.partition_of(spec.subject(999)) == 999
+        assert spec.partition_of(f"{name}.999") == 999
+
+    def test_the_result_is_an_int(self) -> None:
+        spec = TOPICS[HOT_IP_TOPIC]
+
+        value = spec.partition_of(spec.subject(7))
+
+        assert value == 7
+        assert isinstance(value, int)
+        assert not isinstance(value, bool)
+
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            pytest.param(".07", id="leading-zero"),
+            pytest.param(".-1", id="negative"),
+            pytest.param(".x", id="not-a-number"),
+            pytest.param(".7.8", id="two-tokens"),
+            pytest.param("", id="bare-topic-name"),
+            pytest.param(".", id="empty-token"),
+            pytest.param(".+7", id="explicit-plus"),
+            pytest.param(".00", id="double-zero"),
+            pytest.param(". 7", id="leading-space"),
+            pytest.param(".7 ", id="trailing-space"),
+            pytest.param(".7\n", id="trailing-newline"),
+            pytest.param(".1_000", id="underscore"),
+            pytest.param(".0x7", id="hex"),
+            pytest.param(".7.", id="trailing-dot"),
+            pytest.param(".*", id="wildcard"),
+        ],
+    )
+    def test_anything_but_the_canonical_decimal_token_is_none(self, suffix: str) -> None:
+        # "`<name>.07`, `<name>.-1`, `<name>.x`, `<name>.7.8` and `<name>` are
+        # all `None` -- and nothing else": `int()` would accept `07`, `+7`,
+        # ` 7` and `1_000`, and `subject(p)` produces none of them.
+        spec = TOPICS[HOT_IP_TOPIC]
+
+        assert spec.partition_of(f"{HOT_IP_TOPIC}{suffix}") is None
+
+    def test_zero_is_a_partition_but_its_padded_forms_are_not(self) -> None:
+        spec = TOPICS[HOT_IP_TOPIC]
+
+        assert spec.partition_of(f"{HOT_IP_TOPIC}.0") == 0
+        assert spec.partition_of(f"{HOT_IP_TOPIC}.00") is None
+        assert spec.partition_of(f"{HOT_IP_TOPIC}.-0") is None
+
+    def test_another_topics_subject_is_none(self) -> None:
+        # The subject must be *this* topic's: `hammertime.hot-ip.v1.3` is not a
+        # partition of the observations topic, whatever its last token.
+        observations = TOPICS["hammertime.observations.v1"]
+        hot_ip = TOPICS[HOT_IP_TOPIC]
+
+        assert observations.partition_of(hot_ip.subject(3)) is None
+        assert hot_ip.partition_of(observations.subject(3)) is None
+
+    def test_a_subject_of_a_topic_whose_name_extends_this_one_is_none(self) -> None:
+        # `hammertime.observations.v1` is a prefix of
+        # `hammertime.observations-reconciliation.v1` only textually; neither's
+        # subjects are the other's.
+        observations = TOPICS["hammertime.observations.v1"]
+        reconciliation = TOPICS["hammertime.observations-reconciliation.v1"]
+
+        assert observations.partition_of(reconciliation.subject(0)) is None
+        assert reconciliation.partition_of(observations.subject(0)) is None
+
+    @pytest.mark.parametrize("subject", ["", ".", "7", ".7", "hammertime", "hammertime.hot-ip"])
+    def test_a_subject_that_is_not_under_the_topic_at_all_is_none(self, subject: str) -> None:
+        assert TOPICS[HOT_IP_TOPIC].partition_of(subject) is None
+
+    def test_the_filter_itself_is_not_a_partition(self) -> None:
+        # `<topic>.*` is the stream's subject filter, never a stored subject.
+        spec = TOPICS[HOT_IP_TOPIC]
+
+        assert spec.partition_of(spec.subject_filter) is None
+
+
+# --- partition_of round-trips subject (decision 1, as amended) -------------------------
+
+
+# Bounded to 64 bits: JetStream sequences and partitions are `uint64`, and an
+# unbounded strategy could exceed CPython's `int()` digit limit, which is a
+# harness artefact and not the ruling under test.
+_PARTITIONS = st.integers(min_value=0, max_value=2**64 - 1)
+_NEGATIVE = st.integers(min_value=-(2**64), max_value=-1)
+
+
+@given(p=_PARTITIONS)
+@settings(deadline=None, max_examples=200)
+def test_partition_of_inverts_subject_for_every_non_negative_partition(p: int) -> None:
+    # "`p` when `subject == self.subject(p)` for some `p >= 0`" -- for every
+    # such `p`, on every registered topic, beyond the partition count included.
+    for name, _stream_name, _partitions in STREAM_TABLE:
+        spec = TOPICS[name]
+        assert spec.partition_of(spec.subject(p)) == p
+
+
+@given(p=_PARTITIONS)
+@settings(deadline=None, max_examples=200)
+def test_a_zero_padded_token_is_never_a_partition(p: int) -> None:
+    # Assumption 78: the canonical decimal form has no leading zero, so `0`
+    # prepended to any canonical token is a different, non-canonical token.
+    spec = TOPICS[HOT_IP_TOPIC]
+
+    assert spec.partition_of(f"{HOT_IP_TOPIC}.0{p}") is None
+
+
+@given(p=_NEGATIVE)
+@settings(deadline=None, max_examples=200)
+def test_a_negative_token_is_never_a_partition(p: int) -> None:
+    spec = TOPICS[HOT_IP_TOPIC]
+
+    assert spec.partition_of(f"{HOT_IP_TOPIC}.{p}") is None

@@ -79,6 +79,15 @@ each is pinned by the class named after it:
   end_offset - 1`, or immediately when `end_offset <= start_offset`"
   (`TestEndOffset`).
 
+Amendment 3 (2026-09-21) ruling (a) appended one more sentence to the `ack`
+paragraph, pinned in `TestAckPrecedence` as well: "Closed is checked first
+and is absorbing ...: an instance whose `close()` ran before it ever
+subscribed is a closed consumer, not a not-yet-subscribed one, and `ack()` on
+it is a `ValueError` for any iterable, the empty one included; the
+not-yet-subscribed clause above describes an instance that is neither closed
+nor subscribed." (Assumption 51: closed absorbs not-yet-subscribed, not the
+reverse.)
+
 ASSUMPTIONS -- things decision 3 implies but does not spell out. Adjust the
 helper, not the meaning of the assertion:
 
@@ -712,6 +721,30 @@ class TestAckPrecedence:
         consumer = bus.consumer(GROUP)
 
         await consumer.ack([])
+
+    async def test_an_empty_ack_after_a_close_before_subscribe_is_a_value_error(self) -> None:
+        # Amendment 3 ruling (a): "Closed is checked first and is absorbing
+        # ...: an instance whose `close()` ran before it ever subscribed is a
+        # closed consumer, not a not-yet-subscribed one, and `ack()` on it is
+        # a `ValueError` for any iterable, the empty one included."
+        bus = InMemoryBus()
+        consumer = bus.consumer(GROUP)
+        await consumer.close()
+
+        with pytest.raises(ValueError):
+            await consumer.ack([])
+
+    async def test_any_message_after_a_close_before_subscribe_is_a_value_error_too(self) -> None:
+        # "... for any iterable, the empty one included": the non-empty case
+        # of the same closed-before-subscribe instance.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        probe = await _read_group(bus, "probe", TOPIC, 1)
+        consumer = bus.consumer(GROUP)
+        await consumer.close()
+
+        with pytest.raises(ValueError):
+            await consumer.ack(probe)
 
     async def test_any_message_before_subscribe_is_a_value_error(self) -> None:
         # "... accepts exactly the empty iterable": a real message of the

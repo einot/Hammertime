@@ -81,6 +81,16 @@ none contradicts it):
 5. `TestProvision` sleeps for real: exactly the 0.5 s first retry delay of
    ADR-0009 A1, once. ADR-0013 Amendment 1 ruling T12 accepts real sleeps
    of that size.
+6. `TestAServerUrlNatsPyCouldNotParse` (decision 2's CLI bullet as amended
+   2026-09-22, Amendment 4 ruling S2: "Every `--servers` entry is checked
+   with `hammertime.bus.nats.validate_bus_url` ... before anything is
+   connected; an entry it refuses is an argparse error -- `SystemExit(2)`, a
+   message naming the entry's position and not its text -- so a URL nats-py
+   could not parse never reaches nats-py or a record") reads argparse's
+   message off stderr, where assumption 2 already places it, and the whole
+   of stdout as well. The needles `pa`, `ss` and `user` are the dispatch
+   brief's; they exclude ordinary words such as "parse" from the message,
+   which must therefore name the position and nothing of the entry.
 """
 
 from __future__ import annotations
@@ -255,6 +265,89 @@ class TestInvalidArgumentsExitTwo:
         namespace = build_parser().parse_args(["--servers", "nats://a:4222, nats://b:4222,"])
 
         assert namespace.servers == ["nats://a:4222", "nats://b:4222"]
+
+
+# The entry decision 3 (as amended, Amendment 4 ruling S2) names: nats-py's
+# own parse raises `ValueError("Port could not be cast to integer value as
+# 's3cr'")`, echoing the port token. Neither half of the password, nor the
+# whole of it, nor the username, may reach stderr or stdout; the tokens are
+# chosen so that none is a substring of argparse's usage text, of the fixed
+# refusal text or of ordinary English.
+_UNPARSEABLE_SERVERS = "nats://usr7:s3cr/et@nats:4222"
+_UNPARSEABLE_NEEDLES = ("usr7", "s3cr", "et@", "s3cr/et")
+
+
+class TestAServerUrlNatsPyCouldNotParse:
+    """Decision 2's CLI bullet as amended (Amendment 4 ruling S2): "an entry it refuses
+    is an argparse error -- `SystemExit(2)`, a message naming the entry's
+    position and not its text -- so a URL nats-py could not parse never reaches
+    nats-py or a record" (assumption 6 in the module docstring)."""
+
+    def test_it_is_system_exit_two_and_provision_is_never_called(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stub = _ProvisionStub()
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--servers", _UNPARSEABLE_SERVERS])
+
+        assert excinfo.value.code == 2
+        # "never reaches nats-py": `provision` -- and so `nats.connect` -- is
+        # not called with it.
+        assert stub.calls == []
+        capsys.readouterr()
+
+    @pytest.mark.parametrize("needle", _UNPARSEABLE_NEEDLES)
+    def test_nothing_of_the_entry_reaches_stderr_or_stdout(
+        self, needle: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # "a message naming the entry's position and not its text"; spec 47.7
+        # for whatever records were written.
+        assert needle in _UNPARSEABLE_SERVERS
+        _install(monkeypatch, _ProvisionStub())
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit):
+            main(["--servers", _UNPARSEABLE_SERVERS])
+
+        captured = capsys.readouterr()
+        assert needle not in captured.err, f"{needle!r} leaked into stderr: {captured.err!r}"
+        assert needle not in captured.out, f"{needle!r} leaked into stdout: {captured.out!r}"
+        assert _UNPARSEABLE_SERVERS not in captured.err
+        assert _UNPARSEABLE_SERVERS not in captured.out
+
+    def test_a_refused_entry_after_a_good_one_is_still_refused(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # "Every `--servers` entry is checked": the position named is the
+        # second's, and the first's validity does not excuse it.
+        stub = _ProvisionStub()
+        _install(monkeypatch, stub)
+
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--servers", f"{_SERVERS},{_UNPARSEABLE_SERVERS}"])
+
+        assert excinfo.value.code == 2
+        assert stub.calls == []
+        captured = capsys.readouterr()
+        for needle in _UNPARSEABLE_NEEDLES:
+            assert needle in _UNPARSEABLE_SERVERS
+            assert needle not in captured.err
+
+    def test_userinfo_nats_py_reads_is_not_refused(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # "no value that connected before is refused now" (decision 3, as
+        # amended): the two userinfo forms of decision 10 still reach
+        # `provision` as given.
+        stub = _ProvisionStub()
+        _install(monkeypatch, stub)
+
+        run = _run(["--servers", _SECRET_SERVERS], capsys)
+
+        assert run.code == 0
+        assert stub.calls == [{"servers": _SECRET_RAW, "replicas": 1, "timeout_s": 60.0}]
 
 
 # --- 2. invalid HAMMERTIME_LOG_LEVEL: config_invalid record, returned 2 -------------

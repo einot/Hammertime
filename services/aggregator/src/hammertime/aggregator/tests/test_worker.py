@@ -99,6 +99,25 @@ three are shared with `test_sharding.py` and `test_reevaluate.py`:
 7. `worker.stop()` does not close the consumer (decision 8: "the service
    closes the bus ... afterwards"); `_drain` cancels the consume loop after
    `stop()` as teardown hygiene, never as part of an assertion.
+8. **A message that completes in the same wake-up as the stop signal**
+   (ADR-0013 decision 8 as amended 2026-09-22, Amendment 4 ruling R2:
+   "`run()`, on a wake-up in which the stop signal and a received message are
+   both complete, returns without handing the message to `handle()`";
+   assumption 82: the message "was yielded, so it is retained and naked at
+   `close()` on `NatsConsumer`, and delivered-unacknowledged on
+   `MemoryConsumer`; either way the next member applies it once") is
+   modelled by `_GatedBus`: the worker's subscription is held behind an
+   `asyncio.Event` with the message already in the log, the gate is set and
+   `stop()` awaited in the same tick, so the receive completes on the first
+   wake-up that follows -- the same wake-up the stop signal reaches `run()`
+   on. The gate is set with no `await` between it and `worker.stop()`, which
+   is as close to the same-tick shape as `InMemoryBus` allows; whether
+   `run()` observes both in one `asyncio.wait` return or in two consecutive
+   ones is not controllable from a test, so what is asserted is the weaker
+   invariant that holds either way and that ruling R2 makes total: a message
+   that arrives during or after `stop()` is never applied, is never marked
+   handled, and is handed to the next consumer of the group
+   (`TestAMessageThatCompletesWithTheStopSignal`).
 
 NOT asserted here, and why:
 
@@ -515,6 +534,64 @@ class _PrefetchBus(InMemoryBus):
             return inner
         self.prefetcher = _PrefetchingConsumer(inner, self._batch)
         return self.prefetcher
+
+
+class _GatedConsumer:
+    """Holds a `MemoryConsumer`'s subscription behind an `asyncio.Event` (ASSUMPTION 8).
+
+    Until the gate is set nothing is yielded, however much is in the log;
+    once it is, the inner subscription is read as it is. `close()` opens the
+    gate so a blocked iterator can end.
+    """
+
+    def __init__(self, inner: Consumer, gate: asyncio.Event) -> None:
+        self._inner = inner
+        self._gate = gate
+
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+        start_offset: int | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        inner = await self._inner.subscribe(
+            topic, partitions=partitions, listener=listener, start_offset=start_offset
+        )
+        return self._gated(inner)
+
+    async def _gated(self, inner: AsyncIterator[ConsumedMessage]) -> AsyncIterator[ConsumedMessage]:
+        await self._gate.wait()
+        async for message in inner:
+            yield message
+
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        await self._inner.ack(messages)
+
+    async def close(self) -> None:
+        self._gate.set()
+        await self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _GatedBus(InMemoryBus):
+    """An `InMemoryBus` whose *first* consumer -- the worker's own -- is gated (ASSUMPTION 8);
+    every later consumer is a plain `MemoryConsumer`, as in `_PrefetchBus`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self._gated_once = False
+
+    def consumer(self, *args: Any, **kwargs: Any) -> Any:
+        inner = super().consumer(*args, **kwargs)
+        if self._gated_once:
+            return inner
+        self._gated_once = True
+        return _GatedConsumer(inner, self.gate)
 
 
 class TestAnAppliedObservation:
@@ -1538,3 +1615,136 @@ class TestTheMessageInTheQueueReachesTheNextMember:
             assert _records(bus, RECONCILIATION_TOPIC) == []
         finally:
             await _drain(b, b_task)
+
+
+class TestAMessageThatCompletesWithTheStopSignal:
+    """ADR-0013 decision 8 as amended (Amendment 4 ruling R2): "`stop()`'s order is
+    total ... `run()`, on a wake-up in which the stop signal and a received
+    message are both complete, returns without handing the message to
+    `handle()`. The message in hand -- one whose `_handle` holds the lock
+    when the flag is set -- is finished and covered by the final commit, as
+    before; one merely waiting for the lock is not in hand and takes the
+    `UNCLAIMED` path." Assumption 82: "The `run()` skip drops the message
+    received in the same wake-up unhandled ... either way the next member
+    applies it once. Handling it after the final commit is the defect".
+
+    ASSUMPTION 8 (module docstring) explains the `_GatedBus` shape and why the
+    invariant asserted is the one that holds whichever way the wake-ups fall:
+    never applied, never marked, handed to the next consumer of the group.
+    """
+
+    async def test_the_message_is_never_applied_and_reaches_the_next_member(self) -> None:
+        clock = ManualClock(initial=BASE)
+        bus = _GatedBus()
+        metrics = AggregatorMetrics()
+        worker = _worker(bus=bus, clock=clock, metrics=metrics)
+        await worker.start()
+        task = asyncio.create_task(worker.run())
+        try:
+            for _ in range(20):  # let `run()` reach its receive and block behind the gate
+                await asyncio.sleep(0)
+            await bus.producer().publish(
+                OBSERVATIONS_TOPIC,
+                key=str(IP_A),
+                value=_observation(IP_A, 1200, window_start=BASE),
+                message_id="m-a",
+            )
+            for _ in range(10):  # the message is in the log, held back by the gate
+                await asyncio.sleep(0)
+            assert _window_of(worker).is_tracked(IP_A) is False
+            assert not task.done()
+
+            # The gate opens and `stop()` begins with no `await` between the
+            # two: the receive completes on the first wake-up that follows,
+            # the one that also carries the stop signal.
+            bus.gate.set()
+            await worker.stop()
+            await _yield_until(task.done)
+        finally:
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # `run()` returned on its own: neither cancelled nor failed.
+        assert task.done()
+        assert not task.cancelled()
+        assert task.exception() is None
+        # Never applied, never marked, nothing emitted.
+        window = _window_of(worker)
+        assert window.is_tracked(IP_A) is False
+        assert window.tracked_count == 0
+        assert worker.claims.handled_position(0) is None
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert (
+            _counter(
+                metrics, "cold_to_hot_transitions", shard=0, config_version=1, reason="observation"
+            )
+            == 0
+        )
+        # Delivered-unacknowledged: the next consumer of the group is handed it.
+        next_owner = bus.consumer(GROUP)
+        message = await _take_one(await next_owner.subscribe(OBSERVATIONS_TOPIC))
+        assert message.key == str(IP_A).encode()
+
+    async def test_the_same_message_is_applied_when_the_gate_opens_without_a_stop(self) -> None:
+        # The control for the test above: the gate, not the message, is what
+        # keeps it out of the window -- opened with the worker live, the
+        # message is applied and promotes the IP.
+        clock = ManualClock(initial=BASE)
+        bus = _GatedBus()
+        metrics = AggregatorMetrics()
+        worker = _worker(bus=bus, clock=clock, metrics=metrics)
+        await worker.start()
+        task = asyncio.create_task(worker.run())
+        try:
+            for _ in range(20):
+                await asyncio.sleep(0)
+            await bus.producer().publish(
+                OBSERVATIONS_TOPIC,
+                key=str(IP_A),
+                value=_observation(IP_A, 1200, window_start=BASE),
+                message_id="m-a",
+            )
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert _window_of(worker).is_tracked(IP_A) is False
+
+            bus.gate.set()
+
+            await _yield_until(lambda: _window_of(worker).state(IP_A) is IpState.HOT)
+            assert _window_of(worker).total(IP_A) == 1200
+        finally:
+            await _drain(worker, task)
+
+    async def test_a_message_published_after_stop_is_never_applied(self) -> None:
+        # The plain "after" half of the invariant, with no gate at all:
+        # `stop()` has returned, and a message that arrives afterwards is not
+        # this member's to apply.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        metrics = AggregatorMetrics()
+        producer = bus.producer()
+        worker = _worker(bus=bus, clock=clock, metrics=metrics)
+        await worker.start()
+        task = asyncio.create_task(worker.run())
+        try:
+            for _ in range(20):
+                await asyncio.sleep(0)
+            await worker.stop()
+            await producer.publish(
+                OBSERVATIONS_TOPIC,
+                key=str(IP_A),
+                value=_observation(IP_A, 1200, window_start=BASE),
+                message_id="m-a",
+            )
+            for _ in range(20):
+                await asyncio.sleep(0)
+        finally:
+            await _drain(worker, task)
+
+        assert _window_of(worker).is_tracked(IP_A) is False
+        assert worker.claims.handled_position(0) is None
+        next_owner = bus.consumer(GROUP)
+        message = await _take_one(await next_owner.subscribe(OBSERVATIONS_TOPIC))
+        assert message.key == str(IP_A).encode()

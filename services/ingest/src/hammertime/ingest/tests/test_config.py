@@ -33,6 +33,25 @@ ASSUMPTIONS for `TestBusKind`: `IngestSettings.bus_kind` / `bus_brokers` are
 the field names `test_pipeline.py::_settings` already constructs; the kind
 is matched as written (no claim about case-insensitivity either way).
 
+`TestBusBrokersAreValidated` covers ADR-0013 decision 10's
+`HAMMERTIME_BUS_BROKERS` row as superseded 2026-09-22 (Amendment 4 ruling
+S2): "every entry is checked by `hammertime.bus.nats.validate_bus_url` in
+`load_settings`, and an entry nats-py's own parse would refuse is a
+`ValueError` naming the variable and the entry's position, `config_invalid`,
+exit 2"; decision 3 (as amended): "`load_settings` in the aggregator and in
+ingest calls it for every entry of `HAMMERTIME_BUS_BROKERS` (split as
+`NatsBus.__init__` splits it) and turns a refusal into a `ValueError` naming
+the variable and the entry's position". Assumption 15 ("not validated") is
+superseded; `test_the_brokers_value_is_stored_untouched_and_not_validated`
+stays as it is because both of its values are still accepted ("no value that
+connected before is refused now"). Error precedence between this key and
+others is not pinned (ruling T7): every test supplies valid values for every
+other key. The class is a deliberately diffable copy of the aggregator file's
+class of the same name. The needles `pa`, `ss` and `user` are the dispatch
+brief's; they exclude ordinary words such as "parse" and "address" from the
+message, which must therefore name the variable and the position and nothing
+more.
+
 `TestStartingRecordCarriesBusEndpoints` covers ADR-0013 Amendment 2 rulings
 2-3 and decision 3's `bus_endpoints` paragraph: the `starting` record "logs
 `bus_endpoints` **in place of** `bus_brokers`", each entry reduced to
@@ -472,6 +491,162 @@ class TestBusKind:
         # value surfaces at `connect()` as `start_failed`, not here.
         for value in ("nats://nats:4222,nats://nats-2:4222", "not a url at all"):
             assert load_settings({"HAMMERTIME_BUS_BROKERS": value}).bus_brokers == value
+
+
+# --------------------------------------------------------------------------
+# ADR-0013 decision 10 as superseded (Amendment 4 ruling S2): every entry of
+# `HAMMERTIME_BUS_BROKERS` is checked by `validate_bus_url`
+# --------------------------------------------------------------------------
+
+# An entry nats-py's own parse would refuse *and echo*: `urlsplit` ends the
+# authority at the `/`, and `.port` is the cast of `s3cr` (decision 3, as
+# amended). The password's halves, the whole password and the username must
+# reach no message; the tokens are chosen so that none is a substring of the
+# fixed refusal text or of ordinary English.
+BROKERS_WITH_A_SLASH_IN_THE_PASSWORD = "nats://usr7:s3cr/et@nats:4222"
+BROKERS_WITH_AN_UNBALANCED_BRACKET = "nats://[::1"
+BROKERS_REFUSED_FRAGMENTS = ("usr7", "s3cr", "et@", "s3cr/et")
+
+# Userinfo in the form nats-py reads, alongside a second server: accepted, and
+# stored untouched.
+BROKERS_WITH_USERINFO_AND_A_SECOND_SERVER = "nats://user:s3cret@nats:4222, nats://b:4222"
+
+
+class TestBusBrokersAreValidated:
+    """ADR-0013 decision 10 as superseded (Amendment 4 ruling S2): "an entry nats-py's
+    own parse would refuse is a `ValueError` naming the variable and the
+    entry's position, `config_invalid`, exit 2"."""
+
+    def test_an_entry_with_a_slash_in_its_password_is_a_value_error_naming_the_variable(
+        self,
+    ) -> None:
+        env = {
+            "HAMMERTIME_STORE_KIND": "memory",
+            "HAMMERTIME_BUS_BROKERS": BROKERS_WITH_A_SLASH_IN_THE_PASSWORD,
+        }
+
+        with pytest.raises(ValueError, match="HAMMERTIME_BUS_BROKERS"):
+            load_settings(env)
+
+    @pytest.mark.parametrize("fragment", BROKERS_REFUSED_FRAGMENTS)
+    def test_the_rejection_repeats_no_part_of_the_entry(self, fragment: str) -> None:
+        # Decision 3 (as amended): "the message names none of the entry's
+        # text"; section 47.7 / A12 item 4: the variable, never the value.
+        assert fragment in BROKERS_WITH_A_SLASH_IN_THE_PASSWORD
+        env = {
+            "HAMMERTIME_STORE_KIND": "memory",
+            "HAMMERTIME_BUS_BROKERS": BROKERS_WITH_A_SLASH_IN_THE_PASSWORD,
+        }
+
+        with pytest.raises(ValueError) as excinfo:
+            load_settings(env)
+
+        message = str(excinfo.value)
+        assert fragment not in message, f"{fragment!r} echoed in {message!r}"
+        assert BROKERS_WITH_A_SLASH_IN_THE_PASSWORD not in message
+
+    def test_an_unbalanced_bracket_is_a_value_error_naming_the_variable(self) -> None:
+        # (i) "`urlsplit` refuses it" -- the same entry `bus_endpoints` renders
+        # `<unparseable>`.
+        env = {
+            "HAMMERTIME_STORE_KIND": "memory",
+            "HAMMERTIME_BUS_BROKERS": BROKERS_WITH_AN_UNBALANCED_BRACKET,
+        }
+
+        with pytest.raises(ValueError, match="HAMMERTIME_BUS_BROKERS") as excinfo:
+            load_settings(env)
+
+        assert BROKERS_WITH_AN_UNBALANCED_BRACKET not in str(excinfo.value)
+        assert "::1" not in str(excinfo.value)
+
+    def test_a_refused_entry_is_refused_wherever_it_sits_in_the_list(self) -> None:
+        # "for every entry of `HAMMERTIME_BUS_BROKERS` (split as
+        # `NatsBus.__init__` splits it)": a good first entry does not excuse a
+        # bad second one.
+        env = {
+            "HAMMERTIME_STORE_KIND": "memory",
+            "HAMMERTIME_BUS_BROKERS": f"nats://nats:4222, {BROKERS_WITH_A_SLASH_IN_THE_PASSWORD}",
+        }
+
+        with pytest.raises(ValueError, match="HAMMERTIME_BUS_BROKERS") as excinfo:
+            load_settings(env)
+
+        for fragment in BROKERS_REFUSED_FRAGMENTS:
+            assert fragment in env["HAMMERTIME_BUS_BROKERS"]
+            assert fragment not in str(excinfo.value)
+
+    def test_userinfo_that_nats_py_reads_still_loads(self) -> None:
+        # "no value that connected before is refused now": decision 10's two
+        # userinfo forms are legal, and the value is stored untouched.
+        env = {
+            "HAMMERTIME_STORE_KIND": "memory",
+            "HAMMERTIME_BUS_BROKERS": BROKERS_WITH_USERINFO_AND_A_SECOND_SERVER,
+        }
+
+        settings = load_settings(env)
+
+        assert settings.bus_brokers == BROKERS_WITH_USERINFO_AND_A_SECOND_SERVER
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "nats://s3cret-token@nats:4222",
+            "tls://user:s3cret@[::1]:4222/?x=1",
+            "user:s3cret@nats:4222",
+            "nats://nats:4222/",
+        ],
+    )
+    def test_every_pinned_accepted_form_still_loads(self, value: str) -> None:
+        env = {"HAMMERTIME_STORE_KIND": "memory", "HAMMERTIME_BUS_BROKERS": value}
+
+        assert load_settings(env).bus_brokers == value
+
+
+class TestAMalformedBusBrokersExitsTwo:
+    """Ruling S2 end to end: "the process exits 2 with `config_invalid` before nats-py
+    sees the value" -- and no line of stdout carries the password's halves. Same
+    shape as `TestAMalformedRedisUrlExitsTwo`."""
+
+    ENV: ClassVar[dict[str, str]] = {
+        "HAMMERTIME_STORE_KIND": "memory",
+        "HAMMERTIME_BUS_KIND": "nats",
+        "HAMMERTIME_BUS_BROKERS": BROKERS_WITH_A_SLASH_IN_THE_PASSWORD,
+        "HAMMERTIME_LOG_LEVEL": "info",
+    }
+
+    def _run(self) -> int:
+        env = dict(self.ENV)
+        return run_service("ingest", lambda: build_service(load_settings(env)), env=env)
+
+    def test_the_process_exits_2(self) -> None:
+        assert self._run() == 2
+
+    def test_config_invalid_names_the_variable(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._run()
+
+        _, records = _stdout_records(capsys)
+        invalid = [record for record in records if record.get("event") == "config_invalid"]
+        assert len(invalid) == 1
+        assert "HAMMERTIME_BUS_BROKERS" in str(invalid[0].get("error"))
+
+    def test_nothing_started(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._run()
+
+        _, records = _stdout_records(capsys)
+        assert [record for record in records if record.get("event") == "starting"] == []
+
+    @pytest.mark.parametrize("fragment", BROKERS_REFUSED_FRAGMENTS)
+    def test_no_line_of_stdout_carries_the_entrys_text(
+        self, fragment: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Section 47.7, as extended to the userinfo of a bus URL.
+        assert fragment in BROKERS_WITH_A_SLASH_IN_THE_PASSWORD
+        self._run()
+
+        out, records = _stdout_records(capsys)
+        assert fragment not in out
+        for record in records:
+            assert fragment not in json.dumps(record)
 
 
 # --------------------------------------------------------------------------

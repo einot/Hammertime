@@ -111,9 +111,15 @@ Lease ASSUMPTIONS (numbered on from the list above):
    `ManualClock`, so `let_time_pass(seconds)` is `clock.advance(seconds)`
    and no lease test on it touches the wall clock. fakeredis keeps its own
    expiry on `time.time()` with no clock to inject, so the Redis lapse tests
-   use a 1-2 s TTL and a real `asyncio.sleep`, exactly as
+   use a 2 s TTL and a real `asyncio.sleep`, as
    `services/ingest/.../tests/test_dedup.py` already does for `mark_seen`'s
-   TTL; they are the only wall-clock sleeps in this file.
+   TTL; they are the only wall-clock sleeps in this file. The TTL was 1 s
+   until 2026-09-22; ADR-0013 Amendment 4 ruling F widened it because the
+   two "still live" assertions at `0.6 x TTL` "leave a 0.4 s margin, which a
+   loaded CI runner can eat" -- now 0.8 s (assumption 75: "Roughly six extra
+   seconds per suite run ... bought against a flaky gate"). The fractions
+   are unchanged: "the renewal test needs the two sleeps to sum past one
+   TTL, so `0.6` cannot drop below `0.5`".
 9. **`str | None` literally.** A refused acquire returns the holder's id as
    a `str` (asserted with `isinstance`), never a falsy sentinel; a granted
    one returns `None`, not `True`.
@@ -968,12 +974,14 @@ class TestRedisShardStateStoreLease(ShardLeaseContract):
     """`RedisShardStateStore` on fakeredis: expiry is the key's TTL.
 
     ASSUMPTION 8: fakeredis has no injectable clock, so `let_time_pass` is a
-    real `asyncio.sleep` and `LEASE_TTL` is kept at one second (the
-    precedent is `services/ingest/.../tests/test_dedup.py`). The 60 %
-    renewal test therefore sleeps 0.6 s twice and the lapse tests 1.3 s.
+    real `asyncio.sleep` and `LEASE_TTL` is two seconds (ADR-0013 Amendment 4
+    ruling F, assumption 75; the precedent for real sleeps is
+    `services/ingest/.../tests/test_dedup.py`). The 60 % renewal test
+    therefore sleeps 1.2 s twice and the lapse tests 2.3 s, with 0.8 s of
+    margin on each "still live" assertion.
     """
 
-    LEASE_TTL: ClassVar[float] = 1.0
+    LEASE_TTL: ClassVar[float] = 2.0
 
     def make_store(self) -> ShardStateStore:
         return RedisShardStateStore(fakeredis.aioredis.FakeRedis())

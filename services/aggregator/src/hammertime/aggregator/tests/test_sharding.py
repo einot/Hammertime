@@ -132,6 +132,69 @@ the meaning of the assertions:
     refused for the same reason." The direct call is exercised
     (`test_on_assigned_with_an_empty_set_is_a_value_error`): it raises, holds
     nothing, and touches the store not at all.
+11. **A two-shard worker on the memory bus.** `InMemoryBus` refuses any
+    static set other than `{0}` (decision 3), so the `load()`-fault tests of
+    Amendment 3 ruling (d) -- "shards `{p, q}`, `p < q`, `load(q)` raises" --
+    run over `_AnyPartitionsBus`, whose consumer accepts any static set the
+    way `NatsConsumer` does ("accepts any non-negative partition"): it awaits
+    `listener.on_assigned` with the full set before subscribing the inner
+    `MemoryConsumer`, and if the listener raises the inner never subscribed,
+    which is decision 3's "the consumer is left as if `subscribe()` had never
+    been called". Its `ack()` is the real `MemoryConsumer.ack()`, so
+    `stop()`'s `ack(())` on the failed start is exactly the call assumption
+    56 describes -- nothing is mocked away.
+12. **A re-claimed shard gets a new window** (Amendment 4 assumption 70:
+    "not the surviving one ... a fresh load and warm-up is what any new claim
+    gets"). `TestReclaimingAShardAfterStop` asserts object identity changes
+    and that the handled position survives, which is the R6 sentence "a new
+    window built in place of the old one; its handled position is kept".
+13. **`_FailingAckBus`** models a consumer whose acknowledgement fails at the
+    final commit (a broker outage at `ack_sync`, decision 3): its `ack()`
+    records itself in the trace and raises. That is the case R4's `finally`
+    exists for, and the trace shows the release following the failed ack.
+
+Amendment 3 (2026-09-21) and Amendment 4 (2026-09-22) rulings pinned here,
+each by the class named after it:
+
+* Ruling (c): "after `stop()`, `run_maintenance()` returns normally without
+  renewing, sweeping, emitting or writing" (assumption 53: a silent no-op,
+  not an error) -- `TestNothingActsOnAShardAfterStop`, with the next owner
+  already holding the lease and a demotion due in the sweep that must not run.
+* Ruling (d): "A `load()` that raises inside this call is a fault, not a
+  refusal ...: `ShardClaims` logs nothing, releases no lease inside the call,
+  and lets the exception propagate the same way, to exit 1. The leases the
+  call acquired -- the failed shard's included, since it was acquired before
+  its `load()` -- stay in the held set, so `release()` drops them when
+  `run_service` calls `stop()` on the failed start ..., and they lapse after
+  `lease_ttl_s` when the store cannot be reached for that either." Ruling R5
+  reaffirms it "with the replacement consequence stated": "a replacement
+  under any `member_id` starts at once" after the release; when the leases
+  merely lapse, "a replacement with a *different* id is refused with
+  `shard_owned_elsewhere` ... a replacement with the same id reacquires at
+  once either way" -- `TestAFaultingLoadInsideOnAssigned`.
+* Ruling R2: "`stop()`'s order is total ... From the moment `stop()` sets
+  the stop flag, every path that could act on a shard checks the flag under
+  the worker lock and stands down: `handle()` returns `UNCLAIMED` without
+  decoding, applying, emitting or marking, so the message stays
+  unacknowledged and `close()` hands it to the next member;
+  `run_maintenance()` and `apply_config()` return without renewing,
+  sweeping, re-evaluating, emitting or writing (`apply_config()` leaves the
+  worker's `config` as it was ...)" -- `TestNothingActsOnAShardAfterStop`.
+* Ruling R6: "Which shards `on_assigned` skips ...: a shard is skipped only
+  while this member holds its lease -- the held-lease set is the test, not
+  the windows. A shard whose window survived a `release()` but whose lease
+  is gone is claimed afresh: lease acquired, state loaded, a new window
+  built in place of the old one; its handled position is kept" --
+  `TestReclaimingAShardAfterStop`.
+* Ruling R4: "`stop()` itself runs its sequence once: under the lock,
+  `commit_handled()` inside a `try` whose `finally` is `release()`, so the
+  leases are released even when the final acknowledgement fails -- the
+  exception propagates after the release ... A later `stop()` -- the
+  runner's `_stop_quietly` after a crash exit, by which time the service has
+  closed the bus and `ack(())` would be a `ValueError` -- acquires the lock
+  and returns without touching the bus or the store; that is what
+  "idempotent" means for it." -- `TestStopRunsOnceAndReleasesInAFinally`,
+  and the second-`stop()` trace test in `TestReleasingLeases`.
 
 NOT asserted here, and why:
 
@@ -142,6 +205,9 @@ NOT asserted here, and why:
   `packages/hammertime-core/.../tests/test_runtime.py` gives for omitting
   its own lifecycle records. The observable half of A5's claim assertion
   (`inherited_hot=2`) is asserted on the window instead: `hot_count == 2`.
+  Ruling (d)'s "logs nothing" is likewise asserted by its observable half:
+  the exception is the fault itself and not `ShardOwnedElsewhereError`, and
+  no `release_lease` reaches the store inside the call.
 * **The `unclaimed_partition` log record** (A19), for the same reason. Its
   counterpart -- that A19's record comes with no counter -- *is* asserted,
   on the metrics object.
@@ -339,6 +405,76 @@ class _TappedBus(InMemoryBus):
         return stream
 
 
+class _FailingAckConsumer(_RecordingConsumer):
+    """A `_RecordingConsumer` whose `ack()` records itself and then fails (ASSUMPTION 13)."""
+
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        self._trace.append("ack")
+        raise RuntimeError("ack failed")
+
+
+class _FailingAckBus(_TappedBus):
+    """A `_TappedBus` whose consumers cannot acknowledge: the `commit_handled()` inside
+    `stop()` raises, which is the case Amendment 4 ruling R4's `finally` exists for."""
+
+    def consumer(self, *args: Any, **kwargs: Any) -> Any:
+        wrapped = _FailingAckConsumer(InMemoryBus.consumer(self, *args, **kwargs), self.trace)
+        self.consumers.append(wrapped)
+        return wrapped
+
+
+class _AnyPartitionsConsumer:
+    """A `Consumer` that accepts any static partition set, as `NatsConsumer` does
+    (ASSUMPTION 11), on top of a real `MemoryConsumer`.
+
+    The listener is awaited with the full set before the inner consumer
+    subscribes (decision 3: "`subscribe()` awaits `listener.on_assigned(...)`
+    exactly once -- with the full static set ... before it returns"); if it
+    raises, the inner never subscribed and stays neither closed nor
+    subscribed, so its `ack([])` returns normally.
+    """
+
+    def __init__(self, inner: Consumer) -> None:
+        self._inner = inner
+
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+        start_offset: int | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        assigned = frozenset(partitions) if partitions is not None else frozenset({0})
+        if not assigned:
+            raise ValueError("an empty partition set is refused before the listener is called")
+        if listener is not None:
+            await listener.on_assigned(frozenset((topic, p) for p in assigned))
+        return await self._inner.subscribe(
+            topic, partitions=None, listener=None, start_offset=start_offset
+        )
+
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        await self._inner.ack(messages)
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _AnyPartitionsBus(InMemoryBus):
+    """An `InMemoryBus` whose consumers accept any static partition set (ASSUMPTION 11)."""
+
+    def consumer(self, *args: Any, **kwargs: Any) -> Any:
+        return _AnyPartitionsConsumer(super().consumer(*args, **kwargs))
+
+
+class _StoreDown(Exception):
+    """The fault Amendment 3 ruling (d) names: "the store unreachable" during `load()`."""
+
+
 class _RecordingStore:
     """A `ShardStateStore` that records every call, delegating to a real
     `MemoryShardStateStore` (which takes the test's clock, ADR-0013 decision
@@ -376,6 +512,28 @@ class _RecordingStore:
     def clear(self) -> None:
         self.calls.clear()
         self.trace.clear()
+
+
+class _FaultingLoadStore(_RecordingStore):
+    """A `_RecordingStore` whose `load()` raises `_StoreDown` for one shard (ruling (d)).
+
+    The attempt is recorded before the fault, so the call sequence shows the
+    lease taken and the load tried; `heal()` makes the shard loadable again,
+    for the replacement that starts after the fault.
+    """
+
+    def __init__(self, clock: ManualClock, *, faulty_shard: int) -> None:
+        super().__init__(clock)
+        self._faulty_shard: int | None = faulty_shard
+
+    def heal(self) -> None:
+        self._faulty_shard = None
+
+    async def load(self, shard: int) -> ShardState:
+        if shard == self._faulty_shard:
+            self._note("load", shard)
+            raise _StoreDown(f"shard {shard}: store unreachable")
+        return await super().load(shard)
 
 
 async def _claims_and_consumer(
@@ -1342,6 +1500,27 @@ class TestReleasingLeases:
 
         assert trace == ["flush", "ack", "release_lease"]
 
+    async def test_a_second_stop_appends_nothing_to_the_trace(self) -> None:
+        # Amendment 4 ruling R4: "`stop()` itself runs its sequence once ... A
+        # later `stop()` ... acquires the lock and returns without touching
+        # the bus or the store" -- no flush, no ack, no release.
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        bus = _TappedBus(trace)
+        store = _RecordingStore(clock, trace)
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, state_store=store)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        trace.clear()
+        await worker.stop()
+        assert trace == ["flush", "ack", "release_lease"]
+        trace.clear()
+
+        await worker.stop()
+
+        assert trace == []
+
     async def test_stop_frees_the_lease_for_the_next_member(self) -> None:
         clock = ManualClock(initial=BASE)
         bus = _TappedBus()
@@ -2159,3 +2338,671 @@ class TestHandoverBetweenTwoMembers:
             assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == "aggregator-3"
         finally:
             await members.stop_all()
+
+
+class TestNothingActsOnAShardAfterStop:
+    """ADR-0013 decision 8 as amended (Amendment 4 ruling R2): "`stop()`'s order is
+    total. From the moment `stop()` sets the stop flag, every path that could
+    act on a shard checks the flag under the worker lock and stands down";
+    decision 7 as amended (Amendment 3 ruling (c)): "After `stop()` has
+    released the leases, `run_maintenance()` renews nothing and sweeps
+    nothing: it returns normally without touching the store, the windows or
+    the producer." Decision 7's rule underneath both: "a member acts on a
+    shard only while it holds the lease"."""
+
+    async def test_run_maintenance_after_stop_sweeps_nothing_while_the_next_owner_holds_the_lease(
+        self,
+    ) -> None:
+        # Ruling (c)'s scenario: A stopped, B holding the lease, and a
+        # `HotIpRemoved` due in any sweep A ran (its only bucket left the
+        # window at BASE + 300) -- "after the next owner may have loaded that
+        # shard's HOT set". A's sweep must not run: no `ShardLeaseLostError`
+        # (it renews nothing), nothing emitted, nothing written, A's window
+        # left as it was, B still the holder.
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        bus = _TappedBus(trace)
+        store = _RecordingStore(clock, trace)
+        feed = _Feed(bus)
+        a = _worker(bus=bus, clock=clock, state_store=store, member_id=MEMBER_A)
+        await a.start()
+        assert await feed.deliver(a, IP_A, 1200) is ObservationOutcome.APPLIED
+        await a.stop()
+        b = _worker(bus=bus, clock=clock, state_store=store, member_id=MEMBER_B)
+        await b.start()
+        try:
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_B
+            clock.advance(310)
+            trace.clear()
+
+            await a.run_maintenance()
+
+            assert trace == []
+            assert [envelope.event_type for envelope in _hot_ip_events(bus)] == ["HotIpAdded"]
+            window = a.window(0)
+            assert window is not None
+            assert window.state(IP_A) is IpState.HOT
+            assert window.is_tracked(IP_A) is True
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_B
+            assert (await store.load(0)).hot_ips == frozenset({IP_A})
+        finally:
+            await b.stop()
+
+    async def test_run_maintenance_after_stop_returns_normally_with_nobody_holding_the_lease(
+        self,
+    ) -> None:
+        # The same without a successor: the lease is free, and a sweep that
+        # "re-takes nothing" must not quietly reacquire it either.
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        bus = _TappedBus(trace)
+        store = _RecordingStore(clock, trace)
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, state_store=store)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        await worker.stop()
+        clock.advance(310)
+        trace.clear()
+
+        await worker.run_maintenance()
+
+        assert trace == []
+        assert [envelope.event_type for envelope in _hot_ip_events(bus)] == ["HotIpAdded"]
+        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) is None
+
+    async def test_run_maintenance_on_a_never_started_worker_returns_normally(self) -> None:
+        # No claim, no lease, no window: nothing to renew and nothing to sweep,
+        # and the store is not consulted.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        worker = _worker(bus=_TappedBus(), clock=clock, state_store=store)
+
+        await worker.run_maintenance()
+
+        assert store.calls == []
+        assert worker.shards == frozenset()
+
+    async def test_apply_config_after_stop_is_a_total_no_op(self) -> None:
+        # Ruling R2 (closing assumption 54; assumption 63: "a total no-op,
+        # leaving the worker's `config` unchanged and logging nothing"): a
+        # tracked IP at 600 is COLD under v1 and would be promoted by v2's
+        # thresholds, and nothing of that happens -- no transition, the
+        # worker's and the window's config as they were, the window
+        # untouched, the store and the producer untouched.
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        bus = _TappedBus(trace)
+        store = _RecordingStore(clock, trace)
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, state_store=store)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 600) is ObservationOutcome.APPLIED
+        window = worker.window(0)
+        assert window is not None
+        assert window.state(IP_A) is IpState.COLD
+        assert worker.config.config_version == 1
+        await worker.stop()
+        trace.clear()
+        lower = _config(config_version=2, hot_threshold=500, cold_threshold=400)
+
+        await worker.apply_config(lower)
+
+        assert trace == []
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert worker.config.config_version == 1
+        assert worker.config.hot_threshold == 1000
+        assert worker.config.cold_threshold == 800
+        assert window.config.config_version == 1
+        assert window.config.hot_threshold == 1000
+        assert window.state(IP_A) is IpState.COLD
+        assert window.hot_count == 0
+        assert window.total(IP_A) == 600
+        assert (await store.load(0)).hot_ips == frozenset()
+
+    async def test_handle_after_stop_is_unclaimed_and_the_message_stays_unacknowledged(
+        self,
+    ) -> None:
+        # Ruling R2 / decision 8's `UNCLAIMED` sentence as amended: "for any
+        # message handed to `handle()` after `stop()` has begun, whatever its
+        # partition: after `stop()` the member holds no lease, so every
+        # partition is one it must not act on" -- here partition 0, for which
+        # the member still holds a window. "`handle()` returns `UNCLAIMED`
+        # without decoding, applying, emitting or marking, so the message
+        # stays unacknowledged and `close()` hands it to the next member."
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        metrics = AggregatorMetrics()
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, metrics=metrics)
+        await worker.start()
+        await worker.stop()
+
+        outcome = await feed.deliver(worker, IP_B, 1200)
+
+        assert outcome is ObservationOutcome.UNCLAIMED
+        window = worker.window(0)
+        assert window is not None
+        assert window.is_tracked(IP_B) is False
+        assert window.tracked_count == 0
+        # Not marked: the handled position never moved.
+        assert worker.claims.handled_position(0) is None
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        # A19's no-counter rule, unchanged for this `UNCLAIMED`.
+        assert metrics.get("observations_rejected", reason="malformed") == 0
+        for reason in ("late", "future", "expired_bucket"):
+            assert metrics.get("late_messages", reason=reason) == 0
+        # Unacknowledged: the next consumer of the group is handed it first.
+        next_owner = bus.consumer(GROUP)
+        message = await _take_one(await next_owner.subscribe(OBSERVATIONS_TOPIC))
+        assert message.key == str(IP_B).encode()
+
+    async def test_handle_after_stop_is_unclaimed_for_a_message_that_would_have_been_applied(
+        self,
+    ) -> None:
+        # The same message is `APPLIED` on a live member: the stand-down is
+        # the stop flag's doing and not the message's.
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        feed = _Feed(bus)
+        live = _worker(bus=bus, clock=clock, member_id=MEMBER_A)
+        await live.start()
+        assert await feed.deliver(live, IP_B, 1200) is ObservationOutcome.APPLIED
+        await live.stop()
+
+        assert await feed.deliver(live, IP_B, 1200) is ObservationOutcome.UNCLAIMED
+        window = live.window(0)
+        assert window is not None
+        assert window.total(IP_B) == 1200
+
+
+class TestAFaultingLoadInsideOnAssigned:
+    """ADR-0013 decision 7 as amended (Amendment 3 ruling (d); Amendment 4 ruling R5):
+    "A `load()` that raises inside this call is a fault, not a refusal ...:
+    `ShardClaims` logs nothing, releases no lease inside the call, and lets
+    the exception propagate the same way, to exit 1. The leases the call
+    acquired -- the failed shard's included, since it was acquired before its
+    `load()` -- stay in the held set, so `release()` drops them when
+    `run_service` calls `stop()` on the failed start ..., and they lapse
+    after `lease_ttl_s` when the store cannot be reached for that either."
+    Shards `{0, 1}` over `_AnyPartitionsBus` (ASSUMPTION 11); `load(1)`
+    raises `_StoreDown`."""
+
+    def _worker(self, clock: ManualClock, store: ShardStateStore) -> AggregatorWorker:
+        return AggregatorWorker(
+            bus=_AnyPartitionsBus(),
+            state_store=store,
+            clock=clock,
+            config=DEFAULTS,
+            metrics=AggregatorMetrics(),
+            shard_ids=frozenset({0, 1}),
+            member_id=MEMBER_A,
+            lease_ttl_s=LEASE_TTL_SECONDS,
+        )
+
+    async def test_the_fault_propagates_as_itself_out_of_start(self) -> None:
+        # "a fault, not a refusal": the exception is the store's own, not
+        # `ShardOwnedElsewhereError`, and it reaches `worker.start()`.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = self._worker(clock, store)
+
+        with pytest.raises(_StoreDown) as excinfo:
+            await worker.start()
+
+        assert not isinstance(excinfo.value, ShardOwnedElsewhereError)
+
+    async def test_shard_zero_was_leased_and_loaded_and_shard_one_leased_before_its_load(
+        self,
+    ) -> None:
+        # Decision 7 (ruling T6): "acquire `p`, load `p`, build `p`'s window,
+        # and only then the next shard's acquire" -- the fault lands after
+        # shard 1's acquire, so its lease is in the held set too.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = self._worker(clock, store)
+
+        with pytest.raises(_StoreDown):
+            await worker.start()
+
+        sequence = [call[:2] for call in store.calls if call[0] in ("acquire_lease", "load")]
+        assert sequence == [
+            ("acquire_lease", 0),
+            ("load", 0),
+            ("acquire_lease", 1),
+            ("load", 1),
+        ]
+        assert worker.window(0) is not None
+        assert worker.window(1) is None
+
+    async def test_no_lease_is_released_inside_the_call_and_both_stay_held(self) -> None:
+        # "releases no lease inside the call": the observable half of "logs
+        # nothing" (module docstring) -- nothing reaches the store's
+        # `release_lease`, and both shards are still this member's.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = self._worker(clock, store)
+
+        with pytest.raises(_StoreDown):
+            await worker.start()
+
+        assert [call for call in store.calls if call[0] == "release_lease"] == []
+        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == MEMBER_A
+
+    async def test_stop_after_the_failed_start_returns_normally_and_releases_both(self) -> None:
+        # Ruling (d): "`release()` drops them when `run_service` calls
+        # `stop()` on the failed start ... the failed shard's included";
+        # assumption 56: that `stop()` "acknowledges nothing and cannot raise
+        # from the bus" -- `ack(())` on the never-subscribed consumer returns
+        # normally (ruling (a)), and the flush is a no-op.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = self._worker(clock, store)
+        with pytest.raises(_StoreDown):
+            await worker.start()
+        store.clear()
+
+        await worker.stop()
+
+        assert sorted(call for call in store.calls if call[0] == "release_lease") == [
+            ("release_lease", 0, MEMBER_A),
+            ("release_lease", 1, MEMBER_A),
+        ]
+        assert await store.acquire_lease(0, MEMBER_C, 1.0) is None
+        assert await store.acquire_lease(1, MEMBER_C, 1.0) is None
+
+    async def test_a_replacement_under_any_id_starts_at_once_after_the_release(self) -> None:
+        # Ruling R5: "a `load()` ... that raises while the store answers is
+        # followed by an immediate release from the runner's `stop()`, and a
+        # replacement under any `member_id` starts at once."
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        failed = self._worker(clock, store)
+        with pytest.raises(_StoreDown):
+            await failed.start()
+        await failed.stop()
+        store.heal()
+        replacement = AggregatorWorker(
+            bus=_AnyPartitionsBus(),
+            state_store=store,
+            clock=clock,
+            config=DEFAULTS,
+            metrics=AggregatorMetrics(),
+            shard_ids=frozenset({0, 1}),
+            member_id=MEMBER_B,
+            lease_ttl_s=LEASE_TTL_SECONDS,
+        )
+
+        await replacement.start()
+
+        try:
+            assert replacement.shards == frozenset({0, 1})
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_B
+            assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == MEMBER_B
+        finally:
+            await replacement.stop()
+
+    async def test_without_a_stop_the_leases_lapse_after_the_ttl(self) -> None:
+        # "they lapse after `lease_ttl_s` when the store cannot be reached for
+        # that either": held until the TTL, then acquirable by anyone.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        worker = self._worker(clock, store)
+        with pytest.raises(_StoreDown):
+            await worker.start()
+        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == MEMBER_A
+
+        clock.advance(int(LEASE_TTL_SECONDS) + 1)
+
+        assert await store.acquire_lease(0, OTHER_MEMBER, LONG_LEASE_SECONDS) is None
+        assert await store.acquire_lease(1, OTHER_MEMBER, LONG_LEASE_SECONDS) is None
+
+    async def test_without_a_stop_a_replacement_with_a_different_id_is_refused_until_then(
+        self,
+    ) -> None:
+        # Ruling R5's crash outcome: "a replacement with a *different* id is
+        # refused with `shard_owned_elsewhere` and exits 1 on each attempt
+        # for at most `lease_ttl_s`".
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        failed = self._worker(clock, store)
+        with pytest.raises(_StoreDown):
+            await failed.start()
+        store.heal()
+        replacement = AggregatorWorker(
+            bus=_AnyPartitionsBus(),
+            state_store=store,
+            clock=clock,
+            config=DEFAULTS,
+            metrics=AggregatorMetrics(),
+            shard_ids=frozenset({0, 1}),
+            member_id=MEMBER_B,
+            lease_ttl_s=LEASE_TTL_SECONDS,
+        )
+
+        with pytest.raises(ShardOwnedElsewhereError):
+            await replacement.start()
+
+        assert replacement.shards == frozenset()
+
+    async def test_without_a_stop_a_replacement_with_the_same_id_reacquires_at_once(self) -> None:
+        # Ruling R5: "a replacement with the same id reacquires at once either
+        # way".
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        failed = self._worker(clock, store)
+        with pytest.raises(_StoreDown):
+            await failed.start()
+        store.heal()
+        replacement = self._worker(clock, store)
+
+        await replacement.start()
+
+        try:
+            assert replacement.shards == frozenset({0, 1})
+        finally:
+            await replacement.stop()
+
+    async def test_the_fault_propagates_out_of_subscribe_and_the_consumer_holds_nothing(
+        self,
+    ) -> None:
+        # At the `ShardClaims` level, on the plain memory bus with the one
+        # shard it has: decision 3's "If `on_assigned` raises, `subscribe()`
+        # propagates the exception and holds nothing".
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=0)
+        bus = InMemoryBus()
+        consumer = bus.consumer(GROUP)
+        claims = ShardClaims(
+            state_store=store,
+            producer=bus.producer(),
+            consumer=consumer,
+            clock=clock,
+            config=DEFAULTS,
+            member_id=MEMBER_A,
+            lease_ttl_s=LEASE_TTL_SECONDS,
+        )
+
+        with pytest.raises(_StoreDown):
+            await consumer.subscribe(OBSERVATIONS_TOPIC, listener=claims)
+
+        assert claims.window(0) is None
+        assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert [call for call in store.calls if call[0] == "release_lease"] == []
+        # "as if `subscribe()` had never been called": the empty ack is accepted.
+        await consumer.ack([])
+        # And the held set still covers the shard: `release()` drops it.
+        await claims.release()
+        assert ("release_lease", 0, MEMBER_A) in store.calls
+        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) is None
+
+
+class TestReclaimingAShardAfterStop:
+    """ADR-0013 decision 7 as amended (Amendment 4 ruling R6): "Which shards
+    `on_assigned` skips ...: a shard is skipped only while this member holds
+    its lease -- the held-lease set is the test, not the windows. A shard
+    whose window survived a `release()` but whose lease is gone is claimed
+    afresh: lease acquired, state loaded, a new window built in place of the
+    old one; its handled position is kept, as nothing ever lowers it.
+    Reachable only by a direct call after `stop()`"."""
+
+    async def _stopped_after_one_promotion(
+        self, clock: ManualClock, store: _RecordingStore, *, lease_ttl_s: float
+    ) -> tuple[AggregatorWorker, _TappedBus]:
+        bus = _TappedBus()
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, state_store=store, lease_ttl_s=lease_ttl_s)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        await worker.stop()
+        assert ("release_lease", 0, MEMBER_A) in store.calls
+        return worker, bus
+
+    async def test_on_assigned_after_stop_takes_the_lease_again(self) -> None:
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        worker, _bus = await self._stopped_after_one_promotion(
+            clock, store, lease_ttl_s=LONG_LEASE_SECONDS
+        )
+        store.clear()
+
+        await worker.claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        try:
+            # "lease acquired, state loaded", in decision 7's order.
+            sequence = [call[:2] for call in store.calls if call[0] in ("acquire_lease", "load")]
+            assert sequence == [("acquire_lease", 0), ("load", 0)]
+            assert ("acquire_lease", 0, MEMBER_A, LONG_LEASE_SECONDS) in store.calls
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        finally:
+            await worker.claims.release()
+
+    async def test_the_reclaim_builds_a_new_window_and_keeps_the_handled_position(self) -> None:
+        # ASSUMPTION 12 (assumption 70): a fresh window, seeded from the
+        # store's current HOT set with a warm-up, and the position kept.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        worker, _bus = await self._stopped_after_one_promotion(
+            clock, store, lease_ttl_s=LONG_LEASE_SECONDS
+        )
+        old_window = worker.window(0)
+        assert old_window is not None
+        position = worker.claims.handled_position(0)
+        assert position is not None
+        clock.advance(HANDOVER_SECONDS)
+
+        await worker.claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        try:
+            new_window = worker.window(0)
+            assert new_window is not None
+            assert new_window is not old_window
+            assert new_window.hot_ips() == frozenset({IP_A})
+            assert new_window.is_inherited(IP_A) is True
+            assert new_window.total(IP_A) == 0
+            assert new_window.in_warmup is True
+            assert new_window.warm_until == BASE + HANDOVER_SECONDS + WINDOW_SECONDS
+            assert worker.claims.handled_position(0) == position
+            assert worker.shards == frozenset({0})
+            assert worker.claims.windows() == (new_window,)
+        finally:
+            await worker.claims.release()
+
+    async def test_renew_leases_after_the_reclaim_renews_it(self) -> None:
+        # The re-taken lease is back in the held set: `renew_leases()` renews
+        # it, and the renewal keeps it past its original expiry.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        worker, _bus = await self._stopped_after_one_promotion(
+            clock, store, lease_ttl_s=LEASE_TTL_SECONDS
+        )
+        await worker.claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        try:
+            clock.advance(20)
+            store.clear()
+
+            await worker.claims.renew_leases()
+
+            assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+            assert ("load", 0) not in store.calls
+            clock.advance(20)  # 40 s after the reclaim, 20 s after the renewal
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        finally:
+            await worker.claims.release()
+
+    async def test_a_shard_whose_lease_is_held_is_skipped(self) -> None:
+        # The other half of the same sentence: "a shard is skipped only while
+        # this member holds its lease" -- on a live member a second
+        # `on_assigned` for the held shard loads nothing and keeps the window.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        bus = _TappedBus()
+        worker = _worker(bus=bus, clock=clock, state_store=store)
+        await worker.start()
+        try:
+            window = worker.window(0)
+            assert window is not None
+            store.clear()
+
+            await worker.claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+            assert ("load", 0) not in store.calls
+            assert worker.window(0) is window
+        finally:
+            await worker.stop()
+
+    async def test_a_shard_whose_lease_another_member_took_is_refused(self) -> None:
+        # After `stop()` the lease is free and another member may hold it; the
+        # surviving window does not make the shard this member's.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        worker, _bus = await self._stopped_after_one_promotion(
+            clock, store, lease_ttl_s=LONG_LEASE_SECONDS
+        )
+        assert await store.acquire_lease(0, OTHER_MEMBER, LONG_LEASE_SECONDS) is None
+
+        with pytest.raises(ShardOwnedElsewhereError):
+            await worker.claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        assert await store.acquire_lease(0, MEMBER_C, 1.0) == OTHER_MEMBER
+
+
+class TestStopRunsOnceAndReleasesInAFinally:
+    """ADR-0013 decision 8 as amended (Amendment 4 ruling R4): "`stop()` itself runs
+    its sequence once: under the lock, `commit_handled()` inside a `try` whose
+    `finally` is `release()`, so the leases are released even when the final
+    acknowledgement fails -- the exception propagates after the release, and
+    the messages it failed to acknowledge reach the next member after
+    `ack_wait`, at-least-once as ADR-0003 has it. A later `stop()` ...
+    acquires the lock and returns without touching the bus or the store; that
+    is what "idempotent" means for it." Assumptions 64-65."""
+
+    async def test_a_second_stop_returns_normally(self) -> None:
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        await worker.stop()
+
+        await worker.stop()
+
+    async def test_a_second_stop_after_the_bus_is_closed_returns_normally(self) -> None:
+        # "by which time the service has closed the bus and `ack(())` would be
+        # a `ValueError`": the runner's `_stop_quietly` after a crash exit.
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        await worker.stop()
+        await bus.consumers[-1].close()
+        # The hazard is real: a second `stop()` that reached the bus would raise.
+        with pytest.raises(ValueError):
+            await bus.consumers[-1].ack([])
+
+        await worker.stop()
+
+    async def test_a_second_stop_touches_neither_the_bus_nor_the_store(self) -> None:
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        bus = _TappedBus(trace)
+        store = _RecordingStore(clock, trace)
+        worker = _worker(bus=bus, clock=clock, state_store=store)
+        await worker.start()
+        await worker.stop()
+        await bus.consumers[-1].close()
+        trace.clear()
+        store.calls.clear()
+
+        await worker.stop()
+
+        assert trace == []
+        assert store.calls == []
+
+    async def test_a_failing_final_acknowledgement_still_releases_the_lease(self) -> None:
+        # Assumption 64: "`release()` in `stop()`'s `finally`. When the final
+        # acknowledgement fails ... releasing at once lets the next member take
+        # it now". The exception still propagates.
+        clock = ManualClock(initial=BASE)
+        bus = _FailingAckBus()
+        state_store = MemoryShardStateStore(clock=clock)
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, state_store=state_store)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+
+        with pytest.raises(RuntimeError, match="ack failed"):
+            await worker.stop()
+
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) is None
+
+    async def test_the_release_follows_the_failed_acknowledgement(self) -> None:
+        # The trace of the same failure: flush, the ack that raised, then the
+        # release -- the order decision 8 gives, with the `finally` visible.
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        bus = _FailingAckBus(trace)
+        store = _RecordingStore(clock, trace)
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, state_store=store)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        trace.clear()
+
+        with pytest.raises(RuntimeError):
+            await worker.stop()
+
+        assert trace == ["flush", "ack", "release_lease"]
+
+    async def test_the_messages_it_failed_to_acknowledge_reach_the_next_member(self) -> None:
+        # "the messages it failed to acknowledge reach the next member ...,
+        # at-least-once": on the memory bus, at once.
+        clock = ManualClock(initial=BASE)
+        bus = _FailingAckBus()
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        with pytest.raises(RuntimeError):
+            await worker.stop()
+
+        next_owner = bus.consumer(GROUP)
+        message = await _take_one(await next_owner.subscribe(OBSERVATIONS_TOPIC))
+
+        assert message.key == str(IP_A).encode()
+
+    async def test_a_second_stop_after_a_failed_one_returns_normally(self) -> None:
+        # "runs its sequence once": the failed attempt was the one run, and
+        # the second neither retries the acknowledgement nor raises.
+        clock = ManualClock(initial=BASE)
+        trace: list[str] = []
+        bus = _FailingAckBus(trace)
+        store = _RecordingStore(clock, trace)
+        feed = _Feed(bus)
+        worker = _worker(bus=bus, clock=clock, state_store=store)
+        await worker.start()
+        assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
+        with pytest.raises(RuntimeError):
+            await worker.stop()
+        trace.clear()
+
+        await worker.stop()
+
+        assert trace == []
+
+    async def test_stop_before_start_returns_normally_and_touches_nothing(self) -> None:
+        # ADR-0009 decision 3: `stop()` is "safe before start()".
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        worker = _worker(bus=_TappedBus(), clock=clock, state_store=store)
+
+        await worker.stop()
+
+        assert store.calls == []
