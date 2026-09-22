@@ -31,12 +31,14 @@ worker's `stop()` has sent its final acknowledgement on the live consumer
 
 import asyncio
 import contextlib
-from collections.abc import Iterator, Mapping
+import time
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 import uvicorn
 from hammertime.aggregator.config import AggregatorSettings
 from hammertime.aggregator.metrics import AggregatorMetrics
+from hammertime.aggregator.sharding.assignment import ShardHeldBySameMemberError
 from hammertime.aggregator.worker import CONSUMER_GROUP, AggregatorWorker
 from hammertime.bus.interface import MessageBus
 from hammertime.bus.memory import InMemoryBus
@@ -109,12 +111,19 @@ class AggregatorService:
         *,
         transport: NatsBus | None = None,
         store_client: Redis | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.name = SERVICE_NAME
         self._settings = settings
         self._worker = worker
         self._transport = transport
         self._store_client = store_client
+        # The seams every `connect_with_retry` this service makes is given,
+        # so a test drives the startup backoff -- a shard-lease wait above
+        # all -- without wall time (ADR-0013 Amendment 6, assumption 104).
+        self._sleep = sleep
+        self._monotonic = monotonic
         self._readiness = Readiness()
         self._log = get_logger(SERVICE_NAME)
         self._poller = ConfigPoller(
@@ -144,12 +153,50 @@ class AggregatorService:
         lease is held (ADR-0013 decisions 3 and 7). A shard another member
         holds is `ShardOwnedElsewhereError` out of here -- not transient, so
         `run_service` logs `start_failed` and exits 1.
+
+        A shard held by another *instance* of this member is the one refusal
+        that is retried (decision 7 as amended by Amendment 6 ruling 2): the
+        claim runs under `connect_with_retry` as the `shard_leases`
+        dependency, so a predecessor that died without releasing is waited
+        out on ADR-0009 A1's schedule -- each attempt a fresh `subscribe()`,
+        each refusal a `dependency_unavailable` record -- and its shards are
+        claimed the moment its leases lapse, within
+        `HAMMERTIME_AGGREGATOR_LEASE_TTL_S`. A live twin never lets go: under
+        `run_service` the start is over within `HAMMERTIME_STARTUP_TIMEOUT_S`
+        of entry here, and the process exits 1 with `start_failed`. Which of
+        ADR-0009 A1's two forms that record takes -- `reason=startup_timeout`
+        from the outer `wait_for`, or `error=` naming the
+        `ShardHeldBySameMemberError` this coroutine re-raises when
+        `connect_with_retry` runs out of budget -- is unspecified, and nothing
+        may depend on it (ADR-0013 Amendment 8 ruling 1); the diagnosis is in
+        the `shard_held_by_same_member` and `dependency_unavailable
+        dependency=shard_leases` records either way. A caller that awaits
+        `start()` directly has no outer deadline and gets the re-raised
+        `ShardHeldBySameMemberError`.
         """
         if self._transport is not None:
-            await connect_with_retry("bus", self._transport.start, transient=TRANSIENT_ERRORS)
+            await connect_with_retry(
+                "bus",
+                self._transport.start,
+                transient=TRANSIENT_ERRORS,
+                sleep=self._sleep,
+                monotonic=self._monotonic,
+            )
         if self._store_client is not None:
-            await connect_with_retry("store", self._ping_store, transient=_TRANSIENT_STORE_ERRORS)
-        await self._worker.start()
+            await connect_with_retry(
+                "store",
+                self._ping_store,
+                transient=_TRANSIENT_STORE_ERRORS,
+                sleep=self._sleep,
+                monotonic=self._monotonic,
+            )
+        await connect_with_retry(
+            "shard_leases",
+            self._worker.start,
+            transient=(ShardHeldBySameMemberError,),
+            sleep=self._sleep,
+            monotonic=self._monotonic,
+        )
         self._readiness.mark_ready()
 
     async def run(self) -> None:
@@ -254,6 +301,11 @@ class AggregatorService:
         `bus_endpoints` stands in for the configured `HAMMERTIME_BUS_BROKERS`:
         a NATS URL may carry userinfo, and no record may carry it (ADR-0013
         decision 3 as amended by Amendment 2, ruling 3).
+
+        `instance_id` stands beside `member_id` (Amendment 6 ruling 2(e)):
+        it is half of the token this process's leases are held under, so an
+        operator can match it against the `owner` another process reports in
+        `shard_held_by_same_member` or `shard_lease_lost`.
         """
         fields: dict[str, object] = {
             "bus_kind": self._settings.bus_kind,
@@ -264,6 +316,7 @@ class AggregatorService:
             "bind": f"{self._settings.host}:{self._settings.port}",
             "consumer_group": CONSUMER_GROUP,
             "member_id": self._settings.member_id,
+            "instance_id": self._worker.instance_id,
             "shard_ids": sorted(self._settings.shard_ids),
         }
         if self._settings.store_kind == "redis":

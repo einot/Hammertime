@@ -287,10 +287,14 @@ def _validate_bus_brokers(value: str) -> None:
 def _parse_member_id(value: str | None) -> str:
     """`HAMMERTIME_AGGREGATOR_MEMBER_ID`: the hostname when unset; never empty.
 
-    ADR-0013 decision 7: two members sharing an id share its leases and are
-    not told apart, and "" is the templating accident ADR-0011 A3 describes,
-    so a set-but-empty (or whitespace-only) value is refused. The value is
-    otherwise stored as given.
+    ADR-0013 decision 7 as amended by Amendment 6: this value is the member
+    half of the shard lease's owner token, `<member_id>/<instance_id>`, so it
+    identifies the member and not the process -- two processes started under
+    one id are told apart by their instance tokens and the second is refused,
+    which is why decision 7 no longer says "two members sharing an id share
+    its leases and are not told apart". "" is the templating accident
+    ADR-0011 A3 describes, so a set-but-empty (or whitespace-only) value is
+    refused. The value is otherwise stored as given.
     """
     if value is None:
         return socket.gethostname()

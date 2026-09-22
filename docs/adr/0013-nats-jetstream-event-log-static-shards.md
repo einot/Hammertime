@@ -51,7 +51,35 @@ or `#` is refused at startup; the broker-list split is the public
 `hammertime.bus.split_bus_servers`; `HAMMERTIME_BUS_BROKERS` is validated
 only under `bus_kind=nats`, the `validate_redis_url` precedent; rule (iii)
 of `validate_bus_url` governs over "no value that connected before is
-refused now", which is qualified; the two stale test names are ruled).
+refused now", which is qualified; the two stale test names are ruled);
+amended a sixth time 2026-09-22 (see "Amendment 6" — the #90 residual is
+ruled: two processes under one `HAMMERTIME_AGGREGATOR_MEMBER_ID` both took
+the same leases, because the grant condition read a matching id as a
+renewal; the lease value is now the process's token
+`<member_id>/<instance_id>`, a same-member holder is refused and waited
+out inside the startup deadline, the compose file's `container_name`
+refuses `--scale`, and the recreated-container behaviour ruling N pinned
+the id for is restated: a clean recreate pays nothing, an unclean one
+waits at most `lease_ttl_s` in-process); amended a seventh time
+2026-09-22 (see "Amendment 7" — the R9 review of Amendment 6: two edits
+that amendment's list promised were absent from the files and are now
+made (decision 8's `AggregatorWorker` `instance_id` keyword and property;
+ADR-0001's pointer at its Amendment 2 item 1), spec §20 said a same-member
+holder "refuses to start" where the shipped behaviour waits it out,
+assumption 99's legacy-value guarantee is qualified for a `member_id`
+containing `/`, assumption 102's "shares the startup deadline" is
+corrected to the per-call clock ADR-0009 A1 already rules, and the
+`NatsConsumer` re-subscribe path is recorded as untested under #52. No
+decision changes in substance and no code behaviour changes); amended an
+eighth time 2026-09-22 (see "Amendment 8" — the R10 review of Amendment 7:
+Amendment 7's own correction of assumption 102 is corrected, because
+`connect_with_retry` gives up one backoff delay before its own deadline, so
+the live-twin case produces whichever of ADR-0009 A1's two `start_failed`
+records wins a race A1 rules unspecified; the same over-determined claim is
+qualified where it also stands, in Amendment 6 ruling 2(c) and in decision
+7's `on_assigned` bullet; `AggregatorService.start()`'s docstring is brief
+C11's to fix; `docs/spec/README.md`'s §22 row gains ADR-0001 Amendment 3. No
+decision changes in substance and no code behaviour changes).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
@@ -1084,7 +1112,9 @@ on the subject with no consumer) — no service-side check is added
 `p`, it must hold the shard's lease. The lease lives in the
 `ShardStateStore` — the store that already holds the shard's HOT set and
 sequence, is reachable by every member, and is the one dependency every
-aggregator already has — under the owner id of the member. The interface
+aggregator already has — under the owner id of the member *(the owner
+**token** of the process since 2026-09-22, Amendment 6 ruling 2; see the
+note after the block)*. The interface
 gains two methods:
 
 ```python
@@ -1097,6 +1127,20 @@ class ShardStateStore(Protocol):
     async def release_lease(self, shard: int, owner: str) -> None:
         """Drop shard's lease iff owner holds it; a no-op otherwise. Never raises for an unheld lease."""
 ```
+
+*The `owner` argument is an opaque token, not a member id (amended
+2026-09-22, Amendment 6 ruling 2): the store grants iff no live lease
+exists or the live lease's value equals the caller's token, releases iff
+equal, and reads nothing into the value. `ShardClaims` passes
+`lease_owner = f"{member_id}/{instance_id}"`, where `instance_id` is a
+random token generated once per process, so that a second process started
+under the same `member_id` is refused rather than treated as a renewal;
+the holder a refusal returns is that token, which `ShardClaims` splits at
+its last `/` to tell another member from another instance of itself.
+Neither backend changes in code; the interface docstring's "the id of the
+member that holds it" reads "the token of the owner that holds it", and
+the `ShardLeaseContract` tests are unchanged, their `MEMBER_*` strings
+being tokens like any other.*
 
 `RedisShardStateStore`: key `hammertime:agg:{shard}:owner`, value the
 owner id, one atomic server-side step per call (a Lua script: `GET`;
@@ -1180,7 +1224,41 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   among the shards the call claimed, so a refusal later in the same call
   rolls it back with the others. Ruling (d) is unchanged: the faulting
   call itself still releases nothing. Reachable only by a direct second
-  call, since the normal path exits 1 after the fault.*
+  call, since the normal path exits 1 after the fault.* *Amended
+  2026-09-22 (Amendment 6 ruling 2): the holder a refused `acquire_lease`
+  returns is split at its last `/` into a member id and an instance id (a
+  value with no `/` is a member id with an empty instance). A holder whose
+  member id is not this process's is the refusal above, unchanged. A
+  holder with this process's member id and another instance — a
+  predecessor that died without releasing, or a live twin started under
+  the same `HAMMERTIME_AGGREGATOR_MEMBER_ID`; the lease cannot tell which
+  at that moment — is logged `WARNING event=shard_held_by_same_member
+  shard=<p> owner=<token> member=<self> instance=<self instance>`, rolled
+  back exactly as above, and raised as `ShardHeldBySameMemberError(shard,
+  owner)`, a subclass of `ShardOwnedElsewhereError`. `AggregatorService.start()`
+  calls `worker.start()` through `connect_with_retry("shard_leases", ...,
+  transient=(ShardHeldBySameMemberError,))`, so that refusal is retried on
+  ADR-0009 A1's schedule under the startup deadline — each attempt a fresh
+  `subscribe()`, which both consumers permit after a listener that raised,
+  since each marks itself subscribed only once the listener has returned —
+  and a dead predecessor's leases, lapsing within `lease_ttl_s`, are taken
+  without the process exiting; a live twin's never lapse, the deadline
+  expires, and the process exits 1 with `start_failed`. A refusal by
+  another member is not retried. The same-instance re-acquire of the
+  previous sentence is unaffected: it passes the same token and is a
+  renewal.*
+  *Qualified 2026-09-22 (Amendment 8 ruling 2): "the deadline expires" is
+  loose, and nothing may be read into which deadline it is.
+  `connect_with_retry` stops one backoff delay short of its own deadline
+  (ADR-0009 A1 step 4) while `run_service`'s outer `asyncio.wait_for` fires
+  at the full `HAMMERTIME_STARTUP_TIMEOUT_S`, so either can end the wait —
+  and therefore `start_failed` carries either `reason=startup_timeout` or
+  an `error=` naming the last `ShardHeldBySameMemberError`. A1 rules that
+  race unspecified. What holds in both cases: the wait is over within
+  `HAMMERTIME_STARTUP_TIMEOUT_S` of `start()` being entered, the exit code
+  is 1, and the `shard_held_by_same_member` and `dependency_unavailable
+  dependency=shard_leases` records that carry the diagnosis are already in
+  the log.*
 * `ShardClaims.renew_leases()` calls `acquire_lease` for every held shard;
   `AggregatorWorker.run_maintenance()` calls it **first**, before the
   expiry sweep, under the worker lock, so a member that has lost a shard
@@ -1213,7 +1291,18 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   TTL. The reference compose file therefore sets
   `HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` on its one aggregator
   (decision 11), and its comment no longer says "keyed by the container
-  name".*
+  name".* *Superseded 2026-09-22 (Amendment 6 rulings 2 and 3): the lease
+  value is the process's token, so a replacement with the same `member_id`
+  is a different instance and does **not** reacquire at once. A clean stop
+  releases first, so a restart or a recreate that received its SIGTERM
+  pays nothing, as before. After an unclean death the replacement is
+  refused with `shard_held_by_same_member` and waits inside `start()` for
+  the predecessor's leases to lapse — at most `lease_ttl_s`, with no exit
+  and `/readyz` answering 503 meanwhile — then claims them; a replacement
+  with a different id is refused with `shard_owned_elsewhere` and exits 1
+  at once, as before, retried only by its orchestrator. The compose pin of
+  `aggregator-0` is what puts a recreated container on the first path
+  rather than the second.*
   *`release()` empties the set of shards whose lease this member holds and
   leaves the windows where they are; `ShardClaims` keeps that set apart
   from its windows for exactly this reason, `renew_leases()` renews only
@@ -1225,14 +1314,30 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
 `socket.gethostname()`; set-but-empty is a `ValueError`) and
 `HAMMERTIME_AGGREGATOR_LEASE_TTL_S` (default 30; a positive number that
 MUST exceed `HAMMERTIME_AGGREGATOR_MAINTENANCE_INTERVAL_S`, else
-`ValueError`, since renewal happens once per maintenance interval).
+`ValueError`, since renewal happens once per maintenance interval). *The
+instance token is not configurable (amended 2026-09-22, Amendment 6):
+`ShardClaims` generates it per construction (`secrets.token_hex(8)`;
+injectable as `instance_id` for tests) and `AggregatorWorker` passes it
+through. For a replacement's wait to complete inside one start,
+`HAMMERTIME_AGGREGATOR_LEASE_TTL_S` should stay below
+`HAMMERTIME_STARTUP_TIMEOUT_S` (30 against 60 by default); `load_settings`
+does not check this, as it does not read the runner's key (assumption
+107).*
 
 **Failure shape, summarised.** Overlap at start: `shard_owned_elsewhere`
 (ERROR), `start_failed`, exit 1, `/readyz` never 200. Overlap discovered
 later (a lease lapsed and another member took the shard): `shard_lease_lost`
 (ERROR), `run_exited`, exit 1. No new metric series: ADR-0011 A13's list of
 nine is closed and the two records plus `shards_claimed` reading 0 are the
-observables (assumption 19).
+observables (assumption 19). *Same-member overlap at start (amended
+2026-09-22, Amendment 6): `shard_held_by_same_member` (WARNING) per refused
+attempt and `dependency_unavailable dependency=shard_leases` between
+attempts; then either `shard_claimed` and `ready` once a dead
+predecessor's leases lapse, or `start_failed` and exit 1 at the startup
+deadline while a live twin keeps renewing. `instance_id` joins `member_id`
+in the `starting` record, so the tokens in those records can be matched
+across processes; `shard_lease_lost` gains `instance=<self>` and its
+`owner` is the holder's token. Still no new metric series.*
 
 **What is enforced versus what stays an operator invariant.** Enforced:
 no two live members with distinct `member_id`s hold the same shard for
@@ -1243,7 +1348,17 @@ in some member's set (decision 6); `lease_ttl_s` comfortably exceeds the
 longest stall a member can suffer (a configuration re-evaluation pass over
 `max_tracked_ips` IPs holds the lock and delays renewal — with the
 defaults, 30 s against a pass that yields every 1000 IPs; an operator who
-raises `max_tracked_ips` should raise the TTL with it).
+raises `max_tracked_ips` should raise the TTL with it). *Corrected
+2026-09-22 (Amendment 6 ruling 2): "`member_id`s are unique per live
+member (two members sharing an id share its leases and are not told
+apart)" is no longer true and is no longer an operator invariant. Two
+processes sharing an id are told apart by their instance tokens, and the
+second is refused — after a wait bounded by `lease_ttl_s`, in case the
+first is a dead predecessor. The enforced statement is now: no two live
+processes, whatever their `member_id`s, hold the same shard for longer
+than one maintenance interval past a lapsed lease. The other two operator
+invariants — every partition in some member's set; `lease_ttl_s` above
+the longest stall — stand.*
 
 ### 8. The aggregator: acknowledge what was handled; `REDELIVERED` is the eighth outcome; no revocation path
 
@@ -1254,9 +1369,13 @@ surface after this ADR:
 class ShardClaims:                                   # satisfies AssignmentListener
     def __init__(self, *, state_store, producer, consumer, clock, config,
                  member_id: str, lease_ttl_s: float,
-                 max_tracked_ips: int = 1_000_000) -> None: ...
+                 max_tracked_ips: int = 1_000_000,
+                 instance_id: str | None = None) -> None: ...   # added 2026-09-22, Amendment 6: None -> secrets.token_hex(8)
     config: DetectionConfig                          # property (ADR-0011 A18)
     shards: frozenset[int]                           # property
+    member_id: str                                   # property (Amendment 6)
+    instance_id: str                                 # property (Amendment 6): this process's token
+    lease_owner: str                                 # property (Amendment 6): f"{member_id}/{instance_id}", the owner passed to every lease call
     def window(self, shard: int) -> ShardWindow | None: ...
     def windows(self) -> tuple[ShardWindow, ...]: ...
     def adopt_config(self, config: DetectionConfig) -> None: ...   # ADR-0011 A18, unchanged
@@ -1409,6 +1528,17 @@ test construction stays valid; `build_service` passes the settings' values.
 favour of `hammertime.bus.nats.NatsBus` and `TRANSIENT_ERRORS`; the
 `MessageBus` protocol moves to `hammertime.bus.interface` (decision 3).
 
+*`AggregatorWorker`'s keyword list gains a third (amended 2026-09-22,
+Amendment 6 ruling 2(a); written here by Amendment 7 ruling 1, Amendment
+6's edit list having promised this edit without making it):
+`instance_id: str | None = None`, keyword-only and forwarded to
+`ShardClaims`, where `None` means "generate one" (`secrets.token_hex(8)`,
+once per construction). The worker also gains an `instance_id: str`
+property returning `ShardClaims.instance_id` — the property
+`AggregatorService.startup_fields()` reads to put `instance_id` in the
+`starting` record (ruling 2(e)). `build_service` passes nothing for it, so
+every process generates its own.*
+
 ### 9. The trie's replay position is the stream sequence; the detector must tolerate redelivery order
 
 ADR-0010's Consequences deferred "how the trie snapshot records its replay
@@ -1547,7 +1677,18 @@ here as the contract):
   `HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` (amended 2026-09-22,
   Amendment 4 ruling N; decision 7, as corrected), so a recreated
   container reacquires its shards at once instead of waiting out the
-  lease TTL under a fresh container ID.*
+  lease TTL under a fresh container ID.* *Amended 2026-09-22 (Amendment 6
+  ruling 2): the `aggregator` service also sets `container_name:
+  hammertime-aggregator-0`, so that Compose refuses `docker compose up
+  --scale aggregator=N` outright — the Compose specification: "Compose
+  does not scale a service beyond one container if the Compose file
+  specifies a `container_name`. Attempting to do so results in an error."
+  (Sources, Amendment 6). A second replica would share the pinned member
+  id and the `all` set; the lease now refuses it too, but later and
+  slower than Compose does. The `member_id` pin stays, and what it buys is
+  no longer an instant reacquire but the same-member classification that
+  makes a recreated container wait in-process for its predecessor's
+  leases instead of exiting 1 (decision 7, as amended).*
 * `broker` (Kafka) is removed; `deploy/docker-compose.redpanda.yml` is
   deleted; the `KAFKA_*` block and `CLUSTER_ID` go with them.
 * `Makefile` `up` becomes `docker compose -f deploy/docker-compose.yml up
@@ -2998,7 +3139,13 @@ auditor's `member_id` note.
   TTL. Ruled: the compose file sets `HAMMERTIME_AGGREGATOR_MEMBER_ID:
   aggregator-0` (assumption 80) and the comment is corrected;
   `.env.example`'s "which a restarted container ... keeps" is qualified
-  the same way. Decision 7's parenthesis is corrected in place.
+  the same way. Decision 7's parenthesis is corrected in place. *Note
+  2026-09-22 (Amendment 6 ruling 3): the premise — a recreated container
+  "would wait out the TTL" — holds only when the old container did not
+  release, i.e. after an unclean death; a recreate that received its
+  SIGTERM releases in `stop()` and the replacement pays nothing. The pin
+  is kept for the reason ruling 3 there gives, and the wait it once
+  avoided is now an in-process wait rather than a crash loop.*
 
 No `CHANGES` line follows from any of these: the NATS transport, the
 provisioner, the lease and the compose stack this branch introduces have
@@ -3132,7 +3279,11 @@ continues the ADR's list):
 80. **`HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` in compose rather
     than `hostname: aggregator-0`.** The variable is what decision 7
     defines and what `.env.example` documents; a `hostname:` would work
-    through the default and hide the dependency.
+    through the default and hide the dependency. *Note 2026-09-22
+    (Amendment 6): the pin stands, and is load-bearing for a different
+    reason — a replacement under a pinned id is a same-member holder to
+    the lease and waits in-process; under the hostname default it is
+    another member and exits 1 (Amendment 6 ruling 3).*
 81. **The five `Dockerfile`s are this epic's change set**, although four
     predate it. Scope judgement: one line each, no behaviour change, and
     the alternative leaves the tree inconsistent with its own ADR-0012
@@ -3599,3 +3750,1173 @@ Read on 2026-09-22 for Amendment 5:
   under `memory`" bullet and the "nothing is ruled about
   `HAMMERTIME_BUS_BROKERS`" bullet); the R2 and S2 reports as relayed by
   the top-level session.
+
+## Amendment 6 (2026-09-22) — the #90 residual: a shared member identity defeated the lease; the lease now identifies the process
+
+Why: decision 7 answered #90 for two members with *different*
+`member_id`s and recorded, under "what stays an operator invariant", that
+"two members sharing an id share its leases and are not told apart".
+`acquire_lease` grants when the live lease is the caller's own — the clause
+`renew_leases()` and Amendment 5 ruling 1's re-acquire rely on — so two
+processes started under one `member_id` both succeed, each reading its own
+id in the key as a renewal; both load the same `next_sequence`, build
+independent windows and publish under one identity with colliding
+sequences. That is #90's harm, undetected. Amendment 4 ruling N then
+pinned `HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` in the reference
+compose file so a recreated container would not wait out its own stale
+lease, which turned the invariant into one the shipped stack invites
+breaking: `docker compose up --scale aggregator=2` gives two containers
+the same identity and the same `all` set. The top-level session asked for
+a ruling on five questions — scope; mechanism; the recreated-container
+behaviour the pin was for; which shipped documents are now wrong; whether
+#90 can close — with the warning that a ruling which merely moves the
+problem from the twin hole to the crash loop is not a ruling. Each is
+ruled below, and every edit to a decision's text is in place with a dated
+italic note. *(Corrected 2026-09-22, Amendment 7 ruling 1: that last
+clause was false when it was written. Two edits this list promises were
+not in the change set — decision 8's `AggregatorWorker` keyword and
+property, and ADR-0001's pointer at its Amendment 2 item 1 — and ruling 6
+miscites its source for "there is none". The R9 review found the two
+missing edits; Amendment 7's own audit found the miscitation. All three
+are corrected, each at the item it belongs to.)*
+
+Every edit outside this section, with the superseded wording quoted or
+the insertion point named:
+
+* **Status line.** Gained the "amended a sixth time 2026-09-22" clause.
+* **Decision 7, "What is checked".** "under the owner id of the member"
+  gained the italic pointer; after the interface block, the italic "The
+  `owner` argument is an opaque token" paragraph (ruling 2).
+* **Decision 7, `on_assigned` bullet.** Appended the italic "Amended
+  2026-09-22 (Amendment 6 ruling 2)" paragraph: the holder's token is
+  classified, a same-member holder is `ShardHeldBySameMemberError`, and
+  `AggregatorService.start()` waits it out (ruling 2).
+* **Decision 7, `release()` bullet.** Appended the italic supersession of
+  "a replacement with the same `member_id` ... reacquires at once, and one
+  with a different id waits at most `lease_ttl_s`, crash-looping with
+  `shard_owned_elsewhere` until then" (rulings 2 and 3).
+* **Decision 7, Configuration.** Appended the italic `instance_id` and
+  deadline sentences.
+* **Decision 7, "Failure shape, summarised".** Appended the italic
+  same-member shape and the `starting`/`shard_lease_lost` fields.
+* **Decision 7, "What is enforced versus what stays an operator
+  invariant".** Appended the italic correction: "`member_id`s are unique
+  per live member (two members sharing an id share its leases and are not
+  told apart)" is no longer true and no longer an operator invariant.
+* **Decision 8, `ShardClaims` block.** Gained `instance_id: str | None =
+  None` and the `member_id`, `instance_id` and `lease_owner` properties.
+  `AggregatorWorker` gains the same `instance_id: str | None = None`
+  keyword and an `instance_id` property (it is not shown as a block in
+  this ADR; the keyword list decision 8 gives it — `member_id="aggregator"`,
+  `lease_ttl_s=30.0` — gains this third), and `build_service` passes
+  nothing for it, so every process generates its own. *(Corrected
+  2026-09-22, Amendment 7 ruling 1: the `ShardClaims` half of this item
+  was made; the `AggregatorWorker` half was not — decision 8's keyword
+  sentence was left unchanged and no `instance_id` property appeared
+  anywhere in this ADR's body, while the code and its tests carried both.
+  The italic paragraph now at the end of decision 8 is that edit.)*
+* **Decision 11, application-services bullet.** Appended the italic
+  `container_name` sentence and what the `member_id` pin now buys.
+* **Assumption 80.** Appended the italic note on the pin's purpose.
+* **Amendment 4, ruling N.** Appended the italic note that its premise
+  holds for the unclean-death case only.
+* **Outside this file** (same change set): ADR-0001 gains Amendment 3 — a
+  dated pointer at Amendment 2 item 1, recording that the lease is now
+  per process and the unique-`member_id` invariant is enforced — and its
+  status line; `docs/runbook.md` gains "Aggregator will not start: a
+  shard is leased elsewhere"; spec §20's note gains the parenthesis
+  "(another process under the same member id included)". `docs/spec/README.md`
+  is unchanged: no section moves, and the §20/21 row already maps the
+  lease. *(Corrected 2026-09-22, Amendment 7 rulings 1 and 2: ADR-0001's
+  Amendment 3 and status line were written, but the pointer sentence
+  itself was never inserted at Amendment 2 item 1, so a reader following
+  #90's trail into clause 1 found superseded wording with nothing
+  pointing forward; it is in place as of Amendment 7's change set. The
+  §20 parenthesis was inserted, and was wrong: it made the normative spec
+  say a same-member holder "refuses to start", which is the crash loop
+  ruling 3 removed. Amendment 7 ruling 2 replaces that wording.)* The code, test, compose, `.env.example`, `deploy/k8s/README.md`
+  and `CHANGES` edits are briefs C9 and T9 of the hand-off report, not
+  this ADR's to make.
+
+**Rulings.** Numbered 1-6: the brief's five questions in its order, then
+`CHANGES`.
+
+1. **Scope — fixed now, under the epic's acceptance criterion; the M8
+   milestone does not defer it.** The residual sits inside the mechanism
+   the epic shipped *as its answer to #90*, and the epic's acceptance
+   criteria listed "#90 resolved"; #90's harm, reachable from the shipped
+   reference stack by one command-line flag, is not resolved. The
+   invariant the residual rests on is not one the reference stack lets an
+   operator keep: the file pins the id, so every replica has it. The change
+   is bounded — no store code changes, one classification in
+   `ShardClaims`, one wait in `AggregatorService.start()`, one compose
+   line — and `CLAUDE.md`'s pre-1.0 standing order applies to a step this
+   clear. Milestone placement is the tracker's; this ADR takes the
+   acceptance-criterion reading as governing (assumption 97).
+2. **Mechanism — the lease value identifies the process; the store is
+   unchanged; a same-member holder is waited out inside the startup
+   deadline; the compose file refuses scaling.**
+   (a) *The token.* `ShardClaims` gains `instance_id` (default
+   `secrets.token_hex(8)`, sixteen hex characters generated once per
+   construction; injectable for tests — assumption 98) and passes
+   `lease_owner = f"{member_id}/{instance_id}"` as the `owner` of every
+   `acquire_lease` and `release_lease` call. The store attaches no meaning
+   to the token: it grants iff no live lease exists or the live value
+   equals the caller's token, releases iff equal. Neither backend changes
+   in code; their docstrings and `interface.py`'s say "owner token" where
+   they said "member id" (assumption 109). The three behaviours the brief
+   named as load-bearing keep working because the token is stable for the
+   process's life: `renew_leases()` passes the token the process acquired
+   under and is granted as before; Amendment 5 ruling 1's re-acquire of a
+   leased-but-unwindowed shard passes the same token and is a renewal, so
+   ruling 1 and assumptions 83-85 stand unchanged; `release()` deletes
+   only this process's own leases — which the member-id value did not
+   guarantee: a stopping twin released the survivor's shards.
+   (b) *Classification.* On a non-`None` result from `acquire_lease`,
+   `on_assigned` splits the holder at its **last** `/` (`rpartition`):
+   before it the holder's member id, after it the instance; a value with
+   no `/` is a member id with an empty instance (assumption 99). A holder
+   whose member id differs is decision 7's refusal, unchanged:
+   `shard_owned_elsewhere` (ERROR), rollback, `ShardOwnedElsewhereError`,
+   exit 1 on the first attempt. A holder with the same member id and
+   another instance — the same instance is a renewal the store grants, so
+   this is the only other case — is `WARNING event=shard_held_by_same_member
+   shard=<p> owner=<token> member=<self> instance=<self instance>`, the
+   same rollback, and `ShardHeldBySameMemberError(shard, owner)`, a
+   subclass of `ShardOwnedElsewhereError` (assumptions 100-101). Such a
+   holder is one of two things the lease cannot distinguish at that
+   moment: a predecessor that died without releasing, whose leases lapse
+   within `lease_ttl_s`, or a live twin, which keeps renewing.
+   (c) *The wait.* `AggregatorService.start()` calls `worker.start()`
+   through `connect_with_retry("shard_leases", self._worker.start,
+   transient=(ShardHeldBySameMemberError,), sleep=..., monotonic=...)`:
+   ADR-0009 A1's schedule (0.5 s doubling to a 5 s cap) under the startup
+   deadline `HAMMERTIME_STARTUP_TIMEOUT_S` (60 s), one `dependency_unavailable
+   dependency=shard_leases attempt=N` record per refusal (assumption 102).
+   Each attempt is a full `subscribe()`; that is legal because both
+   consumers set their subscribed flag only after the listener returned
+   (`memory.py` and `nats.py`, repository facts; decision 3's "as if
+   `subscribe()` had never been called"), `NatsConsumer` unsubscribes its
+   inboxes on the way out, and `on_assigned`'s rollback leaves
+   `ShardClaims` holding nothing. A dead predecessor's leases lapse inside
+   the deadline whenever `lease_ttl_s` is below the startup timeout (30 s
+   against 60 s by default); the replacement then claims, logs
+   `shard_claimed`, and becomes ready without a process exit. A live twin
+   never lets go: the deadline expires, the last `ShardHeldBySameMemberError`
+   is re-raised, `run_service` logs `start_failed` and the process exits 1.
+   *Qualified 2026-09-22 (Amendment 8 ruling 2): that sentence names one of
+   two possible endings as the ending. `connect_with_retry` re-raises one
+   backoff delay before its own deadline (ADR-0009 A1 step 4) and
+   `run_service`'s outer `asyncio.wait_for` fires at the full
+   `HAMMERTIME_STARTUP_TIMEOUT_S`, so a live twin ends the start with
+   `start_failed` carrying either the re-raised error or
+   `reason=startup_timeout` — A1 rules which one unspecified, and the
+   ADR-0009 record table's `start_failed` row admits both. The exit code is
+   1 and the diagnosis is in the preceding `shard_held_by_same_member` and
+   `dependency_unavailable dependency=shard_leases` records either way.*
+   A refusal by another member is not in the transient tuple and exits 1
+   at once, as today. `AggregatorService.__init__` gains `sleep` and
+   `monotonic` keywords (defaults `asyncio.sleep`, `time.monotonic`)
+   passed to every `connect_with_retry` it makes, so a test drives the
+   wait without wall time (assumption 104).
+   (d) *The reference deployment.* `deploy/docker-compose.yml`'s
+   aggregator keeps `HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` and
+   gains `container_name: hammertime-aggregator-0` (assumption 105). The
+   Compose specification: "Compose does not scale a service beyond one
+   container if the Compose file specifies a `container_name`. Attempting
+   to do so results in an error." (Sources). `docker compose up --scale
+   aggregator=2` is therefore refused by Compose before any container
+   exists, which is where an at-most-one-per-identity guarantee belongs;
+   the lease is the check behind it for everything Compose cannot see.
+   Nothing is lost: a multi-member compose deployment needs a distinct
+   `HAMMERTIME_SHARD_IDS` per member, which `--scale` cannot express — it
+   is a second service, not a second replica. (The shipped file's fixed
+   host port `8083:8083` already keeps a second container from *starting*,
+   since one host port cannot be bound twice; that is an accident of the
+   port mapping, stated from recall and not verified against a primary
+   source, and an operator who drops the mapping behind a proxy loses it.
+   It is not relied on — assumption 110.)
+   (e) *Records.* `startup_fields()` gains `instance_id`, so a process's
+   `starting` record can be matched against the token in another
+   process's `shard_held_by_same_member` or `shard_lease_lost` record
+   (assumption 103); `shard_lease_lost` gains `instance=<self>` and its
+   `owner` is the holder's token.
+   *Rejected, with what each costs.* **A liveness key per process,
+   leases unchanged** (`hammertime:agg:member:{member_id}` holding the
+   instance token with a TTL, renewed each sweep; a second process refused
+   when it holds another token): the same detection and the same wait — a
+   dead predecessor's member key lives exactly as long as its leases would
+   — for one more key per member, a second renewal path to keep in step
+   with the first, and leases that still misstate who holds them (a
+   stopping twin would still release the survivor's shards). It buys
+   nothing the token does not and costs a mechanism. **Leave the store and
+   the aggregator alone and make the deployment safe** (`container_name`
+   alone, the StatefulSet alone): closes the one-flag path and nothing
+   else. Any orchestration that breaks at-most-one — a force-deleted
+   StatefulSet Pod still running on a partitioned node, which the
+   Kubernetes documentation names as the case that "will violate the at
+   most one semantics that StatefulSet is designed to guarantee"
+   (Sources); a Deployment used by mistake; two hosts with one hostname —
+   is silent double ownership, and decision 7 would keep promising a
+   detection it does not perform. It is taken *as well*, not instead.
+   **Same-member takeover on staleness** (grant to a same-member claimant
+   when the holder's last renewal is older than *k* maintenance intervals,
+   so a replacement waits seconds rather than the TTL): over-design for
+   the residual — a second timing parameter, a cross-process clock
+   comparison inside the Lua script, and a real hazard, since a member
+   stalled past *k* intervals but alive (the re-evaluation pass decision 7
+   already warns about) would be taken over by its own replacement.
+   Recorded as the refinement to reach for if the TTL wait proves costly
+   (assumption 106). **A structured interface**
+   (`acquire_lease(shard, member, instance, ttl)`): the same semantics for
+   a larger diff (two backends, the contract tests, every caller), and the
+   store would still compare the pair for equality and nothing more; the
+   token *is* the pair. **Unpinning `member_id` in compose** (the hostname
+   default): reopens ruling N — a replacement under a new container id is
+   *another member* to the lease, exit 1 at once, crash-looping for the
+   TTL — and under this amendment also loses the same-member
+   classification that turns that crash loop into an in-process wait. The
+   pin is kept, and it is now load-bearing for that reason (ruling 3).
+3. **The recreated container: a clean recreate pays nothing, as before;
+   after an unclean death the replacement waits in-process for at most
+   `lease_ttl_s`, and that is accepted, with the reason.** `docker compose
+   up --build`, `docker compose restart`, `kubectl rollout restart` and a
+   Pod eviction all stop the old process with SIGTERM: `stop()` releases
+   the leases (decision 8, in a `finally`), and the new instance acquires
+   at once. Ruling N's "a recreated one ... would wait out the TTL" holds
+   only when the old process did not release — SIGKILL after the stop
+   grace period, OOM, host loss, a store unreachable at release
+   (assumption 108) — and in exactly those cases the shipped instant
+   takeover *was* the twin hole: the lease could not know the predecessor
+   was dead and took the member id's word for it. Now the replacement
+   (same `member_id`, new `instance_id`) is refused with
+   `shard_held_by_same_member`, retries under the startup deadline, takes
+   the shards the moment the predecessor's leases lapse (`lease_ttl_s`
+   after their last renewal, so less than `lease_ttl_s` after the death),
+   and reports `ready`; `/readyz` answers 503 meanwhile, `make up --wait`
+   (30 x 2 s) covers it at the default TTL, and there is no exit and no
+   crash loop. The bound is acceptable because it is the bound decision 7
+   already accepted for a different-id replacement; because the
+   replacement rebuilds its counters from empty either way and
+   under-counts inherited IPs for one `window_seconds` (300 s by default),
+   inside whose shadow 30 s of lease wait falls; and because the
+   alternative is a lease that cannot detect the failure #90 is about.
+   An operator who needs a shorter wait lowers `HAMMERTIME_AGGREGATOR_LEASE_TTL_S`
+   (it must still exceed the maintenance interval and cover the longest
+   stall, decision 7) and keeps it below `HAMMERTIME_STARTUP_TIMEOUT_S`
+   (assumption 107). The hostname default is unchanged and its cost is
+   now stated exactly: a replacement under a *new* hostname is another
+   member to the lease and exits 1 at once, retried only by its
+   orchestrator, for at most `lease_ttl_s`; a StatefulSet Pod and a pinned
+   compose service keep their name and get the in-process wait.
+   `deploy/k8s/README.md`: the StatefulSet remains the only supported
+   shape. Its guarantee — "StatefulSet ensures that, at any time, there is
+   at most one Pod with a given identity running in a cluster" (Sources)
+   — is what makes a same-name replacement a predecessor and never a
+   twin; the force-deletion case the same page warns about, "the
+   duplication of a still-running Pod", is now detected rather than
+   silent: the replacement waits, and if the old Pod is still renewing it
+   fails start instead of sharing the shards. A Deployment is still not a
+   supported shape; the difference is that it is now refused rather than
+   silently double-owning.
+4. **Which shipped documents are wrong, and which merely incomplete.**
+   Wrong, and corrected: decision 7's "two members sharing an id share its
+   leases and are not told apart" (corrected in place; it was accurate and
+   is now false) and its "a replacement with the same `member_id` ...
+   reacquires at once" (superseded in place); `deploy/k8s/README.md`'s "so
+   a restart reacquires them at once and a second owner is refused" — true
+   for a clean restart, false after an unclean one, and "a second owner"
+   now includes a Pod bearing the same name (C9 rewrites the bullet);
+   `.env.example`'s member block — "which a restarted container keeps but
+   a recreated one ... does not — it would wait out the lease TTL under a
+   fresh container ID" describes the crash loop the same-member wait
+   replaces, and says nothing of the instance token (C9 rewrites it).
+   Incomplete, not wrong: `docs/runbook.md` had no lease entry at all
+   (added in this change set); ADR-0001 Amendment 2 item 1 ("a violation
+   is detected: before claiming a shard a member takes the shard's lease
+   ... under its `member_id`") is true as far as it goes and gains a dated
+   pointer (ADR-0001 Amendment 3); spec §20's "leased to another live
+   member" is true and gains a parenthesis; Amendment 4 ruling N and
+   assumption 80 are correct history whose premise is now narrower (noted
+   in place); Amendment 5 ruling 1 and assumptions 83-85 are untouched,
+   the re-acquire still being a renewal; `docs/spec/integration-scenarios.md`
+   §7's handover sentence ("its shard leases released, the next owner
+   constructed afterwards, taking the leases") is unchanged in truth.
+5. **#90 closes when C9 and T9 land and the gate passes.** Both readings
+   of "overlapping sets across members" are then refused: distinct ids
+   (decision 7, shipped) and one id in two processes (this amendment).
+   What remains open is not #90's: the narrow-fencing residual — a stalled
+   member acts for up to one maintenance interval after its lease lapsed,
+   and `record_transition` carries no fencing token (ADR-0011 A2; decision
+   7, assumption 18) — and the integration-level check of the compose
+   behaviour, which is #52's. The closing comment should say: overlap
+   between distinct member ids has been refused since ADR-0013 decision 7;
+   overlap between two processes sharing one id — reachable from the
+   compose file by `--scale` — is refused since Amendment 6, the lease
+   now carrying a per-process token, the reference compose file refusing
+   `--scale` by `container_name`, and a replacement after an unclean stop
+   waiting in-process for its predecessor's leases (at most
+   `HAMMERTIME_AGGREGATOR_LEASE_TTL_S`) rather than taking them over; the
+   fencing residual is ADR-0011 A2's and stays where it is recorded.
+6. **`CHANGES`.** Two lines, user-visible under `CLAUDE.md`'s rules
+   (changed behaviour; a changed reference deployment, which has precedent
+   in the file), written by C9, newest first, above the current first
+   line (assumption 112):
+
+   ```text
+   Aggregator shard leases identify the process, not just the member: a second process started under the same HAMMERTIME_AGGREGATOR_MEMBER_ID is refused (shard_held_by_same_member, then start_failed), and a replacement after an unclean stop waits up to HAMMERTIME_AGGREGATOR_LEASE_TTL_S for its predecessor's leases to lapse instead of taking them over at once
+   Reference compose file sets container_name on the aggregator, so docker compose up --scale aggregator=N is refused
+   ```
+
+   Not `BREAKING`: no running deployment needs action (there is none —
+   Context, prerequisite 5), and an older build's plain member-id lease
+   value is read as a same-member holder with an empty instance and waited
+   out, not misread. *(Corrected 2026-09-22, Amendment 7 rulings 1 and 4.
+   The citation was wrong: Context's "Prerequisites, as verified" item 5
+   is the Kafka cold-start measurement. The claim belongs to Context's
+   operational-case item 5, "Nothing is in production: no image in this
+   repository has ever been started" — which is the whole of the
+   non-`BREAKING` label's support. The second half of the sentence is an
+   aside and is true only when the member id contains no `/`: a bare
+   legacy value that itself contains one splits at its own last `/` and is
+   classified as another member, so such a process exits 1 at once instead
+   of waiting. Assumption 99, as amended, states the limit. The label
+   stands — no such value can exist, because no build that writes one has
+   ever run.)*
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+97. **The epic's acceptance criterion governs over the milestone.** The
+    residual is a hole in the shipped answer to #90, not new work the
+    issue would have deferred; the M8 placement predates the answer.
+98. **`secrets.token_hex(8)` as the instance token.** Sixty-four random
+    bits: enough to make a collision between the handful of processes
+    that ever share a store negligible, short enough to read in a log
+    record. `uuid4().hex` would do the same at twice the length. Not a
+    boot id or a PID: neither is unique across hosts, and a PID repeats.
+99. **`/` as the separator, split at the last one, and a bare value is a
+    member id with an empty instance.** A hostname cannot contain `/`; an
+    operator-set `member_id` may, which is why the split is from the
+    right and the instance never contains one. A lease value written by a
+    build before this amendment (a plain member id) or by anything else
+    is then classified by member equality — waited out if it names this
+    member, refused at once otherwise — and never misread as this
+    process's own. *Qualified 2026-09-22 (Amendment 7 ruling 4, on the R9
+    review's finding 5): that last guarantee holds only for a member id
+    with no `/` in it. A process whose own `member_id` contains one —
+    `region-1/aggregator-a` — meeting a bare legacy value equal to that
+    id splits it at the id's own last `/`, compares `region-1` against
+    `region-1/aggregator-a`, finds them different, and exits 1 at once
+    with `shard_owned_elsewhere` instead of waiting the lease out. The
+    code cannot do better from the value alone: `a/b` is both "the bare
+    member id `a/b`" and "member `a`, instance `b`", and preferring the
+    tokenised reading is right, because every value this build writes is
+    tokenised. Accepted rather than fixed: no build that writes a bare
+    value has ever run (Context's operational-case item 5), so no such
+    value can exist outside a store an operator wrote by hand. What the
+    misclassification would cost if one did is one process exit and an
+    orchestrator restart per attempt for at most `lease_ttl_s` — the
+    pre-Amendment-6 crash loop, loud and self-clearing, not silent double
+    ownership.*
+100. **`ShardHeldBySameMemberError` subclasses `ShardOwnedElsewhereError`.**
+     Every existing `pytest.raises(ShardOwnedElsewhereError)` keeps its
+     meaning ("this member does not hold the shard"), `run_service` still
+     sees the base type as non-transient, and only the aggregator's own
+     `start()` names the subclass as retryable. The tests that distinguish
+     the two assert `isinstance` against the subclass.
+101. **The same-member record is a WARNING, not an ERROR, and keeps the
+     `shard_owned_elsewhere` name for the other-member case.** A refused
+     attempt that is about to be retried is not yet a failure; the failure,
+     when it comes, is `start_failed`. ADR-0011 A13's closed list of
+     metric series is untouched: the wait is observable through the two
+     records and `/readyz`.
+102. **The wait reuses `connect_with_retry` under the name `shard_leases`
+     and shares the startup deadline** rather than taking a parameter of
+     its own. A predecessor's lease is a dependency that is not yet
+     available in the sense A1 already uses; a separate deadline would be
+     one more knob whose right value is "the TTL plus a little", which the
+     startup timeout already exceeds by default. A slow bus plus a full
+     TTL wait can exhaust the shared 60 s; the result is `start_failed`
+     and an orchestrator restart that then succeeds, bounded and loud.
+     *Corrected 2026-09-22 (Amendment 7 ruling 5, on the R9 review's
+     finding 6): "shares the startup deadline" is wrong as a statement
+     about the mechanism, and the code is right. What the three
+     `connect_with_retry` calls in `AggregatorService.start()` — `bus`,
+     `store`, `shard_leases` — share is the *value*
+     `HAMMERTIME_STARTUP_TIMEOUT_S`, not one deadline instant: each starts
+     its own clock on entry, which is what ADR-0009 A1 already rules
+     ("Which deadline fires first is unspecified ... `connect_with_retry`
+     defaults its own `timeout_s` to the same value but starts its clock
+     later"), and what `IngestService` already does with its two calls.
+     What actually bounds `start()` as a whole is `run_service`'s
+     `asyncio.wait_for(service.start(), startup_timeout)`. So the
+     paragraph's conclusion holds — a slow bus plus a full TTL wait is
+     bounded at 60 s and loud — but the record it produces is
+     `start_failed reason=startup_timeout` from the outer wait, not the
+     re-raised last `ShardHeldBySameMemberError`; the
+     `shard_held_by_same_member` and `dependency_unavailable
+     dependency=shard_leases` records are already in the log either way,
+     so the diagnostic is in the log, not in the `start_failed` fields.
+     A caller that drives `start()` directly instead of through
+     `run_service` has no outer deadline and can wait up to three times
+     the startup timeout; no shipped entry point does — `__main__` goes
+     through `run_service`, and `build_service`'s injected-transport shape
+     is for tests — so nothing is changed in the code for it (ruling 5).*
+     *Corrected again 2026-09-22 (Amendment 8 ruling 1, on the R10 review's
+     finding 1): the note above is right that each call starts its own
+     clock and wrong about what the log then shows. `connect_with_retry`
+     gives up one backoff delay **before** its own deadline — `if remaining
+     <= delay: raise`, which is ADR-0009 A1 step 4's "the sleep that would
+     overrun the deadline is never started" — so on the default schedule it
+     re-raises at the first refusal with under 5 s of its own budget left,
+     about 57.5 s after its first attempt if the attempts themselves cost
+     nothing, while the outer `asyncio.wait_for` fires a full 60 s after
+     `start()` was entered. Which record appears therefore turns on how
+     long the `bus` and `store` legs took: under about 2.5 s between them
+     and the re-raise wins, over it and the outer wait does. That is
+     exactly the race ADR-0009 A1 declines to specify ("Which deadline
+     fires first is unspecified ... either can win ... a test must not
+     depend on which"), and A1's `start_failed` row admits both shapes. So
+     neither this assumption nor Amendment 7's note may name one: what is
+     guaranteed is that `start()` is bounded by the outer wait at
+     `HAMMERTIME_STARTUP_TIMEOUT_S` from its entry, that the process exits
+     1 with a `start_failed` record, and that the diagnosis is in the
+     `shard_held_by_same_member` and `dependency_unavailable
+     dependency=shard_leases` records that precede it in either case. An
+     operator greps for those two, not for a particular `start_failed`
+     field (`docs/runbook.md`'s lease entry already reads that way).*
+103. **`instance_id` joins the aggregator's `starting` record.** ADR-0009
+     A7's row lists ingest's fields only (its Amendment 5 assumption), and
+     this ADR records the aggregator's, so no ADR-0009 edit follows.
+104. **`AggregatorService(sleep=, monotonic=)` are the test seams**, the
+     shape `connect_with_retry` and `AggregatorWorker` already use, rather
+     than a module-level lookup a test would monkeypatch.
+105. **`container_name: hammertime-aggregator-0`.** The project name is
+     `hammertime` and Compose's generated name would be
+     `hammertime-aggregator-1`; the `-0` matches the member id. The other
+     services are not given names: nothing about them needs at-most-one.
+106. **Staleness-based same-member takeover is deferred, not refused for
+     ever.** If a 30 s wait after an unclean death proves costly in
+     practice, that is the refinement to design; it needs the clock
+     comparison and the stall hazard worked through.
+107. **`lease_ttl_s < HAMMERTIME_STARTUP_TIMEOUT_S` is guidance, not a
+     `load_settings` check.** The aggregator's settings do not read the
+     runner's key; adding the cross-read for one inequality whose
+     violation is loud (`start_failed` within the deadline) is not worth
+     the coupling.
+108. **A clean recreate releases first.** Compose stops a container with
+     SIGTERM and a 10 s default grace (`.env.example`'s own note, kept
+     above `HAMMERTIME_SHUTDOWN_TIMEOUT_S=8`) before recreating it, and a
+     Kubernetes rollout or eviction likewise sends SIGTERM under the
+     termination grace period; `stop()` releases in a `finally`. Only a
+     stop that exceeds the grace period, a kill, or a store unreachable at
+     release leaves a lease behind. From the repository's own settings
+     and general knowledge of both orchestrators; the Compose and
+     Kubernetes reference pages for the stop sequence were not fetched.
+109. **No store code changes; the contract tests stand.** The three
+     store docstrings are edited so the interface does not claim the
+     value is a member id; `ShardLeaseContract`'s assertions hold for any
+     opaque string.
+110. **The host-port collision is an aside, from recall.** Not cited as a
+     guarantee and not relied on by any ruling.
+111. **The Compose and Kubernetes citations are from `raw.githubusercontent.com`
+     `main`, not versioned documentation pages**, because `docs.docker.com`
+     and `kubernetes.io` are blocked from this environment; the quoted
+     sentences are stable statements of long-standing behaviour, but the
+     reviewer should treat them as such.
+112. **The second `CHANGES` line qualifies.** A reference-deployment
+     change that makes a previously accepted command fail is observable,
+     and the file already records compose-stack changes ("Reference
+     deployment runs nats:2.15.0-alpine ...").
+113. **Names: `instance_id`, `lease_owner`, `shard_held_by_same_member`,
+     `ShardHeldBySameMemberError`, `shard_leases`.** "Instance" rather
+     than "process" because a process is what an instance usually is but
+     not what the token promises; "same member" rather than "predecessor"
+     because the lease cannot tell a predecessor from a twin at the
+     moment it refuses.
+
+Read on 2026-09-22 for Amendment 6:
+
+* `https://raw.githubusercontent.com/compose-spec/compose-spec/main/05-services.md`
+  (summarised by the fetch tool; `main`): under `container_name` —
+  "Compose does not scale a service beyond one container if the Compose
+  file specifies a `container_name`. Attempting to do so results in an
+  error." and "`container_name` follows the regex format of
+  `[a-zA-Z0-9][a-zA-Z0-9_.-]+`"; the `ports` section says nothing about
+  scaling or host-port conflicts. Taken from it: ruling 2(d) and the name
+  in assumption 105.
+* `https://raw.githubusercontent.com/docker/compose/main/docs/reference/compose_up.md`
+  (summarised): `--scale` — "Scale SERVICE to NUM instances. Overrides
+  the `scale` setting in the Compose file if present."; `--wait` — "Wait
+  for services to be running|healthy. Implies detached mode." Taken from
+  it: that `--scale` is a command-line override no `deploy.replicas`
+  value in the file can forbid, which is why `container_name` is the
+  mechanism.
+* `https://raw.githubusercontent.com/kubernetes/website/main/content/en/docs/tasks/run-application/force-delete-stateful-set-pod.md`
+  (summarised): "StatefulSet ensures that, at any time, there is at most
+  one Pod with a given identity running in a cluster."; force deletion
+  "would let the StatefulSet controller create a replacement Pod with
+  that same identity. This can lead to the duplication of a still-running
+  Pod, and if said Pod can still communicate with the other members of
+  the StatefulSet, will violate the at most one semantics that
+  StatefulSet is designed to guarantee." Taken from it: rulings 2 and 3's
+  statements about the StatefulSet, and the case the deployment-only
+  candidate leaves silent.
+* `https://raw.githubusercontent.com/kubernetes/website/main/content/en/docs/concepts/workloads/controllers/statefulset.md`
+  (summarised): "StatefulSet Pods have a unique identity that consists of
+  an ordinal, a stable network identity, and stable storage. The identity
+  sticks to the Pod, regardless of which node it's (re)scheduled on." No
+  "at most one" sentence on that page; it is on the force-delete page
+  above.
+* Blocked: `https://docs.docker.com/reference/compose-file/services/`,
+  `https://docs.docker.com/reference/cli/docker/compose/up/`,
+  `https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/`
+  (`EGRESS_BLOCKED`, all three); hence assumption 111.
+* Repository facts: `packages/hammertime-store/src/hammertime/store/redis.py`
+  (`_ACQUIRE_LEASE_SCRIPT`: `if (not current) or current == ARGV[1]`;
+  `_RELEASE_LEASE_SCRIPT`) and `memory.py` (`acquire_lease`: `if holder
+  is not None and holder != owner: return holder`);
+  `services/aggregator/src/hammertime/aggregator/sharding/assignment.py`
+  (`on_assigned`'s refusal branch and rollback; `renew_leases`;
+  `release`); `worker.py` (`DEFAULT_MEMBER_ID`, `DEFAULT_LEASE_TTL_S`;
+  `start()` assigning `_stream` only after `subscribe()` returns);
+  `service.py` (`start()` calling `worker.start()` directly;
+  `startup_fields()`'s `member_id`); `config.py` (`_parse_member_id`;
+  no read of `HAMMERTIME_STARTUP_TIMEOUT_S`);
+  `packages/hammertime-core/src/hammertime/core/runtime.py`
+  (`connect_with_retry`'s `sleep`, `monotonic`, `timeout_s` and
+  `transient` parameters; `startup_timeout_s()`);
+  `packages/hammertime-bus/src/hammertime/bus/memory.py` and `nats.py`
+  (`self._subscribed = True` after `await listener.on_assigned(...)`;
+  `NatsConsumer`'s `_unsubscribe_all()` on a raising listener);
+  `deploy/docker-compose.yml` (the aggregator's `ports`, `environment`,
+  no `restart:`, no `container_name`; `valkey` without a volume);
+  `deploy/k8s/README.md`; `.env.example` lines 84-90 and 12-13;
+  `docs/runbook.md` (no lease entry); the test classes and helpers T9
+  names (`_RecordingStore.calls` tuples, `_claims`, `_worker`,
+  `TestShardLeasesAreTakenOnClaim`, `TestRenewingLeases`,
+  `TestReleasingLeases`, `TestHandoverBetweenTwoMembers`); the
+  architect's brief for this ruling as written by the top-level session.
+
+## Amendment 7 (2026-09-22) — the R9 review of Amendment 6: edits promised but not made, and three texts the shipped code does not match
+
+Why: Amendment 6 opened by claiming that "every edit to a decision's text
+is in place with a dated italic note". It was not. The R9 review of the
+implementation branch found two edits its list promises that are absent
+from the files — decision 8's `AggregatorWorker` keyword and
+`instance_id` property, and ADR-0001's dated pointer at its Amendment 2
+item 1 — and three places where text this ADR wrote is contradicted by the
+code that ships beside it: spec §20 says a same-member holder "refuses to
+start" when the shipped behaviour waits it out, assumption 99 promises a
+legacy lease value is waited out when a member id containing `/` makes
+that false, and assumption 102 says the three `connect_with_retry` calls
+in `AggregatorService.start()` share one startup deadline when each takes
+its own. It also found one docstring left carrying a sentence Amendment 6
+struck (`_parse_member_id`, ruling 3 below) and one untested path the
+same-member wait depends on (ruling 6). The top-level session asked for a
+ruling on all seven of the review's findings and for an audit of
+Amendment 6's whole edit list first, since the review checked the diff
+and not the promise.
+
+The audit's result, item by item, is ruling 1. Nothing about the
+mechanism ruled in Amendment 6 changes here: the lease still carries
+`<member_id>/<instance_id>`, a same-member holder is still waited out
+inside the startup deadline, and no store, bus or aggregator code change
+follows from this amendment. What changes is the record.
+
+Every edit outside this section, with the insertion point named:
+
+* **Status line.** Gained the "amended a seventh time 2026-09-22" clause.
+* **Decision 8, the `AggregatorWorker` paragraph.** Appended the italic
+  paragraph Amendment 6 promised and did not write: the third keyword
+  `instance_id: str | None = None`, the `instance_id` property, and
+  `build_service` passing nothing for it (ruling 1).
+* **Amendment 6's opening paragraph.** Appended the dated correction of
+  its "every edit ... is in place" claim (ruling 1).
+* **Amendment 6's edit list, "Decision 8, `ShardClaims` block".** Appended
+  the dated note that the `ShardClaims` half was made and the
+  `AggregatorWorker` half was not (ruling 1).
+* **Amendment 6's edit list, "Outside this file".** Appended the dated
+  note that ADR-0001's pointer was never inserted at item 1 and that the
+  §20 parenthesis was inserted and was wrong (rulings 1 and 2).
+* **Amendment 6 ruling 6, the non-`BREAKING` paragraph.** Appended the
+  dated correction of the "Context, prerequisite 5" miscitation and of the
+  legacy-value half of the justification (rulings 1 and 4).
+* **Assumption 99.** Appended the italic qualification for a `member_id`
+  containing `/` (ruling 4).
+* **Assumption 102.** Appended the italic correction of "shares the
+  startup deadline" (ruling 5).
+* **Outside this file** (same change set): spec §20's note — the
+  parenthesis "(another process under the same member id included, the
+  lease naming the process — ADR-0013 Amendment 6)" is replaced by the
+  sentences ruling 2 gives; `docs/spec/README.md`'s §20/21 row cites
+  `docs/adr/0001` as "(Amendments 1, 2, 3)" where it said "(Amendments 1,
+  2)" (assumption 121); `docs/adr/0001-single-logical-trie.md` — the
+  pointer sentence is inserted at the end of Amendment 2 item 1's "Now:"
+  text, and Amendment 3's "is read with this sentence appended" becomes
+  "carries this sentence" with a dated note recording that it was missing
+  (ruling 1). ADR-0001's status line already names Amendment 3 and is
+  unchanged. `docs/runbook.md` is unchanged: its lease entry already
+  describes the wait correctly, which is how §20's parenthesis was caught.
+  The `_parse_member_id` docstring fix is brief C10's and the test-comment
+  fix beside it is brief T10's (both ruling 3), not this ADR's to make,
+  and `CHANGES` is unchanged (ruling 7).
+
+**Rulings.** Numbered 1-7: the audit, then the review's findings 3, 4, 5,
+6 and 7 in the order the brief asked for them, then `CHANGES`.
+
+1. **The audit: of Amendment 6's twelve edit-list bullets, ten are in
+   place exactly as described; the other two are part-made.** Bullet 8
+   (decision 8) made its `ShardClaims` half and not its `AggregatorWorker`
+   half; bullet 12 ("Outside this file") made three of its four promised
+   edits, left the fourth out, and got one of the three wrong. The
+   section's opening claim and one citation in ruling 6 are wrong as well.
+   Checked item by item against the files as they stood in the working
+   tree of `claude/gallant-pasteur-fkehtc` (tip reported as 75f83b9; the
+   architect has no shell and did not verify the hash). The lists
+   below are of individual promised edits, so the two part-made bullets
+   appear in more than one of them:
+   * *In place as described* — the status line's sixth-amendment clause;
+     decision 7's "What is checked" italic pointer and the "The `owner`
+     argument is an opaque token" paragraph after the interface block;
+     decision 7's `on_assigned` bullet (the classification, the
+     `ShardHeldBySameMemberError`, the wait); decision 7's `release()`
+     bullet supersession; decision 7's Configuration italic; decision 7's
+     "Failure shape, summarised" italic; decision 7's "What is enforced
+     versus what stays an operator invariant" correction; the `ShardClaims`
+     half of the decision 8 item (`instance_id: str | None = None` and the
+     `member_id`, `instance_id`, `lease_owner` properties, at the block);
+     decision 11's `container_name` italic; assumption 80's note;
+     Amendment 4 ruling N's note; `docs/runbook.md`'s new "Aggregator will
+     not start: a shard is leased elsewhere" entry.
+   * *Promised and absent* — (a) the `AggregatorWorker` half of the
+     decision 8 item. Decision 8's keyword sentence still read
+     "`member_id: str` and `lease_ttl_s: float` ... with defaults", with no
+     third keyword, and no `instance_id` property appeared anywhere in this
+     ADR's body, although `AggregatorWorker.__init__` takes
+     `instance_id: str | None = None` and exposes `instance_id`, and
+     `AggregatorService.startup_fields()` reads it. R9 finding 1. (b) the
+     dated pointer at ADR-0001 Amendment 2 item 1. ADR-0001's Amendment 3
+     and status line were written; item 1 itself was untouched, so
+     Amendment 3's "One pointer, in place" was false and #90's trail into
+     clause 1 ended on superseded wording. R9 finding 2. Both edits are
+     made in this change set.
+   * *Present but not as claimed* — spec §20's parenthesis was inserted and
+     says the wrong thing (ruling 2). And Amendment 6's opening sentence,
+     "every edit to a decision's text is in place with a dated italic
+     note", which the two absent edits make false.
+   * *True as written, incomplete as a claim* — "`docs/spec/README.md` is
+     unchanged". It was, and no section moved; but the §20/21 row cites
+     ADR-0001's amendments by number and ADR-0001 gained one that bears on
+     §20. Corrected here as an index sync (assumption 121).
+   * *A miscitation found by this audit, not by the review* — ruling 6
+     rests "no running deployment needs action" on "Context, prerequisite
+     5". Context has two numbered lists: the epic's operational case,
+     whose item 5 is "Nothing is in production: no image in this
+     repository has ever been started", and "Prerequisites, as verified",
+     whose item 5 is the Kafka cold-start measurement. The ADR uses
+     "prerequisite 5" for the second (status line). The claim is true and
+     the citation named the wrong list; corrected in place.
+2. **Spec §20 states the wait, not a refusal.** The parenthesis made the
+   normative spec say that a member finding a shard held by another
+   process under its own member id "refuses to start" — the crash loop
+   Amendment 6 ruling 3 exists to remove, and the opposite of what the
+   code does in the dominant case. §20's note now reads: a member that
+   finds one of its shards leased to another live member refuses to start;
+   since 2026-09-22 the lease value names the *process*, so a shard still
+   held under this member's own id by a different process is detected too,
+   and *that* case is waited out rather than refused outright, because the
+   holder may be a predecessor that died without releasing — the member
+   retries inside its startup deadline, claims the shard as soon as the
+   lease lapses, and fails the start only if the holder is still renewing
+   when that deadline expires. The sentences this amendment adds keep the
+   section's normative register: they introduce no environment key and no
+   log-record name of their own — the keys and record names for the wait
+   stay where they already are, in decision 7 and in `docs/runbook.md`
+   (assumption 115).
+3. **`_parse_member_id`'s docstring loses the struck sentence; here is the
+   replacement, for brief C10.** The docstring still asserts "ADR-0013
+   decision 7: two members sharing an id share its leases and are not told
+   apart" — the sentence Amendment 6 ruling 2 struck from decision 7 as no
+   longer true — and uses it as the setting for refusing an empty value.
+   Amendment 6 ruling 4's enumeration of wrong documents missed it. The
+   replacement keeps the reason for the refusal, says what the value now
+   is, and says why the old sentence went, so a reader who greps for it
+   finds the answer:
+
+   ```text
+   `HAMMERTIME_AGGREGATOR_MEMBER_ID`: the hostname when unset; never empty.
+
+   ADR-0013 decision 7 as amended by Amendment 6: this value is the member
+   half of the shard lease's owner token, `<member_id>/<instance_id>`, so it
+   identifies the member and not the process -- two processes started under
+   one id are told apart by their instance tokens and the second is refused,
+   which is why decision 7 no longer says "two members sharing an id share
+   its leases and are not told apart". "" is the templating accident
+   ADR-0011 A3 describes, so a set-but-empty (or whitespace-only) value is
+   refused. The value is otherwise stored as given.
+   ```
+
+   No behaviour changes: the docstring is the whole of the edit, and
+   `_parse_member_id`'s signature and body stand as they are (assumption
+   119). The same struck sentence stands in one more place the review did
+   not name, found by this amendment's audit: the comment inside
+   `TestMemberIdAndLeaseTtl.test_a_set_but_empty_member_id_is_a_value_error`
+   (`services/aggregator/.../tests/test_config.py`), which paraphrases it
+   as the reason for the refusal. It is a comment, not an assertion, so
+   nothing fails on it; it is corrected for the same reason the docstring
+   is, through `test-author` (brief T10), and the replacement keeps the
+   history rather than deleting it:
+
+   ```text
+   "set-but-empty is a `ValueError`": "" is the templating accident
+   ADR-0011 A3 describes. (The clause that used to stand here -- "two
+   members sharing an id share its leases and are not told apart" -- was
+   struck from decision 7 by ADR-0013 Amendment 6: two processes under one
+   id are now told apart by their instance tokens.)
+   ```
+4. **The legacy bare value: the text is qualified, the classification
+   stays non-`BREAKING`, and member ids are not restricted.** A lease value
+   written by a build from before Amendment 6 is a bare `member_id`.
+   Assumption 99 promised such a value is "waited out if it names this
+   member"; that fails when the member id itself contains a `/`, because
+   `rpartition("/")` then splits the id at its own last separator and the
+   holder is classified as another member — exit 1 at once rather than a
+   wait. The code cannot distinguish the two forms from the value alone
+   (`a/b` is both a bare id and a member/instance pair), and preferring the
+   tokenised reading is correct, because every value this build writes is
+   tokenised. Ruled: qualify assumption 99 and ruling 6's justification
+   (both amended above) and change nothing else. *Rejected, with what each
+   costs.* **A whole-value equality check first** (`owner ==
+   self._member_id` classified as same-member before the split): closes
+   exactly this case for one comparison, but opens a worse one in the
+   direction that matters — a member whose id is `a/b` would then read a
+   live token from member `a`, instance `b` as its own member and wait for
+   it instead of failing at once, turning a genuine other-member overlap
+   into a slow start. **Refusing `/` in
+   `HAMMERTIME_AGGREGATOR_MEMBER_ID`** (a `load_settings` check, exit 2):
+   a new operator-visible constraint on a shipped key, and a `CHANGES`
+   line, to protect against a value no build in this repository has ever
+   written — no image here has ever been started (Context's
+   operational-case item 5). Recorded as the change to make if a
+   pre-Amendment-6 store ever does turn up (assumption 116).
+   **`BREAKING`**: the label is for a running deployment that needs action
+   to keep working (`CLAUDE.md`), and there is none; the legacy-value
+   reading was never the ground for the label, only an aside beside it.
+5. **Assumption 102's text is corrected; the code is not.** The three
+   `connect_with_retry` calls in `AggregatorService.start()` share the
+   *value* `HAMMERTIME_STARTUP_TIMEOUT_S` and not one deadline instant:
+   each computes `deadline = monotonic() + timeout` on entry. That is
+   already ADR-0009 A1's ruling — "Which deadline fires first is
+   unspecified ... `connect_with_retry` defaults its own `timeout_s` to
+   the same value but starts its clock later" — and already what
+   `IngestService` does with its `store` and `bus` calls, so the
+   aggregator is consistent with the ADR that owns the helper and with the
+   other shipped service. Containment of `start()` as a whole is
+   `run_service`'s `asyncio.wait_for(service.start(), startup_timeout)`.
+   The assumption's conclusion survives (a slow bus plus a full TTL wait
+   is bounded at 60 s and loud) but its record is `start_failed
+   reason=startup_timeout`, not the re-raised
+   `ShardHeldBySameMemberError`; the `shard_held_by_same_member` and
+   `dependency_unavailable dependency=shard_leases` records are in the log
+   in either case, so what the outer deadline costs is the `error=` field
+   of one record, not the diagnosis. *Corrected 2026-09-22 (Amendment 8
+   ruling 1): the clause from "but its record is" to "not the diagnosis"
+   is wrong to name a record at all, and wrong in the direction it names —
+   `connect_with_retry` gives up one backoff delay before its own deadline
+   (ADR-0009 A1 step 4), so with a bus and store that answer quickly it is
+   the re-raise that reaches `run_service` first. Either can win, A1 rules
+   which unspecified, and assumption 102 above carries the corrected text.
+   The rest of this ruling — the per-call clock, `run_service`'s
+   `wait_for` as the containment of `start()` as a whole, and the decision
+   to change no code (assumptions 117 and 118) — stands.* A caller driving `start()` directly
+   has no outer deadline and could wait three times the timeout; no
+   shipped entry point does that — `__main__` goes through `run_service`
+   and `build_service`'s injected-transport shape is for tests — so it is
+   not worth a per-service deadline mechanism that neither ADR-0009 nor
+   the other service has (assumption 117). `connect_with_retry`'s own
+   docstring is left alone (assumption 118).
+6. **The NATS re-subscribe gap is recorded, not closed now.** The
+   same-member wait makes a second `subscribe()` call on the same consumer
+   after a listener raised, and on the only production transport that path
+   is `NatsConsumer.subscribe()`'s `except BaseException: await
+   self._unsubscribe_all(); raise` before `self._subscribed = True`. Source
+   reading says it is correct, and this amendment re-read it: the flag is
+   set only after `on_assigned` returns, and `_unsubscribe_all()` swaps
+   `_pull_subs` for a fresh list and drops the push subscription, so the
+   next attempt binds cleanly. It has no test, because `NatsConsumer` has
+   no tests at all — `packages/hammertime-bus/.../tests/` covers the memory
+   bus, topics, streams, endpoints and the assignment helper, and every
+   aggregator test drives `InMemoryBus`. A regression there turns the wait
+   into `RuntimeError("subscribe() was already called")`, which is in no
+   transient tuple, so the second attempt exits 1 and the recreated
+   container crash-loops again. The reviewer's recommendation is accepted:
+   writing the first NATS-backed test in this round would mean standing up
+   the transport fixture that #52 exists to build, for one path. Recorded
+   here, and the top-level session should add it to #52 as a named case —
+   "a listener that raises leaves `NatsConsumer` re-subscribable; the
+   aggregator's same-member wait depends on it" — since the architect
+   cannot edit the issue (assumption 120).
+7. **`CHANGES` is unchanged.** Nothing ruled here changes behaviour, a
+   default, a config key, a wire format or a deployment; the two lines
+   Amendment 6 ruling 6 specified are already on the branch verbatim and
+   still describe what ships. (Separately, and not required by any ruling:
+   R9 noted as a non-finding that the first line's "a second process
+   started under the same `HAMMERTIME_AGGREGATOR_MEMBER_ID` is refused"
+   over-states slightly, since a second process whose `HAMMERTIME_SHARD_IDS`
+   is disjoint from the first's never meets its leases and starts
+   normally. The reference stack pins `all`, so the line is true of every
+   deployment the file describes. Left as it is.)
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+114. **Corrections are dated notes at the item they belong to, and
+     Amendment 6's text is not rewritten.** The convention of this file is
+     superseded text kept in place with a dated note; a promise that was
+     never kept is worth the same treatment, because deleting it would
+     hide that the record and the tree disagreed for a day. The cost is
+     that the edit list now reads as a list of promises with corrections
+     attached rather than a list of edits.
+115. **The §20 sentences add no environment key and no record name of
+     their own.** Not that the section names none: `HAMMERTIME_SHARD_IDS`
+     is already there, in the "Ownership is static" clause that opens the
+     very sentence whose end this change set replaces — so what is left
+     untouched is that key name and its gloss, not the sentence carrying
+     them. What is new describes the wait without putting
+     `HAMMERTIME_AGGREGATOR_LEASE_TTL_S`,
+     `HAMMERTIME_STARTUP_TIMEOUT_S`, `shard_held_by_same_member` or
+     `dependency_unavailable` into the spec; the operator-facing form
+     carrying all four already exists in `docs/runbook.md`, and a reader
+     who needs them follows the ADR pointer. Judgement call, with its
+     cost: a reader of §20 alone learns that the wait is bounded by the
+     startup deadline but not which key sets it.
+116. **The `/`-in-`member_id` legacy case is accepted, not fixed, and
+     recorded as the change to make if it stops being hypothetical.** It
+     rests on Context's operational-case item 5 (nothing has ever been
+     started), which is also what the non-`BREAKING` label rests on: if
+     that stops being true before 1.0, both this and the label are to be
+     re-read together.
+117. **No per-service shared deadline is introduced for `start()`.**
+     Judgement call: the three-times-the-timeout exposure is real but
+     unreachable from any shipped entry point, and a deadline threaded
+     through one service's `start()` would leave `IngestService` and
+     ADR-0009 A1 describing a different mechanism from the aggregator's.
+     If a cross-service in-process composition is ever shipped, this is
+     the place to revisit.
+118. **`connect_with_retry`'s docstring is left as it is.** Its "the same
+     deadline `run_service` puts around `start()` as a whole" reads as a
+     statement about the default's value, which is accurate, and ADR-0009
+     A1 states the per-call clock explicitly. A reviewer who reads it as a
+     claim that sequential calls share an instant should say so and it
+     becomes a one-line coder fix; this amendment judged it not worth
+     opening a core package's docstring for.
+119. **The replacement docstring in ruling 3 names decision 7 and
+     ADR-0011 A3 only.** It does not restate the wait, the token format's
+     split rule or the error names; `assignment.py` and `service.py`
+     carry those, and a settings parser that explained the lease protocol
+     would drift again the next time the protocol moved.
+120. **The NATS test gap is recorded in this ADR and belongs to #52.**
+     The architect has no GitHub access and cannot add it to the issue;
+     if the session does not, this paragraph is the only record, which is
+     weaker than a tracked case but better than nothing. It is not a
+     `CLAUDE.md` "Disabled CI coverage" entry: nothing is disabled or
+     skipped, the test was never written.
+121. **`docs/spec/README.md`'s §20/21 row gains ADR-0001's Amendment 3.**
+     Beyond the seven findings, and made because this change set alters
+     §20's note and the architect's standing instruction is to keep that
+     index in sync with what a section maps to. Three characters of
+     content; no row moves and no section number changes.
+122. **No `CHANGES` line follows from this amendment.** Every edit here
+     brings a document into line with behaviour that already ships
+     unchanged; `CLAUDE.md` lists docstring and documentation edits with
+     no observable effect among the things not to record, and an entry
+     saying "the spec now describes what the code already did" would tell
+     an operator nothing to act on.
+
+Read on 2026-09-22 for Amendment 7: no external sources. Nothing in this
+amendment turns on how an external system behaves — the Compose,
+Kubernetes and NATS citations it relies on are Amendment 6's, unchanged
+and not re-fetched, and the two that matter here (`container_name` and the
+StatefulSet guarantee) are not touched by any ruling above.
+
+Repository facts checked for this amendment, in the working tree of
+`claude/gallant-pasteur-fkehtc`: every location named in
+ruling 1, read individually;
+`services/aggregator/src/hammertime/aggregator/worker.py` (the
+`instance_id` keyword at the constructor and the `instance_id` property
+returning `self._claims.instance_id`);
+`services/aggregator/src/hammertime/aggregator/service.py` (`start()`'s
+three `connect_with_retry` calls; `startup_fields()`'s `instance_id`);
+`services/aggregator/src/hammertime/aggregator/sharding/assignment.py`
+(`on_assigned`'s `owner.rpartition("/")` and the `not separator` branch);
+`services/aggregator/src/hammertime/aggregator/config.py`
+(`_parse_member_id`'s docstring);
+`packages/hammertime-core/src/hammertime/core/runtime.py`
+(`connect_with_retry`'s `deadline = monotonic() + (...)` on entry;
+`run_service`'s `asyncio.wait_for(service.start(), startup_timeout)`);
+`services/ingest/src/hammertime/ingest/app.py` (its two
+`connect_with_retry` calls, the same shape);
+`packages/hammertime-bus/src/hammertime/bus/nats.py`
+(`subscribe()`'s `except BaseException` path and `_unsubscribe_all()`) and
+that package's `tests/` directory (no `NatsConsumer` test);
+`docs/adr/0009-service-process-lifecycle.md` A1 ("The schedule, exactly";
+the "Which deadline fires first is unspecified" assumption);
+`docs/runbook.md`'s lease entry; `CHANGES` lines 1-2; the R9 review report
+and the architect's brief for this ruling, both as relayed by the
+top-level session. The gate was reported green by the session (1947
+passed, 8 skipped; ruff, ruff format, mypy clean) and was not run here.
+
+## Amendment 8 (2026-09-22) — the R10 review of Amendment 7: a correction that over-determined the outcome, and the places the opposite claim still stood
+
+Why: Amendment 7 ruling 5 corrected assumption 102's "shares the startup
+deadline" — rightly — and then said what the live-twin case logs:
+`start_failed reason=startup_timeout` from `run_service`'s outer wait,
+"not the re-raised last `ShardHeldBySameMemberError`". That is wrong twice
+over. It is wrong as a prediction, because `connect_with_retry` gives up
+one backoff delay before its own deadline, so with a bus and store that
+answer quickly the re-raise is what normally reaches `run_service` first;
+and it is wrong in kind, because ADR-0009 A1 — the ruling Amendment 7
+cited as governing — says in terms that *which deadline fires first is
+unspecified* and that a test must not depend on it. The R10 review found
+it, the top-level session verified the give-up condition in
+`runtime.py`, and this amendment rules the text. It also rules the other
+places the same over-determined claim stands (in the other direction) and
+the one index row Amendment 7's sync left behind. Nothing about the
+mechanism changes, and no store, bus or aggregator code change follows;
+one docstring is corrected through a `coder` brief, since it is not this
+ADR's to edit.
+
+The arithmetic, for the record, using the shipped defaults and ignoring
+what the attempts themselves cost. `connect_with_retry` sets `deadline =
+monotonic() + 60` on entry and, after each refusal, re-raises when
+`deadline - monotonic() <= delay`, where `delay` is the sleep it would
+take next (0.5 doubling to a 5 s cap). With sleeps 0.5, 1, 2, 4, 5, 5,
+... the attempts fall at 0, 0.5, 1.5, 3.5, 7.5, 12.5, ... and the first
+one with 5 s or less of budget left is at 57.5 s: the helper re-raises
+there, 2.5 s before its own deadline. `run_service`'s
+`asyncio.wait_for(service.start(), 60)` fires 60 s after `start()` was
+entered, and the `shard_leases` call is the third of three, so it starts
+its clock after the `bus` and `store` legs have returned. The inner
+re-raise therefore wins whenever those two legs together take less than
+about 2.5 s, and the outer wait wins when they take longer. Both are exit
+1 with a `start_failed` record; A1 rules the race unspecified, and
+ADR-0009's log-record table already admits both shapes of the record.
+
+Every edit outside this section, with the insertion point named:
+
+* **Status line.** Gained the "amended an eighth time 2026-09-22" clause.
+* **Assumption 102.** Appended the italic correction of Amendment 7's own
+  note (ruling 1). This is the site that carries the settled text.
+* **Amendment 7 ruling 5.** Appended the italic correction of its
+  "but its record is ..." clause (ruling 1). The R10 review named
+  assumption 102 and three other sites but not this one; it is the same
+  sentence and is corrected with them.
+* **Amendment 6 ruling 2(c).** Appended the italic qualification of "the
+  deadline expires, the last `ShardHeldBySameMemberError` is re-raised,
+  `run_service` logs `start_failed`" (ruling 2).
+* **Decision 7, the `on_assigned` bullet.** Appended the italic
+  qualification of "the deadline expires, and the process exits 1 with
+  `start_failed`" (ruling 2).
+* **Outside this file** (same change set): `docs/spec/README.md`'s §22 row
+  cites `docs/adr/0001` as "(Amendments 1, 2, 3)" where it said
+  "(Amendments 1, 2)" (ruling 3). Nothing else outside this file changes:
+  `AggregatorService.start()`'s docstring is brief C11's (ruling 2),
+  `docs/spec/hammertime_spec_1.md` §20, `docs/runbook.md`, `CHANGES` and
+  every test are unchanged, each for a reason given in the ruling that
+  looked at it.
+
+**Rulings.** Numbered 1-4: the text of the correction, the other sites
+that carry the claim, the index row, then `CHANGES`.
+
+1. **The outcome is one of two records and nothing may depend on which.**
+   The correct text — now at assumption 102, and the text any other site
+   is measured against — says only what is guaranteed: a live twin that
+   keeps renewing ends the start within `HAMMERTIME_STARTUP_TIMEOUT_S` of
+   `start()` being entered, the process exits 1, a `start_failed` record
+   is logged, and the diagnosis is in the `shard_held_by_same_member`
+   (WARNING, one per refused attempt) and `dependency_unavailable
+   dependency=shard_leases` records that precede it in either case.
+   Whether that `start_failed` carries `reason=startup_timeout` and
+   `timeout_s` from `run_service`'s outer `asyncio.wait_for`, or `error=`
+   naming the re-raised `ShardHeldBySameMemberError`, is the race ADR-0009
+   A1 declines to specify. Amendment 7's correction named the second as
+   impossible when it is the one that normally happens; the original
+   assumption 102 named it as certain when the outer wait can take it.
+   Both over-determined the same sentence in opposite directions, and the
+   fix for both is to stop at the guarantee. A caller that drives
+   `start()` directly — no shipped entry point does; `__main__` goes
+   through `run_service` — has no outer wait at all, and what it sees is
+   the re-raised `ShardHeldBySameMemberError`, which is
+   `connect_with_retry`'s own documented contract (A1 step 4) and not a
+   fact about the race. *Rejected, with what each costs.* **Make the
+   outcome determinate in the code** (pass `timeout_s` to the
+   `shard_leases` call, or thread one deadline through `start()`): it
+   would buy a greppable record and a testable outcome, at the price of
+   the aggregator having a startup mechanism neither ADR-0009 A1 nor
+   `IngestService` has — Amendment 7 assumption 117 weighed and refused
+   this, and nothing in R10 changes that; if a later epic wants a
+   determinate record it belongs in ADR-0009, applied to every service at
+   once. **Say "normally the re-raise" and leave it there**: true today
+   and false the first time a deployment's NATS handshake is slow, which
+   is precisely the reading A1 forbids.
+2. **The same claim at three other sites: two ADR sites are qualified
+   here, the docstring goes to `coder`, and four more sites that R10 did
+   not name are ruled unchanged.** The test applied to each is whether it
+   names one of the two `start_failed` shapes as *the* shape.
+   * *Amendment 6 ruling 2(c)* said "the deadline expires, the last
+     `ShardHeldBySameMemberError` is re-raised, `run_service` logs
+     `start_failed` and the process exits 1". It names one shape;
+     qualified in place.
+   * *Decision 7's `on_assigned` bullet* says only "a live twin's never
+     lapse, the deadline expires, and the process exits 1 with
+     `start_failed`" — it names no shape, so R10's "the identical claim"
+     overstates what is there. It is still qualified, for the weaker
+     defect: "the deadline expires" invites the inference that there is
+     one deadline and that it is reached, when the helper stops short of
+     its own and `run_service`'s is a different instant. This bullet is
+     the canonical statement a reader reaches first, which is why it is
+     worth the note rather than being left as merely under-determined.
+   * *`AggregatorService.start()`'s docstring*, in the aggregator's
+     `service.py`, ends "the startup deadline
+     expires, the last `ShardHeldBySameMemberError` is re-raised, and the
+     process exits 1 with `start_failed`". It names one shape and is
+     corrected, but this ADR may not edit code: brief C11 carries the
+     exact replacement.
+   * *Unchanged, with the reason.* Spec §20's note ("fails the start only
+     if the holder is still renewing when that deadline expires") and
+     `docs/runbook.md`'s lease entry ("the wait ends at
+     `HAMMERTIME_STARTUP_TIMEOUT_S` with `start_failed` and exit 1") name
+     no shape and describe the bound, which is what each register needs;
+     decision 7's "Failure shape, summarised" italic says "or
+     `start_failed` and exit 1 at the startup deadline while a live twin
+     keeps renewing", likewise. And the aggregator's own
+     `test_service.py` quotes ruling 2(c) in its module docstring but
+     elides the clause corrected here — its quotation ends at "is
+     re-raised ..." — while the comment in
+     `test_a_live_twin_is_retried_until_the_startup_deadline_and_then_raises`
+     already draws the right line ("what `start()` owes the runner is the
+     last `ShardHeldBySameMemberError`"), which is `start()`'s own
+     contract and not the race. No test changes, and no `test-author`
+     brief follows from this amendment (assumption 126).
+3. **`docs/spec/README.md`'s §22 row gains ADR-0001 Amendment 3, for the
+   reason the §20/21 row did.** Amendment 3's only content edit is the
+   sentence inside Amendment 2 item 1 — the replacement of clause 1, which
+   is the single-ownership clause §22's note draws on when it says
+   overlapping static sets are detected because "a second live owner of a
+   shard refuses to start". A same-member second process is now such an
+   owner, so the amendment bears on §22 exactly as it bears on §20.
+   Amendment 7 assumption 121 gave no reason for stopping at the §20/21
+   row and there was none; R10 is right that the judgment was not
+   reviewable as written. §22's own text is unchanged: "a second live
+   owner of a shard refuses to start" stays true of the live twin, which
+   fails its start after the wait (ADR-0001 Amendment 3 makes the same
+   point about its own "promised" blockquote).
+4. **`CHANGES` is unchanged.** Every edit here and in brief C11 brings a
+   document or a docstring into line with behaviour that already ships and
+   is not altered. No feature, default, config key, wire format or event
+   schema moves, and an operator has nothing to do differently; `CLAUDE.md`
+   lists docstring and documentation edits with no observable effect among
+   the things not to record. The two lines Amendment 6 ruling 6 specified
+   stay as they are and still describe what ships.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+123. **An amendment section, not a bare dated note.** A dated note inside
+     assumption 102's dated note, with no section stating the ruling,
+     would leave the settled answer readable only by reconstructing two
+     superseded claims; and the change set spans five sites in this file
+     (the status line, assumption 102, Amendment 7 ruling 5, Amendment 6
+     ruling 2(c) and decision 7's `on_assigned` bullet) plus one index
+     row, which is what an amendment section is for. The cost
+     is an eighth clause on an already long status line and a third
+     layer of note at assumption 102. Amendment 7 assumption 114's
+     convention — superseded text kept in place with a dated note, never
+     rewritten — is followed rather than reopened.
+124. **The 57.5 s and 2.5 s figures are an illustration, not a
+     guarantee.** They assume the shipped defaults (60 s startup timeout,
+     0.5 s doubling to a 5 s cap) and attempts that cost nothing; a real attempt
+     is a full `subscribe()` with store round trips, so the attempt times
+     drift later and the crossover moves. They are stated because "one
+     backoff delay early" is too abstract to check, and they are stated
+     as arithmetic a reader can redo, not as a bound anything may rely
+     on. Nothing in ruling 1 depends on the numbers.
+125. **The test for which sites needed an edit is "does it name one of
+     the two `start_failed` shapes as the shape".** Chosen rather than
+     "does it mention the deadline", which would have pulled in the spec,
+     the runbook and two more italics in decision 7 for no gain and
+     would have put log-record detail into a normative spec section that
+     Amendment 7 assumption 115 deliberately kept free of it. Decision
+     7's `on_assigned` bullet is edited despite failing this test, for
+     the reason ruling 2 gives; that is the one judgment call in the set.
+126. **No test changes and no `test-author` brief.** Read before ruling:
+     `test_a_live_twin_is_retried_until_the_startup_deadline_and_then_raises`
+     calls `service.start()` directly, so no outer `wait_for` exists in
+     it and `pytest.raises(ShardHeldBySameMemberError)` is an assertion
+     about `connect_with_retry`'s contract, not about the race. Its
+     docstring quotation elides the corrected clause. So no test asserts
+     which deadline wins, and A1 says none may — if a later test wants to
+     cover the `run_service` path, it must assert exit 1 and the two
+     preceding records, never the `start_failed` fields.
+127. **The §22 row gains ADR-0001's amendment only.** ADR-0013's own
+     Amendment 6 also bears on that sentence, but the row cites this ADR
+     by decision ("decisions 4, 5, 7, 8") as the §20/21 row does
+     ("decisions 1, 6, 7"), and decision 7 is already cited; adding
+     amendment numbers to the ADR-0013 citation would be a new convention
+     for that column, applied to one row. Left for whoever decides the
+     column should cite amendments throughout.
+128. **Brief C11 is the whole of the code change, and it is a docstring.**
+     `AggregatorService.start()`'s signature and body stand as they are;
+     nothing about the wait, the transient tuple or the order of the three
+     `connect_with_retry` calls moves. If a reviewer reads the replacement
+     as changing behaviour, that is a finding, not an intended effect.
+129. **Whether #90 can now close is the session's call, not this ADR's.**
+     The architect has no GitHub access and has not read the issue; what
+     this amendment can say is that after C11 lands, no document or
+     docstring in the repository states a same-member outcome this
+     amendment contradicts, which was the residual R10 named. The #52
+     case recorded by Amendment 7 assumption 120 (the `NatsConsumer`
+     re-subscribe path) is still owed to that issue and is not this
+     round's to add.
+
+Read on 2026-09-22 for Amendment 8: no external sources, and none were
+fetched. Nothing ruled here turns on how an external system behaves — the
+whole of it is this repository's own code and its own ADRs. Where an
+earlier amendment's Compose, Kubernetes or NATS citations are relied on,
+they are relied on unchanged and were not re-fetched.
+
+Repository facts checked for this amendment, each opened and read in the
+working tree of `claude/gallant-pasteur-fkehtc` (reported tip 7a6d775; the
+architect has no shell and did not verify the hash, the tree state or the
+gate):
+`packages/hammertime-core/src/hammertime/core/runtime.py` —
+`connect_with_retry`'s `deadline = monotonic() + (startup_timeout_s() if
+timeout_s is None else timeout_s)` on entry, its `if remaining <= delay:
+raise` after the `dependency_unavailable` record, `RETRY_INITIAL_DELAY_S =
+0.5` and `RETRY_MAX_DELAY_S = 5.0`, `startup_timeout_s()` reading
+`os.environ`, `DEFAULT_STARTUP_TIMEOUT_S = 60.0`, and `_supervise`'s
+`asyncio.wait_for(service.start(), startup_timeout)` with its `except
+TimeoutError` logging `start_failed reason=startup_timeout timeout_s=` and
+its `except Exception` logging `start_failed error= exc_info=True`;
+`services/aggregator/src/hammertime/aggregator/service.py` — `start()`'s
+docstring and its three `connect_with_retry` calls in the order `bus`,
+`store`, `shard_leases`, none passing `timeout_s`;
+`services/aggregator/src/hammertime/aggregator/__main__.py` (`main()` goes
+through `run_service` with no `env=`);
+`services/aggregator/src/hammertime/aggregator/tests/test_service.py` —
+the module docstring's quotation of ruling 2(c) and
+`TestStartWaitsOutAHolderOfTheSameMember`'s three tests;
+`docs/adr/0009-service-process-lifecycle.md` — A1's "The schedule,
+exactly" steps 1-5, the "Which deadline fires first is unspecified"
+assumption, and the log-record table's `start_failed` row;
+`docs/adr/0013-...` — decision 7's `on_assigned` bullet, its
+Configuration and "Failure shape, summarised" italics, Amendment 6 ruling
+2(c), Amendment 7 in full and assumptions 99-122;
+`docs/adr/0001-single-logical-trie.md` — the status line, Amendment 2 item
+1 with the inserted sentence, and Amendment 3;
+`docs/spec/hammertime_spec_1.md` §20 and §22; `docs/spec/README.md`'s §20/21
+and §22 rows; `docs/runbook.md`'s "Aggregator will not start" entry; and
+the R10 review report and this round's brief, both as relayed by the
+top-level session.

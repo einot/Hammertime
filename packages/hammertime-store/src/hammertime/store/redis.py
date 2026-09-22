@@ -94,8 +94,10 @@ _SHARD_KEY_PREFIX = "hammertime:agg:"
 #: `acquire_lease` as one atomic server-side step (ADR-0013 decision 7):
 #: grant if no lease exists or the live lease is the caller's own, in which
 #: case the expiry is reset to now + TTL; otherwise return the holder. KEYS[1]
-#: is the owner key, ARGV[1] the caller's member id, ARGV[2] the TTL in whole
-#: seconds. Redis's `GET` returns Lua `false` for a missing key.
+#: is the owner key, ARGV[1] the caller's owner token -- an opaque string
+#: compared for equality, `<member_id>/<instance_id>` from the aggregator
+#: (ADR-0013 Amendment 6) -- and ARGV[2] the TTL in whole seconds. Redis's
+#: `GET` returns Lua `false` for a missing key.
 _ACQUIRE_LEASE_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if (not current) or current == ARGV[1] then
@@ -134,7 +136,7 @@ def _sequence_key(shard: int) -> str:
 
 
 def _owner_key(shard: int) -> str:
-    """The member id currently holding this shard's lease, with the lease's TTL."""
+    """The owner token currently holding this shard's lease, with the lease's TTL."""
     return f"{_SHARD_KEY_PREFIX}{shard}:owner"
 
 
@@ -250,8 +252,10 @@ class RedisShardStateStore:
     WATCH-based optimistic transaction here.
 
     The lease (`acquire_lease`/`release_lease`, ADR-0013 decision 7) is a
-    third key, `hammertime:agg:{shard}:owner`, holding the member id with
-    the lease's TTL as the key's expiry -- the one key under this prefix
+    third key, `hammertime:agg:{shard}:owner`, holding the owner's token --
+    an opaque string this store only ever compares for equality; the
+    aggregator passes `<member_id>/<instance_id>` (ADR-0013 Amendment 6) --
+    with the lease's TTL as the key's expiry, the one key under this prefix
     that *does* expire, which is its whole point: a crashed member's lease
     lapses on its own. Both calls are one Lua `EVAL` each, so the
     compare-and-grant is a single server-side step, as the ADR requires;

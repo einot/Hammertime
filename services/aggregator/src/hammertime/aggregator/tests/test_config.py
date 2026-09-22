@@ -787,9 +787,11 @@ class TestMemberIdAndLeaseTtl:
         assert load_settings(_env(HAMMERTIME_AGGREGATOR_MEMBER_ID="agg-3")).member_id == "agg-3"
 
     def test_a_set_but_empty_member_id_is_a_value_error(self) -> None:
-        # "set-but-empty is a `ValueError`": two members sharing an id share
-        # its leases and are not told apart, and "" is the templating
-        # accident ADR-0011 A3 describes.
+        # "set-but-empty is a `ValueError`": "" is the templating accident
+        # ADR-0011 A3 describes. (The clause that used to stand here -- "two
+        # members sharing an id share its leases and are not told apart" --
+        # was struck from decision 7 by ADR-0013 Amendment 6: two processes
+        # under one id are now told apart by their instance tokens.)
         with pytest.raises(ValueError, match="HAMMERTIME_AGGREGATOR_MEMBER_ID"):
             load_settings(_env(HAMMERTIME_AGGREGATOR_MEMBER_ID=""))
 

@@ -150,7 +150,9 @@ class MemoryShardStateStore:
 
     The per-shard lease (ADR-0013 decision 7) is `{shard: (owner,
     expires_at)}` against the injected `clock`; an expired entry counts as
-    absent. `clock` defaults to `SystemClock()`, so every argument-free
+    absent. `owner` is an opaque token compared for equality and nothing
+    more -- the aggregator passes `<member_id>/<instance_id>` (ADR-0013
+    Amendment 6). `clock` defaults to `SystemClock()`, so every argument-free
     construction is unchanged; a test passes a `ManualClock` to make a
     lease lapse. `acquire_lease`/`release_lease` contain no `await` either,
     so each is atomic in the same practical sense.
@@ -160,7 +162,7 @@ class MemoryShardStateStore:
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._hot_ips: dict[int, set[Address]] = {}
         self._next_sequence: dict[int, int] = {}
-        # shard -> (owner, expires_at as a UTC epoch second).
+        # shard -> (owner token, expires_at as a UTC epoch second).
         self._leases: dict[int, tuple[str, float]] = {}
 
     async def load(self, shard: int) -> ShardState:
@@ -210,7 +212,7 @@ class MemoryShardStateStore:
             del self._leases[shard]
 
     def _live_holder(self, shard: int, now: float) -> str | None:
-        """The owner of `shard`'s lease if one is live at `now`; an expired one is absent."""
+        """The token holding `shard`'s lease if one is live at `now`; an expired one is absent."""
         lease = self._leases.get(shard)
         if lease is None:
             return None

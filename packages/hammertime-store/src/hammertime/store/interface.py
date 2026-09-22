@@ -180,8 +180,8 @@ class ShardStateStore(Protocol):
         ...
 
     async def acquire_lease(self, shard: int, owner: str, ttl_seconds: float) -> str | None:
-        """Take or renew shard's lease for owner. Returns None on success; otherwise the id of the
-        member that holds it. Atomic: a lease is granted iff no live lease exists or the live
+        """Take or renew shard's lease for owner. Returns None on success; otherwise the token of
+        the owner that holds it. Atomic: a lease is granted iff no live lease exists or the live
         lease is owner's own, in which case its expiry becomes now + ttl_seconds.
 
         ADR-0013 decision 7: the lease is a *detection* mechanism for two
@@ -192,6 +192,14 @@ class ShardStateStore(Protocol):
         `record_transition`'s atomicity (ADR-0011 A2) is untouched. A
         member acquires each shard's lease before loading it, renews every
         maintenance interval, and treats a refusal as fatal.
+
+        `owner` is an opaque token and this store attaches no meaning to
+        it: it compares the stored value with the caller's for equality and
+        reads nothing into either. The aggregator passes
+        `<member_id>/<instance_id>` -- its member id and a token generated
+        once per process -- so that a second process started under one
+        member id is refused rather than granted a renewal, and classifies
+        the holder itself (ADR-0013 Amendment 6).
         """
         ...
 
@@ -200,6 +208,8 @@ class ShardStateStore(Protocol):
 
         Never raises for an unheld lease. A clean stop releases so the
         shard's next owner can take it at once; a crashed member's lease
-        simply expires after its TTL.
+        simply expires after its TTL. `owner` is the same opaque token
+        `acquire_lease` took the lease under, so a release frees only what
+        that caller holds (ADR-0013 Amendment 6).
         """
         ...

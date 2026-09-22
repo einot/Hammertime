@@ -95,6 +95,7 @@ class AggregatorWorker:
         reevaluation_batch: int = DEFAULT_BATCH_SIZE,
         member_id: str = DEFAULT_MEMBER_ID,
         lease_ttl_s: float = DEFAULT_LEASE_TTL_S,
+        instance_id: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._clock = clock
@@ -115,6 +116,7 @@ class AggregatorWorker:
             member_id=member_id,
             lease_ttl_s=lease_ttl_s,
             max_tracked_ips=max_tracked_ips,
+            instance_id=instance_id,
         )
         self._emitter = TransitionEmitter(
             producer=self._producer, state_store=state_store, clock=clock, metrics=metrics
@@ -144,6 +146,11 @@ class AggregatorWorker:
     @property
     def shards(self) -> frozenset[int]:
         return self._claims.shards
+
+    @property
+    def instance_id(self) -> str:
+        """This process's lease token (ADR-0013 decision 7 as amended by Amendment 6)."""
+        return self._claims.instance_id
 
     def window(self, shard: int) -> ShardWindow | None:
         return self._claims.window(shard)
