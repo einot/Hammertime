@@ -16,7 +16,13 @@ Redpanda and `aiokafka` out; assumptions 5 and 14 are superseded. The
 terms being verified against the CNCF announcement, which this environment
 cannot reach); amended 2026-09-21 (see "Amendment 3" — `lupa` enters the
 Class 2 inventory through the `fakeredis[lua]` extra that ADR-0013
-Amendment 1 adds to the `dev` group: MIT, test process only).
+Amendment 1 adds to the `dev` group: MIT, test process only); amended
+2026-09-22 (see "Amendment 4" — decision 5 item 2's "every `Dockerfile`
+`FROM` line" is read to cover `COPY --from=` image references as well,
+which Amendment 1's pinning sweep did not see; the `ghcr.io/astral-sh/uv`
+image the five `Dockerfile`s copy the `uv` binary from is pinned to
+`0.12.17` by the ADR-0013 change and enters the Class 4 table; ADR-0013
+Amendment 4 ruling R9).
 
 Scope note: this ADR records a policy the repository owner gave verbatim
 and turns it into a rule that can be checked in review: which licences
@@ -240,7 +246,13 @@ root `pyproject.toml`, and the build backend.
    finding. Rationale: a licence change applies to versions released after
    it, so an unpinned tag is the path by which a licence change reaches a
    running deployment silently — which is exactly how `redis:7-alpine`
-   became RSALv2 without a diff.
+   became RSALv2 without a diff. *Amended 2026-09-22 (Amendment 4): "every
+   `Dockerfile` `FROM` line" reads "every image reference in a
+   `Dockerfile`, `FROM` and `COPY --from=` alike" — an image a build stage
+   copies from is pulled and its contents executed exactly as a base image
+   is, and the five `Dockerfile`s' `COPY --from=ghcr.io/astral-sh/uv:latest`
+   was the unpinned reference Amendment 1's `FROM`-only sweep did not
+   see.*
 3. Bumping a pinned image is a dependency change under decision 6: the PR
    states the licence of the *new* version, because that is when a licence
    change becomes visible.
@@ -451,7 +463,7 @@ exercise the reference images in CI. Until then the Status column's
 | ruff | 0.16.7 (lock; 0.16.8 on PyPI) | MIT | yes (Astral) — irrelevant under decision 3 | compliant |
 | mypy | 2.3.1 | MIT | no | compliant |
 | hatchling (build backend) | 1.32.3 on PyPI | MIT | no | compliant |
-| uv (package manager) | 0.12.16 on PyPI | MIT OR Apache-2.0 | yes (Astral) — class 3; `pip` + `venv` are the non-drop-in fallback (a lockfile regeneration, no code) | compliant |
+| uv (package manager) | 0.12.16 on PyPI (0.12.17 on 2026-09-22, Amendment 4; the image tag the `Dockerfile`s pin is that version — Class 4 table) | MIT OR Apache-2.0 | yes (Astral) — class 3; `pip` + `venv` are the non-drop-in fallback (a lockfile regeneration, no code) | compliant |
 
 Transitive dependencies (e.g. starlette, pydantic-core, anyio, attrs) are
 not itemised here; decision 3 item 4 audits them at release time.
@@ -473,14 +485,21 @@ As of Amendment 1 every image reference in `deploy/` and every `Dockerfile`
 Amendment 2 (2026-09-21) replaces the two broker rows with the `nats` row
 the ADR-0013 change will land; the provisioner image it adds
 (`tools/provision/Dockerfile`) builds `FROM python:3.12-slim` like the
-service images.
+service images. *Corrected 2026-09-22 (Amendment 4): the `FROM`-only
+sweep missed the `COPY --from=ghcr.io/astral-sh/uv:latest` line every
+`Dockerfile` carries (the four service files since C1; the provisioner
+file, written to the same shape, since the ADR-0013 change); the
+ADR-0013 change pins all five to `0.12.17`, and the row below records
+it. Until that change lands the `:latest` reference is a live decision 5
+item 2 breach in five files, not a settled inventory.*
 
 | Reference | Pinned? | Action |
 | --- | --- | --- |
 | `nats:2.15.0-alpine` (`deploy/docker-compose.yml`, by the ADR-0013 change) | `major.minor.patch` | replaces `apache/kafka:4.3.1` as the reference event log (decision 9 as rewritten); `deploy/docker-compose.redpanda.yml` deleted |
 | `valkey/valkey:9.1.2-alpine` (`deploy/docker-compose.yml`) | `major.minor.patch` | done — replaced `redis:7-alpine` (decision 10) |
 | `prom/prometheus:v3.14.0` (`deploy/docker-compose.yml`) | `major.minor.patch` | done |
-| `python:3.12-slim` × 4 (`services/*/Dockerfile`) | `major.minor` | none |
+| `python:3.12-slim` × 4 (`services/*/Dockerfile`) — × 5 with `tools/provision/Dockerfile` since the ADR-0013 change | `major.minor` | none |
+| `ghcr.io/astral-sh/uv:0.12.17` × 5 (`COPY --from=` in `services/*/Dockerfile` and `tools/provision/Dockerfile`; build stage only — the binary is copied, the image is not run) — MIT OR Apache-2.0 (PyPI `license_expression` for `uv` 0.12.17); provenance (a), published by the project (Astral) on GHCR; added 2026-09-22, Amendment 4 | `major.minor.patch` | pinned by the ADR-0013 change (was `:latest` in all five; ADR-0013 Amendment 4 ruling R9); the tag form and the "pin to a specific uv version" guidance are uv's own Docker guide (Sources, Amendment 4) |
 
 ## Assumptions
 
@@ -1283,3 +1302,74 @@ Assumptions made by this amendment (push back individually):
 5. **No `CHANGES` entry.** A test-only dependency has no user-visible
    effect (`CLAUDE.md`'s `CHANGES` rule: dependency bumps with no
    observable effect are not recorded).
+
+## Amendment 4 (2026-09-22) — `COPY --from=` image references are pinned too; the `uv` image enters Class 4 (ADR-0013 Amendment 4 ruling R9)
+
+Why: the R1 review of the ADR-0013 epic branch found
+`tools/provision/Dockerfile` copying the `uv` binary from
+`ghcr.io/astral-sh/uv:latest`, and the S1 audit noted the same line in
+all four `services/*/Dockerfile`s. Decision 5 item 2 pins "every
+`Dockerfile` `FROM` line", and Amendment 1 recorded every `FROM` line as
+pinned — both true and both blind to `COPY --from=`, which pulls an image
+and copies from it exactly as a base image is pulled. The provisioner
+file is in the ADR-0013 diff, so decision 6 ("every image reference in
+the diff is pinned") binds that change; ADR-0013 Amendment 4 ruling R9
+pins all five files in the same change set rather than leave four
+unpinned beside one pinned. This amendment makes the rule's wording
+cover the case and records the image.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended the "amended 2026-09-22 (see "Amendment 4"
+  ...)" clause.
+* **Decision 5, item 2.** Appended the italic reading of "every
+  `Dockerfile` `FROM` line". Items 1 and 3 unchanged.
+* **Class 2 table, `uv` row.** The version cell — was "0.12.16 on PyPI" —
+  gained the parenthetical "(0.12.17 on 2026-09-22, Amendment 4; the
+  image tag the `Dockerfile`s pin is that version — Class 4 table)".
+* **Class 4 table and its preamble.** The preamble gained the italic
+  correction; the `python:3.12-slim` row's reference cell — was
+  "`python:3.12-slim` × 4 (`services/*/Dockerfile`)" — now notes the
+  fifth file; a `ghcr.io/astral-sh/uv:0.12.17` row is added last.
+
+Assumptions made by this amendment (push back individually):
+
+1. **A `COPY --from=` reference is in scope of decision 5 item 2 by
+   reading, not by a new rule.** The item's rationale (a licence change
+   reaches a build silently through an unpinned tag) applies without
+   change; the wording named `FROM` because that was the only form in the
+   tree when it was written.
+2. **Provenance class (a).** `ghcr.io/astral-sh/uv` is published by the
+   project (Astral) under the project's own organisation; the licence is
+   PyPI's `license_expression` for the same version of the same binary,
+   not read from the image itself, which the architect cannot pull.
+3. **The tag `0.12.17` is taken from uv's Docker guide's own example and
+   PyPI's current version**, not from a registry listing (`docs.astral.sh`
+   is blocked; the GitHub releases API answered 403). If the tag does not
+   resolve at build time, the coder reports it; `0.12` (`major.minor`) is
+   the documented next-narrowest tag and `python:3.12-slim`'s precedent.
+4. **Single-vendor, no paid tier for `uv` itself.** Astral is one company;
+   whether it sells a paid product around `uv` is not established here
+   and is irrelevant under decision 4 (Class 3 tooling) — the Class 4 row
+   asks only provenance and a pin.
+5. **No `CHANGES` entry.** A build-input pin with no observable effect on
+   a running deployment.
+
+Read on 2026-09-22 for Amendment 4:
+
+* `https://pypi.org/pypi/uv/json`: version `0.12.17`, `license_expression`
+  `MIT OR Apache-2.0`, `license_files` `["LICENSE-APACHE", "LICENSE-MIT"]`,
+  author "Astral Software Inc.", repository
+  `https://github.com/astral-sh/uv`.
+* `https://raw.githubusercontent.com/astral-sh/uv/main/docs/guides/integration/docker.md`
+  (summarised by the fetch tool): "Available images" —
+  `ghcr.io/astral-sh/uv:latest`, `ghcr.io/astral-sh/uv:{major}.{minor}.{patch}`
+  (e.g. `0.12.17`), `ghcr.io/astral-sh/uv:{major}.{minor}` (e.g. `0.12`),
+  plus Alpine/Debian/Python-based variants; "Installing uv" — `COPY
+  --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/`, and "it is best
+  practice to pin to a specific uv version, e.g., with: `COPY
+  --from=ghcr.io/astral-sh/uv:0.12.17 /uv /uvx /bin/`"; a SHA256 digest
+  pin is also recommended "as tags can be moved across different commit
+  SHAs".
+* Repository facts: the five `Dockerfile`s' line 2; ADR-0013 Amendment 4
+  ruling R9.

@@ -23,7 +23,22 @@ empty entry included; the held-lease set is kept apart from the windows
 across `stop()` and a `run_maintenance()` after `stop()` does nothing; a
 `load()` failure inside `on_assigned` needs no rollback. The pointer edits
 Amendment 2 left pending — ADR-0009 A7, spec §47.7,
-`integration-scenarios.md` §7 — are made in the same change set). Epic #95's first reason for the swap — that Kafka's cold start
+`integration-scenarios.md` §7 — are made in the same change set); amended
+a fourth time 2026-09-22 (see "Amendment 4" — the nine findings of the R1
+review of the epic branch are ruled, each in place with a dated note:
+`close()` naks the unqueued remainder of a cancelled fetch batch and the
+in-flight residual is recorded with its bound; `stop()`'s order is made
+total — `handle()`, `run_maintenance()`, `apply_config()` and the periodic
+commit all stand down once `stop()` has begun, `run()` hands no message to
+`handle()` after the stop signal, `stop()` releases the leases in a
+`finally` and runs once; `ensure_streams` is unit-tested against a fake;
+`on_assigned` skips a shard only while its lease is held; the `load()`
+fault ruling is reaffirmed with the replacement-id consequence stated;
+`AggregatorService.run()` reports the failure that stopped it, not a
+failing `stop()`; `bus_endpoints` renders an entry with an `@` outside its
+authority as `<unparseable>`; the `uv` image is pinned in all five
+Dockerfiles; the Redis lease tests widen their TTL to 2 s. Assumption 54
+is closed). Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
 owner "may wish to revisit the decision" in that case, so the top-level
@@ -273,7 +288,14 @@ def partition_for(key: bytes | str, partitions: int) -> int:
 and every `Producer` implementation routes `publish(topic, key, value)` to
 partition `partition_for(key, TOPICS[topic].partitions)`. `TopicSpec` gains
 `stream_name` (property), `subject(partition: int) -> str` and
-`subject_filter` (property, `f"{name}.*"`). ADR-0011 assumption 1 rejected
+`subject_filter` (property, `f"{name}.*"`). *It also gains the inverse,
+`partition_of(subject: str) -> int | None` (added 2026-09-22, Amendment 4
+ruling S3): `p` when `subject == self.subject(p)` for some `p >= 0` — the
+canonical decimal form, so `<name>.7` is `7` and `<name>.07`, `<name>.-1`,
+`<name>.x`, `<name>.7.8` and `<name>` are all `None` — and nothing else;
+it is what `NatsConsumer` uses to read a delivered message's partition
+from its subject, and a `None` is a malformed message at the transport
+(decision 5, as amended).* ADR-0011 assumption 1 rejected
 an in-repo hash for Kafka because the broker's client partitioner already
 did the job and a second implementation was "risk without functional gain";
 on JetStream someone has to compute the subject, and the alternative — a
@@ -313,7 +335,30 @@ day-one step that runs **before** the services, and it is idempotent:
   raises `StreamConfigConflictError` and changes nothing. It inspects every
   stream in `specs` before it creates or updates any of them, so a conflict
   on one stream changes nothing on any other either (amended 2026-09-21,
-  Amendment 1 ruling C9).
+  Amendment 1 ruling C9). *What is compared, and that it is unit-tested
+  (amended 2026-09-22, Amendment 4 ruling R3): `ensure_streams` reads
+  `stream_info(name).config` — the `nats.js.api.StreamConfig` nats-py builds
+  from the server's response, in which durations are seconds and the
+  enum-valued fields (`retention`, `storage`, `discard`) are left as the
+  server's strings rather than converted to the enums (nats-py
+  `StreamConfig.from_response`, read from `main`; Sources) — against
+  `stream_config_for(spec, replicas=replicas)`, field by field, after
+  normalising both sides: an `Enum` by its `.value`, a `list` by its
+  elements in order, anything else as it is; so a stream the server reports
+  with `retention="limits"` equals one declared with
+  `RetentionPolicy.LIMITS`, and the comparison does not depend on which
+  form the installed nats-py produces. A missing stream is
+  `nats.js.errors.NotFoundError` from `stream_info` and nothing else;
+  `add_stream` and `update_stream` each receive the declared `StreamConfig`
+  whole; the result has one entry per spec. `stream_config_for` raises
+  `ValueError` for `replicas < 1`. None of this needs a broker: the
+  no-broker exemption of `hammertime.bus.nats` covers `NatsBus`,
+  `NatsProducer` and `NatsConsumer`, which need a live connection, and not
+  `stream_config_for`, `ensure_streams`, `bus_endpoints` or
+  `validate_bus_url`, which are pure over their arguments — a fake
+  `JetStreamContext` exposing `stream_info`, `add_stream` and
+  `update_stream` is the whole harness, and the tests live in the bus
+  package's `tests/test_streams.py`.*
 * A new CLI, `hammertime-provision` (package `tools/provision`, module
   `hammertime.tools.provision`, docstring `Spec: section 19, section 32,
   section 33`), runs `ensure_streams` over `all_topics()`: `hammertime-provision
@@ -356,7 +401,12 @@ day-one step that runs **before** the services, and it is idempotent:
   with `ensure_streams`, imported by name into the tool's module — so a
   test replaces `hammertime.tools.provision.__main__.provision`,
   `nats.connect` and `hammertime.tools.provision.__main__.ensure_streams`
-  respectively, and no test needs a broker.
+  respectively, and no test needs a broker. *Every `--servers` entry is
+  checked with `hammertime.bus.nats.validate_bus_url` (decision 3, as
+  amended 2026-09-22, Amendment 4 ruling S2) before anything is connected;
+  an entry it refuses is an argparse error — `SystemExit(2)`, a message
+  naming the entry's position and not its text — so a URL nats-py could
+  not parse never reaches nats-py or a record.*
 * The reference deployment runs it as a one-shot compose service
   (`provision`) that depends on the broker being healthy, and every
   application service depends on `provision` having completed successfully
@@ -557,6 +607,25 @@ it without waiting: `NatsConsumer` sends a negative acknowledgement
 nothing to send (an unacknowledged message is already deliverable to the
 next consumer) and only marks itself closed. `close()` is idempotent and
 safe before `subscribe()`. After `close()`, `ack()` is a `ValueError`.
+*What "every message this instance delivered" reaches, and what it does
+not (amended 2026-09-22, Amendment 4 ruling R1): it is every nats-py `Msg`
+a fetch loop received — one yielded and unacknowledged (retained), one
+sitting in the in-process queue, and one of a fetched batch that the loop
+had not yet queued when `close()` cancelled it; `_pump_pull` keeps the
+unqueued remainder of its current batch on cancellation (a `Msg` whose
+`put` was interrupted is in the remainder, one whose `put` returned is in
+the queue, never both), and `close()` naks the three sets once each,
+after unsubscribing and before the final flush, as before. What `close()`
+cannot reach is a message the server delivered against the loop's last
+outstanding pull request that never reached the loop: in flight on the
+wire, or in nats-py's private per-subscription pending queue, which only
+a further `fetch()` drains and which no public call empties (Sources).
+Those surface at the next consumer only after `ack_wait` (30 s), and there
+are at most `FETCH_BATCH` (100) of them per durable, because one pull asks
+for at most that many. This is a recorded residual: the "without waiting"
+above holds for what reached the client's loops, and a clean handover pays
+up to `ack_wait` for the rest. The integration job (#52) is where the bound
+is measured; no unit test can reach it.*
 
 **`ConsumedMessage`** keeps its five fields with the meanings above and
 gains `delivery_count` (default 1). It carries no acknowledgement handle:
@@ -580,6 +649,9 @@ class NatsBus:                                   # satisfies MessageBus
 
 def bus_endpoints(servers: str | Iterable[str]) -> list[str]:   # added 2026-09-21, Amendment 2
     """`<scheme>://<host>[:<port>]` per server URL; userinfo, path, query and fragment dropped."""
+
+def validate_bus_url(url: str) -> None:   # added 2026-09-22, Amendment 4 ruling S2
+    """ValueError, naming nothing of `url`, if nats-py's own parse of it would fail or echo it."""
 ```
 
 **`bus_endpoints(servers)`** *(added 2026-09-21, Amendment 2)* is the one
@@ -620,6 +692,58 @@ names the bus servers carries this list under the field name
 provisioning tool's `provision_failed` records (decision 2) — and no
 record of any event carries `HAMMERTIME_BUS_BROKERS` or `--servers`
 verbatim or in any other derived form.
+
+*An `@` outside the authority (amended 2026-09-22, Amendment 4 rulings R8
+and S2). `urlsplit` ends the authority at the first `/`, `?` or `#` after
+the `//` (CPython `urlsplit`, Sources), so a userinfo containing one of
+them unencoded leaves its `@` — and a fragment of the password — outside
+the authority, where the last-`@` rule cannot see it:
+`nats://user:pa/ss@nats:4222` splits into authority `user:pa` and path
+`/ss@nats:4222`, and the rule as written would render `nats://user:pa`.
+Ruled: an entry in which `urlsplit` leaves an `@` in the path, query or
+fragment is rendered as the fixed string `<unparseable>`, whatever its
+authority holds. An `@` there has no meaning in a NATS URL, it is the
+signature of exactly that mistake, and a malformed value is the input a
+redaction cannot be trusted on (assumption 44). Additional examples,
+which tests pin: `nats://user:pa/ss@nats:4222` -> `<unparseable>`;
+`nats://user:pa?ss@nats:4222` -> `<unparseable>`;
+`nats://user:pa#ss@nats:4222` -> `<unparseable>`;
+`nats://user:p@/ss@nats:4222` -> `<unparseable>` (an `@` inside the
+authority and another outside it); `nats://nats:4222/` ->
+`nats://nats:4222` (a path without an `@` is still merely dropped). The
+seven examples above are unchanged.*
+
+*The same URL reaches a record by a second path, closed by
+`validate_bus_url` (Amendment 4 ruling S2, on the S1 audit's finding 2).
+nats-py 2.16.0's `_parse_server_uri` reads `urlparse(...).port`, which
+raises `ValueError("Port could not be cast to integer value as 'pa'")` —
+the port token echoed — and nats-py wraps it in
+`nats.errors.Error("nats: invalid connect url option")` without `from
+None`, so the `ValueError` is the chained `__context__`; `run_service`
+logs `start_failed` with `exc_info=True`, and structlog's
+`format_exc_info` prints the chain, token included, into the `exception`
+field. So `hammertime.bus.nats` gains `validate_bus_url(url: str) ->
+None`, re-exported from `hammertime.bus`, which normalises the entry as
+nats-py does (an entry containing `://` as given; otherwise
+`nats://<entry>`) and raises `ValueError` when (i) `urlsplit` refuses it,
+(ii) `SplitResult.port` raises — the very cast nats-py performs — or (iii)
+an `@` is left outside the authority (the case above); the message names
+none of the entry's text. `load_settings` in the aggregator and in ingest
+calls it for every entry of `HAMMERTIME_BUS_BROKERS` (split as
+`NatsBus.__init__` splits it) and turns a refusal into a `ValueError`
+naming the variable and the entry's position, so the process exits 2
+with `config_invalid` before nats-py sees the value — the store side's
+`validate_redis_url` shape, which ADR-0009 A12 chose for the same `.port`
+hazard, and the helper assumption 46 recommended. The tool checks
+`--servers` the same way (decision 2). As a second line, `_connect`
+catches a `nats.errors.Error` whose `__context__` is a `ValueError` and
+re-raises it `from None`, so that a parse failure the validator did not
+anticipate still logs nats-py's fixed text and no chained token.
+Assumption 15's "not validated by `load_settings`" is superseded; the
+validator checks only what nats-py's own parse would refuse plus (iii),
+so no value that connected before is refused now. Whether nats-py
+percent-decodes userinfo is not verified here; the operator guidance is
+to keep `/`, `?`, `#` and `@` out of bus passwords.*
 
 `producer()` and `consumer()` are callable before `start()`: the objects
 they return use the connection lazily and raise `RuntimeError("NatsBus is
@@ -789,6 +913,34 @@ message is *delivered* when the iterator yields it. The consumer retains
 the nats.py `Msg` for every delivered, unacknowledged message, keyed by
 `(topic, partition, offset)`.
 
+*Malformed at the transport (added 2026-09-22, Amendment 4 rulings S3 and
+S4). Two invariants every in-repo producer keeps are checked on the way
+out of the queue, before a `Msg` becomes a `ConsumedMessage`, because a
+principal that can publish to the stream directly need not keep them: the
+subject's last token must be a partition — `TopicSpec.partition_of(subject)`
+is not `None` (decision 1, as amended); the stream filter `<topic>.*`
+admits any single token, and `int()` on an arbitrary one raised out of
+the iterator, failed the service's `run()` and, the message never having
+been acknowledged, crash-looped every whole-topic durable and every
+positional replay that met it — and, when the message carries a
+`Hammertime-Key` header, `partition_for(key, spec.partitions)` must equal
+that partition, the hash decision 1 puts in this package; a message
+stored under another partition's subject would otherwise be applied by
+that partition's owner, and one IP would be owned by two shards (spec
+section 20's invariant). A message failing either check is not yielded:
+the consumer logs `WARNING event=malformed_subject subject=<s>
+stream_seq=<n> reason=<not-a-partition|partition-mismatch>` (no key, no
+payload), on a durable subscription terminates it (`Msg.term()`, so the
+server never redelivers it) and on a positional subscription skips it,
+and continues with the next. A message without the key header is yielded
+with `key=None` and left to the consumer's own checks (the aggregator's
+`_decode` refuses it). The aggregator's per-partition durables filter on
+the exact numeric subject and cannot receive a non-partition token; the
+checks protect the whole-topic and positional shapes (the detector, the
+trie, `tools/replay`) and, for the key check, every shape. Only the pure
+helpers (`partition_of`, `partition_for`) are unit-tested; the term-and-
+continue path is the integration job's (#52).*
+
 **`ack_wait` redelivery is a supported input.** JetStream redelivers a
 delivered, unacknowledged message to the same live consumer after
 `ack_wait` (30 s), with `delivery_count` incremented. With the aggregator's
@@ -943,7 +1095,28 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   was acquired before its `load()` — stay in the held set, so `release()`
   drops them when `run_service` calls `stop()` on the failed start
   (ADR-0009 A7's `stop_failed` path), and they lapse after `lease_ttl_s`
-  when the store cannot be reached for that either.*
+  when the store cannot be reached for that either.* *Reaffirmed
+  2026-09-22 (Amendment 4 ruling R5) with the replacement consequence
+  stated: `release()` now runs in `stop()`'s `finally` (decision 8, as
+  amended), so a `load()` — or window construction — that raises while
+  the store answers is followed by an immediate release from the runner's
+  `stop()`, and a replacement under any `member_id` starts at once. Only
+  when the store is unreachable for that release too do the leases lapse,
+  and then a replacement with a *different* id is refused with
+  `shard_owned_elsewhere` and exits 1 on each attempt for at most
+  `lease_ttl_s` — the crash outcome, which a rollback inside `on_assigned`
+  could not improve, since its `release_lease` calls would go to the same
+  unreachable store; a replacement with the same id reacquires at once
+  either way.* *Which shards `on_assigned` skips (amended 2026-09-22,
+  Amendment 4 ruling R6): a shard is skipped only while this member holds
+  its lease — the held-lease set is the test, not the windows. A shard
+  whose window survived a `release()` but whose lease is gone is claimed
+  afresh: lease acquired, state loaded, a new window built in place of the
+  old one; its handled position is kept, as nothing ever lowers it.
+  Reachable only by a direct call after `stop()` — `worker.start()`
+  subscribes once — but a member must never report a shard as held
+  (`shards`, `window()`) on the strength of a window alone while another
+  member may hold the lease.*
 * `ShardClaims.renew_leases()` calls `acquire_lease` for every held shard;
   `AggregatorWorker.run_maintenance()` calls it **first**, before the
   expiry sweep, under the worker lock, so a member that has lost a shard
@@ -968,6 +1141,15 @@ HOT set so ADR-0011 A2's atomicity of `record_transition` is untouched.
   name; a Kubernetes StatefulSet gives a pod the same ordinal name)
   reacquires at once, and one with a different id waits at most
   `lease_ttl_s`, crash-looping with `shard_owned_elsewhere` until then.
+  *Corrected 2026-09-22 (Amendment 4 ruling N, on the S1 audit's note):
+  the default `member_id` is `socket.gethostname()`, which under compose
+  is the container ID unless `hostname:` is set — a *restarted* container
+  keeps it, a *recreated* one (`docker compose up --build`, or a
+  replacement after an unclean death) does not, and would wait out the
+  TTL. The reference compose file therefore sets
+  `HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` on its one aggregator
+  (decision 11), and its comment no longer says "keyed by the container
+  name".*
   *`release()` empties the set of shards whose lease this member holds and
   leaves the windows where they are; `ShardClaims` keeps that set apart
   from its windows for exactly this reason, `renew_leases()` renews only
@@ -1070,7 +1252,11 @@ class ShardClaims:                                   # satisfies AssignmentListe
   only ever there to detect a re-claim. `UNCLAIMED` stays as the outcome
   for a message on a partition this member holds no window for (reachable
   only through a direct `handle()` call now; ADR-0011 A19's record and
-  no-counter rule unchanged).
+  no-counter rule unchanged), *and (amended 2026-09-22, Amendment 4 ruling
+  R2) for any message handed to `handle()` after `stop()` has begun,
+  whatever its partition: after `stop()` the member holds no lease, so
+  every partition is one it must not act on, and the `unclaimed_partition`
+  record is logged as for any other `UNCLAIMED`.*
 * **`on_revoked` is gone** from `AssignmentListener`, from `ShardClaims`
   and from `AggregatorWorker`. Static assignment has no revocation; the
   way a shard changes hands is a `stop()` on one member and a `start()` on
@@ -1086,7 +1272,46 @@ class ShardClaims:                                   # satisfies AssignmentListe
   itself (amended 2026-09-21, ruling T8): closing is the service's step,
   after `stop()` has returned, so that the final acknowledgement is sent
   on a live consumer and the `nak` of whatever was fetched but never
-  yielded follows it.
+  yielded follows it. *`stop()`'s order is total (amended 2026-09-22,
+  Amendment 4 rulings R2 and R4). From the moment `stop()` sets the stop
+  flag, every path that could act on a shard checks the flag under the
+  worker lock and stands down: `handle()` returns `UNCLAIMED` without
+  decoding, applying, emitting or marking, so the message stays
+  unacknowledged and `close()` hands it to the next member;
+  `run_maintenance()` and `apply_config()` return without renewing,
+  sweeping, re-evaluating, emitting or writing (`apply_config()` leaves
+  the worker's `config` as it was and logs no `config_reevaluated`; this
+  closes assumption 54); the periodic commit (`_commit_if_due`) is
+  skipped, so the `commit_handled()` inside `stop()` is the last
+  acknowledgement this worker sends; and `run()`, on a wake-up in which
+  the stop signal and a received message are both complete, returns
+  without handing the message to `handle()`. The message in hand — one
+  whose `_handle` holds the lock when the flag is set — is finished and
+  covered by the final commit, as before; one merely waiting for the lock
+  is not in hand and takes the `UNCLAIMED` path. `stop()` itself runs its
+  sequence once: under the lock, `commit_handled()` inside a `try` whose
+  `finally` is `release()`, so the leases are released even when the final
+  acknowledgement fails — the exception propagates after the release, and
+  the messages it failed to acknowledge reach the next member after
+  `ack_wait`, at-least-once as ADR-0003 has it. A later `stop()` — the
+  runner's `_stop_quietly` after a crash exit, by which time the service
+  has closed the bus and `ack(())` would be a `ValueError` — acquires the
+  lock and returns without touching the bus or the store; that is what
+  "idempotent" means for it. `AggregatorService.stop()` is idempotent by
+  the same token, its other steps (readiness, poller, server) being so
+  already.*
+
+  *`AggregatorService.run()` reports what stopped it (amended 2026-09-22,
+  Amendment 4 ruling R7; ADR-0009 decision 5 step 7): when the first of
+  its four tasks completes, `run()` collects the exceptions of the
+  completed tasks first, then calls `stop()` inside a `try` that appends a
+  raised exception to the same list and logs `WARNING stop_failed
+  error=<str>` through the service's logger, then gathers the remaining
+  tasks, closes the clients (the bus first) and raises the first collected
+  exception. `run_exited` therefore names the failure that stopped the
+  service; a `stop()` that fails on the same outage (the final `ack_sync`
+  timing out after the periodic one did) is reported only when nothing
+  failed before it.*
 * **`REDELIVERED`**, the eighth `ObservationOutcome` (`"redelivered"`),
   ruled in decision 5: after the window lookup (`UNCLAIMED` check) and
   before decoding, `if message.offset < claims.handled_position(partition)`
@@ -1176,7 +1401,7 @@ JetStream stream has one sequence across all its subjects, and
 | key | before | now |
 | --- | --- | --- |
 | `HAMMERTIME_BUS_KIND` | `kafka` (default) or `memory` | `nats` (default) or `memory`; `kafka` is a `ValueError` (exit 2) |
-| `HAMMERTIME_BUS_BROKERS` | Kafka bootstrap list, default `localhost:19092` | comma-separated NATS server URLs (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), default `nats://localhost:4222`; not validated by `load_settings` (unchanged posture; ADR-0009 A12's last assumption; assumption 15). *Amended 2026-09-21 (Amendment 2): an entry MAY carry userinfo in the two forms nats-py reads — `nats://user:password@host:4222` and `nats://token@host:4222` — and so may `hammertime-provision --servers`; the value is passed to `nats.connect` as given, and no log record of any service or tool carries it: records name the servers only as `bus_endpoints = bus_endpoints(value)` (decision 3). This extends spec §47.7's "no record may contain a credential" to the userinfo of a bus URL and supersedes ADR-0009 A7's "`bus_brokers` is logged verbatim", which was written for Kafka's `host:port` bootstrap list.* |
+| `HAMMERTIME_BUS_BROKERS` | Kafka bootstrap list, default `localhost:19092` | comma-separated NATS server URLs (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), default `nats://localhost:4222`; not validated by `load_settings` (unchanged posture; ADR-0009 A12's last assumption; assumption 15) — *superseded 2026-09-22 (Amendment 4 ruling S2): every entry is checked by `hammertime.bus.nats.validate_bus_url` in `load_settings`, and an entry nats-py's own parse would refuse is a `ValueError` naming the variable and the entry's position, `config_invalid`, exit 2*. *Amended 2026-09-21 (Amendment 2): an entry MAY carry userinfo in the two forms nats-py reads — `nats://user:password@host:4222` and `nats://token@host:4222` — and so may `hammertime-provision --servers`; the value is passed to `nats.connect` as given, and no log record of any service or tool carries it: records name the servers only as `bus_endpoints = bus_endpoints(value)` (decision 3). This extends spec §47.7's "no record may contain a credential" to the userinfo of a bus URL and supersedes ADR-0009 A7's "`bus_brokers` is logged verbatim", which was written for Kafka's `host:port` bootstrap list.* |
 | `HAMMERTIME_SHARD_IDS` | `auto` (default) or a set | **required**; `all` or a set within `0..127`; `auto` rejected (decision 6) |
 | `HAMMERTIME_AGGREGATOR_MEMBER_ID` | — | new; default `socket.gethostname()` (decision 7) |
 | `HAMMERTIME_AGGREGATOR_LEASE_TTL_S` | — | new; default 30 (decision 7) |
@@ -1211,7 +1436,16 @@ here as the contract):
   `https://hub.docker.com/v2/repositories/library/nats/tags/2.15.0-alpine`
   on 2026-09-21), `command: ["-js", "-sd", "/data", "-m", "8222"]`, a
   named volume `nats-data:/data`, ports `4222:4222` (clients) and
-  `8222:8222` (monitoring), and `healthcheck: wget -qO-
+  `8222:8222` (monitoring) — *published on the loopback interface only,
+  `127.0.0.1:4222:4222` and `127.0.0.1:8222:8222`, and `valkey`'s
+  `127.0.0.1:6379:6379` likewise (amended 2026-09-22, Amendment 4 ruling
+  S1): the server runs with no `authorization` block and the store with no
+  `requirepass`, so anything that can reach those ports can publish
+  observations that bypass every control ingest applies, purge or delete
+  the streams, acknowledge or delete the durables, and rewrite the shard
+  leases and HOT sets; the host's own tooling still reaches them, the
+  healthchecks run inside the containers and need no host mapping, and
+  the trust boundary is stated in assumption 13* — and `healthcheck: wget -qO-
   http://127.0.0.1:8222/healthz?js-enabled-only=true` (the monitoring
   page documents `js-enabled-only` as "Returns an error if JetStream is
   disabled" and 200/400 as the response codes; Sources), interval 2 s,
@@ -1221,13 +1455,26 @@ here as the contract):
   carry (assumption 11).
 * `provision`: builds `tools/provision/Dockerfile` (same shape as the
   service Dockerfiles), runs `hammertime-provision --servers nats://nats:4222`,
-  `restart: "no"`, `depends_on: nats: condition: service_healthy`.
+  `restart: "no"`, `depends_on: nats: condition: service_healthy`. *Its
+  `COPY --from=ghcr.io/astral-sh/uv:<tag>` line is pinned to `0.12.17`
+  (amended 2026-09-22, Amendment 4 ruling R9; the release current on
+  2026-09-22 — PyPI `uv` 0.12.17, `license_expression` `MIT OR
+  Apache-2.0`; the image tag form `ghcr.io/astral-sh/uv:{major}.{minor}.{patch}`
+  and the "pin to a specific uv version" guidance are uv's own; Sources),
+  and the four `services/*/Dockerfile`s, which carried the same `:latest`
+  since before this epic, are pinned to the same tag in the same change
+  set so the five files keep one shape. ADR-0012 Amendment 4 carries the
+  inventory row.*
 * `ingest`, `aggregator`, `trie`, `detector`: `HAMMERTIME_BUS_BROKERS:
   nats://nats:4222`; `depends_on: provision: condition:
   service_completed_successfully` and `valkey: condition: service_healthy`
   where applicable; `valkey` gains `healthcheck: valkey-cli ping`. The
   application services keep the `/readyz` healthchecks ADR-0009 decision
-  10 specified (added if not yet present).
+  10 specified (added if not yet present). *The `aggregator` service sets
+  `HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` (amended 2026-09-22,
+  Amendment 4 ruling N; decision 7, as corrected), so a recreated
+  container reacquires its shards at once instead of waiting out the
+  lease TTL under a fresh container ID.*
 * `broker` (Kafka) is removed; `deploy/docker-compose.redpanda.yml` is
   deleted; the `KAFKA_*` block and `CLUSTER_ID` go with them.
 * `Makefile` `up` becomes `docker compose -f deploy/docker-compose.yml up
@@ -1345,7 +1592,11 @@ not make. Push back on them individually.
    see; 10 000 costs pending-state memory only when pending. Unlimited
    redelivery because every message is acknowledged on some path
    (decision 5). Durables never expire because an unowned shard must keep
-   its position.
+   its position. *"A clean stop `nak`s and pays nothing" is qualified
+   2026-09-22 (Amendment 4 ruling R1): it pays nothing for what reached
+   the client's fetch loops; up to `FETCH_BATCH` messages per durable that
+   the server delivered against the last outstanding pull and that never
+   reached a loop wait out `ack_wait` (decision 3, `close()`).*
 10. **The message key rides in a `Hammertime-Key` header.** JetStream has
     no message key; the subject carries the partition, not the key, and
     the aggregator asserts the key against the entry's IP (ADR-0004
@@ -1374,6 +1625,32 @@ not make. Push back on them individually.
     `--servers` MAY carry userinfo (decision 10, as amended), which is why
     the no-userinfo-in-logs rule and `bus_endpoints` are settled now,
     before any deployment carries one, rather than when one does.*
+    *The trust boundary this implies, stated (amended 2026-09-22,
+    Amendment 4 ruling S1, on the S1 audit's finding 1): the bus and the
+    store are inside the trust boundary, and the reference deployment
+    trusts everything that can open a TCP connection to them. With no
+    NATS `authorization` block and no Valkey `requirepass`, a principal
+    that reaches 4222 can publish a well-formed observation under any
+    subject — applied by the aggregator as if ingest had authenticated,
+    rate-limited and deduplicated it, so spec section 36's controls are
+    bypassed entirely — pre-publish a legitimate agent's next `event_id`
+    so that ingest's real publish is a silent duplicate, purge or delete a
+    stream (`deny_delete`/`deny_purge` are `false`, decision 2) and
+    acknowledge or delete the `hammertime-aggregator-<p>` durables; one
+    that reaches 6379 can rewrite `hammertime:agg:<p>:owner` to evict a
+    live member (`ShardLeaseLostError`, exit 1) or delete a HOT set; and
+    8222 (`/connz`, `/jsz`, `/varz`) discloses client addresses, subjects
+    and stream state. The reference compose file therefore publishes
+    4222, 8222 and 6379 on `127.0.0.1` only (decision 11), `.env.example`'s
+    event-log block says so, and any deployment in which a host other
+    than the one running the stack can reach those ports MUST put NATS
+    `authorization` and Valkey `requirepass` in front of them — the step
+    ADR-0009 A1's credential rule and the `TRANSIENT_ERRORS` comment
+    already anticipate — before it is exposed. This is a statement of the
+    boundary, not a mechanism: no authentication is added to the bus or
+    the store here (a follow-up, Consequences), and the services' own
+    ports (8080-8083, 9090) are unchanged and are the owner's to reconsider
+    (open question in the Amendment 4 report).*
 14. **Connection options: fail-fast connect, unbounded reconnect, by
     switching the client's options after the initial connect.**
     *(Rewritten 2026-09-21, Amendment 1.)* So that `connect_with_retry`
@@ -1401,7 +1678,12 @@ not make. Push back on them individually.
     exit 1 rather than exit 2. Adding a grammar of Hammertime's own is the
     second-definition-of-validity A12 argued against; a driver-parser
     helper like `validate_redis_url` is a candidate follow-up, not done
-    here.
+    here. *Superseded 2026-09-22 (Amendment 4 ruling S2): the helper is
+    `validate_bus_url`, called from `load_settings` and the tool; it
+    checks only what nats-py's own parse would refuse (plus an `@` outside
+    the authority), so it is the driver's definition of validity, not a
+    second one, and a malformed URL is now exit 2 with `config_invalid`
+    and no echo of the value. Decision 3, `bus_endpoints` paragraph.*
 16. **`HAMMERTIME_SHARD_IDS` is required rather than defaulting to
     `all`.** A default of `all` plus lease detection would be safe for one
     member and would make every scale-out fail at start; requiring the
@@ -1529,10 +1811,18 @@ not make. Push back on them individually.
 * **`CHANGES`**: the lines are in the hand-off report; this ADR itself
   gets none (ADR-0012 assumption 16).
 * **Not done here, named.** A publish retry inside `ObservationPublisher`;
-  validation of `HAMMERTIME_BUS_BROKERS`; consumer-config reconciliation
+  validation of `HAMMERTIME_BUS_BROKERS` (*done 2026-09-22, Amendment 4
+  ruling S2: `validate_bus_url`*); consumer-config reconciliation
   in the provisioner; a byte cap on streams; a counter for redeliveries;
   unifying `replay_position` and `event_sequence`; the `integration` job's
-  re-enable (#52).
+  re-enable (#52). *Added 2026-09-22 (Amendment 4): authentication on the
+  bus and the store (NATS `authorization`, Valkey `requirepass`) plumbed
+  through the services — assumption 13 states the boundary and decision 11
+  binds the ports to loopback, but no credential is configured; a public
+  drain of a pull subscription's pending messages at `close()`, should
+  nats-py expose one (ruling R1's residual); a counter or record for
+  `PubAck.duplicate=True` at ingest, so a pre-published `event_id` is at
+  least observable (the S1 audit's optional suggestion, not ruled on).*
 
 ## Sources
 
@@ -2121,7 +2411,13 @@ continues the ADR's list):
     `HAMMERTIME_BUS_BROKERS`" follow-up under Consequences now has a
     security argument as well as an exit-code one, and a driver-parser
     helper in the shape of `validate_redis_url` (raising a message that
-    repeats nothing of the value) is the recommended form.
+    repeats nothing of the value) is the recommended form. *Closed
+    2026-09-22 (Amendment 4 ruling S2): the S1 audit confirmed the path at
+    the pinned version — nats-py's fixed-text `errors.Error` chains the
+    `ValueError` as `__context__`, and `format_exc_info` prints the chain
+    — and `validate_bus_url` plus `_connect`'s `from None` re-raise close
+    both the value's route to nats-py and the chained text's route to
+    `start_failed`.*
 47. **Field renamed (`bus_endpoints`) rather than value replaced under
     `bus_brokers`.** A reader of `starting` should not have to know
     whether the field is the configured value or a reduction of it. The
@@ -2361,7 +2657,8 @@ continues the ADR's list):
     `stop()`; it is listed as an open question rather than widened into
     this ruling, because a direct caller of `apply_config()` after `stop()`
     in a test may be asserting the pass's arithmetic on the surviving
-    windows on purpose.
+    windows on purpose. *Closed 2026-09-22 (Amendment 4 ruling R2): it is
+    a no-op after `stop()`; no test called it after `stop()`.*
 55. **No rollback on a `load()` fault, relying on `run_service`'s
     `stop()`-on-failed-start.** If a future runner stopped calling
     `stop()` after a failed `start()`, the leases would lapse after
@@ -2423,3 +2720,433 @@ source was consulted):
   §47 row already maps `bus_endpoints`; no mapping change needed),
   ADR-0009 A7 and Amendment 4, spec §47.7,
   `docs/spec/integration-scenarios.md` §7.
+
+## Amendment 4 (2026-09-22) — the R1 review's nine findings and the S1 audit's four, ruled
+
+Why: the `reviewer` (report R1, branch `claude/gallant-pasteur-fkehtc` at
+091716c) returned three medium and six low findings against the epic
+branch, and the `security-auditor` (report S1, at 49cbc5a) one medium and
+three low, plus two notes. Every finding is either a defect this ADR's
+text already forbids, a gap in the text that let a defect through, or a
+residual the text promised more about than the mechanism can deliver.
+Each is ruled below — fixed in this epic, recorded as a residual with its
+bound, or not a defect with the reason — and every ruling that changes a
+decision's text is made in place with a dated italic note. The Amendment 3
+briefs C6, T4, T5 and T6 are folded into the two consolidated briefs
+(C7 for `coder`, T7 for `test-author`) in the hand-off report, so that
+the session dispatches exactly one of each. Nothing here changes a
+decision in substance except the two residuals it names (rulings R1 and
+S1) and the validator ruling S2 supersedes assumption 15 with.
+
+Every edit outside this section, with the superseded wording quoted or
+the insertion point named:
+
+* **Status line.** Gained the "amended a fourth time 2026-09-22" clause.
+* **Decision 1, `TopicSpec` sentence.** Appended the italic
+  `partition_of(subject)` definition (ruling S3).
+* **Decision 2, `ensure_streams` bullet.** Appended the italic "What is
+  compared, and that it is unit-tested" text (ruling R3).
+* **Decision 2, CLI bullet.** Appended the italic `--servers` validation
+  sentence (ruling S2).
+* **Decision 3, `close()` paragraph.** Appended the italic "What 'every
+  message this instance delivered' reaches" text (ruling R1).
+* **Decision 3, `hammertime.bus.nats` block.** Gained `validate_bus_url`.
+* **Decision 3, after the `bus_endpoints` paragraph.** Two italic
+  paragraphs: "An `@` outside the authority" (rulings R8 and S2) and "The
+  same URL reaches a record by a second path" (ruling S2).
+* **Decision 5, after the fetching paragraph.** The italic "Malformed at
+  the transport" paragraph (rulings S3 and S4).
+* **Decision 7, `on_assigned` bullet.** Two italic sentences appended
+  after Amendment 3's: the R5 reaffirmation and the R6 skip rule.
+* **Decision 7, `release()` bullet.** Appended the italic correction of
+  "compose gives a restarted container the same name" (ruling N).
+* **Decision 8, `stop()` bullet.** Appended the italic "`stop()`'s order
+  is total" text (rulings R2 and R4) and a second italic paragraph on
+  `AggregatorService.run()` (ruling R7).
+* **Decision 8, `UNCLAIMED` sentence.** Appended the italic post-`stop()`
+  clause (ruling R2).
+* **Decision 10, `HAMMERTIME_BUS_BROKERS` row.** "not validated by
+  `load_settings` (unchanged posture ...)" gained the dated "superseded"
+  clause (ruling S2).
+* **Decision 11, `nats` bullet.** The port list gained the italic
+  loopback ruling (S1); the `provision` bullet the italic `uv` pin (R9);
+  the application-services bullet the italic `member_id` sentence (N).
+* **Assumption 9.** Appended the italic qualification of "a clean stop
+  `nak`s and pays nothing" (ruling R1).
+* **Assumption 13.** Appended the italic trust-boundary paragraph (S1).
+* **Assumption 15.** Appended the italic "Superseded" note (S2).
+* **Assumption 46.** Appended the italic "Closed" note (S2).
+* **Assumption 54.** Appended the italic "Closed" note (R2).
+* **Consequences, "Not done here, named".** `validation of
+  HAMMERTIME_BUS_BROKERS` marked done; three follow-ups added
+  (bus/store authentication, a pending-queue drain, a duplicate counter).
+* **Outside this file** (same change set): ADR-0012 gains Amendment 4 —
+  decision 5 item 2 covers `COPY --from=` image references, the Class 4
+  table gains the `ghcr.io/astral-sh/uv:0.12.17` row and its preamble is
+  corrected, the Class 2 `uv` row records the current version (ruling
+  R9). `docs/spec/README.md` is unchanged: no section-to-file mapping
+  moves (the new test file sits under a package the §19 row already
+  maps).
+
+**Rulings.** R1-R9 are the reviewer's findings in its order; F is its
+flake note; S1-S4 are the auditor's findings in its order; N is the
+auditor's `member_id` note.
+
+* **R1 (`close()` nak gap) — path (1) real and fixed here; path (2) a
+  residual, recorded with its bound.** Decision 3 promised "every message
+  this instance delivered" back to the group "without waiting" and
+  decision 8 "at once"; the mechanism reached the retained and the queued
+  `Msg`s and dropped the unqueued remainder of a cancelled batch on the
+  floor, and cannot reach what the server delivered against a pull that
+  the loop never read. The remainder is the loop's own local — a
+  `CancelledError` handler that hands it to `close()` closes path (1)
+  with no new API. Path (2) has no clean fix: nats-py's per-subscription
+  pending queue is private and is drained only by a further `fetch()`
+  (Sources), and issuing one at `close()` would pull yet more messages to
+  nak. Recorded: at most `FETCH_BATCH` per durable, surfacing after
+  `ack_wait`; "without waiting" now means "for what reached the client".
+  Measured, if at all, by the integration job (#52).
+* **R2 (work after `stop()`) — real, fixed here, and widened to every
+  path.** Ruling (c) guarded `run_maintenance()` and left `apply_config()`
+  open (assumption 54); the reviewer's scenario (a) — a sweep queued on
+  the lock behind `stop()` emitting `HotIpRemoved` for a shard the next
+  owner has already loaded — is decision 7's rule broken by lock order,
+  and (b) — `run()` handling a message that completed in the same wake-up
+  as the stop signal, after the final commit — is decision 8's `stop()`
+  order broken by `asyncio.wait` returning two done tasks. One principle
+  covers all of it: once the stop flag is set, nothing acts on a shard.
+  So `handle()`, `run_maintenance()`, `apply_config()` and
+  `_commit_if_due()` each check the flag under the lock and stand down,
+  and `run()` does not call `handle()` when the stop task is in `done`.
+  `handle()`'s stand-down is `UNCLAIMED` (assumption 61); the periodic
+  commit's is a skip (assumption 66); `apply_config()`'s is a total
+  no-op (assumption 63). Assumption 54 is closed.
+* **R3 (`ensure_streams` untested) — real; tests are due.** The
+  exemption in `nats.py`'s docstring ("no unit tests here by design") was
+  written for the classes that need a live connection and was read as
+  covering the whole module; `ensure_streams` and `stream_config_for`
+  are pure over a three-method fake, and `test_cli.py` stubs them out.
+  Decision 2 now states what is compared, in what form nats-py presents
+  the server's config, and that the tests live in `test_streams.py`; the
+  tests are specified in brief T7 from that text.
+* **R4 (`stop()` after the bus is closed) — real, fixed here.** The
+  docstring said "idempotent"; the second call reached `ack(())` on a
+  closed consumer and raised, and the runner makes that call at every
+  crash exit. Ruled: `stop()` runs its sequence once and a later call
+  returns after taking the lock; and, since the same failure path showed
+  that a `commit_handled()` that raises leaves the leases held, the
+  release moves into a `finally` (assumption 64). The alternative — an
+  `ack` skipped when nothing was handled — was rejected because decision
+  8's uniform flush-then-ack trace is pinned by tests and is what makes
+  the commit path observable.
+* **R5 (rollback on a `load()` fault) — reaffirmed.** The reviewer's
+  scenario, a replacement with a different id crash-looping for up to
+  `lease_ttl_s`, arises only when the store is unreachable for the
+  release too, and a rollback inside `on_assigned` would fail on the same
+  store; with R4's `finally` the reachable-store case releases at once
+  even when the final commit fails. The consequence for a replacement is
+  now stated in decision 7 rather than implied.
+* **R6 (`on_assigned` skipping a windowed-but-unleased shard) — real,
+  fixed here.** The skip tested the windows; the lease is the claim. The
+  held-lease set is the test, and a shard with a surviving window and no
+  lease is claimed afresh with a new window (assumption 70). `shards`,
+  `window()` and `windows()` keep reporting the windows (assumption 69).
+* **R7 (`service.run()` masking the original failure) — real, fixed
+  here.** ADR-0009 decision 5 step 7's `run_exited` must name why the
+  service stopped; collecting `done`'s exceptions before `stop()` and
+  catching `stop()`'s own preserves that. The `stop_failed` record is
+  logged by the service at `WARNING` (assumption 71).
+* **R8 (`bus_endpoints` with an unencoded `/`, `?` or `#`) — real; the
+  definition changes.** The rule "the authority after its last `@`" was
+  implemented exactly and still leaked, because `urlsplit` ends the
+  authority before the `@`. An `@` left outside the authority is the
+  signature of the mistake and renders as `<unparseable>` (assumption
+  72). The seven pinned examples stand; five are added. The test file is
+  `test_endpoints.py`; the behaviour change is in `bus_endpoints` alone.
+* **R9 (`uv:latest` in the provisioner Dockerfile) — this epic's to fix,
+  in all five files.** ADR-0012 decision 6 binds every image reference in
+  the diff, and the provisioner Dockerfile is in the diff; the four
+  service Dockerfiles predate it, but they are one line each, the
+  provisioner file was written to match their shape, and leaving four
+  unpinned next to one pinned would be a worse state than either. The
+  tag is `0.12.17` (assumption 73). ADR-0012's Amendment 1 said every
+  `FROM` line was pinned and was right about `FROM`; `COPY --from=` was
+  not in its sweep, and ADR-0012 Amendment 4 extends the rule's wording
+  so that it is.
+* **F (Redis lease timing tests) — widen now.** The `RedisShardStateStore`
+  contract sleeps for real against fakeredis with `LEASE_TTL = 1.0`; the
+  two "still live" assertions (`0.6 x TTL`, and the renewal test's second
+  `0.6 x TTL`) leave a 0.4 s margin, which a loaded CI runner can eat. The
+  TTL becomes `2.0` (margins 0.8 s; assumption 75). The fractions are
+  unchanged: the renewal test needs the two sleeps to sum past one TTL,
+  so `0.6` cannot drop below `0.5`.
+* **S1 (unauthenticated bus and store on every host interface) — real,
+  fixed here as far as the boundary can be stated; authentication itself
+  is a follow-up.** The reference stack published 4222, 8222 and 6379 on
+  `0.0.0.0` with no credential and no statement anywhere that the bus
+  and the store are inside the trust boundary; the auditor's scenarios
+  (a)-(e) all follow. Ruled: the three ports are published on
+  `127.0.0.1` only (decision 11); assumption 13 states the boundary and
+  the obligation on any non-local deployment; `.env.example`'s event-log
+  block carries the same paragraph (brief C7). Not done: NATS
+  `authorization` and Valkey `requirepass` plumbed through the services
+  (Consequences), `deny_delete`/`deny_purge` on the streams (assumption
+  76), and the services' own ports (open question).
+* **S2 (`bus_endpoints` residual plus the chained `ValueError` in
+  `start_failed`) — real, fixed here on both paths.** The first path is
+  R8's. The second — nats-py's `errors.Error` chaining the `ValueError`
+  whose text carries the port token — is closed at the source by
+  `validate_bus_url` in `load_settings` and the tool (exit 2, no echo)
+  and, as a second line, by `_connect` re-raising `from None`
+  (assumption 74). Assumption 15 is superseded and assumption 46 closed.
+* **S3 (`int(suffix)` on the subject's last token) — real, fixed here.**
+  Decision 5's "a poison message cannot loop" assumed the message reached
+  the worker; a non-partition token failed the iterator first, and on a
+  whole-topic durable or a positional replay the same message came back
+  on every restart. Ruled: `TopicSpec.partition_of` is the parse, a
+  `None` is malformed at the transport, terminated on a durable and
+  skipped on a positional subscription, logged as `malformed_subject`
+  (assumptions 77-78). Only the helper is unit-tested.
+* **S4 (partition not checked against the key's hash) — real, fixed
+  here, in the bus rather than the worker.** The auditor's fix — a fifth
+  `_decode` check — would mark every message on `InMemoryBus` malformed,
+  because the memory bus has one partition and every message's partition
+  is `0` whatever its key (decision 3), so the whole in-process suite and
+  the integration harness would fail. The invariant is the transport's:
+  `NatsProducer` computes the subject from the key, so `NatsConsumer`
+  checks that `partition_for(key, spec.partitions)` equals the subject's
+  partition on the way out of the queue, and a mismatch is malformed at
+  the transport exactly as in S3. With the worker's existing key-equals-IP
+  check that gives subject-equals-IP's-partition end to end, and the
+  memory bus is untouched (assumption 79).
+* **N (the compose comment "keyed by the container name by default") —
+  inaccurate; fixed here.** The default is `socket.gethostname()`, the
+  container ID under compose; a recreated container would wait out the
+  TTL. Ruled: the compose file sets `HAMMERTIME_AGGREGATOR_MEMBER_ID:
+  aggregator-0` (assumption 80) and the comment is corrected;
+  `.env.example`'s "which a restarted container ... keeps" is qualified
+  the same way. Decision 7's parenthesis is corrected in place.
+
+No `CHANGES` line follows from any of these: the NATS transport, the
+provisioner, the lease and the compose stack this branch introduces have
+not reached `master`, so none of their behaviour has been observable, and
+the epic's own `BREAKING` lines already cover the swap (Amendment 2
+ruling 4, ADR-0012 Amendment 2 assumption 5). The four service
+Dockerfiles' `uv` pin is a build-input change with no observable effect.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+59. **The batch remainder is kept per consumer instance, not per pump.**
+    A list on the instance that every cancelled `_pump_pull` appends to
+    is the smallest bookkeeping that lets `close()` nak it after the
+    pumps are gathered; the order among the three sets naked (queued,
+    remainder, retained) does not matter, since each `Msg` is in exactly
+    one of them.
+60. **The residual's bound is `FETCH_BATCH` per durable and `ack_wait`.**
+    From the pull request's `batch` (`_fetch_n` asks for at most the
+    batch, less what it drained) and the server's redelivery rule; a
+    request's `expires` (5 s) bounds how long after cancellation the
+    server can still deliver against it, and an `UNSUB` on the inbox
+    stops delivery sooner, but neither shortens the wait for a message
+    already delivered. Not measured; #52's.
+61. **`handle()` after `stop()` returns `UNCLAIMED` with the
+    `unclaimed_partition` record rather than raising or adding a
+    record.** Raising would turn a benign teardown race into a failure
+    (assumption 53's argument); a new record would widen ADR-0011
+    decision 8's list for a case whose meaning `UNCLAIMED` already has
+    ("belongs to whichever member holds the partition, not to this one").
+    The `run()` skip keeps the record off the common race; it can still
+    fire when `handle()` was queued on the lock before `stop()`.
+62. **A message waiting for the lock at `stop()` is not "in hand".** Only
+    an executing `_handle` is; the waiting one takes the `UNCLAIMED` path
+    and is naked at `close()`, so it is applied once, by the next owner.
+    The alternative — letting it through because it was received before
+    the flag — would put it after the final commit, which is the defect.
+63. **`apply_config()` after `stop()` is a total no-op**, leaving the
+    worker's `config` unchanged and logging nothing. Adopting the
+    configuration without re-evaluating would leave the windows and the
+    worker disagreeing; nothing reads the worker's config after `stop()`
+    except tests. A direct `reload_config()` after `stop()` still logs the
+    poller's `config_applied`, which is the poller's record and is
+    accepted.
+64. **`release()` in `stop()`'s `finally`.** When the final acknowledgement
+    fails the shard is orphaned until the TTL either way; releasing at
+    once lets the next member take it now and re-apply the unacknowledged
+    messages after `ack_wait`, which is at-least-once. The exception
+    still propagates, so `run_exited` reports it.
+65. **A second `stop()` waits on the lock, then returns.** Rather than
+    returning immediately: a caller of the second `stop()` may reasonably
+    expect the first to have finished when it returns, and the runner's
+    `_stop_quietly` is exactly such a caller.
+66. **`_commit_if_due()` is skipped once the flag is set**, checked under
+    the lock. It costs one branch and makes "the final commit is the last
+    acknowledgement" literally true; a periodic commit already holding
+    the lock when the flag is set runs to completion before `stop()`'s.
+67. **The `ensure_streams` fake is a three-method object** — `stream_info`
+    raising `nats.js.errors.NotFoundError()` (constructible with no
+    arguments; `APIError.__init__` defaults every field) or returning an
+    object whose `.config` is an `api.StreamConfig`, `add_stream`,
+    `update_stream` — and the tests exercise the actual side both with
+    the server's strings and with the enums, so the comparison does not
+    depend on which form the installed nats-py's `from_response` yields
+    (read from `main`, assumption 28's caveat).
+68. **`stream_config_for(replicas < 1)` is a `ValueError`.** Recorded from
+    the code; the CLI already refused a non-positive `--replicas` and
+    the helper refuses the same value one layer down.
+69. **`shards`, `window()` and `windows()` keep reporting the windows
+    after `release()`.** Decision 8 says the windows survive `stop()` for
+    tests to read; changing `shards` to the held-lease set would change
+    what `shards_claimed` reads after `stop()` (moot: the process exits)
+    and what tests read (not moot). R6 changes only which shards
+    `on_assigned` skips.
+70. **A re-claimed shard gets a new window**, not the surviving one. The
+    surviving window's counters are stale by however long the lease was
+    gone and its inherited set is not the store's current HOT set; a
+    fresh load and warm-up is what any new claim gets.
+71. **`stop_failed` is logged by `AggregatorService.run()` at `WARNING`
+    with `error=str(exc)`**, the runner's own record name reused for the
+    same event one layer down; it is not pinned by a test.
+72. **An `@` in the path, query or fragment renders `<unparseable>`**
+    rather than, say, the authority up to its first `:`. A rendering
+    that guessed at the host would be a redaction of an input it cannot
+    parse (assumption 44's argument); and an entry with an `@` inside the
+    authority *and* one outside (`nats://user:p@/ss@nats:4222`) is
+    `<unparseable>` too, although the last-`@` rule alone would render
+    `nats://` for it, because the outside `@` is the signal.
+73. **`uv` pinned to `0.12.17`, the release current on 2026-09-22.** The
+    version and licence are from PyPI's JSON; the image tag form and the
+    "pin to a specific uv version" guidance are from uv's own Docker
+    guide, read from the `astral-sh/uv` repository on `main`
+    (`docs.astral.sh` is blocked from this environment), whose example
+    tag is `0.12.17`; the GitHub releases API answered 403. The architect
+    cannot pull the image; if the tag does not resolve at build time the
+    coder reports it rather than falling back to `latest`, and
+    `major.minor` (`0.12`) is the documented next-narrowest tag.
+74. **Both the validator and the `from None` re-raise.** The validator
+    alone closes the path for the URLs it recognises; the re-raise
+    covers a parse failure it did not anticipate at the cost of hiding a
+    chained `ValueError`'s text in `start_failed` — which is the text
+    that must not be logged. The validator's three checks are nats-py's
+    two parses plus the `@`-outside-authority signature; it adds no host
+    or port grammar of Hammertime's own.
+75. **`LEASE_TTL = 2.0` for the Redis lease contract.** Roughly six extra
+    seconds per suite run (four lapse sleeps of 2.3 s, three "still live"
+    sleeps of 1.2 s, against 1.3 s and 0.6 s today) bought against a flaky
+    gate; a flake costs a rerun of the whole gate.
+76. **`deny_delete`/`deny_purge` stay `false`.** They are not editable
+    after creation (Sources, streams page), so flipping them later is a
+    stream recreation; inside the trust boundary an operator may need to
+    purge, and outside it the flag is no substitute for authentication.
+    Named, not changed.
+77. **A malformed subject is terminated (`Msg.term()`) on a durable, not
+    acknowledged.** `+TERM` is the server's word for "will not be
+    processed"; both stop redelivery. On a positional subscription
+    (`ack_policy none`) nothing can be sent and the message is skipped.
+78. **Only the canonical decimal token is a partition**; `07` and `+7` are
+    not, although `int()` accepts them, because `subject(p)` never
+    produces them and a non-canonical token is not one of ours. Whether
+    the parsed partition is below the topic's count is not checked, as
+    decision 3 says `NatsConsumer` accepts any non-negative partition.
+79. **The key-hash check lives in `NatsConsumer`, not the worker, and a
+    message without the key header is not checked there.** The worker's
+    `_decode` already refuses a `None` key (`message.key !=
+    ip_text.encode()`), so a keyless message reaches `MALFORMED` by the
+    existing path; adding the header check to the memory bus would be
+    vacuous (one partition). The `malformed_subject` record carries the
+    subject and the stream sequence and not the key, so that a record
+    never carries an attacker-chosen value beyond the subject token.
+80. **`HAMMERTIME_AGGREGATOR_MEMBER_ID: aggregator-0` in compose rather
+    than `hostname: aggregator-0`.** The variable is what decision 7
+    defines and what `.env.example` documents; a `hostname:` would work
+    through the default and hide the dependency.
+81. **The five `Dockerfile`s are this epic's change set**, although four
+    predate it. Scope judgement: one line each, no behaviour change, and
+    the alternative leaves the tree inconsistent with its own ADR-0012
+    rule until a separate issue is filed and landed.
+82. **The `run()` skip drops the message received in the same wake-up
+    unhandled.** It was yielded, so it is retained and naked at `close()`
+    on `NatsConsumer`, and delivered-unacknowledged on `MemoryConsumer`;
+    either way the next member applies it once. Handling it after the
+    final commit is the defect; handling it before would need `stop()` to
+    wait for a message that may never come.
+
+Read on 2026-09-22 for Amendment 4:
+
+* `https://raw.githubusercontent.com/nats-io/nats.py/main/nats/src/nats/js/client.py`
+  (summarised by the fetch tool; `main`, not the 2.16.0 tag): `Subscription`
+  exposes `pending_msgs` ("Number of delivered messages by the NATS Server
+  that are being buffered in the pending queue") and `pending_bytes`, both
+  read-only counts; `_fetch_one` "Checks the queue first: `while not
+  queue.empty(): ... queue.get_nowait()`" and discards status messages
+  "meant for other fetch requests"; `_fetch_n` "Drains existing queue
+  messages initially, then sends a no-wait request" ("First request: Use
+  no_wait to synchronously get as many available based on the batch
+  size"), then "a lingering request with remaining deadline". Taken from
+  it: ruling R1's residual (no public drain; only a fetch empties the
+  pending queue, and a fetch sends a request).
+* `https://raw.githubusercontent.com/nats-io/nats.py/main/nats/src/nats/js/errors.py`:
+  `APIError.__init__(self, code=None, description=None, err_code=None,
+  stream=None, seq=None)`; `NotFoundError(APIError)` "A 404 error",
+  `BadRequestError` "A 400 error", `ServiceUnavailableError` "A 503
+  error", each `pass`. Taken from it: assumption 67's constructible fake.
+* `https://raw.githubusercontent.com/nats-io/nats.py/main/nats/src/nats/js/api.py`
+  (summarised): `StreamConfig` fields (`retention: Optional[RetentionPolicy]
+  = None`, `discard ... = DiscardPolicy.OLD`, `max_age: Optional[float]`,
+  `storage: Optional[StorageType]`, `duplicate_window: float = 0`, ...);
+  `from_response` "performs nanosecond conversions and nested object
+  conversions but does not convert enum string values. Fields like
+  `retention`, `storage`, and `discard` remain as strings"; `StreamInfo`
+  (`config: StreamConfig`, `state: StreamState`, ...). Taken from it:
+  ruling R3's statement of what is compared.
+* `https://raw.githubusercontent.com/python/cpython/3.12/Lib/urllib/parse.py`:
+  `urlsplit` — `if url[:2] == '//': netloc, url = _splitnetloc(url, 2)`,
+  then the bracket check raising `ValueError("Invalid IPv6 URL")`, then
+  `#` and `?` splits; `_NetlocResultMixinStr._userinfo` uses
+  `netloc.rpartition('@')` and `_hostinfo` partitions the host part on
+  `[`/`]` and `:` (so `.port` is `int()` of whatever follows the last
+  `:`). `_splitnetloc` (not quoted by the tool) is the search for the
+  first of `/?#` from position 2, which is the delimiting the ruling
+  relies on. Taken from it: rulings R8 and S2.
+* `https://raw.githubusercontent.com/astral-sh/uv/main/docs/guides/integration/docker.md`
+  (summarised): "Available images" lists `ghcr.io/astral-sh/uv:latest`,
+  `ghcr.io/astral-sh/uv:{major}.{minor}.{patch}` "e.g.
+  `ghcr.io/astral-sh/uv:0.12.17`" and `ghcr.io/astral-sh/uv:{major}.{minor}`;
+  "Installing uv": `COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx
+  /bin/` and "it is best practice to pin to a specific uv version, e.g.,
+  with: `COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /uvx /bin/`";
+  pinning a SHA256 digest is also recommended "as tags can be moved
+  across different commit SHAs". Taken from it: ruling R9's tag.
+* `https://pypi.org/pypi/uv/json`: version `0.12.17`, `license_expression`
+  `MIT OR Apache-2.0`, `license_files` `LICENSE-APACHE`, `LICENSE-MIT`,
+  author "Astral Software Inc.". Taken from it: ruling R9 and ADR-0012
+  Amendment 4's row.
+* Blocked or refused: `docs.python.org` and `docs.astral.sh`
+  (`EGRESS_BLOCKED`); `api.github.com/repos/astral-sh/uv/releases/latest`
+  (HTTP 403). The primary sources above were read in their place.
+* Repository facts: `packages/hammertime-bus/src/hammertime/bus/nats.py`
+  (`_pump_pull`'s `for msg in batch: await self._queue.put(msg)` with no
+  `CancelledError` bookkeeping; `close()` naking `[*queued,
+  *retained.values()]`; `ensure_streams`, `_plain`, `_MUTABLE_STREAM_FIELDS`,
+  `_IMMUTABLE_STREAM_FIELDS`, `stream_config_for`'s `replicas < 1`;
+  `bus_endpoints` lines 292-323; `_to_consumed`'s `int(suffix)`;
+  `_connect`); `services/aggregator/src/hammertime/aggregator/worker.py`
+  (`run()`'s `asyncio.wait` and `if receive_task not in done`; `stop()`
+  with no idempotency guard and no `finally`; `run_maintenance()` and
+  `apply_config()` with no stop-flag check; `_commit_if_due`; `_handle`);
+  `sharding/assignment.py` (`on_assigned`'s `if shard in self._windows:
+  continue`; the refusal-only rollback); `service.py` (`run()` calling
+  `stop()` before collecting `done`'s exceptions; `startup_fields`);
+  `packages/hammertime-core/src/hammertime/core/runtime.py`
+  (`_stop_quietly`, `_supervise`'s crash-exit `stop()`, `ConfigPoller`);
+  `deploy/docker-compose.yml` (ports `4222:4222`, `8222:8222`,
+  `6379:6379`; the aggregator comment); `.env.example` lines 16-24 and
+  71-73; the five `Dockerfile`s (`COPY --from=ghcr.io/astral-sh/uv:latest`);
+  `packages/hammertime-store/src/hammertime/store/tests/test_shard_state.py`
+  (`ShardLeaseContract`, `LEASE_TTL = 1.0`, the `0.6`/`+ 0.3` sleeps);
+  `packages/hammertime-bus/src/hammertime/bus/tests/test_endpoints.py`
+  (the seven pinned examples); `tools/provision/.../tests/test_cli.py`
+  (`_FakeEnsureStreams`); the aggregator tests' harness classes
+  (`_TappedBus`, `_Feed`, `_Members`, `_PrefetchBus`); ADR-0012 decisions
+  5 and 6 and its Class 2/4 tables; the R1 and S1 reports as relayed by
+  the top-level session.
