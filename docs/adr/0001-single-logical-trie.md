@@ -6,7 +6,10 @@ amended 2026-09-21 (Amendment 2: the event log is NATS JetStream and shard
 assignment is static — clauses 1, 3 and 6 of Amendment 1's model, its
 "not promised" list and four of its assumptions are superseded by ADR-0013;
 the original text is kept in place with dated notes, and Amendment 2 at the
-end states each replacement)
+end states each replacement); amended 2026-09-22 (Amendment 3: the shard
+lease is taken under a per-process token, so a second process sharing a
+`member_id` is detected too — a pointer at Amendment 2 item 1, per
+ADR-0013 Amendment 6)
 
 ## Context
 
@@ -396,3 +399,41 @@ Assumptions made by this amendment (push back individually):
 * **No CHANGES entry.** The observable changes (required
   `HAMMERTIME_SHARD_IDS`, the lease records) are ADR-0013's and are
   recorded by the change that implements it.
+
+## Amendment 3 (2026-09-22) — the lease is per process, so a shared `member_id` is detected too (ADR-0013 Amendment 6)
+
+Why: Amendment 2 item 1 says a member "takes the shard's lease in the
+state store under its `member_id`", and #90 cites this ADR's clause 1 as
+the record of the unenforced operator invariant the lease replaced. One
+invariant survived that replacement unnamed here: two processes started
+under one `member_id` were not told apart, because the lease's grant
+condition read a matching id as a renewal — and the reference compose file
+pins the id, so `docker compose up --scale aggregator=2` produced exactly
+that. ADR-0013 Amendment 6 rules it: the lease value is now the process's
+token `<member_id>/<instance_id>`, a second process under the same
+`member_id` is refused (after a wait bounded by
+`HAMMERTIME_AGGREGATOR_LEASE_TTL_S`, in case the holder is a predecessor
+that died without releasing), and the compose file refuses `--scale` by
+`container_name`. One pointer, in place; nothing in this ADR is
+re-decided.
+
+Every edit outside this section: none to the clauses themselves. Item 1
+of Amendment 2 is read with this sentence appended to its "Now:" text —
+*since 2026-09-22 (ADR-0013 Amendment 6) the lease is taken under the
+process's token rather than the bare `member_id`, so a second live
+process sharing a `member_id` is refused as well, and "the two-owners
+hazard therefore lasts at most one maintenance interval past a lapsed
+lease" holds for that case too.* The "promised" blockquote after the "not
+promised" paragraph is unchanged in wording: "a second live owner of a
+shard fails to start" already covers a same-id owner, now that it does.
+
+Assumptions made by this amendment (push back individually):
+
+* **A pointer, not a rewording of item 1.** Item 1 is a dated record of
+  what replaced clause 1 on 2026-09-21; the process token is a refinement
+  of the same mechanism, recorded where the mechanism is (ADR-0013
+  decision 7, as amended), and this ADR only needs to stop being cited as
+  evidence that a shared id goes undetected.
+* **No CHANGES entry from this ADR.** The two lines are ADR-0013
+  Amendment 6 ruling 6's and are written by the change that implements
+  it.

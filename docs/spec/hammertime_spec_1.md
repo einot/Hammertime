@@ -938,8 +938,10 @@ This minimizes distributed coordination for individual IP state.
 > (required; `all` or an explicit set, disjoint across members) names the
 > partitions a member owns, delivered through the bus's assignment listener,
 > and a member that finds one of its shards leased to another live member
-> refuses to start (ADR-0013 decisions 6 and 7; an explicitly empty set is
-> a configuration error, ADR-0011 Amendment 1). The sliding counters are
+> (another process under the same member id included, the lease naming
+> the process — ADR-0013 Amendment 6) refuses to start (ADR-0013
+> decisions 6 and 7; an explicitly empty set is a configuration error,
+> ADR-0011 Amendment 1). The sliding counters are
 > process-local; the set of HOT IPs per shard is kept in a durable state
 > store and inherited on claim, so a restart or handover never leaves the
 > trie holding an IP no owner remembers. Because the partitioner maps an IP
