@@ -22,6 +22,28 @@ alone; `service.py` was not read:
   steps (readiness, poller, server) being so already." (Ruling R4;
   `TestStopIsIdempotent`.)
 
+ADR-0013 decision 7 as amended 2026-09-22 (Amendment 6 ruling 2) adds the
+wait this file's last two classes are written against:
+
+* "`AggregatorService.start()` calls `worker.start()` through
+  `connect_with_retry("shard_leases", self._worker.start,
+  transient=(ShardHeldBySameMemberError,), sleep=..., monotonic=...)`:
+  ADR-0009 A1's schedule (0.5 s doubling to a 5 s cap) under the startup
+  deadline `HAMMERTIME_STARTUP_TIMEOUT_S` (60 s) ... A dead predecessor's
+  leases lapse inside the deadline whenever `lease_ttl_s` is below the
+  startup timeout ...; the replacement then claims, logs `shard_claimed`,
+  and becomes ready without a process exit. A live twin never lets go: the
+  deadline expires, the last `ShardHeldBySameMemberError` is re-raised ... A
+  refusal by another member is not in the transient tuple and exits 1 at
+  once, as today. `AggregatorService.__init__` gains `sleep` and `monotonic`
+  keywords (defaults `asyncio.sleep`, `time.monotonic`) passed to every
+  `connect_with_retry` it makes, so a test drives the wait without wall
+  time." (`TestStartWaitsOutAHolderOfTheSameMember`.)
+* "`startup_fields()` gains `instance_id`, so a process's `starting` record
+  can be matched against the token in another process's
+  `shard_held_by_same_member` or `shard_lease_lost` record" (ruling 2(e),
+  assumption 103). (`TestStartupFields`.)
+
 ASSUMPTIONS -- what the ADRs do not pin; adjust the helpers, not the meaning
 of the assertions:
 
@@ -61,7 +83,35 @@ of the assertions:
    cleanly. The double counts calls so that "at least once" is observable.
 7. The `stop_failed` record itself is not asserted (assumption 71: "it is
    not pinned by a test"), for the reason every aggregator test file gives
-   for log records.
+   for log records. Neither are `dependency_unavailable
+   dependency=shard_leases` and `shard_held_by_same_member`, the two records
+   Amendment 6's wait emits: same reason, and the wait's observables are the
+   recorded sleeps, the exception and `ready`.
+8. **The lease tests use a real `AggregatorWorker`**, on an `InMemoryBus`
+   (partition `{0}`) and a `MemoryShardStateStore` over a `ManualClock`, not
+   `_WorkerDouble`: "the worker holds the shard" and "each attempt a fresh
+   `subscribe()`" are the worker's own behaviour, and a double asserting them
+   would be asserting itself. Its keywords are `test_worker.py`'s
+   ASSUMPTION 1, with `member_id` set to the settings' own so the two agree
+   as `build_service` makes them agree.
+9. **The startup deadline is set through the environment.** ADR-0009 A1:
+   `connect_with_retry`'s `timeout_s=None` "reads `os.environ`", so
+   `HAMMERTIME_STARTUP_TIMEOUT_S` is monkeypatched to a few seconds. Nothing
+   waits on it in wall time -- the injected `monotonic` is what the deadline
+   is measured against -- and the assertions on the schedule are written to
+   hold for the default 60 s too, so a service that passes its own
+   `timeout_s` instead does not silently fail them.
+10. **`_FakeWait` advances the store's clock by the delay it is asked to
+    sleep.** That is how a lease TTL passes: the retry schedule is the only
+    thing that moves time in these tests. `ManualClock` is integer-valued
+    (`packages/hammertime-store/.../test_shard_state.py`), so the advance is
+    the delay rounded up -- which can only make the predecessor's lease lapse
+    sooner, never later, so "at least one retry" stays a real assertion.
+11. **A twin is modelled by a store that never grants.** Ruling 2(b)'s live
+    twin "keeps renewing", so its holder never lapses; `_TwinHoldsEveryLease`
+    answers every `acquire_lease` with the twin's token and counts the
+    attempts, which is what makes "each attempt is a full `subscribe()`"
+    observable.
 
 The detection document on disk is the one `test_reevaluate.py` writes
 (`_write_config`); the `DetectionConfig` handed to the service is the same
@@ -72,18 +122,49 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from hammertime.aggregator.config import AggregatorSettings
+from hammertime.aggregator.metrics import AggregatorMetrics
 from hammertime.aggregator.service import AggregatorService
+from hammertime.aggregator.sharding.assignment import (
+    ShardHeldBySameMemberError,
+    ShardOwnedElsewhereError,
+)
 from hammertime.aggregator.worker import AggregatorWorker
+from hammertime.bus.memory import InMemoryBus
+from hammertime.core.addressing.address import Address
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.runtime import Service
+from hammertime.core.state.enums import IpState
+from hammertime.core.time.clock import ManualClock
+from hammertime.store.interface import ShardState, ShardStateStore
+from hammertime.store.memory import MemoryShardStateStore
 
 WINDOW_SECONDS = 300
 BUCKET_SECONDS = 10
+
+# The `T0` of `docs/spec/integration-scenarios.md` section 2, as every other
+# aggregator test file uses it.
+BASE = 1_800_000_000
+
+# ADR-0013 Amendment 6 ruling 2(a): one member id, two per-process tokens --
+# this process's and the one a predecessor (or a live twin) left in the store.
+MEMBER_ID = "m"
+INSTANCE_SELF = "instance-self"
+INSTANCE_OTHER = "instance-other"
+OWNER_SELF = f"{MEMBER_ID}/{INSTANCE_SELF}"
+OWNER_OTHER = f"{MEMBER_ID}/{INSTANCE_OTHER}"
+ANOTHER_MEMBER = "aggregator-elsewhere"
+
+# Ruling 2(c): "A dead predecessor's leases lapse inside the deadline whenever
+# `lease_ttl_s` is below the startup timeout (30 s against 60 s by default)" --
+# the same relation, scaled to the retry schedule this test drives by hand.
+WORKER_LEASE_TTL_S = 2.0
+STARTUP_TIMEOUT_S = 5.0
 
 # ADR-0013 decision 7's default TTL exceeds decision 9's default maintenance
 # interval; with both intervals raised to an hour the TTL is raised with them.
@@ -134,7 +215,7 @@ def _settings(detection_config_path: Path) -> AggregatorSettings:
         store_kind="memory",
         redis_url="redis://localhost:6379/0",
         shard_ids=frozenset({0}),
-        member_id="m",
+        member_id=MEMBER_ID,
         lease_ttl_s=LEASE_TTL_SECONDS,
         maintenance_interval_s=AN_HOUR,
         config_poll_interval_s=AN_HOUR,
@@ -193,12 +274,101 @@ class _CrashingWorker(_WorkerDouble):
         raise ValueError("stop failed")
 
 
+class _FakeWait:
+    """ADR-0009 A2 / ADR-0013 Amendment 6 ruling 2(c): the `sleep` and
+    `monotonic` seams, driven by one recorded elapsed time.
+
+    Every delay the retry schedule asks for is recorded, added to the injected
+    `monotonic` -- so the startup deadline arrives without wall time -- and,
+    when a clock is given, applied to it as well, so a lease TTL passes
+    exactly as the schedule spends it (ASSUMPTION 10).
+    """
+
+    def __init__(self, clock: ManualClock | None = None) -> None:
+        self.delays: list[float] = []
+        self.elapsed = 0.0
+        self._clock = clock
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.elapsed += delay
+        if self._clock is not None:
+            self._clock.advance(math.ceil(delay))
+        await asyncio.sleep(0)
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+
+class _TwinHoldsEveryLease:
+    """ASSUMPTION 11: a `ShardStateStore` that never grants a lease, because
+    the holder is "a live twin, which keeps renewing" (ruling 2(b))."""
+
+    def __init__(self, clock: ManualClock, holder: str) -> None:
+        self._inner = MemoryShardStateStore(clock=clock)
+        self._holder = holder
+        self.attempts = 0
+
+    async def load(self, shard: int) -> ShardState:
+        return await self._inner.load(shard)
+
+    async def record_transition(
+        self, shard: int, ip: Address, state: IpState, sequence: int
+    ) -> None:
+        await self._inner.record_transition(shard, ip, state, sequence)
+
+    async def acquire_lease(self, shard: int, owner: str, ttl_seconds: float) -> str | None:
+        self.attempts += 1
+        return self._holder
+
+    async def release_lease(self, shard: int, owner: str) -> None:
+        return None
+
+
 def _service(tmp_path: Path, worker: _WorkerDouble) -> AggregatorService:
     """ASSUMPTION 1: the constructor, spelled in one place."""
 
     path = _write_config(tmp_path / "detection.json")
     # The double stays a double; the cast only satisfies the constructor's annotation.
     return AggregatorService(_settings(path), cast(AggregatorWorker, worker), DETECTION_CONFIG)
+
+
+def _aggregator_worker(
+    *,
+    clock: ManualClock,
+    state_store: ShardStateStore,
+    instance_id: str | None = INSTANCE_SELF,
+    lease_ttl_s: float = WORKER_LEASE_TTL_S,
+) -> AggregatorWorker:
+    """ASSUMPTION 8: a real worker, whose claims take the real leases."""
+
+    return AggregatorWorker(
+        bus=InMemoryBus(),
+        state_store=state_store,
+        clock=clock,
+        config=DETECTION_CONFIG,
+        metrics=AggregatorMetrics(),
+        shard_ids=None,
+        member_id=MEMBER_ID,
+        lease_ttl_s=lease_ttl_s,
+        instance_id=instance_id,
+    )
+
+
+def _service_with_wait(
+    tmp_path: Path, worker: AggregatorWorker, wait: _FakeWait
+) -> AggregatorService:
+    """The constructor with Amendment 6's two seams: "`sleep` and `monotonic`
+    keywords ... passed to every `connect_with_retry` it makes"."""
+
+    path = _write_config(tmp_path / "detection.json")
+    return AggregatorService(
+        _settings(path),
+        worker,
+        DETECTION_CONFIG,
+        sleep=wait.sleep,
+        monotonic=wait.monotonic,
+    )
 
 
 async def _run_bounded(service: AggregatorService) -> None:
@@ -328,3 +498,131 @@ class TestStopIsIdempotent:
         await service.stop()
 
         assert service.ready is False
+
+
+class TestStartWaitsOutAHolderOfTheSameMember:
+    """ADR-0013 decision 7 as amended (Amendment 6 ruling 2(c)): `start()`
+    retries `worker.start()` on `ShardHeldBySameMemberError` only, on ADR-0009
+    A1's schedule, under the startup deadline; a dead predecessor's lease is
+    taken the moment it lapses, a live twin's never is, and another member's
+    holder is not retried at all.
+
+    Nothing here waits on wall time: every delay goes through the injected
+    `sleep`, which is also what moves the store's clock (ASSUMPTION 10).
+    """
+
+    async def test_a_dead_predecessors_lease_is_waited_out_and_then_claimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # "a dead predecessor's leases, lapsing within `lease_ttl_s`, are
+        # taken without the process exiting": `start()` returns, the shard is
+        # this process's, and `/readyz` can answer 200.
+        monkeypatch.setenv("HAMMERTIME_STARTUP_TIMEOUT_S", str(STARTUP_TIMEOUT_S))
+        clock = ManualClock(initial=BASE)
+        store = MemoryShardStateStore(clock=clock)
+        assert await store.acquire_lease(0, OWNER_OTHER, WORKER_LEASE_TTL_S) is None
+        wait = _FakeWait(clock)
+        worker = _aggregator_worker(clock=clock, state_store=store)
+        service = _service_with_wait(tmp_path, worker, wait)
+
+        await service.start()
+
+        try:
+            assert service.ready is True
+            assert worker.shards == frozenset({0})
+            assert await store.acquire_lease(0, ANOTHER_MEMBER, 1.0) == OWNER_SELF
+            # At least one refusal was retried, on A1's schedule.
+            assert wait.delays
+            assert wait.delays[0] == 0.5
+        finally:
+            await service.stop()
+
+    async def test_a_live_twin_is_retried_until_the_startup_deadline_and_then_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # "a live twin's never lapse, the deadline expires, and the process
+        # exits 1 with `start_failed`": what `start()` owes the runner is the
+        # last `ShardHeldBySameMemberError` and a service that is not ready.
+        monkeypatch.setenv("HAMMERTIME_STARTUP_TIMEOUT_S", str(STARTUP_TIMEOUT_S))
+        clock = ManualClock(initial=BASE)
+        store = _TwinHoldsEveryLease(clock, OWNER_OTHER)
+        wait = _FakeWait(clock)
+        worker = _aggregator_worker(clock=clock, state_store=store)
+        service = _service_with_wait(tmp_path, worker, wait)
+
+        with pytest.raises(ShardHeldBySameMemberError):
+            await service.start()
+
+        try:
+            assert service.ready is False
+            assert worker.shards == frozenset()
+            # ADR-0009 A1: "the sleeps are `0.5, 1, 2, 4, 5, 5, 5, ...`" and
+            # "the last attempt is always made *before* the deadline".
+            assert wait.delays[:3] == [0.5, 1.0, 2.0]
+            # Each attempt is a full `subscribe()`, so each asked the store again.
+            assert store.attempts >= len(wait.delays) + 1
+        finally:
+            await service.stop()
+
+    async def test_another_members_holder_is_refused_without_a_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # "A refusal by another member is not in the transient tuple and exits
+        # 1 at once, as today": the plain `ShardOwnedElsewhereError`, and not
+        # one second of wait.
+        monkeypatch.setenv("HAMMERTIME_STARTUP_TIMEOUT_S", str(STARTUP_TIMEOUT_S))
+        clock = ManualClock(initial=BASE)
+        store = MemoryShardStateStore(clock=clock)
+        assert await store.acquire_lease(0, ANOTHER_MEMBER, 3600.0) is None
+        wait = _FakeWait(clock)
+        worker = _aggregator_worker(clock=clock, state_store=store)
+        service = _service_with_wait(tmp_path, worker, wait)
+
+        with pytest.raises(ShardOwnedElsewhereError) as excinfo:
+            await service.start()
+
+        try:
+            assert not isinstance(excinfo.value, ShardHeldBySameMemberError)
+            assert wait.delays == []
+            assert service.ready is False
+            assert await store.acquire_lease(0, MEMBER_ID, 1.0) == ANOTHER_MEMBER
+        finally:
+            await service.stop()
+
+
+class TestStartupFields:
+    """ADR-0013 Amendment 6 ruling 2(e): "`startup_fields()` gains
+    `instance_id`, so a process's `starting` record can be matched against the
+    token in another process's `shard_held_by_same_member` or
+    `shard_lease_lost` record" (assumption 103). The record itself is
+    `run_service`'s and is not asserted (ASSUMPTION 7); the fields it is built
+    from are the service's."""
+
+    def test_the_fields_carry_the_workers_own_instance_id(self, tmp_path: Path) -> None:
+        clock = ManualClock(initial=BASE)
+        # Built as a shipped process builds it -- "`build_service` passes
+        # nothing for it, so every process generates its own".
+        worker = _aggregator_worker(
+            clock=clock, state_store=MemoryShardStateStore(clock=clock), instance_id=None
+        )
+        service = _service_with_wait(tmp_path, worker, _FakeWait())
+
+        fields = service.startup_fields()
+
+        assert fields["instance_id"] == worker.instance_id
+        assert isinstance(fields["instance_id"], str)
+        assert fields["instance_id"] != ""
+
+    def test_member_id_is_still_there(self, tmp_path: Path) -> None:
+        # Decision 7's "Failure shape, summarised" as amended: "`instance_id`
+        # joins `member_id` in the `starting` record" -- joins, not replaces.
+        clock = ManualClock(initial=BASE)
+        worker = _aggregator_worker(
+            clock=clock, state_store=MemoryShardStateStore(clock=clock), instance_id=None
+        )
+        service = _service_with_wait(tmp_path, worker, _FakeWait())
+
+        fields = service.startup_fields()
+
+        assert "member_id" in fields
+        assert fields["member_id"] == MEMBER_ID

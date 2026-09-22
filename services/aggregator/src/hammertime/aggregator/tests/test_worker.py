@@ -47,14 +47,22 @@ three are shared with `test_sharding.py` and `test_reevaluate.py`:
 
 1. `AggregatorWorker(*, bus, state_store, clock, config, metrics,
    shard_ids=None, max_tracked_ips=1_000_000, member_id="aggregator",
-   lease_ttl_s=30.0)`, all keyword-only, taking the whole `bus` rather than
-   a pre-built producer/consumer pair -- the same choice ADR-0009 made for
+   lease_ttl_s=30.0, instance_id=None)`, all keyword-only, taking the whole
+   `bus` rather than a pre-built producer/consumer pair -- the same choice
+   ADR-0009 made for
    `build_service` ("takes an `InMemoryBus`, not a `Producer`/`Consumer`")
    and the same one `services/ingest/.../tests/test_pipeline.py::_build_app`
    relies on, so a test can keep its own reference and read every topic's
    log back. `shard_ids=None` is "every partition as the bus defines it",
    `{0}` on `InMemoryBus` (ADR-0013 decision 6). The two lease keywords and
-   their defaults are ADR-0013 decision 8's.
+   their defaults are ADR-0013 decision 8's; the third, `instance_id`, is
+   ADR-0013 Amendment 6's ("`AggregatorWorker` gains the same `instance_id:
+   str | None = None` keyword and an `instance_id` property ... and
+   `build_service` passes nothing for it, so every process generates its
+   own"), forwarded to `ShardClaims`, where `None` means
+   `secrets.token_hex(8)`. `_worker` leaves it `None` -- every test below
+   that does not name it gets a generated token, as a shipped process does
+   -- and `TestTheInstanceToken` is where it is named.
 2. `await worker.start()` (claims and leases, per ADR-0013 decision 3
    "`subscribe()` awaits `listener.on_assigned(...)` ... before it
    returns"), `await worker.run()` (the consume loop), `await worker.stop()`
@@ -339,6 +347,7 @@ def _worker(
     state_store: MemoryShardStateStore | None = None,
     config: DetectionConfig = DEFAULTS,
     member_id: str = MEMBER_A,
+    instance_id: str | None = None,
 ) -> AggregatorWorker:
     """ASSUMPTION 1 (see the module docstring)."""
 
@@ -350,6 +359,7 @@ def _worker(
         metrics=metrics,
         shard_ids=None,
         member_id=member_id,
+        instance_id=instance_id,
     )
 
 
@@ -1934,3 +1944,54 @@ class TestAStreamFailureThatCompletesWithTheStopSignal:
         assert worker.claims.handled_position(0) is None
         assert _records(bus, HOT_IP_TOPIC) == []
         assert await state_store.acquire_lease(0, MEMBER_B, 1.0) is None
+
+
+class TestTheInstanceToken:
+    """ADR-0013 Amendment 6 ruling 2(a): "`ShardClaims` gains `instance_id`
+    (default `secrets.token_hex(8)`, sixteen hex characters generated once per
+    construction; injectable for tests) and passes `lease_owner =
+    f"{member_id}/{instance_id}"` as the `owner` of every `acquire_lease` and
+    `release_lease` call"; decision 8's block as amended: "`AggregatorWorker`
+    gains the same `instance_id: str | None = None` keyword and an
+    `instance_id` property ..., and `build_service` passes nothing for it, so
+    every process generates its own".
+
+    The token's *effect* on a claim is `test_sharding.py`'s; what is pinned
+    here is that the worker takes the keyword, exposes it, and hands it to the
+    claims that own the leases.
+    """
+
+    def _built(
+        self, *, member_id: str = MEMBER_A, instance_id: str | None = None
+    ) -> AggregatorWorker:
+        return _worker(
+            bus=InMemoryBus(),
+            clock=ManualClock(initial=BASE),
+            metrics=AggregatorMetrics(),
+            member_id=member_id,
+            instance_id=instance_id,
+        )
+
+    def test_an_injected_instance_id_is_the_workers_own(self) -> None:
+        worker = self._built(instance_id="x")
+
+        assert worker.instance_id == "x"
+
+    def test_the_claims_lease_owner_ends_with_the_injected_instance_id(self) -> None:
+        worker = self._built(member_id=MEMBER_A, instance_id="x")
+
+        assert worker.claims.lease_owner.endswith("/x")
+        assert worker.claims.lease_owner == f"{MEMBER_A}/x"
+        assert worker.claims.instance_id == "x"
+
+    def test_two_workers_built_without_one_differ_in_their_instance_id(self) -> None:
+        # "so a second process started under the same `member_id` is refused
+        # rather than treated as a renewal" (decision 7, "What is checked", as
+        # amended): two workers of one member id carry two tokens.
+        first = self._built()
+        second = self._built()
+
+        assert first.instance_id
+        assert second.instance_id
+        assert first.instance_id != second.instance_id
+        assert first.claims.lease_owner != second.claims.lease_owner

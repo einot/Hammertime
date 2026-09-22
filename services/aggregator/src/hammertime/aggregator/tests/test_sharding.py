@@ -44,9 +44,14 @@ The second is ADR-0013 decision 8's block:
     class ShardClaims:                                   # satisfies AssignmentListener
         def __init__(self, *, state_store, producer, consumer, clock, config,
                      member_id: str, lease_ttl_s: float,
-                     max_tracked_ips: int = 1_000_000) -> None: ...
+                     max_tracked_ips: int = 1_000_000,
+                     instance_id: str | None = None) -> None: ...   # None -> secrets.token_hex(8)
         config: DetectionConfig
         shards: frozenset[int]
+        member_id: str        # property (Amendment 6)
+        instance_id: str      # property (Amendment 6): this process's token
+        lease_owner: str      # property (Amendment 6): f"{member_id}/{instance_id}",
+                              # the owner passed to every lease call
         def window(self, shard: int) -> ShardWindow | None: ...
         def windows(self) -> tuple[ShardWindow, ...]: ...
         def adopt_config(self, config: DetectionConfig) -> None: ...
@@ -57,18 +62,35 @@ The second is ADR-0013 decision 8's block:
         async def release(self) -> None: ...
         async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None: ...
 
-with `ShardOwnedElsewhereError(shard, owner)` and `ShardLeaseLostError(shard,
-owner)` in `hammertime.aggregator.sharding.assignment` (decision 7).
+with `ShardOwnedElsewhereError(shard, owner)`, `ShardLeaseLostError(shard,
+owner)` and -- since Amendment 6 ruling 2 --
+`ShardHeldBySameMemberError(shard, owner)`, a subclass of
+`ShardOwnedElsewhereError`, in `hammertime.aggregator.sharding.assignment`
+(decision 7).
+
+ADR-0013 Amendment 6 (2026-09-22) is what the lease owner means here: "The
+`owner` argument is an opaque token, not a member id ...: the store grants
+iff no live lease exists or the live lease's value equals the caller's
+token, releases iff equal, and reads nothing into the value. `ShardClaims`
+passes `lease_owner = f"{member_id}/{instance_id}"`, where `instance_id` is
+a random token generated once per process, so that a second process started
+under the same `member_id` is refused rather than treated as a renewal; the
+holder a refusal returns is that token, which `ShardClaims` splits at its
+last `/` to tell another member from another instance of itself." Ruling
+2(b) classifies the holder; `TestTheInstanceTokenTellsProcessesOfOneMemberApart`
+is written against it.
 
 ASSUMPTIONS -- details the ADRs do not pin. Adjust the helpers below, not
 the meaning of the assertions:
 
 1. `AggregatorWorker(*, bus, state_store, clock, config, metrics,
    shard_ids=None, max_tracked_ips=1_000_000, member_id="aggregator",
-   lease_ttl_s=30.0)`, and `await worker.start()` / `await
+   lease_ttl_s=30.0, instance_id=None)`, and `await worker.start()` / `await
    worker.handle(message)` / `await worker.run()` / `await
    worker.run_maintenance()` / `await worker.stop()`. ADR-0013 decision 8
-   names the two new keywords and their defaults; `shard_ids=None` "is
+   names the two lease keywords and their defaults; Amendment 6 names the
+   third ("`AggregatorWorker` gains the same `instance_id: str | None =
+   None` keyword and an `instance_id` property"). `shard_ids=None` "is
    passed to the bus as `partitions=None`, 'every partition as the bus
    defines it' -- `{0}` on `InMemoryBus`" (decision 6). See
    `test_worker.py`, which states the same assumption.
@@ -102,11 +124,17 @@ the meaning of the assertions:
    closes the bus ... afterwards". On the memory bus an unacknowledged
    message is deliverable to the next consumer whether or not the previous
    one was closed, so the handover tests do not depend on it either way.
-7. Handover members carry distinct `member_id`s and a lease TTL
-   (`LONG_LEASE_SECONDS`) far longer than any clock advance in this file, and
-   the state store shares the members' `ManualClock`; so the only way B can
-   acquire shard 0 is A's `stop()` having released it. Lease-lapse tests use
-   `LEASE_TTL_SECONDS` (30, the ADR's default) and advance past it.
+7. **Members are distinguished by their owner token, not by their id**
+   (Amendment 6 ruling 2: the store "reads nothing into the value"). The
+   handover members keep distinct `member_id`s all the same -- two
+   successive processes of one deployment normally share an id, but a
+   handover test that gave them one would be asserting the same-member path
+   of `TestTheInstanceTokenTellsProcessesOfOneMemberApart` instead of the
+   handover -- and a lease TTL (`LONG_LEASE_SECONDS`) far longer than any
+   clock advance in this file, and the state store shares the members'
+   `ManualClock`; so the only way B can acquire shard 0 is A's `stop()`
+   having released it. Lease-lapse tests use `LEASE_TTL_SECONDS` (30, the
+   ADR's default) and advance past it.
 8. The `ShardLeaseLostError` from `run_maintenance()` leaves the sweep
    unrun. Decision 7 orders the renewal "**first**, before the expiry sweep
    ... so a member that has lost a shard emits nothing more for it"; that is
@@ -152,6 +180,30 @@ the meaning of the assertions:
     final commit (a broker outage at `ack_sync`, decision 3): its `ack()`
     records itself in the trace and raises. That is the case R4's `finally`
     exists for, and the trace shows the release following the failed ack.
+14. **The helpers inject a *known* instance token by default.** Amendment 6
+    makes `instance_id=None` mean `secrets.token_hex(8)`, which no assertion
+    on `_RecordingStore.calls` could name; `_claims`, `_claims_and_consumer`
+    and `_worker` therefore default to `INSTANCE_A` and pass whatever they
+    are given straight through, so `instance_id=None` given explicitly still
+    reaches the ADR's generated default (which
+    `test_two_claims_built_without_an_instance_id_get_distinct_tokens` is
+    what exercises). Every owner in a store assertion is
+    `_owner(member, instance)` -- `f"{member}/{instance}"`, the `lease_owner`
+    the ADR names.
+15. **A pre-seeded holder standing for "another member" is written either
+    bare (`OTHER_MEMBER`) or as a token (`OTHER_MEMBER/<instance>`).** Ruling
+    2(b) and assumption 99: "a value with no `/` is a member id with an empty
+    instance", so both are another member's holder and neither may be
+    classified as the same member. The tests that care assert the refusal is
+    a `ShardOwnedElsewhereError` and *not* a `ShardHeldBySameMemberError`
+    (assumption 100: "The tests that distinguish the two assert `isinstance`
+    against the subclass"), and the parametrised
+    `test_a_shard_leased_elsewhere_is_refused` covers both spellings.
+16. **`MEMBER_C` and `OTHER_MEMBER` as probe owners** -- the value a test
+    passes to `state_store.acquire_lease` to read back who holds a shard --
+    stay bare ids. Assumption 109: the store "reads nothing into the value",
+    and a probe is refused (or granted) by equality alone, whatever its
+    shape.
 
 Amendment 3 (2026-09-21), Amendment 4 (2026-09-22) and Amendment 5
 (2026-09-22) rulings pinned here, each by the class named after it:
@@ -205,11 +257,23 @@ Amendment 3 (2026-09-21), Amendment 4 (2026-09-22) and Amendment 5
   and returns without touching the bus or the store; that is what
   "idempotent" means for it." -- `TestStopRunsOnceAndReleasesInAFinally`,
   and the second-`stop()` trace test in `TestReleasingLeases`.
+* Amendment 6 (2026-09-22) ruling 2: the lease owner is the process's token,
+  and a holder that names this member with another instance is
+  `ShardHeldBySameMemberError`, rolled back like any refusal --
+  `TestTheInstanceTokenTellsProcessesOfOneMemberApart`. Ruling 2 also
+  supersedes Amendment 4 ruling R5's "a replacement with the same id
+  reacquires at once": in `TestAFaultingLoadInsideOnAssigned`, the two tests
+  named `..._a_replacement_with_the_same_id_waits_for_the_lease` and
+  `..._a_claimant_with_the_same_token_reacquires_at_once` pin the amended
+  form -- a replacement is a different instance and waits out the
+  predecessor's leases, while the same token is granted at once.
 
 NOT asserted here, and why:
 
-* **The `shard_claimed` / `shard_owned_elsewhere` / `shard_lease_lost` log
-  records** of decisions 7 and 8. ADR-0009 decision 5 and section 47.7 fix
+* **The `shard_claimed` / `shard_owned_elsewhere` / `shard_held_by_same_member`
+  / `shard_lease_lost` log records** of decisions 7 and 8 (the third added by
+  Amendment 6 ruling 2, `WARNING ... owner=<token> member=<self>
+  instance=<self instance>`). ADR-0009 decision 5 and section 47.7 fix
   the event names and fields but not a record shape a unit test can assert
   against without a configured logger -- the same reason
   `packages/hammertime-core/.../tests/test_runtime.py` gives for omitting
@@ -253,6 +317,7 @@ from hammertime.aggregator.lateness import ObservationOutcome
 from hammertime.aggregator.metrics import AggregatorMetrics
 from hammertime.aggregator.sharding.assignment import (
     ShardClaims,
+    ShardHeldBySameMemberError,
     ShardLeaseLostError,
     ShardOwnedElsewhereError,
 )
@@ -298,6 +363,27 @@ MEMBER_A = "aggregator-a"
 MEMBER_B = "aggregator-b"
 MEMBER_C = "aggregator-c"
 OTHER_MEMBER = "aggregator-elsewhere"
+
+# ADR-0013 Amendment 6 ruling 2(a): the per-process token, "generated once
+# per construction; injectable for tests". Two of them stand for two
+# processes started under one `member_id` -- a predecessor and its
+# replacement, or a live twin.
+INSTANCE_A = "instance-aaaa"
+INSTANCE_B = "instance-bbbb"
+
+
+def _owner(member_id: str, instance_id: str) -> str:
+    """The `lease_owner` of Amendment 6 ruling 2(a): `f"{member_id}/{instance_id}"`.
+
+    "the `owner` of every `acquire_lease` and `release_lease` call".
+    """
+
+    return f"{member_id}/{instance_id}"
+
+
+# The owner token of every claim the helpers build unless a test says otherwise
+# (ASSUMPTION 14).
+OWNER_A = _owner(MEMBER_A, INSTANCE_A)
 
 IP_A = Address.parse("198.51.100.1")
 IP_B = Address.parse("198.51.100.2")
@@ -554,6 +640,7 @@ async def _claims_and_consumer(
     config: DetectionConfig | None = None,
     trace: list[str] | None = None,
     member_id: str = MEMBER_A,
+    instance_id: str | None = INSTANCE_A,
     lease_ttl_s: float = LEASE_TTL_SECONDS,
     max_tracked_ips: int = 1_000_000,
 ) -> tuple[ShardClaims, _RecordingConsumer]:
@@ -562,7 +649,8 @@ async def _claims_and_consumer(
     The inner consumer is subscribed first, the way the worker's own consumer
     is by the time any assignment callback can run -- `commit_handled()`
     acknowledges on it, and the acknowledgement tests read on its stream
-    (ASSUMPTION 4).
+    (ASSUMPTION 4). `instance_id` is passed through as given, `None`
+    included, and defaults to a known token (ASSUMPTION 14).
     """
 
     resolved_bus = bus if bus is not None else InMemoryBus()
@@ -578,6 +666,7 @@ async def _claims_and_consumer(
         member_id=member_id,
         lease_ttl_s=lease_ttl_s,
         max_tracked_ips=max_tracked_ips,
+        instance_id=instance_id,
     )
     return claims, consumer
 
@@ -590,6 +679,7 @@ async def _claims(
     config: DetectionConfig | None = None,
     trace: list[str] | None = None,
     member_id: str = MEMBER_A,
+    instance_id: str | None = INSTANCE_A,
     lease_ttl_s: float = LEASE_TTL_SECONDS,
     max_tracked_ips: int = 1_000_000,
 ) -> ShardClaims:
@@ -602,6 +692,7 @@ async def _claims(
         config=config,
         trace=trace,
         member_id=member_id,
+        instance_id=instance_id,
         lease_ttl_s=lease_ttl_s,
         max_tracked_ips=max_tracked_ips,
     )
@@ -616,9 +707,14 @@ def _worker(
     config: DetectionConfig | None = None,
     metrics: AggregatorMetrics | None = None,
     member_id: str = MEMBER_A,
+    instance_id: str | None = INSTANCE_A,
     lease_ttl_s: float = LONG_LEASE_SECONDS,
 ) -> AggregatorWorker:
-    """ASSUMPTION 1 (see the module docstring); mirrored in `test_worker.py`."""
+    """ASSUMPTION 1 (see the module docstring); mirrored in `test_worker.py`.
+
+    `instance_id` defaults to a known token (ASSUMPTION 14) so that the owner
+    of every lease this worker takes is nameable in an assertion.
+    """
 
     return AggregatorWorker(
         bus=bus,
@@ -629,6 +725,7 @@ def _worker(
         shard_ids=None,
         member_id=member_id,
         lease_ttl_s=lease_ttl_s,
+        instance_id=instance_id,
     )
 
 
@@ -1090,10 +1187,12 @@ class TestClaimingAShard:
 
 class TestShardLeasesAreTakenOnClaim:
     """ADR-0013 decision 7: "Before a member builds a `ShardWindow` for shard
-    `p`, it must hold the shard's lease" -- `acquire_lease(p, member_id,
+    `p`, it must hold the shard's lease" -- `acquire_lease(p, <owner token>,
     lease_ttl_s)` in `on_assigned`, before `state_store.load(p)`; a
     non-`None` result is a refusal that releases every lease this call
-    acquired and raises `ShardOwnedElsewhereError`."""
+    acquired and raises `ShardOwnedElsewhereError`. The owner is the
+    process's token since Amendment 6 ruling 2: "`ShardClaims` passes
+    `lease_owner = f"{member_id}/{instance_id}"`"."""
 
     async def test_the_lease_is_acquired_before_the_shard_is_loaded(self) -> None:
         # ASSUMPTION 5.
@@ -1105,19 +1204,26 @@ class TestShardLeasesAreTakenOnClaim:
 
         methods = [call[0] for call in store.calls]
         assert methods.index("acquire_lease") < methods.index("load")
-        assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
         assert ("load", 0) in store.calls
 
-    async def test_the_lease_carries_the_member_id_and_ttl(self) -> None:
+    async def test_the_lease_carries_the_owner_token_and_ttl(self) -> None:
+        # Amendment 6 ruling 2(a): the `owner` argument is the claim's
+        # `lease_owner`, member id and instance token, and nothing else.
         clock = ManualClock(initial=BASE)
         store = _RecordingStore(clock)
         claims = await _claims(
-            clock=clock, state_store=store, member_id="aggregator-7", lease_ttl_s=45.0
+            clock=clock,
+            state_store=store,
+            member_id="aggregator-7",
+            instance_id=INSTANCE_B,
+            lease_ttl_s=45.0,
         )
 
         await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
 
-        assert ("acquire_lease", 0, "aggregator-7", 45.0) in store.calls
+        assert claims.lease_owner == _owner("aggregator-7", INSTANCE_B)
+        assert ("acquire_lease", 0, _owner("aggregator-7", INSTANCE_B), 45.0) in store.calls
 
     async def test_the_claimed_shard_is_leased_to_this_member(self) -> None:
         clock = ManualClock(initial=BASE)
@@ -1126,7 +1232,7 @@ class TestShardLeasesAreTakenOnClaim:
 
         await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
 
-        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
 
     async def test_every_shard_is_leased_in_sorted_order_before_its_load(self) -> None:
         # ASSUMPTION 5 (ruled, T6): "strictly sequentially per shard: acquire
@@ -1144,7 +1250,7 @@ class TestShardLeasesAreTakenOnClaim:
         acquires = [call for call in store.calls if call[0] == "acquire_lease"]
         assert [call[1] for call in acquires] == [0, 1, 2]
         for shard in (0, 1, 2):
-            acquire_at = store.calls.index(("acquire_lease", shard, MEMBER_A, LEASE_TTL_SECONDS))
+            acquire_at = store.calls.index(("acquire_lease", shard, OWNER_A, LEASE_TTL_SECONDS))
             load_at = store.calls.index(("load", shard))
             assert acquire_at < load_at
         sequence = [call[:2] for call in store.calls if call[0] in ("acquire_lease", "load")]
@@ -1158,14 +1264,26 @@ class TestShardLeasesAreTakenOnClaim:
         ]
         assert claims.shards == frozenset({0, 1, 2})
 
-    async def test_a_shard_leased_elsewhere_is_refused(self) -> None:
+    @pytest.mark.parametrize(
+        "holder",
+        [OTHER_MEMBER, _owner(OTHER_MEMBER, INSTANCE_B)],
+        ids=["a-bare-member-id", "a-member-id-with-an-instance"],
+    )
+    async def test_a_shard_leased_elsewhere_is_refused(self, holder: str) -> None:
+        # ASSUMPTION 15. Amendment 6 ruling 2(b): "A holder whose member id
+        # differs is decision 7's refusal, unchanged", whether the holder is
+        # a token or a bare id left by a build before the amendment -- and it
+        # is never the same-member case, which is the only one `start()`
+        # waits out.
         clock = ManualClock(initial=BASE)
         state_store = MemoryShardStateStore(clock=clock)
-        await state_store.acquire_lease(0, OTHER_MEMBER, LEASE_TTL_SECONDS)
+        await state_store.acquire_lease(0, holder, LEASE_TTL_SECONDS)
         claims = await _claims(clock=clock, state_store=state_store)
 
-        with pytest.raises(ShardOwnedElsewhereError):
+        with pytest.raises(ShardOwnedElsewhereError) as excinfo:
             await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+
+        assert not isinstance(excinfo.value, ShardHeldBySameMemberError)
 
     async def test_a_refused_claim_holds_no_window(self) -> None:
         clock = ManualClock(initial=BASE)
@@ -1222,8 +1340,8 @@ class TestShardLeasesAreTakenOnClaim:
         with pytest.raises(ShardOwnedElsewhereError):
             await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0), (OBSERVATIONS_TOPIC, 1)}))
 
-        assert ("release_lease", 0, MEMBER_A) in store.calls
-        assert ("release_lease", 1, MEMBER_A) not in store.calls
+        assert ("release_lease", 0, OWNER_A) in store.calls
+        assert ("release_lease", 1, OWNER_A) not in store.calls
 
     async def test_the_refusal_propagates_out_of_subscribe(self) -> None:
         # "The exception propagates out of `subscribe()`": the listener is
@@ -1242,6 +1360,7 @@ class TestShardLeasesAreTakenOnClaim:
             config=DEFAULTS,
             member_id=MEMBER_A,
             lease_ttl_s=LEASE_TTL_SECONDS,
+            instance_id=INSTANCE_A,
         )
 
         with pytest.raises(ShardOwnedElsewhereError):
@@ -1279,18 +1398,258 @@ class TestShardLeasesAreTakenOnClaim:
         await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
 
         assert claims.window(0) is not None
-        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
 
-    async def test_the_same_member_id_reacquires_at_once(self) -> None:
-        # "a replacement with the same `member_id` ... reacquires at once".
+
+class TestTheInstanceTokenTellsProcessesOfOneMemberApart:
+    """ADR-0013 decision 7 as amended (Amendment 6 ruling 2): "the holder a
+    refused `acquire_lease` returns is split at its last `/` into a member id
+    and an instance id (a value with no `/` is a member id with an empty
+    instance). A holder whose member id is not this process's is the refusal
+    above, unchanged. A holder with this process's member id and another
+    instance -- a predecessor that died without releasing, or a live twin
+    started under the same `HAMMERTIME_AGGREGATOR_MEMBER_ID`; the lease cannot
+    tell which at that moment -- is logged `WARNING
+    event=shard_held_by_same_member ...`, rolled back exactly as above, and
+    raised as `ShardHeldBySameMemberError(shard, owner)`, a subclass of
+    `ShardOwnedElsewhereError`. ... The same-instance re-acquire ... is
+    unaffected: it passes the same token and is a renewal."
+
+    Ruling 2(a) is what makes the two cases distinguishable at all: the three
+    behaviours it calls load-bearing -- `renew_leases()` "passes the token the
+    process acquired under and is granted as before", the re-acquire of a
+    leased-but-unwindowed shard "passes the same token and is a renewal", and
+    "`release()` deletes only this process's own leases -- which the member-id
+    value did not guarantee: a stopping twin released the survivor's shards"
+    -- are each pinned below.
+
+    The `shard_held_by_same_member` record itself is not asserted, for the
+    reason the module docstring gives for every log record; what is asserted
+    is the exception type, the rollback and what the store holds afterwards.
+    """
+
+    def _assigned(self, *shards: int) -> frozenset[tuple[str, int]]:
+        return frozenset((OBSERVATIONS_TOPIC, shard) for shard in shards)
+
+    async def test_a_live_lease_under_this_claims_own_token_is_a_renewal(self) -> None:
+        # "the same instance is a renewal the store grants, so this is the
+        # only other case": the store "grants iff no live lease exists or the
+        # live lease's value equals the caller's token".
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        await state_store.acquire_lease(0, OWNER_A, LONG_LEASE_SECONDS)
+        claims = await _claims(clock=clock, state_store=state_store)
+
+        await claims.on_assigned(self._assigned(0))
+
+        assert claims.window(0) is not None
+        assert claims.shards == frozenset({0})
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
+
+    async def test_a_second_on_assigned_after_release_passes_the_same_token(self) -> None:
+        # The token is "stable for the process's life": one `ShardClaims`
+        # acquires under one owner, whatever it has released in between.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        claims = await _claims(clock=clock, state_store=store)
+        await claims.on_assigned(self._assigned(0))
+        await claims.release()
+        store.clear()
+
+        await claims.on_assigned(self._assigned(0))
+
+        assert claims.lease_owner == OWNER_A
+        assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
+        assert claims.window(0) is not None
+
+    async def test_another_instance_of_the_same_member_is_refused(self) -> None:
+        # "A holder with this process's member id and another instance ... is
+        # ... `ShardHeldBySameMemberError(shard, owner)`, a subclass of
+        # `ShardOwnedElsewhereError`" (assumption 100).
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        await state_store.acquire_lease(0, _owner(MEMBER_A, INSTANCE_B), LONG_LEASE_SECONDS)
+        claims = await _claims(clock=clock, state_store=state_store)
+
+        with pytest.raises(ShardHeldBySameMemberError) as excinfo:
+            await claims.on_assigned(self._assigned(0))
+
+        assert isinstance(excinfo.value, ShardOwnedElsewhereError)
+
+    async def test_the_same_member_refusal_holds_no_window_and_leaves_the_holder(self) -> None:
+        # "rolled back exactly as above": the refused claim holds nothing, and
+        # the twin -- or the dead predecessor -- is still the holder.
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        twin = _owner(MEMBER_A, INSTANCE_B)
+        await state_store.acquire_lease(0, twin, LONG_LEASE_SECONDS)
+        claims = await _claims(clock=clock, state_store=state_store)
+
+        with pytest.raises(ShardHeldBySameMemberError):
+            await claims.on_assigned(self._assigned(0))
+
+        assert claims.window(0) is None
+        assert claims.shards == frozenset()
+        assert claims.windows() == ()
+        assert await state_store.acquire_lease(0, MEMBER_C, 1.0) == twin
+
+    async def test_the_same_member_refusal_releases_the_leases_taken_earlier_in_the_call(
+        self,
+    ) -> None:
+        # The mirror of the other-member rollback above ("releases every lease
+        # this call acquired so far, and raises"): shard 0 was free and taken,
+        # shard 1 is the twin's, and the rollback frees shard 0 for anyone.
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        twin = _owner(MEMBER_A, INSTANCE_B)
+        await store.acquire_lease(1, twin, LONG_LEASE_SECONDS)
+        store.clear()
+        claims = await _claims(clock=clock, state_store=store)
+
+        with pytest.raises(ShardHeldBySameMemberError):
+            await claims.on_assigned(self._assigned(0, 1))
+
+        assert ("release_lease", 0, OWNER_A) in store.calls
+        assert ("release_lease", 1, OWNER_A) not in store.calls
+        assert claims.shards == frozenset()
+        assert await store.acquire_lease(0, MEMBER_C, 1.0) is None
+        assert await store.acquire_lease(1, MEMBER_C, 1.0) == twin
+
+    async def test_a_bare_holder_equal_to_this_member_id_is_the_same_member_case(self) -> None:
+        # Assumption 99: "A lease value written by a build before this
+        # amendment (a plain member id) ... is then classified by member
+        # equality -- waited out if it names this member".
         clock = ManualClock(initial=BASE)
         state_store = MemoryShardStateStore(clock=clock)
         await state_store.acquire_lease(0, MEMBER_A, LONG_LEASE_SECONDS)
-        claims = await _claims(clock=clock, state_store=state_store, member_id=MEMBER_A)
+        claims = await _claims(clock=clock, state_store=state_store)
 
-        await claims.on_assigned(frozenset({(OBSERVATIONS_TOPIC, 0)}))
+        with pytest.raises(ShardHeldBySameMemberError):
+            await claims.on_assigned(self._assigned(0))
+
+        assert claims.window(0) is None
+        assert await state_store.acquire_lease(0, MEMBER_C, 1.0) == MEMBER_A
+
+    async def test_a_member_id_containing_a_slash_is_split_at_the_last_one(self) -> None:
+        # Ruling 2(b) and assumption 99: "an operator-set `member_id` may
+        # [contain `/`], which is why the split is from the right and the
+        # instance never contains one" -- so `region-1/aggregator-a` is one
+        # member, and its two instances are told apart rather than read as two
+        # members.
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        member = "region-1/aggregator-a"
+        await state_store.acquire_lease(0, _owner(member, INSTANCE_B), LONG_LEASE_SECONDS)
+        claims = await _claims(
+            clock=clock, state_store=state_store, member_id=member, instance_id=INSTANCE_A
+        )
+
+        with pytest.raises(ShardHeldBySameMemberError):
+            await claims.on_assigned(self._assigned(0))
+
+    async def test_the_predecessors_lease_is_claimed_once_it_lapses(self) -> None:
+        # Ruling 3: the replacement "is refused with `shard_held_by_same_member`,
+        # retries under the startup deadline, takes the shards the moment the
+        # predecessor's leases lapse". Here the retry is the second direct
+        # call; `test_service.py` owns the retry loop itself.
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        await state_store.acquire_lease(0, _owner(MEMBER_A, INSTANCE_B), LEASE_TTL_SECONDS)
+        claims = await _claims(clock=clock, state_store=state_store)
+        with pytest.raises(ShardHeldBySameMemberError):
+            await claims.on_assigned(self._assigned(0))
+
+        clock.advance(int(LEASE_TTL_SECONDS) + 1)
+        await claims.on_assigned(self._assigned(0))
 
         assert claims.window(0) is not None
+        assert claims.shards == frozenset({0})
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
+
+    async def test_renew_leases_passes_the_token(self) -> None:
+        # Ruling 2(a): "`renew_leases()` passes the token the process acquired
+        # under and is granted as before".
+        clock = ManualClock(initial=BASE)
+        store = _RecordingStore(clock)
+        claims = await _claims(clock=clock, state_store=store)
+        await claims.on_assigned(self._assigned(0))
+        store.clear()
+
+        await claims.renew_leases()
+
+        assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
+
+    async def test_a_twins_token_in_the_store_is_a_lease_lost_error(self) -> None:
+        # Decision 7: a non-`None` result from the renewal "logs `ERROR
+        # event=shard_lease_lost ...` and raises `ShardLeaseLostError(shard,
+        # owner)`" -- and since Amendment 6 a twin of this member's own id is
+        # such an owner, because its token is not this process's.
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        claims = await _claims(clock=clock, state_store=state_store)
+        await claims.on_assigned(self._assigned(0))
+        clock.advance(int(LEASE_TTL_SECONDS) + 1)
+        assert (
+            await state_store.acquire_lease(0, _owner(MEMBER_A, INSTANCE_B), LONG_LEASE_SECONDS)
+            is None
+        )
+
+        with pytest.raises(ShardLeaseLostError):
+            await claims.renew_leases()
+
+    async def test_release_leaves_the_other_instances_lease_in_place(self) -> None:
+        # Ruling 2(a): "`release()` deletes only this process's own leases --
+        # which the member-id value did not guarantee: a stopping twin
+        # released the survivor's shards." This claim's lease lapses, the twin
+        # takes the shard, and this claim's `release()` must not free it.
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        claims = await _claims(clock=clock, state_store=state_store)
+        await claims.on_assigned(self._assigned(0))
+        clock.advance(int(LEASE_TTL_SECONDS) + 1)
+        twin = _owner(MEMBER_A, INSTANCE_B)
+        assert await state_store.acquire_lease(0, twin, LONG_LEASE_SECONDS) is None
+
+        await claims.release()
+
+        assert await state_store.acquire_lease(0, MEMBER_C, 1.0) == twin
+
+    async def test_two_claims_built_without_an_instance_id_get_distinct_tokens(self) -> None:
+        # Ruling 2(a): the default is `secrets.token_hex(8)`, "generated once
+        # per construction", so "a second process started under the same
+        # `member_id` is refused rather than treated as a renewal"; the owner
+        # every lease call carries is `f"{member_id}/{instance_id}"`.
+        clock = ManualClock(initial=BASE)
+        first = await _claims(clock=clock, instance_id=None)
+        second = await _claims(clock=clock, instance_id=None)
+
+        assert first.member_id == MEMBER_A
+        assert second.member_id == MEMBER_A
+        assert first.instance_id
+        assert second.instance_id
+        assert first.instance_id != second.instance_id
+        assert first.lease_owner == f"{first.member_id}/{first.instance_id}"
+        assert second.lease_owner == f"{second.member_id}/{second.instance_id}"
+        assert first.lease_owner != second.lease_owner
+
+    async def test_a_generated_token_refuses_a_second_process_of_the_same_member(self) -> None:
+        # The two halves together: two claims built as two processes are,
+        # sharing one `member_id` and a store, and the second is refused with
+        # the same-member error rather than granted a renewal -- #90's
+        # residual, "both load the same `next_sequence`, build independent
+        # windows and publish under one identity with colliding sequences".
+        clock = ManualClock(initial=BASE)
+        state_store = MemoryShardStateStore(clock=clock)
+        first = await _claims(clock=clock, state_store=state_store, instance_id=None)
+        second = await _claims(clock=clock, state_store=state_store, instance_id=None)
+        await first.on_assigned(self._assigned(0))
+
+        with pytest.raises(ShardHeldBySameMemberError):
+            await second.on_assigned(self._assigned(0))
+
+        assert second.window(0) is None
+        assert first.window(0) is not None
+        assert await state_store.acquire_lease(0, MEMBER_C, 1.0) == first.lease_owner
 
 
 class TestRenewingLeases:
@@ -1308,8 +1667,8 @@ class TestRenewingLeases:
         await claims.renew_leases()
 
         assert sorted(call for call in store.calls if call[0] == "acquire_lease") == [
-            ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS),
-            ("acquire_lease", 1, MEMBER_A, LEASE_TTL_SECONDS),
+            ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS),
+            ("acquire_lease", 1, OWNER_A, LEASE_TTL_SECONDS),
         ]
         assert ("load", 0) not in store.calls
         assert ("load", 1) not in store.calls
@@ -1324,7 +1683,7 @@ class TestRenewingLeases:
         await claims.renew_leases()
         clock.advance(20)  # 40 s after the claim, 20 s after the renewal
 
-        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
 
     async def test_renew_leases_with_nothing_held_touches_nothing(self) -> None:
         clock = ManualClock(initial=BASE)
@@ -1359,7 +1718,7 @@ class TestRenewingLeases:
 
         await claims.renew_leases()
 
-        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
 
     async def test_run_maintenance_renews_the_leases_before_it_sweeps(self) -> None:
         # ASSUMPTION 8. The demotion of IP_A is due in this sweep (its only
@@ -1382,7 +1741,7 @@ class TestRenewingLeases:
             assert trace[0] == "acquire_lease"
             assert "record_transition" in trace
             assert trace.index("acquire_lease") < trace.index("record_transition")
-            assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+            assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
             assert [envelope.event_type for envelope in _hot_ip_events(bus)] == [
                 "HotIpAdded",
                 "HotIpRemoved",
@@ -1401,7 +1760,7 @@ class TestRenewingLeases:
 
             await worker.run_maintenance()
 
-            assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+            assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
         finally:
             await worker.stop()
 
@@ -1462,8 +1821,8 @@ class TestReleasingLeases:
         await claims.release()
 
         assert sorted(call for call in store.calls if call[0] == "release_lease") == [
-            ("release_lease", 0, MEMBER_A),
-            ("release_lease", 1, MEMBER_A),
+            ("release_lease", 0, OWNER_A),
+            ("release_lease", 1, OWNER_A),
         ]
 
     async def test_release_writes_nothing_and_emits_nothing(self) -> None:
@@ -1537,7 +1896,7 @@ class TestReleasingLeases:
         state_store = MemoryShardStateStore(clock=clock)
         worker = _worker(bus=bus, clock=clock, state_store=state_store)
         await worker.start()
-        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
 
         await worker.stop()
 
@@ -1922,7 +2281,7 @@ class TestTheWorkerClaimsShardZero:
         try:
             assert worker.shards == frozenset({0})
             assert worker.window(0) is not None
-            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
         finally:
             await worker.stop()
 
@@ -2029,14 +2388,20 @@ class TestHandoverBetweenTwoMembers:
             clock.advance(HANDOVER_SECONDS)
 
             b = members.build()
-            with pytest.raises(ShardOwnedElsewhereError):
+            with pytest.raises(ShardOwnedElsewhereError) as excinfo:
                 await b.start()
 
+            # Another member, not another instance of this one: Amendment 6
+            # ruling 2(b) leaves this refusal "unchanged" and it is not the
+            # one `AggregatorService.start()` waits out.
+            assert not isinstance(excinfo.value, ShardHeldBySameMemberError)
             assert b.window(0) is None
             assert b.shards == frozenset()
             # A is untouched: still the holder, its window intact.
             assert a.window(0) is not None
-            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == "aggregator-1"
+            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == _owner(
+                "aggregator-1", INSTANCE_A
+            )
             assert _identities(bus) == [("HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0)]
         finally:
             await members.stop_all()
@@ -2058,7 +2423,9 @@ class TestHandoverBetweenTwoMembers:
             b = await members.start()
 
             assert b.window(0) is not None
-            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == "aggregator-2"
+            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == _owner(
+                "aggregator-2", INSTANCE_A
+            )
         finally:
             await members.stop_all()
 
@@ -2345,7 +2712,9 @@ class TestHandoverBetweenTwoMembers:
                 ("HotIpAdded", str(IP_A), SHARD_AGENT_ID, 0),
                 ("HotIpRemoved", str(IP_A), SHARD_AGENT_ID, 1),
             ]
-            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == "aggregator-3"
+            assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == _owner(
+                "aggregator-3", INSTANCE_A
+            )
         finally:
             await members.stop_all()
 
@@ -2381,7 +2750,7 @@ class TestNothingActsOnAShardAfterStop:
         b = _worker(bus=bus, clock=clock, state_store=store, member_id=MEMBER_B)
         await b.start()
         try:
-            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_B
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == _owner(MEMBER_B, INSTANCE_A)
             clock.advance(310)
             trace.clear()
 
@@ -2393,7 +2762,7 @@ class TestNothingActsOnAShardAfterStop:
             assert window is not None
             assert window.state(IP_A) is IpState.HOT
             assert window.is_tracked(IP_A) is True
-            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_B
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == _owner(MEMBER_B, INSTANCE_A)
             assert (await store.load(0)).hot_ips == frozenset({IP_A})
         finally:
             await b.stop()
@@ -2539,7 +2908,9 @@ class TestAFaultingLoadInsideOnAssigned:
     Shards `{0, 1}` over `_AnyPartitionsBus` (ASSUMPTION 11); `load(1)`
     raises `_StoreDown`."""
 
-    def _worker(self, clock: ManualClock, store: ShardStateStore) -> AggregatorWorker:
+    def _worker(
+        self, clock: ManualClock, store: ShardStateStore, *, instance_id: str = INSTANCE_A
+    ) -> AggregatorWorker:
         return AggregatorWorker(
             bus=_AnyPartitionsBus(),
             state_store=store,
@@ -2549,6 +2920,7 @@ class TestAFaultingLoadInsideOnAssigned:
             shard_ids=frozenset({0, 1}),
             member_id=MEMBER_A,
             lease_ttl_s=LEASE_TTL_SECONDS,
+            instance_id=instance_id,
         )
 
     async def test_the_fault_propagates_as_itself_out_of_start(self) -> None:
@@ -2598,8 +2970,8 @@ class TestAFaultingLoadInsideOnAssigned:
             await worker.start()
 
         assert [call for call in store.calls if call[0] == "release_lease"] == []
-        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
-        assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
+        assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == OWNER_A
 
     async def test_stop_after_the_failed_start_returns_normally_and_releases_both(self) -> None:
         # Ruling (d): "`release()` drops them when `run_service` calls
@@ -2617,8 +2989,8 @@ class TestAFaultingLoadInsideOnAssigned:
         await worker.stop()
 
         assert sorted(call for call in store.calls if call[0] == "release_lease") == [
-            ("release_lease", 0, MEMBER_A),
-            ("release_lease", 1, MEMBER_A),
+            ("release_lease", 0, OWNER_A),
+            ("release_lease", 1, OWNER_A),
         ]
         assert await store.acquire_lease(0, MEMBER_C, 1.0) is None
         assert await store.acquire_lease(1, MEMBER_C, 1.0) is None
@@ -2643,14 +3015,15 @@ class TestAFaultingLoadInsideOnAssigned:
             shard_ids=frozenset({0, 1}),
             member_id=MEMBER_B,
             lease_ttl_s=LEASE_TTL_SECONDS,
+            instance_id=INSTANCE_B,
         )
 
         await replacement.start()
 
         try:
             assert replacement.shards == frozenset({0, 1})
-            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_B
-            assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == MEMBER_B
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == _owner(MEMBER_B, INSTANCE_B)
+            assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == _owner(MEMBER_B, INSTANCE_B)
         finally:
             await replacement.stop()
 
@@ -2662,8 +3035,8 @@ class TestAFaultingLoadInsideOnAssigned:
         worker = self._worker(clock, store)
         with pytest.raises(_StoreDown):
             await worker.start()
-        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
-        assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
+        assert await store.acquire_lease(1, OTHER_MEMBER, 1.0) == OWNER_A
 
         clock.advance(int(LEASE_TTL_SECONDS) + 1)
 
@@ -2675,7 +3048,8 @@ class TestAFaultingLoadInsideOnAssigned:
     ) -> None:
         # Ruling R5's crash outcome: "a replacement with a *different* id is
         # refused with `shard_owned_elsewhere` and exits 1 on each attempt
-        # for at most `lease_ttl_s`".
+        # for at most `lease_ttl_s`" -- and, since Amendment 6 ruling 2(b),
+        # that refusal is the plain one, not the same-member subclass.
         clock = ManualClock(initial=BASE)
         store = _FaultingLoadStore(clock, faulty_shard=1)
         failed = self._worker(clock, store)
@@ -2691,30 +3065,66 @@ class TestAFaultingLoadInsideOnAssigned:
             shard_ids=frozenset({0, 1}),
             member_id=MEMBER_B,
             lease_ttl_s=LEASE_TTL_SECONDS,
+            instance_id=INSTANCE_B,
         )
 
-        with pytest.raises(ShardOwnedElsewhereError):
+        with pytest.raises(ShardOwnedElsewhereError) as excinfo:
             await replacement.start()
 
+        assert not isinstance(excinfo.value, ShardHeldBySameMemberError)
         assert replacement.shards == frozenset()
 
-    async def test_without_a_stop_a_replacement_with_the_same_id_reacquires_at_once(self) -> None:
-        # Ruling R5: "a replacement with the same id reacquires at once either
-        # way".
+    async def test_without_a_stop_a_replacement_with_the_same_id_waits_for_the_lease(self) -> None:
+        # Ruling R5 said "a replacement with the same id reacquires at once
+        # either way"; Amendment 6 rulings 2 and 3 supersede exactly that
+        # sentence -- "the lease value is the process's token, so a
+        # replacement with the same `member_id` is a different instance and
+        # does **not** reacquire at once ... the replacement is refused with
+        # `shard_held_by_same_member` and waits inside `start()` for the
+        # predecessor's leases to lapse -- at most `lease_ttl_s`". Here the
+        # wait is the clock advance; `test_service.py` owns the retry loop.
         clock = ManualClock(initial=BASE)
         store = _FaultingLoadStore(clock, faulty_shard=1)
         failed = self._worker(clock, store)
         with pytest.raises(_StoreDown):
             await failed.start()
         store.heal()
-        replacement = self._worker(clock, store)
+        replacement = self._worker(clock, store, instance_id=INSTANCE_B)
+
+        with pytest.raises(ShardHeldBySameMemberError):
+            await replacement.start()
+
+        assert replacement.shards == frozenset()
+        clock.advance(int(LEASE_TTL_SECONDS) + 1)
 
         await replacement.start()
 
         try:
             assert replacement.shards == frozenset({0, 1})
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == _owner(MEMBER_A, INSTANCE_B)
         finally:
             await replacement.stop()
+
+    async def test_without_a_stop_a_claimant_with_the_same_token_reacquires_at_once(self) -> None:
+        # The half of ruling R5 Amendment 6 leaves standing: the store "grants
+        # iff no live lease exists or the live lease's value equals the
+        # caller's token", so a claimant presenting the token the faulted
+        # start acquired under is granted a renewal at once.
+        clock = ManualClock(initial=BASE)
+        store = _FaultingLoadStore(clock, faulty_shard=1)
+        failed = self._worker(clock, store)
+        with pytest.raises(_StoreDown):
+            await failed.start()
+        store.heal()
+        same_token = self._worker(clock, store, instance_id=INSTANCE_A)
+
+        await same_token.start()
+
+        try:
+            assert same_token.shards == frozenset({0, 1})
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
+        finally:
+            await same_token.stop()
 
     async def test_the_fault_propagates_out_of_subscribe_and_the_consumer_holds_nothing(
         self,
@@ -2734,19 +3144,20 @@ class TestAFaultingLoadInsideOnAssigned:
             config=DEFAULTS,
             member_id=MEMBER_A,
             lease_ttl_s=LEASE_TTL_SECONDS,
+            instance_id=INSTANCE_A,
         )
 
         with pytest.raises(_StoreDown):
             await consumer.subscribe(OBSERVATIONS_TOPIC, listener=claims)
 
         assert claims.window(0) is None
-        assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
         assert [call for call in store.calls if call[0] == "release_lease"] == []
         # "as if `subscribe()` had never been called": the empty ack is accepted.
         await consumer.ack([])
         # And the held set still covers the shard: `release()` drops it.
         await claims.release()
-        assert ("release_lease", 0, MEMBER_A) in store.calls
+        assert ("release_lease", 0, OWNER_A) in store.calls
         assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) is None
 
 
@@ -2768,7 +3179,7 @@ class TestReclaimingAShardAfterStop:
         await worker.start()
         assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
         await worker.stop()
-        assert ("release_lease", 0, MEMBER_A) in store.calls
+        assert ("release_lease", 0, OWNER_A) in store.calls
         return worker, bus
 
     async def test_on_assigned_after_stop_takes_the_lease_again(self) -> None:
@@ -2785,8 +3196,8 @@ class TestReclaimingAShardAfterStop:
             # "lease acquired, state loaded", in decision 7's order.
             sequence = [call[:2] for call in store.calls if call[0] in ("acquire_lease", "load")]
             assert sequence == [("acquire_lease", 0), ("load", 0)]
-            assert ("acquire_lease", 0, MEMBER_A, LONG_LEASE_SECONDS) in store.calls
-            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+            assert ("acquire_lease", 0, OWNER_A, LONG_LEASE_SECONDS) in store.calls
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
         finally:
             await worker.claims.release()
 
@@ -2836,10 +3247,10 @@ class TestReclaimingAShardAfterStop:
 
             await worker.claims.renew_leases()
 
-            assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+            assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
             assert ("load", 0) not in store.calls
             clock.advance(20)  # 40 s after the reclaim, 20 s after the renewal
-            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+            assert await store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
         finally:
             await worker.claims.release()
 
@@ -2932,6 +3343,7 @@ class TestALeasedButUnwindowedShardIsClaimedToCompletion:
             shard_ids=shard_ids,
             member_id=MEMBER_A,
             lease_ttl_s=LEASE_TTL_SECONDS,
+            instance_id=INSTANCE_A,
         )
         with pytest.raises(_StoreDown):
             await worker.start()
@@ -2955,7 +3367,7 @@ class TestALeasedButUnwindowedShardIsClaimedToCompletion:
 
         sequence = [call[:2] for call in store.calls if call[0] in ("acquire_lease", "load")]
         assert sequence == [("acquire_lease", 1), ("load", 1)]
-        assert ("acquire_lease", 1, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert ("acquire_lease", 1, OWNER_A, LEASE_TTL_SECONDS) in store.calls
         assert worker.window(1) is not None
         assert worker.window(0) is not None
         assert worker.shards == frozenset({0, 1})
@@ -2973,8 +3385,8 @@ class TestALeasedButUnwindowedShardIsClaimedToCompletion:
 
         await worker.claims.renew_leases()
 
-        assert ("acquire_lease", 0, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
-        assert ("acquire_lease", 1, MEMBER_A, LEASE_TTL_SECONDS) in store.calls
+        assert ("acquire_lease", 0, OWNER_A, LEASE_TTL_SECONDS) in store.calls
+        assert ("acquire_lease", 1, OWNER_A, LEASE_TTL_SECONDS) in store.calls
         assert ("load", 0) not in store.calls
         assert ("load", 1) not in store.calls
         assert worker.shards == frozenset({0, 1})
@@ -3017,7 +3429,7 @@ class TestALeasedButUnwindowedShardIsClaimedToCompletion:
         with pytest.raises(ShardOwnedElsewhereError):
             await worker.claims.on_assigned(self._assigned(0, 1, 2))
 
-        assert ("release_lease", 1, MEMBER_A) in store.calls
+        assert ("release_lease", 1, OWNER_A) in store.calls
         assert worker.window(1) is None
         assert 1 not in worker.shards
         # Released for anyone: the other member can take shard 1 at once.
@@ -3090,7 +3502,7 @@ class TestStopRunsOnceAndReleasesInAFinally:
         worker = _worker(bus=bus, clock=clock, state_store=state_store)
         await worker.start()
         assert await feed.deliver(worker, IP_A, 1200) is ObservationOutcome.APPLIED
-        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == MEMBER_A
+        assert await state_store.acquire_lease(0, OTHER_MEMBER, 1.0) == OWNER_A
 
         with pytest.raises(RuntimeError, match="ack failed"):
             await worker.stop()
