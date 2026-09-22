@@ -10,13 +10,19 @@ what stands): decision 7 (the per-shard lease in the state store) and
 decision 8 (acknowledge what was handled; no revocation path).
 
 `ShardClaims` is the aggregator's `AssignmentListener`. Claiming a partition
-means taking its lease under this member's id, loading that shard's
-`ShardState` and building its `ShardWindow` from it -- strictly in that
-order, one shard at a time, so a refusal on shard `q` has loaded nothing for
-`q`. A refusal (another live member holds the lease) rolls back every claim
-this call made and raises `ShardOwnedElsewhereError`; it is how #90's
-two-owners misconfiguration is caught at start rather than as a
-double-counted shard.
+means taking its lease under this *process's* token --
+`lease_owner = f"{member_id}/{instance_id}"`, the instance token generated
+once per construction (decision 7 as amended by Amendment 6) -- loading that
+shard's `ShardState` and building its `ShardWindow` from it -- strictly in
+that order, one shard at a time, so a refusal on shard `q` has loaded
+nothing for `q`. A refusal rolls back every claim this call made and raises;
+it is how #90's two-owners misconfiguration is caught at start rather than
+as a double-counted shard. The holder the store returns is classified by its
+member id: another member is `ShardOwnedElsewhereError`, which is fatal,
+while another instance of this member -- a predecessor that died without
+releasing, or a twin started under the same `member_id` -- is
+`ShardHeldBySameMemberError`, which `AggregatorService.start()` waits out
+under the startup deadline.
 
 There is no revocation: a shard changes hands by `stop()` on one member and
 `start()` on another. `release()` frees the leases at a clean stop so the
@@ -42,6 +48,7 @@ why decision 5 exempts those IPs from HOT -> COLD for that window
 """
 
 import logging
+import secrets
 
 from hammertime.aggregator.window.store import ShardWindow
 from hammertime.bus.interface import ConsumedMessage, Consumer, Producer
@@ -69,6 +76,31 @@ class ShardOwnedElsewhereError(Exception):
         self.owner = owner
 
 
+class ShardHeldBySameMemberError(ShardOwnedElsewhereError):
+    """A shard's lease is held by another instance running under this member's id.
+
+    The holder is a predecessor that died without releasing -- its leases
+    lapse within `lease_ttl_s` -- or a live twin started under the same
+    `HAMMERTIME_AGGREGATOR_MEMBER_ID`, which keeps renewing; the lease cannot
+    tell them apart at the moment it refuses. `AggregatorService.start()`
+    names this subclass as transient, so the attempt is retried under the
+    startup deadline: the first case claims its shards without an exit, the
+    second ends in `start_failed` and exit 1 (ADR-0013 decision 7 as amended
+    by Amendment 6 ruling 2). Being a subclass, it is still a
+    `ShardOwnedElsewhereError` -- "this member does not hold the shard" --
+    everywhere that distinction is all that matters.
+    """
+
+    def __init__(self, shard: int, owner: str) -> None:
+        # Not `super().__init__`: the base's message would say the holder is
+        # another member, and the attributes are set identically here.
+        Exception.__init__(
+            self, f"shard {shard} is leased to {owner!r}, whose member id is this process's own"
+        )
+        self.shard = shard
+        self.owner = owner
+
+
 class ShardLeaseLostError(Exception):
     """A held shard's lease lapsed and another member took it.
 
@@ -91,6 +123,8 @@ class ShardClaims:
         "_config",
         "_consumer",
         "_handled",
+        "_instance_id",
+        "_lease_owner",
         "_lease_ttl_s",
         "_leased",
         "_max_tracked_ips",
@@ -112,6 +146,7 @@ class ShardClaims:
         member_id: str,
         lease_ttl_s: float,
         max_tracked_ips: int = DEFAULT_MAX_TRACKED_IPS,
+        instance_id: str | None = None,
     ) -> None:
         self._state_store = state_store
         self._producer = producer
@@ -119,6 +154,14 @@ class ShardClaims:
         self._clock = clock
         self._config = config
         self._member_id = member_id
+        # Amendment 6 ruling 2(a): sixty-four random bits, generated once per
+        # construction and stable for this process's life, so that every
+        # lease call of this object -- acquire, renew, release -- carries one
+        # token and a second process under the same `member_id` is refused
+        # rather than read as a renewal. `instance_id` is injectable for
+        # tests only; nothing configures it.
+        self._instance_id = secrets.token_hex(8) if instance_id is None else instance_id
+        self._lease_owner = f"{member_id}/{self._instance_id}"
         self._lease_ttl_s = lease_ttl_s
         self._max_tracked_ips = max_tracked_ips
         self._windows: dict[int, ShardWindow] = {}
@@ -145,6 +188,21 @@ class ShardClaims:
     def shards(self) -> frozenset[int]:
         """The partitions claimed right now."""
         return frozenset(self._windows)
+
+    @property
+    def member_id(self) -> str:
+        """`HAMMERTIME_AGGREGATOR_MEMBER_ID`: the member these claims are made for."""
+        return self._member_id
+
+    @property
+    def instance_id(self) -> str:
+        """This process's lease token, generated once per construction (Amendment 6)."""
+        return self._instance_id
+
+    @property
+    def lease_owner(self) -> str:
+        """`<member_id>/<instance_id>`: the `owner` passed to every lease call."""
+        return self._lease_owner
 
     def window(self, shard: int) -> ShardWindow | None:
         """The claimed shard's window, or None for a shard this member holds no window for."""
@@ -231,10 +289,16 @@ class ShardClaims:
         token on `record_transition` itself.
         """
         for shard in sorted(self._leased):
-            owner = await self._state_store.acquire_lease(shard, self._member_id, self._lease_ttl_s)
+            owner = await self._state_store.acquire_lease(
+                shard, self._lease_owner, self._lease_ttl_s
+            )
             if owner is not None:
                 logger.error(
-                    "shard_lease_lost shard=%d owner=%s member=%s", shard, owner, self._member_id
+                    "shard_lease_lost shard=%d owner=%s member=%s instance=%s",
+                    shard,
+                    owner,
+                    self._member_id,
+                    self._instance_id,
                 )
                 raise ShardLeaseLostError(shard, owner)
 
@@ -245,10 +309,13 @@ class ShardClaims:
         `commit_handled()`, so a clean stop hands the shards over at once.
         Nothing is written to the state store beyond the lease keys and
         nothing is emitted: the next owner inherits the HOT set and warms up.
+        The release carries this process's token, so it drops only leases
+        this process holds: a stopping twin cannot free the survivor's
+        shards (Amendment 6 ruling 2(a)).
         """
         leased, self._leased = sorted(self._leased), set()
         for shard in leased:
-            await self._state_store.release_lease(shard, self._member_id)
+            await self._state_store.release_lease(shard, self._lease_owner)
 
     # --- AssignmentListener --------------------------------------------------
 
@@ -258,10 +325,25 @@ class ShardClaims:
         Strictly sequential per shard, in sorted order: acquire `p`, load
         `p`, build `p`'s window, and only then the next shard's acquire
         (Amendment 1 ruling T6), so a refusal on shard `q` has loaded nothing
-        for `q` and can undo exactly the shards before it. A non-`None`
-        result from `acquire_lease` is a refusal: it is logged, every lease
-        and window this call made is rolled back, and
-        `ShardOwnedElsewhereError` propagates out of `subscribe()`.
+        for `q` and can undo exactly the shards before it. The lease is taken
+        under this process's own token, `lease_owner` (ADR-0013 decision 7 as
+        amended by Amendment 6 ruling 2), never under the bare member id.
+
+        A non-`None` result from `acquire_lease` is a refusal, and the holder
+        it returns is classified by splitting it at its **last** `/`: before
+        it the holder's member id, after it the holder's instance (a value
+        with no `/` -- one written by a build from before Amendment 6, say --
+        is a member id with an empty instance). Either way every lease and
+        window this call made is rolled back first. A holder whose member id
+        differs logs `ERROR shard_owned_elsewhere` and raises
+        `ShardOwnedElsewhereError`, which is in no transient tuple and takes
+        the process down with `start_failed`. A holder carrying this member's
+        id and another instance logs `WARNING shard_held_by_same_member` and
+        raises `ShardHeldBySameMemberError`, which `AggregatorService.start()`
+        retries under the startup deadline: a dead predecessor's leases lapse
+        within `lease_ttl_s` and are then claimed, a live twin's never do and
+        the deadline ends the process. The same instance is not a case: the
+        store grants its own token as a renewal.
 
         An empty set is a `ValueError` (ruling T5): it is unreachable through
         the bus, which refuses an empty static set before calling the
@@ -294,18 +376,35 @@ class ShardClaims:
         for _topic, shard in sorted(partitions):
             if shard in self._leased and shard in self._windows:
                 continue
-            owner = await self._state_store.acquire_lease(shard, self._member_id, self._lease_ttl_s)
+            owner = await self._state_store.acquire_lease(
+                shard, self._lease_owner, self._lease_ttl_s
+            )
             if owner is not None:
-                logger.error(
-                    "shard_owned_elsewhere shard=%d owner=%s member=%s",
-                    shard,
-                    owner,
-                    self._member_id,
-                )
+                holder_member, separator, _holder_instance = owner.rpartition("/")
+                if not separator:
+                    holder_member = owner
+                same_member = holder_member == self._member_id
+                if same_member:
+                    logger.warning(
+                        "shard_held_by_same_member shard=%d owner=%s member=%s instance=%s",
+                        shard,
+                        owner,
+                        self._member_id,
+                        self._instance_id,
+                    )
+                else:
+                    logger.error(
+                        "shard_owned_elsewhere shard=%d owner=%s member=%s",
+                        shard,
+                        owner,
+                        self._member_id,
+                    )
                 for taken in claimed:
                     self._windows.pop(taken, None)
                     self._leased.discard(taken)
-                    await self._state_store.release_lease(taken, self._member_id)
+                    await self._state_store.release_lease(taken, self._lease_owner)
+                if same_member:
+                    raise ShardHeldBySameMemberError(shard, owner)
                 raise ShardOwnedElsewhereError(shard, owner)
             claimed.append(shard)
             self._leased.add(shard)

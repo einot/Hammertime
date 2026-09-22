@@ -71,15 +71,23 @@ services:
       provision: { condition: service_completed_successfully }
       valkey: { condition: service_healthy }
 
-  # Single member owning every shard (ADR-0013 decision 6). A scaled
-  # deployment gives each member a disjoint HAMMERTIME_SHARD_IDS set whose
-  # union is 0-127; the per-shard lease (decision 7) refuses a second owner.
-  # The lease is keyed by HAMMERTIME_AGGREGATOR_MEMBER_ID, whose default is
-  # the hostname -- under compose the container ID, which a recreated
-  # container loses and would then wait out the lease TTL -- so it is set
-  # explicitly here (decision 11, Amendment 4 ruling N).
+  # Single member owning every shard (ADR-0013 decision 6). Each shard is
+  # taken under a lease (decision 7, as amended by Amendment 6) keyed by
+  # HAMMERTIME_AGGREGATOR_MEMBER_ID plus a token this process generates for
+  # itself, so no second owner can hold a shard.
+  # The member id is pinned rather than left to default to the hostname
+  # (under compose the container ID, which a recreated container loses): a
+  # recreated container is then a *same-member* holder, which waits in
+  # process for its predecessor's leases to lapse -- at most
+  # HAMMERTIME_AGGREGATOR_LEASE_TTL_S -- instead of being another member,
+  # which is refused and exits 1.
+  # container_name makes Compose refuse `--scale` on this service, which
+  # would otherwise start a second process under the same member id and the
+  # same shard set: a scaled deployment is separate services with disjoint
+  # HAMMERTIME_SHARD_IDS whose union is 0-127, not replicas.
   aggregator:
     build: { context: .., dockerfile: services/aggregator/Dockerfile }
+    container_name: hammertime-aggregator-0
     env_file: ../.env.example
     environment:
       HAMMERTIME_BUS_BROKERS: nats://nats:4222
