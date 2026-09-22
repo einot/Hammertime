@@ -1,3 +1,11 @@
+BREAKING: the event log is NATS JetStream; HAMMERTIME_BUS_KIND accepts nats (default) or memory instead of kafka, and HAMMERTIME_BUS_BROKERS is a comma-separated list of NATS server URLs (nats://host:4222) instead of Kafka bootstrap addresses; streams must be created with hammertime-provision before any service starts
+BREAKING: HAMMERTIME_SHARD_IDS is required and static: all, or an explicit set within 0..127 that is disjoint per aggregator member; auto is rejected at startup and consumer-group assignment no longer exists
+Reference deployment runs nats:2.15.0-alpine with JetStream instead of Apache Kafka; deploy/docker-compose.redpanda.yml is removed; a one-shot provision service creates the streams before the services start and make up waits for every container to be healthy
+Aggregator refuses to start when another live member holds one of its shards (shard_owned_elsewhere, exit 1) and stops when its shard lease lapses (shard_lease_lost); add HAMMERTIME_AGGREGATOR_MEMBER_ID (default hostname) and HAMMERTIME_AGGREGATOR_LEASE_TTL_S (default 30)
+Aggregator acknowledges a redelivered copy of an observation it already handled under its current claim without applying it again (redelivered_observation)
+Every published event carries Nats-Msg-Id = event_id, so the event log drops a retried duplicate inside its 120 s duplicate window
+Log bus_endpoints (bus URLs without userinfo) in the starting record in place of bus_brokers
+Add hammertime-provision: a one-shot CLI (--servers, --replicas, --timeout) that creates or reconciles the JetStream stream of every registered topic before the services start; exit 0 when every stream matches, 1 when the servers stay unreachable or a stream conflicts on an immutable field, 2 on invalid arguments
 Reference deployment runs Apache Kafka (KRaft) and Valkey instead of Redpanda and Redis; every image is pinned; Redpanda remains available via deploy/docker-compose.redpanda.yml
 Reject a malformed HAMMERTIME_REDIS_URL at startup as invalid configuration (config_invalid, exit 2) instead of failing inside start() with exit 1; checked only when HAMMERTIME_STORE_KIND=redis
 Add aggregator service: consumes hammertime.observations.v1 per shard, maintains per-IP sliding windows, and emits HotIpAdded/HotIpRemoved with weight in attributes

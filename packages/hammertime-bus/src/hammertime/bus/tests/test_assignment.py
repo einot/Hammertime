@@ -1,96 +1,89 @@
-"""Assignment listener: shard claims delivered before `subscribe()` returns.
+"""Assignment listener: the static partition set is delivered before `subscribe()` returns.
 
 Spec: section 20 (distributed processing -- ownership of each IP belongs to
 exactly one shard), section 47 (readiness: "config loaded; consumer
-subscribed; shard claims held"). ADR-0011 decision 1 (a shard *is* a
-partition of `hammertime.observations.v1`; a claim *is* the consumer group's
-assignment), ADR-0009 decision 9 (one fixed consumer group).
+subscribed; shard claims held"). ADR-0013 decision 3 (the bus interface:
+`AssignmentListener` has `on_assigned` only; `subscribe(topic, *,
+partitions=None, listener=None, start_offset=None)`), decision 6 (shard
+assignment is static), ADR-0011 Amendment 1 item A3 (an empty static set is
+a `ValueError` at the bus; unchanged), ADR-0009 decision 9 (one fixed
+consumer group).
 
 This file is written blind to `interface.py`/`memory.py`, per this
-package's test-author convention (see `test_topics.py`'s equivalent note):
-the API under test does not exist yet and is pinned here from ADR-0011
-decision 1's code block alone.
+package's test-author convention: the API is pinned here from ADR-0013
+decision 3's code block and the paragraphs under it alone.
 
-What decision 1 pins, and is asserted below:
+What decision 3 pins, and is asserted below:
 
-* `AssignmentListener` is a `runtime_checkable` `Protocol` with two
-  coroutine methods, `on_revoked(frozenset[tuple[str, int]]) -> None` and
-  `on_assigned(frozenset[tuple[str, int]]) -> None`.
-* `Consumer.subscribe(topic, *, partitions: Iterable[int] | None = None,
-  listener: AssignmentListener | None = None)`.
-* "When a listener is given, `subscribe()` does not return until
-  `on_assigned` has been awaited with the initial assignment." This is the
-  property that makes ADR-0009's "shard claims held" observable from inside
-  `start()`, which is why it is asserted here in three ways: on an empty
+* `AssignmentListener` is a `runtime_checkable` `Protocol` with exactly one
+  coroutine method, `on_assigned(frozenset[tuple[str, int]]) -> None`.
+  "Removed: ... `AssignmentListener.on_revoked`" -- static assignment has no
+  revocation (decision 8: "the way a shard changes hands is a `stop()` on one
+  member and a `start()` on another").
+* "When `listener` is given, `subscribe()` awaits
+  `listener.on_assigned(frozenset((topic, p) for p in <the set>))` exactly
+  once -- with the full static set, or for `partitions=None` with every
+  partition of a registered topic (`{0}` on `InMemoryBus`) -- before it
+  returns; that is what keeps ADR-0009's 'shard claims held' readiness
+  observable at the end of `start()`." Asserted in three ways: on an empty
   log, ahead of the first yielded message, and exactly once.
-* "`InMemoryBus` has one partition per topic: group-managed and static
-  `{0}` both assign `{(topic, 0)}` immediately; any other static set --
-  including the empty set, for every consumer implementation (Amendment 1,
-  item A3) -- is a `ValueError`."
-* An explicitly empty static set is refused, and refused early: ADR-0011
-  Amendment 1 item A3 rules that `Consumer.subscribe(topic,
-  partitions=<empty iterable>)` "raises `ValueError` for every
-  implementation ..., before contacting any broker and without calling the
-  listener. An empty static set is not a way of saying 'nothing';
-  `partitions=None` is the only way of saying 'let the group decide'."
-  Asserted below for `set()` and for `[]` (the parameter is an
-  `Iterable[int]`, so the refusal must not depend on the concrete type),
-  and for the listener never seeing a claim. The `partitions=None` half is
-  every listener test in
-  `TestInitialAssignmentIsDeliveredBeforeSubscribeReturns`, which subscribes
-  without `partitions` and is assigned `{(TOPIC, 0)}`; A3 leaves that path
-  and the group-managed empty *initial* assignment (ready, `WARNING
-  event=no_shards_assigned`) unchanged -- the latter is not observable
-  against the memory bus, see "NOT TESTABLE" below.
-* Static assignment still commits offsets under the group name.
-* `ConsumedMessage.partition` is the shard id the aggregator reads
-  ownership from ("The aggregator never computes an IP hash of its own"),
-  so for the single-partition memory bus it is `0` for every message.
+* "`partitions=None` means every partition of the topic -- ... on
+  `InMemoryBus` `{0}`"; "`partitions=<iterable>` means exactly those
+  partitions; an empty iterable is a `ValueError` raised before any broker
+  is contacted and before `listener` is called (ADR-0011 A3, unchanged);
+  `InMemoryBus` has one partition per topic, so any static set other than
+  `{0}` is a `ValueError` there (unchanged), and `partitions=None` on it is
+  `{0}`."
+* "If `on_assigned` raises, `subscribe()` propagates the exception and holds
+  nothing: the consumer is left as if `subscribe()` had never been called".
+* "A positional subscription may still name `partitions` and a `listener`."
+* Acknowledgements are kept under the group name whichever way the
+  partitions were named (decision 5: "acknowledged positions are kept by
+  durables named after the group").
+* `ConsumedMessage.partition` is the shard id the aggregator reads ownership
+  from (ADR-0011 decision 1's surviving rule, Amendment 7), so for the
+  single-partition memory bus it is `0` for every message.
 
-ASSUMPTIONS -- things decision 1 implies but does not name or pin. Each is
+ASSUMPTIONS -- things decision 3 implies but does not name or pin. Each is
 a judgment call; adjust the test, not the meaning, if the implementation
 settles them differently:
 
 1. `AssignmentListener` is importable from `hammertime.bus.interface`,
-   taken from the ADR block's own `# hammertime.bus.interface (additions)`
-   header. `InMemoryBus` / `bus.producer()` / `bus.consumer(group_id)` /
+   taken from the ADR block's own `# hammertime.bus.interface` header.
+   `InMemoryBus` / `bus.producer()` / `bus.consumer(group_id)` /
    `await consumer.subscribe(...)`-returns-an-async-iterator are carried
-   over from `test_memory_bus.py`, not from the ADR.
-2. `partitions` and `listener` are keyword-only (the ADR block writes them
-   after a bare `*`), and both default to `None`.
+   over from `test_memory_bus.py`.
+2. `partitions`, `listener` and `start_offset` are keyword-only (the ADR
+   block writes them after a bare `*`), and all default to `None`.
 3. The `ValueError` for a rejected static set surfaces when the `subscribe`
    coroutine is awaited (`subscribe` is `async def`, so it cannot surface
    earlier). `pytest.raises` wraps the whole `await` expression, so the
    test passes under either timing.
-4. A rejected static set must not invoke the listener at all: an assignment
-   that was refused was never held, and ADR-0009 readiness must not be able
-   to observe a claim the bus rejected. The ADR does not say this in words.
-5. The signature says `Iterable[int]`, so a list `[0]` is accepted exactly
-   like `{0}`. The ADR only ever writes set literals.
-6. Whether a *second* `subscribe()` on the same consumer re-delivers
-   `on_assigned` is unstated, so no test subscribes twice with a listener;
-   "exactly once" is asserted across one subscribe plus consumption and
-   commit.
-7. `RecordingListener` below is this file's own test double; the ADR names
+4. The signature says `Iterable[int]`, so a list `[0]` is accepted exactly
+   like `{0}`, and `[]` is refused exactly like `set()`. The ADR only ever
+   writes set literals.
+5. "Left as if `subscribe()` had never been called" after a failing
+   `on_assigned` is read literally: the same instance may `subscribe()`
+   again without the `RuntimeError` a second call otherwise raises. Nothing
+   in the ADR says this in words; it is the plain meaning of the sentence.
+6. `RecordingListener` below is this file's own test double; the ADR names
    no concrete implementation (the aggregator's is `ShardClaims`, out of
    scope here).
-
-(The empty static set used to be assumption 5 here -- "deliberately *not*
-tested ... nothing in the ADR disambiguates. Flagged rather than guessed."
-ADR-0011 Amendment 1 item A3 disambiguated it, so it is no longer an
-assumption of this file but one of the properties pinned above.)
+7. A static set refused with `ValueError` does not count as the instance's
+   one `subscribe()`: the refusal happens "before any broker is contacted
+   and before `listener` is called", i.e. before a subscription exists, so
+   the same instance may subscribe again
+   (`test_a_rejected_static_set_leaves_the_instance_unsubscribed`). The ADR
+   states this only for the failing-listener case; extending it to the
+   earlier, cheaper refusal is this file's reading.
 
 NOT TESTABLE against `InMemoryBus`, and not tested anywhere in this file:
 
-* Real rebalance ordering ("every rebalance calls `on_revoked` (before
-  partitions move) then `on_assigned` (after)") and an initially empty
-  group-managed assignment. The memory bus has no coordinator and always
-  assigns `{(topic, 0)}`; only a broker-backed `KafkaConsumer` could show
-  either, and CI has no broker.
-* The deployment rule that static and group-managed members MUST NOT be
-  mixed in one group, and `InMemoryBus`'s "at most one live member per
-  group per topic" limit -- both are stated as constraints on callers,
-  which the ADR itself says "no test relies on".
+* `partitions=None` on `NatsConsumer` (a whole-topic durable) and a static
+  set with more than one partition; the memory bus has one partition.
+* `InMemoryBus`'s "at most one live member per group per topic" limit
+  (ADR-0011 assumption 22, kept by ADR-0013 decision 3) -- a constraint on
+  callers, not a behaviour.
 """
 
 from __future__ import annotations
@@ -104,8 +97,8 @@ from hammertime.bus.memory import InMemoryBus
 # Plain strings handed to `InMemoryBus`, which creates topics on demand.
 # TOPIC is spelled like the observations topic only for readability -- it is
 # never looked up in `TOPICS`, and nothing here asserts that literal (see
-# `test_topics.py`, which deliberately does not pin that name). GROUP is
-# ADR-0009 decision 9's fixed aggregator consumer group.
+# `test_topics.py`, which pins the registry). GROUP is ADR-0009 decision 9's
+# fixed aggregator consumer group.
 TOPIC = "hammertime.observations.v1"
 OTHER_TOPIC = "test.other.v1"
 GROUP = "hammertime-aggregator"
@@ -116,7 +109,6 @@ class RecordingListener:
 
     def __init__(self) -> None:
         self.assigned: list[frozenset[tuple[str, int]]] = []
-        self.revoked: list[frozenset[tuple[str, int]]] = []
         # Interleaves listener callbacks with whatever the test appends
         # (message reads), so "before the first message" is checkable as an
         # ordering rather than only as a count.
@@ -126,9 +118,23 @@ class RecordingListener:
         self.assigned.append(partitions)
         self.trace.append("on_assigned")
 
-    async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None:
-        self.revoked.append(partitions)
-        self.trace.append("on_revoked")
+
+class FailingListener:
+    """An `AssignmentListener` whose `on_assigned` always raises."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None:
+        self.calls += 1
+        raise RuntimeError("claim refused by the listener")
+
+
+class OnlyOnRevoked:
+    """Has the method ADR-0013 removed and not the one it kept."""
+
+    async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None:  # pragma: no cover
+        return None
 
 
 class NotAListener:
@@ -154,15 +160,22 @@ async def _take(stream: AsyncIterator[ConsumedMessage], n: int) -> list[Consumed
     return messages
 
 
-class TestInitialAssignmentIsDeliveredBeforeSubscribeReturns:
-    """ADR-0011 decision 1: "`subscribe()` does not return until `on_assigned`
-    has been awaited with the initial assignment"; that is what makes
-    ADR-0009's "shard claims held" observable inside `start()`."""
+async def _publish(bus: InMemoryBus, *values: bytes) -> None:
+    producer = bus.producer()
+    for index, value in enumerate(values):
+        await producer.publish(
+            TOPIC, key=f"10.0.0.{index + 1}", value=value, message_id=f"m{index}"
+        )
 
-    async def test_group_managed_subscribe_awaits_on_assigned_before_returning(self) -> None:
+
+class TestInitialAssignmentIsDeliveredBeforeSubscribeReturns:
+    """ADR-0013 decision 3: `subscribe()` awaits `on_assigned` "before it
+    returns; that is what keeps ADR-0009's 'shard claims held' readiness
+    observable at the end of `start()`"."""
+
+    async def test_subscribe_without_partitions_awaits_on_assigned_before_returning(self) -> None:
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
+        await _publish(bus, b"first")
 
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
@@ -187,9 +200,7 @@ class TestInitialAssignmentIsDeliveredBeforeSubscribeReturns:
 
     async def test_on_assigned_precedes_the_first_yielded_message(self) -> None:
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
+        await _publish(bus, b"first", b"second")
 
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
@@ -211,28 +222,49 @@ class TestInitialAssignmentIsDeliveredBeforeSubscribeReturns:
 
         assert listener.assigned == [frozenset({(OTHER_TOPIC, 0)})]
 
-    async def test_on_assigned_is_called_exactly_once_across_subscribe_consume_commit(
+    async def test_on_assigned_is_called_exactly_once_across_subscribe_consume_ack_and_close(
         self,
     ) -> None:
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
+        await _publish(bus, b"first", b"second", b"third")
 
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
         stream = await consumer.subscribe(TOPIC, listener=listener)
-        await _take(stream, 2)
-        await consumer.commit()
+        read = await _take(stream, 2)
+        await consumer.ack(read)
+        await _take(stream, 1)
+        await consumer.ack([])
+        await consumer.close()
 
         assert listener.assigned == [frozenset({(TOPIC, 0)})]
+        assert listener.trace == ["on_assigned"]
+
+    async def test_a_reconnecting_member_is_assigned_afresh(self) -> None:
+        # The claim-then-reconnect path the aggregator takes after a restart:
+        # a brand new consumer for the same group is assigned the same set;
+        # nothing is ever taken from the abandoned instance (there is no
+        # coordinator to do so, and no `on_revoked` to tell it).
+        bus = InMemoryBus()
+        await _publish(bus, b"first", b"second")
+
+        first_listener = RecordingListener()
+        first = bus.consumer(GROUP)
+        read = await _take(await first.subscribe(TOPIC, listener=first_listener), 1)
+        await first.ack(read)
+
+        second_listener = RecordingListener()
+        second = bus.consumer(GROUP)
+        await second.subscribe(TOPIC, listener=second_listener)
+
+        assert first_listener.assigned == [frozenset({(TOPIC, 0)})]
+        assert second_listener.assigned == [frozenset({(TOPIC, 0)})]
 
 
 class TestStaticAssignment:
-    """ADR-0011 decision 1: "group-managed and static `{0}` both assign
-    `{(topic, 0)}` immediately; any other static set -- including the empty
-    set, for every consumer implementation (Amendment 1, item A3) -- is a
-    `ValueError`"."""
+    """ADR-0013 decision 3: "`partitions=<iterable>` means exactly those
+    partitions"; on `InMemoryBus` "any static set other than `{0}` is a
+    `ValueError` ..., and `partitions=None` on it is `{0}`"."""
 
     async def test_static_partition_zero_assigns_the_same_single_partition(self) -> None:
         bus = InMemoryBus()
@@ -243,11 +275,19 @@ class TestStaticAssignment:
 
         assert listener.assigned == [frozenset({(TOPIC, 0)})]
 
-    async def test_static_partition_zero_delivers_messages_like_group_managed(self) -> None:
+    async def test_partitions_none_and_static_zero_assign_the_same_set(self) -> None:
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
+        none_listener = RecordingListener()
+        zero_listener = RecordingListener()
+
+        await bus.consumer("group-none").subscribe(TOPIC, partitions=None, listener=none_listener)
+        await bus.consumer("group-zero").subscribe(TOPIC, partitions={0}, listener=zero_listener)
+
+        assert none_listener.assigned == zero_listener.assigned == [frozenset({(TOPIC, 0)})]
+
+    async def test_static_partition_zero_delivers_messages_like_partitions_none(self) -> None:
+        bus = InMemoryBus()
+        await _publish(bus, b"first", b"second")
 
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
@@ -258,7 +298,7 @@ class TestStaticAssignment:
         assert listener.trace[0] == "on_assigned"
 
     async def test_static_partitions_accept_any_iterable_of_ints(self) -> None:
-        # ASSUMPTION 5: the signature says `Iterable[int]`, not `set[int]`.
+        # ASSUMPTION 4: the signature says `Iterable[int]`, not `set[int]`.
         bus = InMemoryBus()
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
@@ -267,18 +307,17 @@ class TestStaticAssignment:
 
         assert listener.assigned == [frozenset({(TOPIC, 0)})]
 
-    async def test_static_assignment_still_commits_offsets_under_the_group_name(self) -> None:
-        # "offsets are still committed under the group name" -- a statically
-        # assigned member resumes where the group left off.
+    async def test_static_assignment_keeps_acknowledgements_under_the_group_name(self) -> None:
+        # Decision 5: "acknowledged positions are kept by durables named
+        # after the group" -- a statically assigned member resumes where the
+        # group left off.
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
+        await _publish(bus, b"first", b"second")
 
         consumer = bus.consumer(GROUP)
         stream = await consumer.subscribe(TOPIC, partitions={0})
-        await _take(stream, 1)
-        await consumer.commit()
+        read = await _take(stream, 1)
+        await consumer.ack(read)
 
         reconnected = bus.consumer(GROUP)
         resumed = await _take(await reconnected.subscribe(TOPIC, partitions={0}), 1)
@@ -295,27 +334,25 @@ class TestStaticAssignment:
         with pytest.raises(ValueError):
             await consumer.subscribe(TOPIC, partitions=partitions)
 
-    async def test_a_rejected_static_set_never_reports_a_claim(self) -> None:
-        # ASSUMPTION 4: a refused assignment was never held, so readiness
-        # must not be able to observe it.
+    @pytest.mark.parametrize("partitions", [{1}, {0, 1}])
+    async def test_a_rejected_static_set_never_reports_a_claim(self, partitions: set[int]) -> None:
+        # A refused assignment was never held, so readiness must not be able
+        # to observe it: the `ValueError` is raised "before `listener` is
+        # called".
         bus = InMemoryBus()
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
 
         with pytest.raises(ValueError):
-            await consumer.subscribe(TOPIC, partitions={1}, listener=listener)
+            await consumer.subscribe(TOPIC, partitions=partitions, listener=listener)
 
         assert listener.assigned == []
-        assert listener.revoked == []
 
     async def test_an_empty_static_set_is_a_value_error(self) -> None:
-        # ADR-0011 Amendment 1 item A3: "An empty static set is not a way of
-        # saying 'nothing'; `partitions=None` is the only way of saying 'let
-        # the group decide'." A member that owned nothing for its whole life
-        # while /readyz reported it healthy is the silent misconfiguration
-        # A3 refuses. (`partitions=None` itself is unaffected -- see
-        # TestInitialAssignmentIsDeliveredBeforeSubscribeReturns, which
-        # subscribes without `partitions` throughout.)
+        # ADR-0011 Amendment 1 item A3, carried unchanged by ADR-0013: "An
+        # empty static set is not a way of saying 'nothing'". A member that
+        # owned nothing for its whole life while /readyz reported it healthy
+        # is the silent misconfiguration A3 refuses.
         bus = InMemoryBus()
         consumer = bus.consumer(GROUP)
 
@@ -323,9 +360,7 @@ class TestStaticAssignment:
             await consumer.subscribe(TOPIC, partitions=set())
 
     async def test_an_empty_static_list_is_a_value_error_too(self) -> None:
-        # ASSUMPTION 5: `partitions` is an `Iterable[int]`, so the refusal
-        # must not depend on the concrete type any more than the acceptance
-        # of `[0]` does. A3 refuses "an empty iterable", not an empty set.
+        # ASSUMPTION 4: A3 refuses "an empty iterable", not an empty set.
         bus = InMemoryBus()
         consumer = bus.consumer(GROUP)
 
@@ -334,9 +369,7 @@ class TestStaticAssignment:
 
     async def test_a_rejected_empty_static_set_never_reports_a_claim(self) -> None:
         # A3: the refusal happens "before contacting any broker and without
-        # calling the listener" -- the same rule ASSUMPTION 4 states for any
-        # other rejected static set, and the reason the empty case cannot be
-        # read as a quiet, ready-but-idle claim.
+        # calling the listener".
         bus = InMemoryBus()
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
@@ -345,33 +378,116 @@ class TestStaticAssignment:
             await consumer.subscribe(TOPIC, partitions=set(), listener=listener)
 
         assert listener.assigned == []
-        assert listener.revoked == []
+
+    async def test_a_rejected_static_set_leaves_the_instance_unsubscribed(self) -> None:
+        # The refusal happens before the subscription exists, so the instance
+        # may still subscribe; a `RuntimeError` here would mean the rejected
+        # call had counted as the one subscription per instance.
+        bus = InMemoryBus()
+        listener = RecordingListener()
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(ValueError):
+            await consumer.subscribe(TOPIC, partitions={1})
+        await consumer.subscribe(TOPIC, partitions={0}, listener=listener)
+
+        assert listener.assigned == [frozenset({(TOPIC, 0)})]
+
+
+class TestAFailingListenerHoldsNothing:
+    """ADR-0013 decision 3: "If `on_assigned` raises, `subscribe()` propagates
+    the exception and holds nothing: the consumer is left as if `subscribe()`
+    had never been called"."""
+
+    async def test_the_listeners_exception_propagates_out_of_subscribe(self) -> None:
+        bus = InMemoryBus()
+        listener = FailingListener()
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(RuntimeError, match="claim refused"):
+            await consumer.subscribe(TOPIC, listener=listener)
+
+        assert listener.calls == 1
+
+    async def test_the_instance_may_subscribe_again_afterwards(self) -> None:
+        # ASSUMPTION 5: "as if `subscribe()` had never been called".
+        bus = InMemoryBus()
+        await _publish(bus, b"first")
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(RuntimeError):
+            await consumer.subscribe(TOPIC, listener=FailingListener())
+        listener = RecordingListener()
+        received = await _take(await consumer.subscribe(TOPIC, listener=listener), 1)
+
+        assert listener.assigned == [frozenset({(TOPIC, 0)})]
+        assert received[0].value == b"first"
+
+    async def test_nothing_is_acknowledged_or_delivered_under_a_refused_claim(self) -> None:
+        # The group's position is untouched: a later consumer sees the log
+        # from the start.
+        bus = InMemoryBus()
+        await _publish(bus, b"first")
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(RuntimeError):
+            await consumer.subscribe(TOPIC, listener=FailingListener())
+
+        later = bus.consumer(GROUP)
+        received = await _take(await later.subscribe(TOPIC), 1)
+        assert received[0].value == b"first"
+
+
+class TestPositionalSubscriptionsMayNameAListener:
+    """ADR-0013 decision 3: "A positional subscription may still name
+    `partitions` and a `listener`."""
+
+    async def test_a_positional_subscription_delivers_the_assignment(self) -> None:
+        bus = InMemoryBus()
+        await _publish(bus, b"first")
+        listener = RecordingListener()
+        consumer = bus.consumer(GROUP)
+
+        stream = await consumer.subscribe(TOPIC, partitions={0}, listener=listener, start_offset=0)
+
+        assert listener.assigned == [frozenset({(TOPIC, 0)})]
+        received = await _take(stream, 1)
+        assert received[0].value == b"first"
+        assert listener.trace == ["on_assigned"]
+
+    async def test_a_positional_subscription_rejects_a_bad_static_set_before_the_listener(
+        self,
+    ) -> None:
+        bus = InMemoryBus()
+        listener = RecordingListener()
+        consumer = bus.consumer(GROUP)
+
+        with pytest.raises(ValueError):
+            await consumer.subscribe(TOPIC, partitions={1}, listener=listener, start_offset=0)
+
+        assert listener.assigned == []
 
 
 class TestSubscribeWithoutAListener:
     """The listener is optional (`listener: AssignmentListener | None = None`);
-    every existing `test_memory_bus.py` call site must keep working."""
+    every `test_memory_bus.py` call site must keep working."""
 
     async def test_subscribe_with_no_listener_still_delivers_messages_in_order(self) -> None:
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
+        await _publish(bus, b"first", b"second")
 
         consumer = bus.consumer(GROUP)
         received = await _take(await consumer.subscribe(TOPIC), 2)
 
         assert [message.value for message in received] == [b"first", b"second"]
 
-    async def test_subscribe_with_no_listener_still_commits_and_resumes(self) -> None:
+    async def test_subscribe_with_no_listener_still_acknowledges_and_resumes(self) -> None:
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
+        await _publish(bus, b"first", b"second")
 
         consumer = bus.consumer(GROUP)
-        await _take(await consumer.subscribe(TOPIC), 1)
-        await consumer.commit()
+        read = await _take(await consumer.subscribe(TOPIC), 1)
+        await consumer.ack(read)
 
         reconnected = bus.consumer(GROUP)
         resumed = await _take(await reconnected.subscribe(TOPIC), 1)
@@ -379,78 +495,18 @@ class TestSubscribeWithoutAListener:
         assert resumed[0].value == b"second"
 
 
-class TestTheMemoryBusNeverRevokes:
-    """ADR-0011 decision 1 / assumption 22: `InMemoryBus` is single-partition
-    and single-member-per-group; it has no rebalances, so a claim taken from
-    it is never handed back on the bus's own initiative."""
-
-    async def test_on_revoked_is_not_called_across_subscribe_consume_and_commit(self) -> None:
-        bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
-        await producer.publish(TOPIC, key="10.0.0.3", value=b"third")
-
-        listener = RecordingListener()
-        consumer = bus.consumer(GROUP)
-        stream = await consumer.subscribe(TOPIC, listener=listener)
-        await _take(stream, 2)
-        await consumer.commit()
-        await _take(stream, 1)
-        await consumer.commit()
-
-        assert listener.revoked == []
-        assert listener.trace == ["on_assigned"]
-
-    async def test_on_revoked_is_not_called_for_a_static_member_either(self) -> None:
-        bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-
-        listener = RecordingListener()
-        consumer = bus.consumer(GROUP)
-        stream = await consumer.subscribe(TOPIC, partitions={0}, listener=listener)
-        await _take(stream, 1)
-        await consumer.commit()
-
-        assert listener.revoked == []
-
-    async def test_on_revoked_is_not_called_on_a_reconnecting_member(self) -> None:
-        # The claim-then-reconnect path the aggregator takes after a
-        # restart: a brand new consumer for the same group is assigned, and
-        # nothing revokes the abandoned instance's claim (there is no
-        # coordinator to do so). Only one member is live at a time, per
-        # ADR-0011 assumption 22.
-        bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
-        await producer.publish(TOPIC, key="10.0.0.2", value=b"second")
-
-        first_listener = RecordingListener()
-        first = bus.consumer(GROUP)
-        await _take(await first.subscribe(TOPIC, listener=first_listener), 1)
-        await first.commit()
-
-        second_listener = RecordingListener()
-        second = bus.consumer(GROUP)
-        await second.subscribe(TOPIC, listener=second_listener)
-
-        assert first_listener.revoked == []
-        assert second_listener.revoked == []
-        assert second_listener.assigned == [frozenset({(TOPIC, 0)})]
-
-
 class TestConsumedMessagePartitionIsTheShardId:
-    """ADR-0011 decision 1: "The aggregator never computes an IP hash of its
-    own; it learns an IP's shard from `ConsumedMessage.partition`." On the
-    single-partition memory bus that shard is always 0, which is why
-    `HAMMERTIME_SHARD_IDS=0` is the compose/integration setting."""
+    """ADR-0011 decision 1's surviving rule (Amendment 7): a shard is a
+    partition and `ConsumedMessage.partition` is the shard id. On the
+    single-partition memory bus that shard is always 0."""
 
     async def test_every_message_carries_partition_zero(self) -> None:
         bus = InMemoryBus()
         producer = bus.producer()
         for index, key in enumerate(["10.0.0.1", "10.0.0.2", "203.0.113.9"]):
-            await producer.publish(TOPIC, key=key, value=f"m{index}".encode())
+            await producer.publish(
+                TOPIC, key=key, value=f"m{index}".encode(), message_id=str(index)
+            )
 
         consumer = bus.consumer(GROUP)
         received = await _take(await consumer.subscribe(TOPIC), 3)
@@ -459,8 +515,7 @@ class TestConsumedMessagePartitionIsTheShardId:
 
     async def test_partition_is_zero_under_static_assignment_too(self) -> None:
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
+        await _publish(bus, b"first")
 
         listener = RecordingListener()
         consumer = bus.consumer(GROUP)
@@ -477,8 +532,7 @@ class TestConsumedMessagePartitionIsTheShardId:
         # on the other: they must be the same kind of value for the
         # aggregator to look a window up by it.
         bus = InMemoryBus()
-        producer = bus.producer()
-        await producer.publish(TOPIC, key="10.0.0.1", value=b"first")
+        await _publish(bus, b"first")
 
         consumer = bus.consumer(GROUP)
         received = await _take(await consumer.subscribe(TOPIC), 1)
@@ -487,16 +541,24 @@ class TestConsumedMessagePartitionIsTheShardId:
 
 
 class TestAssignmentListenerProtocol:
-    """ADR-0011 decision 1: `AssignmentListener` is declared
-    `@runtime_checkable`, so a structural implementation passes
-    `isinstance` without inheriting from it."""
+    """ADR-0013 decision 3: `AssignmentListener` is declared
+    `@runtime_checkable` with `on_assigned` only, so a structural
+    implementation passes `isinstance` without inheriting from it, and
+    `on_revoked` is neither required nor part of the protocol."""
 
-    def test_a_class_with_both_coroutine_methods_is_an_instance(self) -> None:
+    def test_a_class_with_on_assigned_only_is_an_instance(self) -> None:
         assert isinstance(RecordingListener(), AssignmentListener)
 
-    def test_a_class_without_the_methods_is_not_an_instance(self) -> None:
+    def test_a_class_without_on_assigned_is_not_an_instance(self) -> None:
         assert not isinstance(NotAListener(), AssignmentListener)
         assert not isinstance(object(), AssignmentListener)
+
+    def test_a_class_with_only_the_removed_on_revoked_is_not_an_instance(self) -> None:
+        assert not isinstance(OnlyOnRevoked(), AssignmentListener)
+
+    def test_the_protocol_has_no_on_revoked(self) -> None:
+        # "Removed: ... `AssignmentListener.on_revoked`".
+        assert not hasattr(AssignmentListener, "on_revoked")
 
     def test_a_structural_implementation_type_checks_as_the_protocol(self) -> None:
         # Static counterpart to the isinstance check above: this assignment

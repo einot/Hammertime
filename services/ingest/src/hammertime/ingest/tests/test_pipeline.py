@@ -80,6 +80,24 @@ as do ADR-0007's two failed-authentication limiters
 `rate_limiter=` -- to the same frozen `ManualClock`. Nothing in this module
 refills against wall time; see `_build_app`'s own comment for why that
 matters.
+
+ADR-0013 additions (`TestEveryPublishCarriesTheEventIdAsMessageId`,
+`TestTheLogDeduplicatesARepublishedBatch`), written from that ADR's text
+alone. Decision 4: "Every producer in this repository passes the envelope's
+`event_id` as `message_id`: ingest's `ObservationPublisher._publish_one`
+(the per-IP envelope's `event_id`)". Decision 3: with a `message_id` "a
+second publish to the same topic carrying an id the log has seen inside its
+duplicate window is acknowledged and **not** appended"; `InMemoryBus`
+keeps an unbounded window. The `message_id` is observed on a recording
+producer (`_RecordingBus`, the same shape as `_FailingBus`), without
+constructing `ObservationPublisher` directly -- the ADR names the method
+but not the constructor; `_build_app` remains the only way this file
+reaches it. The dedup case runs *two* apps, each with its own
+`MemoryDedupStore`, over one `InMemoryBus`: the `(agent_id, sequence)`
+claim would otherwise answer 200 before the log is reached, and the point
+is the log's own dedup. `_FailingProducer.publish` gains the keyword-only
+`message_id` decision 3 adds to `Producer.publish`, so it still matches the
+signature the pipeline calls.
 """
 
 from __future__ import annotations
@@ -235,20 +253,47 @@ def _build_app(
 class _FailingProducer(MemoryProducer):
     """A `MemoryProducer` whose `publish` always raises (simulated broker outage)."""
 
-    async def publish(self, topic: str, key: bytes | str, value: bytes) -> None:
-        raise RuntimeError("simulated failure: broker bootstrap.internal:9092 unreachable")
+    async def publish(
+        self, topic: str, key: bytes | str, value: bytes, *, message_id: str | None = None
+    ) -> None:
+        raise RuntimeError("simulated failure: broker bootstrap.internal:4222 unreachable")
 
 
 class _FailingBus(InMemoryBus):
     """An `InMemoryBus` whose `producer()` always fails to publish.
 
-    Named/documented server-side detail ("bootstrap.internal:9092") in
+    Named/documented server-side detail ("bootstrap.internal:4222") in
     `_FailingProducer` above exists specifically so
     `TestPublishFailureReturns503` can assert it never reaches the caller.
     """
 
     def producer(self) -> MemoryProducer:
         return _FailingProducer(self)
+
+
+class _RecordingProducer(MemoryProducer):
+    """A `MemoryProducer` that records `(topic, key, message_id)` per publish."""
+
+    def __init__(self, bus: InMemoryBus, calls: list[tuple[str, bytes | str, str | None]]) -> None:
+        super().__init__(bus)
+        self._calls = calls
+
+    async def publish(
+        self, topic: str, key: bytes | str, value: bytes, *, message_id: str | None = None
+    ) -> None:
+        self._calls.append((topic, key, message_id))
+        await super().publish(topic, key, value, message_id=message_id)
+
+
+class _RecordingBus(InMemoryBus):
+    """An `InMemoryBus` whose producers record what they were asked to publish."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, bytes | str, str | None]] = []
+
+    def producer(self) -> MemoryProducer:
+        return _RecordingProducer(self, self.calls)
 
 
 def _headers(agent_id: str, token: str) -> dict[str, str]:
@@ -1029,3 +1074,121 @@ class TestOverCapacityBatchIs413NotA500:
         )
         assert response.status_code == 413
         assert _topic_records(bus) == []
+
+
+# --------------------------------------------------------------------------
+# ADR-0013 decisions 3 and 4: `message_id = event_id` on every publish
+# --------------------------------------------------------------------------
+
+_THREE_IPS: list[dict[str, object]] = [
+    {"ip": "10.8.8.1", "request_count": 5},
+    {"ip": "10.8.8.2", "request_count": 7},
+    {"ip": "10.8.8.3", "request_count": 9},
+]
+
+
+class TestEveryPublishCarriesTheEventIdAsMessageId:
+    """ADR-0013 decision 4: ingest's `ObservationPublisher._publish_one`
+    passes "the per-IP envelope's `event_id`" as `message_id`, so that the
+    stream "drops a second copy of any record whose `event_id` it has seen
+    in the last 120 s" (#88)."""
+
+    def test_each_per_ip_message_is_published_under_its_envelopes_event_id(self) -> None:
+        bus = _RecordingBus()
+        client, _ = _build_app(bus=bus)
+
+        response = client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=_THREE_IPS),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+
+        assert response.status_code == 202
+        assert len(bus.calls) == len(_THREE_IPS)
+        event_id_by_key = {key: envelope.event_id for key, envelope in _decoded_records(bus)}
+        for topic, key, message_id in bus.calls:
+            assert topic == OBSERVATIONS.name
+            key_bytes = key if isinstance(key, bytes) else key.encode("utf-8")
+            assert message_id is not None
+            assert message_id == event_id_by_key[key_bytes]
+
+    def test_message_ids_of_one_fan_out_are_pairwise_distinct(self) -> None:
+        # ADR-0004 point 4 gives every split message a distinct `event_id`;
+        # decision 4 carries that distinctness into the ids the log dedups
+        # by, so no per-IP message can be dropped as a copy of a sibling.
+        bus = _RecordingBus()
+        client, _ = _build_app(bus=bus)
+
+        client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=_THREE_IPS),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+
+        message_ids = [message_id for _topic, _key, message_id in bus.calls]
+        assert len(message_ids) == 3
+        assert len(set(message_ids)) == 3
+
+    def test_no_publish_omits_the_message_id(self) -> None:
+        # Coalesced entries and single-entry batches alike: every publish
+        # this service makes carries an id ("Every producer in this
+        # repository passes the envelope's `event_id` as `message_id`").
+        bus = _RecordingBus()
+        client, _ = _build_app(bus=bus)
+        observations = [
+            {"ip": "10.8.8.9", "request_count": 4},
+            {"ip": "10.8.8.9", "request_count": 6},
+            {"ip": "10.8.8.10", "request_count": 1},
+        ]
+
+        client.post(
+            "/v1/observations",
+            json=_body(sequence=1, observations=observations),
+            headers=_headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN),
+        )
+
+        assert len(bus.calls) == 2
+        assert all(message_id is not None for _topic, _key, message_id in bus.calls)
+
+
+class TestTheLogDeduplicatesARepublishedBatch:
+    """ADR-0013 decision 3 / decision 4: the same accepted batch published
+    twice into one `InMemoryBus` -- by two ingest instances, each with its own
+    dedup store, so both answer 202 -- yields one message per IP, because the
+    per-IP envelopes carry the same `event_id`s and the log "is acknowledged
+    and **not** appended" for an id it has seen."""
+
+    def test_the_same_batch_through_two_instances_yields_one_message_per_ip(self) -> None:
+        bus = InMemoryBus()
+        first_client, _ = _build_app(bus=bus)
+        second_client, _ = _build_app(bus=bus)
+        body = _body(sequence=1, observations=_THREE_IPS)
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+
+        first = first_client.post("/v1/observations", json=body, headers=headers)
+        second = second_client.post("/v1/observations", json=body, headers=headers)
+
+        assert first.status_code == 202
+        assert second.status_code == 202  # its own dedup store has never seen sequence 1
+        records = _topic_records(bus)
+        assert len(records) == len(_THREE_IPS)
+        assert {key for key, _value in records} == {
+            _canonical(str(entry["ip"])).encode("utf-8") for entry in _THREE_IPS
+        }
+
+    def test_a_different_sequence_is_not_deduplicated(self) -> None:
+        # The control: distinct `(agent_id, sequence)` means distinct
+        # `event_id`s (ADR-0003), so nothing is dropped.
+        bus = InMemoryBus()
+        first_client, _ = _build_app(bus=bus)
+        second_client, _ = _build_app(bus=bus)
+        headers = _headers(KNOWN_AGENT_ID, KNOWN_AGENT_TOKEN)
+
+        first_client.post(
+            "/v1/observations", json=_body(sequence=1, observations=_THREE_IPS), headers=headers
+        )
+        second_client.post(
+            "/v1/observations", json=_body(sequence=2, observations=_THREE_IPS), headers=headers
+        )
+
+        assert len(_topic_records(bus)) == 2 * len(_THREE_IPS)

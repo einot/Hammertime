@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from hammertime.bus.nats import split_bus_servers, validate_bus_url
 from hammertime.store import validate_redis_url
 
 _DEFAULT_BIND = "0.0.0.0:8080"
@@ -19,8 +20,8 @@ _DEFAULT_MAX_OBSERVATIONS = 10_000
 _DEFAULT_CONFIG_PATH = "./config/detection.v1.json"
 _DEFAULT_RATE_LIMIT_RPS = 50.0
 _DEFAULT_AGENTS_PATH = "./config/agents.v2.json"
-_DEFAULT_BUS_KIND = "kafka"
-_DEFAULT_BUS_BROKERS = "localhost:19092"
+_DEFAULT_BUS_KIND = "nats"
+_DEFAULT_BUS_BROKERS = "nats://localhost:4222"
 _DEFAULT_STORE_KIND = "redis"
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
@@ -38,7 +39,9 @@ _DEFAULT_OBSERVATION_BURST = 10_000
 # --- ADR-0009: process lifecycle (spec section 47) -------------------------
 _DEFAULT_CONFIG_POLL_INTERVAL_S = 1.0
 
-_ALLOWED_BUS_KINDS = frozenset({"kafka", "memory"})
+_BUS_BROKERS_KEY = "HAMMERTIME_BUS_BROKERS"
+
+_ALLOWED_BUS_KINDS = frozenset({"nats", "memory"})
 _ALLOWED_STORE_KINDS = frozenset({"redis", "memory"})
 
 
@@ -63,10 +66,19 @@ class IngestSettings:
     rate_limit_rps: float
     #: HAMMERTIME_INGEST_AGENTS_PATH: the agent registry document.
     agents_path: Path
-    #: HAMMERTIME_BUS_KIND: "kafka" | "memory".
+    #: HAMMERTIME_BUS_KIND: "nats" | "memory" (ADR-0013 decision 10; any
+    #: other value is a `ValueError`, exit 2).
     bus_kind: str
-    #: HAMMERTIME_BUS_BROKERS: bootstrap servers, meaningful only when
-    #: bus_kind == "kafka".
+    #: HAMMERTIME_BUS_BROKERS: comma-separated NATS server URLs
+    #: (`nats://host:4222`, also `tls://`, `ws://`, `wss://`), meaningful
+    #: only when bus_kind == "nats". Every entry is checked by
+    #: `load_settings` with `hammertime.bus.nats.validate_bus_url`, and that
+    #: check runs when bus_kind == "nats" and not otherwise (ADR-0013
+    #: Amendment 4 ruling S2, gated by Amendment 5 ruling 5) -- the
+    #: dataclass itself does not validate at all. An
+    #: entry MAY carry userinfo (`user:password@` or `token@`), so no log
+    #: record carries this field verbatim -- the `starting` record names the
+    #: servers as `bus_endpoints` (ADR-0013 Amendment 2, rulings 1-3).
     bus_brokers: str
     #: HAMMERTIME_STORE_KIND: "redis" | "memory".
     store_kind: str
@@ -137,6 +149,24 @@ def _parse_choice(name: str, value: str, *, allowed: frozenset[str]) -> str:
     return value
 
 
+def _validate_bus_brokers(value: str) -> None:
+    """Refuse an entry nats-py's own parse would refuse, naming its position only.
+
+    ADR-0013 decision 3 as amended by Amendment 4 ruling S2: the value is
+    split as `NatsBus.__init__` splits it (on `,`, stripped, empties
+    dropped) and every entry goes through `validate_bus_url`, whose message
+    carries none of the entry's text -- an entry may hold a password, and a
+    `config_invalid` record must not echo it. So the process exits 2 here
+    rather than reaching nats-py, whose parse failure chains a `ValueError`
+    that repeats the token it could not cast (assumption 46, closed).
+    """
+    for index, entry in enumerate(split_bus_servers(value)):
+        try:
+            validate_bus_url(entry)
+        except ValueError as exc:
+            raise ValueError(f"{_BUS_BROKERS_KEY}: entry {index} is {exc}") from None
+
+
 def _parse_nonnegative_int(name: str, value: str) -> int:
     try:
         parsed = int(value)
@@ -181,6 +211,20 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
         # 2) rather than inside start(). Under "memory" the value is never
         # interpreted, so a set-but-malformed one is ignored, not rejected.
         validate_redis_url(redis_url)
+    bus_kind = _parse_choice(
+        "HAMMERTIME_BUS_KIND",
+        source.get("HAMMERTIME_BUS_KIND", _DEFAULT_BUS_KIND),
+        allowed=_ALLOWED_BUS_KINDS,
+    )
+    bus_brokers = source.get(_BUS_BROKERS_KEY, _DEFAULT_BUS_BROKERS)
+    if bus_kind == "nats":
+        # ADR-0013 Amendment 4 ruling S2 as gated by Amendment 5 ruling 5:
+        # an entry nats-py's own parse would refuse is invalid
+        # configuration, so it must fail here (config_invalid, exit 2)
+        # rather than inside connect(). Under memory the value is never
+        # interpreted, so a set-but-malformed one is ignored, not rejected
+        # (ADR-0009 A12).
+        _validate_bus_brokers(bus_brokers)
     return IngestSettings(
         host=host,
         port=port,
@@ -195,12 +239,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> IngestSettings:
             source.get("HAMMERTIME_INGEST_RATE_LIMIT_RPS", str(_DEFAULT_RATE_LIMIT_RPS)),
         ),
         agents_path=Path(source.get("HAMMERTIME_INGEST_AGENTS_PATH", _DEFAULT_AGENTS_PATH)),
-        bus_kind=_parse_choice(
-            "HAMMERTIME_BUS_KIND",
-            source.get("HAMMERTIME_BUS_KIND", _DEFAULT_BUS_KIND),
-            allowed=_ALLOWED_BUS_KINDS,
-        ),
-        bus_brokers=source.get("HAMMERTIME_BUS_BROKERS", _DEFAULT_BUS_BROKERS),
+        bus_kind=bus_kind,
+        bus_brokers=bus_brokers,
         store_kind=store_kind,
         redis_url=redis_url,
         auth_failure_rate_per_min=_parse_positive_number(

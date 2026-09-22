@@ -1,6 +1,10 @@
 # ADR 0010 — One prefix predicate, two read APIs, and the event granularity between trie and detector
 
-Status: accepted
+Status: accepted; amended 2026-09-21 (see "Amendment 1" at the end — the
+replay-position item the Consequences deferred is settled by ADR-0013
+decision 9 now that the event log has one stream sequence, and decision
+3's "flushed before the consumer position ... is committed" is restated
+for a trie that keeps no consumer position; both noted in place)
 
 Scope note: this ADR pins down the interfaces the cross-service tests of
 issue #26 (`docs/spec/integration-scenarios.md`) observe the pipeline through,
@@ -96,6 +100,14 @@ all prefixes of that event so a consumer can group them). Events for one
 hot-IP event are published before the next hot-IP event is applied; the
 producer is flushed before the consumer position for the hot-ip topic is
 committed, so a crash cannot commit an update whose stats were never emitted.
+
+> Amended 2026-09-21 (ADR-0013 decision 9; Amendment 1): the trie reads
+> `hammertime.hot-ip.v1` positionally from its snapshot's `replay_position`
+> and holds no consumer position on the log. The last sentence therefore
+> reads: the producer is flushed before a snapshot records a
+> `replay_position` that covers the event, so a restart cannot skip an
+> event whose stats never reached the log. The invariant is the same; the
+> thing that records it is the snapshot alone.
 
 Twenty-five messages per transition is acceptable for the same reason
 ADR-0005 gave for not scoring continuously: hysteresis makes transitions rare
@@ -209,3 +221,80 @@ It is never used to spread the delta. This is what
   `hammertime.hot-ip.v1` (§33's single "event sequence number" is not a Kafka
   offset) is likewise deferred to the trie epic; the scenarios only observe
   the result (exact counts after restart), not the format.
+
+> Amended 2026-09-21: settled by ADR-0013 decision 9 — see Amendment 1.
+
+## Amendment 1 (2026-09-21) — the trie's replay position is the stream sequence (ADR-0013)
+
+Why: the last Consequences bullet deferred how the trie snapshot records
+its replay position, because with a multi-partition Kafka topic §33's
+single "event sequence number" had no counterpart — a position was a
+vector of per-partition offsets. ADR-0013 makes the event log a NATS
+JetStream stream, which has one monotonic sequence across every subject,
+and `ConsumedMessage.offset` is that sequence. The item is answerable and
+this amendment answers it; decisions 1, 2, 4, 5 and 6 are untouched, and
+decision 3 is restated in one sentence for a trie that keeps no consumer
+position.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Was "Status: accepted". Now adds the amended clause.
+* **Decision 3, dated blockquote after the first paragraph.** The sentence
+  "the producer is flushed before the consumer position for the hot-ip
+  topic is committed, so a crash cannot commit an update whose stats were
+  never emitted" is restated in the blockquote; the original text is
+  unchanged.
+* **Consequences, last bullet, dated one-line blockquote** pointing here.
+
+Ruling (ADR-0013 decision 9, restated so it can be read from this ADR):
+
+1. The trie subscribes to `hammertime.hot-ip.v1` positionally —
+   `Consumer.subscribe(topic, start_offset=<replay_position + 1>)`, or
+   `start_offset=1` with no snapshot — applies messages in the order the
+   iterator yields them, and never acknowledges. There is no
+   `hammertime-trie` durable consumer; ADR-0009 decision 9's name is
+   unused by the trie.
+2. The snapshot records `replay_position: int`, the `offset` of the last
+   hot-ip message applied before the snapshot was written. That integer is
+   §33's "event sequence number"; after loading a snapshot the trie replays
+   every message with `offset > replay_position`.
+3. The trie's `event_sequence` — its count of applied hot-ip events,
+   carried on `PrefixStatsChanged.sequence` and in every read response
+   (decision 4; ADR-0001 Amendment 1 clause 4) — is **unchanged** and is a
+   different number from `replay_position`. Whether the two should be one
+   (the stream sequence satisfies every property decision 4's assumption
+   "one trie-wide `sequence` ... chosen for groupability" asks for: strictly
+   increasing, shared by the twenty-five stats of one event, not promised
+   dense) is left to the trie epic and is named as an open question in
+   ADR-0013's hand-off report; it would touch `docs/protocol/read-api-v1.md`
+   and ADR-0001 clause 4, which this amendment does not.
+4. Readiness (ADR-0009 decision 4: replayed "to the log end as it stood
+   when `start()` began") uses the bus's `await bus.end_offset(topic)`,
+   read at `start()` — the offset the next appended message will receive,
+   `1` for an empty stream and `0` for an empty memory log. The service
+   has replayed to the log end once the last applied offset is
+   `>= end_offset - 1`, or immediately when `end_offset <= start_offset`
+   (ADR-0013 decision 9 and assumption 20, as amended).
+
+   > Amended 2026-09-21: was "uses the bus's `last_offset(topic)` read at
+   > `start()` (ADR-0013 assumption 20)". ADR-0013 Amendment 1 (ruling
+   > C5.2) renamed it `end_offset`, made it `async` on the `MessageBus`
+   > protocol, and redefined it as the next offset so that one readiness
+   > inequality holds on both buses.
+5. The detector is bound by ADR-0013 decision 9's redelivery constraint:
+   it holds a durable subscription, so after a crash it may be handed an
+   older `PrefixStatsChanged` after a newer one for the same prefix, and
+   its "latest known stats" view (decision 5) MUST apply an event only if
+   its `sequence` is greater than the one it holds for that prefix.
+
+Assumptions made by this amendment (push back individually):
+
+* **Two numbers rather than one.** Unifying `event_sequence` with the
+  stream sequence is attractive (§33 would then name one integer and the
+  read APIs would expose a real log position) but widens this amendment
+  into the read-API protocol and ADR-0001 clause 4. Kept separate so that
+  ADR-0013 lands without a protocol change; raised for the owner.
+* **The field name `replay_position`** is chosen here so the trie epic and
+  `tools/replay` agree on it; the snapshot format is otherwise the trie
+  epic's.
+* **No CHANGES entry**: no snapshot format has shipped.

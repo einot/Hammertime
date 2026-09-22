@@ -84,6 +84,57 @@ NOT tested here, deliberately:
   observable property (no lost update to the HOT set under interleaved
   awaits) and says so; it is not a substitute.
 
+**Per-shard leases (ADR-0013 decision 7)** -- `ShardLeaseContract` and the
+two `Test*Lease*` classes below, written from that decision's text alone:
+
+    async def acquire_lease(self, shard: int, owner: str, ttl_seconds: float) -> str | None:
+        # Take or renew shard's lease for owner. Returns None on success; otherwise
+        # the id of the member that holds it. Atomic: a lease is granted iff no live
+        # lease exists or the live lease is owner's own, in which case its expiry
+        # becomes now + ttl_seconds.
+    async def release_lease(self, shard: int, owner: str) -> None:
+        # Drop shard's lease iff owner holds it; a no-op otherwise. Never raises
+        # for an unheld lease.
+
+`RedisShardStateStore`: "key `hammertime:agg:{shard}:owner`, value the owner
+id, one atomic server-side step per call ..., TTL in whole seconds rounded
+up". `MemoryShardStateStore` "gains an optional `clock: Clock | None = None`
+constructor keyword (default `SystemClock()`, so every existing
+argument-free construction is unchanged) and keeps `{shard: (owner,
+expires_at)}`; an expired entry counts as absent. `load` and
+`record_transition` are unchanged, and the lease key is separate from the
+HOT set".
+
+Lease ASSUMPTIONS (numbered on from the list above):
+
+8. **How a lease lapses per backend.** The memory store takes the test's
+   `ManualClock`, so `let_time_pass(seconds)` is `clock.advance(seconds)`
+   and no lease test on it touches the wall clock. fakeredis keeps its own
+   expiry on `time.time()` with no clock to inject, so the Redis lapse tests
+   use a 2 s TTL and a real `asyncio.sleep`, as
+   `services/ingest/.../tests/test_dedup.py` already does for `mark_seen`'s
+   TTL; they are the only wall-clock sleeps in this file. The TTL was 1 s
+   until 2026-09-22; ADR-0013 Amendment 4 ruling F widened it because the
+   two "still live" assertions at `0.6 x TTL` "leave a 0.4 s margin, which a
+   loaded CI runner can eat" -- now 0.8 s (assumption 75: "Roughly six extra
+   seconds per suite run ... bought against a flaky gate"). The fractions
+   are unchanged: "the renewal test needs the two sleeps to sum past one
+   TTL, so `0.6` cannot drop below `0.5`".
+9. **`str | None` literally.** A refused acquire returns the holder's id as
+   a `str` (asserted with `isinstance`), never a falsy sentinel; a granted
+   one returns `None`, not `True`.
+10. **Renewal is observable as a later expiry.** "Its expiry becomes now +
+    ttl_seconds": a renewal at 60 % of the TTL keeps the lease alive past
+    the original expiry, which is what `renew_leases()` (ADR-0013 decision
+    7) relies on every maintenance interval.
+11. **Whole seconds rounded up** is asserted on the Redis key's `TTL`: a
+    `ttl_seconds` of `0.4` yields `TTL == 1` and one of `2.5` yields `3`
+    (fakeredis reports whole seconds; a value of `2` would mean rounding
+    down or to nearest, both of which the ADR rules out).
+12. **The lease key of a never-recorded shard is the only key written**, so
+    a lease is observable in the keyspace without a `:hot`/`:seq` pair, and
+    releasing it deletes the key rather than leaving an empty value.
+
 Formerly listed here as unpinned, now tested: **an out-of-order
 `sequence`**. Whether a lower `sequence` lowers `next_sequence` was left
 untested and flagged for the architect; ADR-0011 Amendment 1 item A2 ruled
@@ -101,11 +152,14 @@ below, so both backends are held to it
 """
 
 import asyncio
+import math
+from typing import ClassVar
 
 import fakeredis.aioredis
 import pytest
 from hammertime.core.addressing.address import Address
 from hammertime.core.state.enums import IpState
+from hammertime.core.time.clock import ManualClock
 from hammertime.store.interface import ShardState, ShardStateStore
 from hammertime.store.memory import MemoryShardStateStore
 from hammertime.store.redis import RedisShardStateStore
@@ -113,6 +167,13 @@ from hammertime.store.redis import RedisShardStateStore
 IP_A = Address.parse("198.51.100.7")
 IP_B = Address.parse("203.0.113.19")
 IP_C = Address.parse("192.0.2.200")
+
+# ADR-0013 decision 7: leases are keyed by member id.
+MEMBER_A = "aggregator-0"
+MEMBER_B = "aggregator-1"
+MEMBER_C = "aggregator-2"
+
+BASE = 1_800_000_000
 
 
 async def _key_names(client: fakeredis.aioredis.FakeRedis, pattern: str) -> set[str]:
@@ -669,3 +730,361 @@ class TestRedisStateSurvivesTheProcess:
         assert inherited.hot_ips == frozenset({IP_A})
         assert state.hot_ips == frozenset()
         assert state.next_sequence == 2
+
+
+# --------------------------------------------------------------------------
+# ADR-0013 decision 7: the per-shard lease (#90)
+# --------------------------------------------------------------------------
+
+
+class ShardLeaseContract:
+    """Behaviour every `ShardStateStore` owes ADR-0013 decision 7's lease.
+
+    Subclassed once per backend so both are held to the same contract; not
+    collected itself (no `Test` prefix). `LEASE_TTL` and `let_time_pass` are
+    the backend's (ASSUMPTION 8): the memory store advances an injected
+    `ManualClock`, the Redis store sleeps for real against fakeredis's own
+    expiry.
+    """
+
+    LEASE_TTL: ClassVar[float]
+
+    def make_store(self) -> ShardStateStore:
+        raise NotImplementedError
+
+    async def let_time_pass(self, seconds: float) -> None:
+        raise NotImplementedError
+
+    async def test_a_free_shard_is_granted(self) -> None:
+        # "Returns None on success".
+        store = self.make_store()
+
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) is None
+
+    async def test_the_holder_may_acquire_again(self) -> None:
+        # "a lease is granted iff no live lease exists or the live lease is
+        # owner's own" -- the renewal path `renew_leases()` takes.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) is None
+
+    async def test_another_owner_is_refused_while_the_lease_is_live(self) -> None:
+        # "otherwise the id of the member that holds it" -- ASSUMPTION 9: a
+        # `str`, the holder's own id.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        holder = await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL)
+
+        assert holder == MEMBER_A
+        assert isinstance(holder, str)
+
+    async def test_a_refused_acquire_does_not_take_the_lease(self) -> None:
+        # The holder is still the holder afterwards: a third member is
+        # refused with MEMBER_A's id, not MEMBER_B's.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+        await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL)
+
+        assert await store.acquire_lease(0, MEMBER_C, self.LEASE_TTL) == MEMBER_A
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) is None
+
+    async def test_leases_are_per_shard(self) -> None:
+        # Section 20: a shard is the unit of ownership. Holding shard 0 says
+        # nothing about shard 1.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        assert await store.acquire_lease(1, MEMBER_B, self.LEASE_TTL) is None
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) == MEMBER_A
+        assert await store.acquire_lease(1, MEMBER_A, self.LEASE_TTL) == MEMBER_B
+
+    async def test_release_by_the_holder_frees_the_shard(self) -> None:
+        # "Drop shard's lease iff owner holds it".
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        await store.release_lease(0, MEMBER_A)
+
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) is None
+
+    async def test_release_by_a_non_holder_is_a_no_op(self) -> None:
+        # "a no-op otherwise": the holder keeps the lease and nothing is
+        # raised.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        await store.release_lease(0, MEMBER_B)
+
+        assert await store.acquire_lease(0, MEMBER_C, self.LEASE_TTL) == MEMBER_A
+
+    async def test_release_of_an_unheld_lease_never_raises(self) -> None:
+        # "Never raises for an unheld lease."
+        store = self.make_store()
+
+        await store.release_lease(0, MEMBER_A)
+        await store.release_lease(7, MEMBER_B)
+
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) is None
+
+    async def test_release_is_idempotent(self) -> None:
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        await store.release_lease(0, MEMBER_A)
+        await store.release_lease(0, MEMBER_A)
+
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) is None
+
+    async def test_release_frees_only_that_shard(self) -> None:
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+        await store.acquire_lease(1, MEMBER_A, self.LEASE_TTL)
+
+        await store.release_lease(0, MEMBER_A)
+
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) is None
+        assert await store.acquire_lease(1, MEMBER_B, self.LEASE_TTL) == MEMBER_A
+
+    async def test_an_expired_lease_counts_as_absent(self) -> None:
+        # Decision 7: "A crashed member's leases expire after `lease_ttl_s`;
+        # ... one with a different id waits at most `lease_ttl_s`".
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        await self.let_time_pass(self.LEASE_TTL + 0.3)
+
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) is None
+
+    async def test_after_expiry_the_old_holder_is_the_one_refused(self) -> None:
+        # The narrow fencing decision 7 buys: once another member has taken
+        # the lapsed lease, the old holder's renewal is refused with the new
+        # holder's id, which is what turns into `ShardLeaseLostError`.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+        await self.let_time_pass(self.LEASE_TTL + 0.3)
+        await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL)
+
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) == MEMBER_B
+
+    async def test_a_lease_is_still_live_just_before_it_expires(self) -> None:
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        await self.let_time_pass(self.LEASE_TTL * 0.6)
+
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) == MEMBER_A
+
+    async def test_renewal_extends_the_expiry(self) -> None:
+        # ASSUMPTION 10: "its expiry becomes now + ttl_seconds". Renewed at
+        # 60 % of the TTL, the lease is still held at 120 % of the original
+        # TTL, where an un-renewed one would have lapsed.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+        await self.let_time_pass(self.LEASE_TTL * 0.6)
+
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) is None
+        await self.let_time_pass(self.LEASE_TTL * 0.6)
+
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) == MEMBER_A
+
+    async def test_the_same_id_reacquires_a_lapsed_lease_at_once(self) -> None:
+        # Decision 7: "a replacement with the same `member_id` ... reacquires
+        # at once" -- true before and after expiry alike.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+        await self.let_time_pass(self.LEASE_TTL + 0.3)
+
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) is None
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) == MEMBER_A
+
+    async def test_load_and_record_transition_are_unaffected_by_a_lease(self) -> None:
+        # "`load` and `record_transition` are unchanged, and the lease key is
+        # separate from the HOT set".
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        assert await store.load(0) == ShardState(hot_ips=frozenset(), next_sequence=0)
+        await store.record_transition(0, IP_A, IpState.HOT, 4)
+        assert await store.load(0) == ShardState(hot_ips=frozenset({IP_A}), next_sequence=5)
+
+        await store.release_lease(0, MEMBER_A)
+        assert await store.load(0) == ShardState(hot_ips=frozenset({IP_A}), next_sequence=5)
+
+    async def test_a_transition_recorded_by_a_non_holder_is_not_fenced(self) -> None:
+        # Decision 7 / ADR-0011 A2: "the store itself still carries no
+        # fencing token on `record_transition`" -- the lease is detection,
+        # not enforcement, so a write under another member's lease lands.
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL)
+
+        await store.record_transition(0, IP_B, IpState.HOT, 0)
+
+        assert (await store.load(0)).hot_ips == frozenset({IP_B})
+
+    async def test_the_hot_set_does_not_grant_or_block_a_lease(self) -> None:
+        store = self.make_store()
+        await store.record_transition(0, IP_A, IpState.HOT, 0)
+
+        assert await store.acquire_lease(0, MEMBER_A, self.LEASE_TTL) is None
+        assert await store.acquire_lease(0, MEMBER_B, self.LEASE_TTL) == MEMBER_A
+
+
+class TestMemoryShardStateStoreLease(ShardLeaseContract):
+    """`MemoryShardStateStore(clock=...)`: expiry follows the injected clock."""
+
+    LEASE_TTL: ClassVar[float] = 30.0
+    # Set by `make_store`, which every test calls first; a pytest test class
+    # may not define `__init__`.
+    _clock: ManualClock
+
+    def make_store(self) -> ShardStateStore:
+        # A fresh clock per store, so tests never share time.
+        self._clock = ManualClock(initial=BASE)
+        return MemoryShardStateStore(clock=self._clock)
+
+    async def let_time_pass(self, seconds: float) -> None:
+        # `ManualClock` is integer-valued (`now() -> int`); rounding up keeps
+        # "past the TTL" past it and "60 % of the TTL" (18 of 30) exact.
+        self._clock.advance(math.ceil(seconds))
+
+    def test_the_argument_free_construction_is_unchanged(self) -> None:
+        # "default `SystemClock()`, so every existing argument-free
+        # construction is unchanged" -- the contract above already builds
+        # `MemoryShardStateStore()` throughout.
+        assert isinstance(MemoryShardStateStore(), ShardStateStore)
+
+    async def test_an_argument_free_store_grants_and_refuses_leases_too(self) -> None:
+        store = MemoryShardStateStore()
+
+        assert await store.acquire_lease(0, MEMBER_A, 30.0) is None
+        assert await store.acquire_lease(0, MEMBER_B, 30.0) == MEMBER_A
+
+    async def test_a_lease_does_not_lapse_before_its_ttl_on_the_clock(self) -> None:
+        store = self.make_store()
+        await store.acquire_lease(0, MEMBER_A, 30.0)
+
+        self._clock.advance(29)
+
+        assert await store.acquire_lease(0, MEMBER_B, 30.0) == MEMBER_A
+
+
+class TestRedisShardStateStoreLease(ShardLeaseContract):
+    """`RedisShardStateStore` on fakeredis: expiry is the key's TTL.
+
+    ASSUMPTION 8: fakeredis has no injectable clock, so `let_time_pass` is a
+    real `asyncio.sleep` and `LEASE_TTL` is two seconds (ADR-0013 Amendment 4
+    ruling F, assumption 75; the precedent for real sleeps is
+    `services/ingest/.../tests/test_dedup.py`). The 60 % renewal test
+    therefore sleeps 1.2 s twice and the lapse tests 2.3 s, with 0.8 s of
+    margin on each "still live" assertion.
+    """
+
+    LEASE_TTL: ClassVar[float] = 2.0
+
+    def make_store(self) -> ShardStateStore:
+        return RedisShardStateStore(fakeredis.aioredis.FakeRedis())
+
+    async def let_time_pass(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+
+class TestRedisLeaseKeyspace:
+    """ADR-0013 decision 7's Redis key: `hammertime:agg:{shard}:owner`, value
+    the owner id, "TTL in whole seconds rounded up"."""
+
+    def _store(self) -> tuple[RedisShardStateStore, fakeredis.aioredis.FakeRedis]:
+        client = fakeredis.aioredis.FakeRedis()
+        return RedisShardStateStore(client), client
+
+    async def test_the_lease_lives_under_the_owner_key(self) -> None:
+        store, client = self._store()
+
+        await store.acquire_lease(3, MEMBER_A, 30.0)
+
+        value = await client.get("hammertime:agg:3:owner")
+        assert (value.decode() if isinstance(value, bytes) else value) == MEMBER_A
+
+    async def test_the_owner_key_is_the_only_key_a_lease_writes(self) -> None:
+        # ASSUMPTION 12: separate from the HOT set and the sequence, and no
+        # `:hot`/`:seq` pair is created by taking a lease.
+        store, client = self._store()
+
+        await store.acquire_lease(3, MEMBER_A, 30.0)
+
+        assert await _key_names(client, "*") == {"hammertime:agg:3:owner"}
+
+    async def test_the_owner_key_carries_the_ttl_in_whole_seconds(self) -> None:
+        store, client = self._store()
+
+        await store.acquire_lease(0, MEMBER_A, 30.0)
+
+        ttl = await client.ttl("hammertime:agg:0:owner")
+        assert 1 <= ttl <= 30
+
+    async def test_a_fractional_ttl_is_rounded_up(self) -> None:
+        # ASSUMPTION 11: 0.4 s -> `EX 1`; 2.5 s -> `EX 3`.
+        store, client = self._store()
+
+        await store.acquire_lease(0, MEMBER_A, 0.4)
+        await store.acquire_lease(1, MEMBER_A, 2.5)
+
+        assert await client.ttl("hammertime:agg:0:owner") == 1
+        assert await client.ttl("hammertime:agg:1:owner") == 3
+
+    async def test_renewal_rewrites_the_ttl(self) -> None:
+        # A renewal with a longer TTL is visible as a longer remaining TTL:
+        # "its expiry becomes now + ttl_seconds", not the earlier of the two.
+        store, client = self._store()
+        await store.acquire_lease(0, MEMBER_A, 5.0)
+
+        await store.acquire_lease(0, MEMBER_A, 60.0)
+
+        assert await client.ttl("hammertime:agg:0:owner") > 5
+
+    async def test_a_refused_acquire_rewrites_nothing(self) -> None:
+        store, client = self._store()
+        await store.acquire_lease(0, MEMBER_A, 60.0)
+
+        assert await store.acquire_lease(0, MEMBER_B, 5.0) == MEMBER_A
+
+        value = await client.get("hammertime:agg:0:owner")
+        assert (value.decode() if isinstance(value, bytes) else value) == MEMBER_A
+        assert await client.ttl("hammertime:agg:0:owner") > 5
+
+    async def test_release_deletes_the_owner_key(self) -> None:
+        store, client = self._store()
+        await store.acquire_lease(0, MEMBER_A, 30.0)
+
+        await store.release_lease(0, MEMBER_A)
+
+        assert await _key_names(client, "*") == set()
+
+    async def test_release_by_a_non_holder_leaves_the_key(self) -> None:
+        store, client = self._store()
+        await store.acquire_lease(0, MEMBER_A, 30.0)
+
+        await store.release_lease(0, MEMBER_B)
+
+        value = await client.get("hammertime:agg:0:owner")
+        assert (value.decode() if isinstance(value, bytes) else value) == MEMBER_A
+
+    async def test_the_lease_key_does_not_touch_the_hot_and_seq_keys(self) -> None:
+        store, client = self._store()
+        await store.record_transition(0, IP_A, IpState.HOT, 0)
+
+        await store.acquire_lease(0, MEMBER_A, 30.0)
+        await store.release_lease(0, MEMBER_A)
+
+        assert await _key_names(client, "*") == {"hammertime:agg:0:hot", "hammertime:agg:0:seq"}
+        assert await client.ttl("hammertime:agg:0:hot") == -1
+        assert await client.ttl("hammertime:agg:0:seq") == -1
+
+    async def test_a_fresh_store_over_the_same_server_sees_the_lease(self) -> None:
+        # The lease is in the store, "reachable by every member": a second
+        # process (a second client over the same server) is refused.
+        client = fakeredis.aioredis.FakeRedis()
+        await RedisShardStateStore(client).acquire_lease(0, MEMBER_A, 30.0)
+
+        assert await RedisShardStateStore(client).acquire_lease(0, MEMBER_B, 30.0) == MEMBER_A

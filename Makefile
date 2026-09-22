@@ -13,10 +13,10 @@ fmt:
 	uv run ruff format .
 
 typecheck:
-	uv run mypy packages services
+	uv run mypy packages services tools
 
 up:
-	docker compose -f deploy/docker-compose.yml up --build -d
+	docker compose -f deploy/docker-compose.yml up --build -d --wait
 
 down:
 	docker compose -f deploy/docker-compose.yml down -v

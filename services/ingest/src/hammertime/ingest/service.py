@@ -23,7 +23,8 @@ from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI
-from hammertime.bus.memory import InMemoryBus
+from hammertime.bus.interface import MessageBus
+from hammertime.bus.nats import bus_endpoints
 from hammertime.core.config.loader import load as load_detection_config
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.runtime import ConfigPoller, Readiness
@@ -181,10 +182,17 @@ class IngestService:
         return await self._poller.poll_once()
 
     def startup_fields(self) -> Mapping[str, object]:
-        """Decision 5 step 3's `starting` record, with no credential in it."""
+        """Decision 5 step 3's `starting` record, with no credential in it.
+
+        The bus servers are named as `bus_endpoints` -- scheme and host per
+        URL, userinfo dropped -- and never as `bus_brokers`: a NATS URL may
+        carry `user:password@` or `token@` (ADR-0013 decision 3 as amended
+        by Amendment 2, ruling 3; ADR-0009 A7's `bus_brokers` row is
+        superseded).
+        """
         fields: dict[str, object] = {
             "bus_kind": self._settings.bus_kind,
-            "bus_brokers": self._settings.bus_brokers,
+            "bus_endpoints": bus_endpoints(self._settings.bus_brokers),
             "store_kind": self._settings.store_kind,
             "config_path": str(self._settings.detection_config_path),
             "config_version": self._poller.current.config_version,
@@ -234,7 +242,7 @@ class IngestService:
 def build_service(
     settings: IngestSettings,
     *,
-    bus: InMemoryBus | None = None,
+    bus: MessageBus | None = None,
     clock: Clock | None = None,
     dedup_store: DedupStore | None = None,
     agent_registry: AgentRegistry | None = None,

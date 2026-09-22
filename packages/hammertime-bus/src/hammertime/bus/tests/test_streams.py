@@ -1,0 +1,690 @@
+"""`stream_config_for` and `ensure_streams`: the stream a topic declares, reconciled idempotently.
+
+Spec: section 19, section 20, section 32, section 33 (`hammertime.bus.nats`'s own
+citations, ADR-0013 decision 3).
+
+Written from ADR-0013 decision 2 alone -- its `ensure_streams` bullet, the
+stream-configuration block, the italic "What is compared, and that it is
+unit-tested" text appended 2026-09-22 (Amendment 4 ruling R3) and Amendment 4
+assumptions 67-68; `nats.py` was not read. The sentences pinned here:
+
+* Surface: "`stream_config_for(spec: TopicSpec, *, replicas: int = 1) ->
+  nats.js.api.StreamConfig`" and "`async def ensure_streams(js:
+  JetStreamContext, specs: Iterable[TopicSpec], *, replicas: int = 1) ->
+  dict[str, str]` (stream name -> `"created" | "updated" | "unchanged"`)".
+* The block: `name` is decision 1's stream name; `subjects ["<topic>.*"]`;
+  `retention limits`; `max_age TopicSpec.retention_seconds`; `max_bytes -1`,
+  `max_msgs -1`, `max_msgs_per_subject -1`; `discard old`; `storage file`;
+  `num_replicas` the `--replicas` value; `duplicate_window 120 s`;
+  `allow_direct false`, `deny_delete false`, `deny_purge false`,
+  `subject_transform none`. "`stream_config_for` raises `ValueError` for
+  `replicas < 1`" (assumption 68).
+* Reconciliation: "`ensure_streams` calls `stream_info(name)`; on
+  `NotFoundError` it calls `add_stream`; when the stream exists it compares
+  the mutable fields (`subjects`, `max_age`, `duplicate_window`, `max_bytes`,
+  `max_msgs`, `num_replicas`) and calls `update_stream` if any differs; a
+  difference in an immutable field (`retention`, `storage`) raises
+  `StreamConfigConflictError` and changes nothing. It inspects every stream in
+  `specs` before it creates or updates any of them, so a conflict on one
+  stream changes nothing on any other either."
+* What is compared: "`ensure_streams` reads `stream_info(name).config` -- the
+  `nats.js.api.StreamConfig` nats-py builds from the server's response, in
+  which durations are seconds and the enum-valued fields (`retention`,
+  `storage`, `discard`) are left as the server's strings rather than
+  converted to the enums ... -- against `stream_config_for(spec,
+  replicas=replicas)`, field by field, after normalising both sides: an
+  `Enum` by its `.value`, a `list` by its elements in order, anything else as
+  it is; so a stream the server reports with `retention="limits"` equals one
+  declared with `RetentionPolicy.LIMITS`, and the comparison does not depend
+  on which form the installed nats-py produces. A missing stream is
+  `nats.js.errors.NotFoundError` from `stream_info` and nothing else;
+  `add_stream` and `update_stream` each receive the declared `StreamConfig`
+  whole; the result has one entry per spec."
+* The harness: "a fake `JetStreamContext` exposing `stream_info`,
+  `add_stream` and `update_stream` is the whole harness" -- assumption 67: a
+  three-method object, `stream_info` "raising `nats.js.errors.NotFoundError()`
+  (constructible with no arguments ...) or returning an object whose
+  `.config` is an `api.StreamConfig`", exercising "the actual side both with
+  the server's strings and with the enums".
+
+ASSUMPTIONS -- details the text leaves open; adjust the fake, not the meaning
+of the assertions:
+
+1. `stream_info`, `add_stream` and `update_stream` may be called with the
+   argument positionally or by keyword (`name=` / `config=`); the fake accepts
+   both and records the value. nats-py's `add_stream` also takes the config as
+   keyword fields, so the fake builds a `StreamConfig` from `**params` when no
+   whole config is given -- and the tests then assert that what arrived *is*
+   the declared config, which is what "receive the declared `StreamConfig`
+   whole" means.
+2. `StreamConfigConflictError` carries `.stream`, `.field`, `.expected` and
+   `.actual` (the four fields of the tool's `stream_conflict` record, in the
+   order `test_cli.py` already constructs the exception with). Whether
+   `.expected`/`.actual` hold the enum or its string is not ruled, so both are
+   compared through the same `.value` normalisation the ADR prescribes for the
+   comparison itself.
+3. "`allow_direct false`" is asserted as falsy: nats-py's field is
+   `Optional[bool]` with default `None`, and a config that never sets it is
+   as false as one that sets `False`. `subject_transform none` is read with
+   `getattr(..., None)` so an installed nats-py without the field still
+   collects.
+4. The mutable-field list names `subjects`, `max_age`, `duplicate_window`,
+   `max_bytes`, `max_msgs` and `num_replicas`; `max_msgs_per_subject` is in
+   the block but in neither list, so a difference in it alone is not pinned
+   either way.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import replace
+from enum import Enum
+from typing import Any, cast
+
+import nats.js.errors
+import pytest
+from hammertime.bus.nats import StreamConfigConflictError, ensure_streams, stream_config_for
+from hammertime.bus.topics import TOPICS, TopicSpec, all_topics
+from nats.js import api
+
+OBSERVATIONS = TOPICS["hammertime.observations.v1"]
+HOT_IP = TOPICS["hammertime.hot-ip.v1"]
+PREFIX_STATS = TOPICS["hammertime.prefix-stats.v1"]
+
+# Decision 2's block: "duplicate_window 120 s".
+DUPLICATE_WINDOW_SECONDS = 120
+
+
+def _plain(value: object) -> object:
+    """The ADR's normalisation: "an `Enum` by its `.value`, a `list` by its elements in
+    order, anything else as it is"."""
+
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _server_form(config: api.StreamConfig) -> api.StreamConfig:
+    """`config` as nats-py's `StreamConfig.from_response` would present it: the enum-valued
+    fields as the server's strings, `subjects` as a fresh list, everything else as it is."""
+
+    # The strings are what `StreamConfig.from_response` yields for the enum-valued fields.
+    server_form_kwargs: dict[str, Any] = {
+        "retention": _plain(config.retention),
+        "storage": _plain(config.storage),
+        "discard": _plain(config.discard),
+        "subjects": list(config.subjects or []),
+    }
+    return replace(config, **server_form_kwargs)
+
+
+class _StreamInfo:
+    """What `stream_info` answers: "an object whose `.config` is an `api.StreamConfig`"."""
+
+    def __init__(self, config: api.StreamConfig) -> None:
+        self.config = config
+
+
+class _FakeJetStream:
+    """Assumption 67's three-method fake, recording every call in order.
+
+    `existing` maps a stream name to the config the "server" holds for it;
+    `failures` maps a name to an error `stream_info` raises for it instead of
+    answering (ASSUMPTION 1 for the argument shapes).
+    """
+
+    def __init__(
+        self,
+        existing: Mapping[str, api.StreamConfig] | None = None,
+        *,
+        failures: Mapping[str, BaseException] | None = None,
+    ) -> None:
+        self.existing: dict[str, api.StreamConfig] = dict(existing or {})
+        self.failures: dict[str, BaseException] = dict(failures or {})
+        self.calls: list[tuple[str, Any]] = []
+
+    async def stream_info(self, name: str | None = None, **params: Any) -> _StreamInfo:
+        resolved = name if name is not None else params["name"]
+        self.calls.append(("stream_info", resolved))
+        if resolved in self.failures:
+            raise self.failures[resolved]
+        if resolved not in self.existing:
+            raise nats.js.errors.NotFoundError()
+        return _StreamInfo(self.existing[resolved])
+
+    async def add_stream(
+        self, config: api.StreamConfig | None = None, **params: Any
+    ) -> _StreamInfo:
+        resolved = config if config is not None else api.StreamConfig(**params)
+        self.calls.append(("add_stream", resolved))
+        assert resolved.name is not None
+        self.existing[resolved.name] = resolved
+        return _StreamInfo(resolved)
+
+    async def update_stream(
+        self, config: api.StreamConfig | None = None, **params: Any
+    ) -> _StreamInfo:
+        resolved = config if config is not None else api.StreamConfig(**params)
+        self.calls.append(("update_stream", resolved))
+        assert resolved.name is not None
+        self.existing[resolved.name] = resolved
+        return _StreamInfo(resolved)
+
+    def methods(self) -> list[str]:
+        return [call[0] for call in self.calls]
+
+    def arguments(self, method: str) -> list[Any]:
+        return [call[1] for call in self.calls if call[0] == method]
+
+
+async def _ensure(
+    js: _FakeJetStream, specs: Iterable[TopicSpec], *, replicas: int = 1
+) -> dict[str, str]:
+    """`ensure_streams` over the fake, which stands in for the `JetStreamContext`."""
+
+    return await ensure_streams(cast(Any, js), specs, replicas=replicas)
+
+
+# --------------------------------------------------------------------------
+# stream_config_for: decision 2's block
+# --------------------------------------------------------------------------
+
+
+class TestStreamConfigFor:
+    """Decision 2: "`stream_config_for(spec: TopicSpec, *, replicas: int = 1) ->
+    nats.js.api.StreamConfig`" carrying the stream-configuration block."""
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    def test_it_is_a_stream_config_named_after_the_topic(self, spec: TopicSpec) -> None:
+        config = stream_config_for(spec)
+
+        assert isinstance(config, api.StreamConfig)
+        # "name <stream name of decision 1>".
+        assert config.name == spec.stream_name
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    def test_the_single_subject_is_the_topic_filter(self, spec: TopicSpec) -> None:
+        # "subjects ["<topic>.*"]" -- decision 1: "whose single subject filter
+        # is `<topic>.*`".
+        config = stream_config_for(spec)
+
+        assert config.subjects == [spec.subject_filter]
+        assert config.subjects == [f"{spec.name}.*"]
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    def test_retention_is_limits_for_the_topics_retention_seconds(self, spec: TopicSpec) -> None:
+        # "retention limits"; "max_age TopicSpec.retention_seconds (1 d, 7 d,
+        # 30 d, 1 d)".
+        config = stream_config_for(spec)
+
+        assert config.retention == api.RetentionPolicy.LIMITS
+        assert config.max_age == spec.retention_seconds
+
+    def test_the_four_retention_ages_are_the_blocks(self) -> None:
+        # The block's parenthesis, in decision 1's table order: 1 d, 7 d, 30 d,
+        # 1 d.
+        ages = [
+            stream_config_for(TOPICS[name]).max_age
+            for name in (
+                "hammertime.observations.v1",
+                "hammertime.observations-reconciliation.v1",
+                "hammertime.hot-ip.v1",
+                "hammertime.prefix-stats.v1",
+            )
+        ]
+
+        assert ages == [86_400, 7 * 86_400, 30 * 86_400, 86_400]
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    def test_size_and_count_limits_are_unbounded(self, spec: TopicSpec) -> None:
+        # "max_bytes -1 (unbounded) max_msgs -1 max_msgs_per_subject -1".
+        config = stream_config_for(spec)
+
+        assert config.max_bytes == -1
+        assert config.max_msgs == -1
+        assert config.max_msgs_per_subject == -1
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    def test_discard_old_on_file_storage(self, spec: TopicSpec) -> None:
+        # "discard old"; "storage file".
+        config = stream_config_for(spec)
+
+        assert config.discard == api.DiscardPolicy.OLD
+        assert config.storage == api.StorageType.FILE
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    def test_the_duplicate_window_is_two_minutes(self, spec: TopicSpec) -> None:
+        # "duplicate_window 120 s" -- decision 4's deduplication by
+        # `Nats-Msg-Id` is bounded by it.
+        assert stream_config_for(spec).duplicate_window == DUPLICATE_WINDOW_SECONDS
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    def test_the_flags_are_off_and_there_is_no_transform(self, spec: TopicSpec) -> None:
+        # "allow_direct false deny_delete false deny_purge false
+        # subject_transform none" (ASSUMPTION 3; assumption 76 keeps the two
+        # deny flags false on purpose).
+        config = stream_config_for(spec)
+
+        assert not config.allow_direct
+        assert not config.deny_delete
+        assert not config.deny_purge
+        assert getattr(config, "subject_transform", None) is None
+
+    def test_replicas_defaults_to_one(self) -> None:
+        # "num_replicas 1 (the --replicas flag of hammertime-provision; 3 in a
+        # clustered deployment)".
+        assert stream_config_for(OBSERVATIONS).num_replicas == 1
+
+    @pytest.mark.parametrize("replicas", [1, 3, 5])
+    def test_replicas_is_the_keyword(self, replicas: int) -> None:
+        assert stream_config_for(OBSERVATIONS, replicas=replicas).num_replicas == replicas
+
+    @pytest.mark.parametrize("replicas", [0, -1])
+    def test_fewer_than_one_replica_is_a_value_error(self, replicas: int) -> None:
+        # "`stream_config_for` raises `ValueError` for `replicas < 1`"
+        # (assumption 68: the CLI refuses the same value one layer up).
+        with pytest.raises(ValueError):
+            stream_config_for(OBSERVATIONS, replicas=replicas)
+
+    def test_replicas_does_not_change_anything_else(self) -> None:
+        one = stream_config_for(HOT_IP, replicas=1)
+        three = stream_config_for(HOT_IP, replicas=3)
+
+        assert replace(three, num_replicas=1) == one
+
+    def test_it_is_pure(self) -> None:
+        # "pure over their arguments": two calls agree field for field.
+        assert stream_config_for(HOT_IP) == stream_config_for(HOT_IP)
+
+
+# --------------------------------------------------------------------------
+# ensure_streams: created / unchanged / updated / conflict
+# --------------------------------------------------------------------------
+
+
+class TestAMissingStreamIsCreated:
+    """Decision 2: "`ensure_streams` calls `stream_info(name)`; on `NotFoundError` it calls
+    `add_stream`"."""
+
+    async def test_add_stream_is_called_once_with_the_declared_config(self) -> None:
+        js = _FakeJetStream()
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "created"}
+        assert js.methods() == ["stream_info", "add_stream"]
+        assert js.arguments("stream_info") == [HOT_IP.stream_name]
+        # "`add_stream` and `update_stream` each receive the declared
+        # `StreamConfig` whole" (ASSUMPTION 1).
+        assert js.arguments("add_stream") == [stream_config_for(HOT_IP)]
+        assert js.arguments("update_stream") == []
+
+    async def test_the_created_stream_carries_the_replicas_asked_for(self) -> None:
+        js = _FakeJetStream()
+
+        await _ensure(js, [HOT_IP], replicas=3)
+
+        assert js.arguments("add_stream") == [stream_config_for(HOT_IP, replicas=3)]
+        assert js.arguments("add_stream")[0].num_replicas == 3
+
+    async def test_a_second_run_over_the_created_stream_is_unchanged(self) -> None:
+        # Idempotent: "a day-one step that runs **before** the services, and it
+        # is idempotent".
+        js = _FakeJetStream()
+        await _ensure(js, [HOT_IP])
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "unchanged"}
+        assert js.methods() == ["stream_info", "add_stream", "stream_info"]
+
+    async def test_missing_is_not_found_error_and_nothing_else(self) -> None:
+        # "A missing stream is `nats.js.errors.NotFoundError` from `stream_info`
+        # and nothing else": another JetStream error propagates as itself and
+        # creates nothing.
+        js = _FakeJetStream(failures={HOT_IP.stream_name: nats.js.errors.ServiceUnavailableError()})
+
+        with pytest.raises(nats.js.errors.ServiceUnavailableError):
+            await _ensure(js, [HOT_IP])
+
+        assert js.arguments("add_stream") == []
+        assert js.arguments("update_stream") == []
+
+
+class TestAnIdenticalStreamIsUnchanged:
+    """Decision 2: "when the stream exists it compares the mutable fields ... and calls
+    `update_stream` if any differs" -- none differs here."""
+
+    async def test_the_declared_config_itself_is_unchanged(self) -> None:
+        declared = stream_config_for(HOT_IP)
+        js = _FakeJetStream({HOT_IP.stream_name: declared})
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "unchanged"}
+        assert js.methods() == ["stream_info"]
+
+    async def test_an_equal_config_with_the_enums_is_unchanged(self) -> None:
+        # Assumption 67: the actual side "with the enums" -- a distinct object,
+        # every field equal, the enum members as nats-py's dataclass declares.
+        declared = stream_config_for(HOT_IP)
+        with_enums = replace(
+            declared,
+            retention=api.RetentionPolicy.LIMITS,
+            storage=api.StorageType.FILE,
+            discard=api.DiscardPolicy.OLD,
+            subjects=[HOT_IP.subject_filter],
+        )
+        assert with_enums is not declared
+        js = _FakeJetStream({HOT_IP.stream_name: with_enums})
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "unchanged"}
+        assert js.arguments("add_stream") == []
+        assert js.arguments("update_stream") == []
+
+    async def test_the_servers_string_form_is_unchanged(self) -> None:
+        # "so a stream the server reports with `retention="limits"` equals one
+        # declared with `RetentionPolicy.LIMITS`, and the comparison does not
+        # depend on which form the installed nats-py produces": `retention`,
+        # `storage` and `discard` as strings, `subjects` as a list, everything
+        # else identical.
+        server_form = _server_form(stream_config_for(HOT_IP))
+        assert server_form.retention == "limits"
+        assert server_form.storage == "file"
+        assert server_form.discard == "old"
+        assert isinstance(server_form.subjects, list)
+        js = _FakeJetStream({HOT_IP.stream_name: server_form})
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "unchanged"}
+        assert js.arguments("add_stream") == []
+        assert js.arguments("update_stream") == []
+
+    async def test_the_replicas_asked_for_are_what_is_compared(self) -> None:
+        # Declared with `replicas=3` against a server holding 3: unchanged.
+        js = _FakeJetStream({HOT_IP.stream_name: stream_config_for(HOT_IP, replicas=3)})
+
+        result = await _ensure(js, [HOT_IP], replicas=3)
+
+        assert result == {HOT_IP.stream_name: "unchanged"}
+        assert js.arguments("update_stream") == []
+
+
+class TestMutableDriftIsUpdated:
+    """Decision 2: the mutable fields are "`subjects`, `max_age`, `duplicate_window`,
+    `max_bytes`, `max_msgs`, `num_replicas`"; a difference in any "calls
+    `update_stream`"."""
+
+    @pytest.mark.parametrize(
+        ("field", "actual"),
+        [
+            pytest.param("max_age", 3_600, id="max_age"),
+            pytest.param("duplicate_window", 60, id="duplicate_window"),
+            pytest.param("max_bytes", 1_000_000, id="max_bytes"),
+            pytest.param("max_msgs", 1_000, id="max_msgs"),
+            pytest.param("num_replicas", 3, id="num_replicas"),
+            pytest.param("subjects", ["hammertime.hot-ip.v1.>"], id="subjects"),
+        ],
+    )
+    async def test_a_mutable_difference_calls_update_stream_with_the_declared_config(
+        self, field: str, actual: object
+    ) -> None:
+        declared = stream_config_for(HOT_IP)
+        override: dict[str, Any] = {field: actual}
+        drifted = replace(declared, **override)
+        js = _FakeJetStream({HOT_IP.stream_name: drifted})
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "updated"}
+        assert js.methods() == ["stream_info", "update_stream"]
+        # "each receive the declared `StreamConfig` whole".
+        assert js.arguments("update_stream") == [declared]
+        assert js.arguments("add_stream") == []
+
+    async def test_drift_in_the_servers_string_form_is_still_updated(self) -> None:
+        # The normalisation must not hide a real difference: the server's
+        # strings with a different `max_age` is drift, not "unchanged".
+        drifted = _server_form(replace(stream_config_for(HOT_IP), max_age=3_600))
+        js = _FakeJetStream({HOT_IP.stream_name: drifted})
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "updated"}
+        assert js.arguments("update_stream") == [stream_config_for(HOT_IP)]
+
+    async def test_a_replica_count_below_the_one_asked_for_is_updated(self) -> None:
+        # "num_replicas 1 (the --replicas flag ...; 3 in a clustered
+        # deployment)": scaling the flag up reconciles the existing stream.
+        js = _FakeJetStream({HOT_IP.stream_name: stream_config_for(HOT_IP, replicas=1)})
+
+        result = await _ensure(js, [HOT_IP], replicas=3)
+
+        assert result == {HOT_IP.stream_name: "updated"}
+        assert js.arguments("update_stream") == [stream_config_for(HOT_IP, replicas=3)]
+
+    async def test_a_second_run_after_the_update_is_unchanged(self) -> None:
+        js = _FakeJetStream({HOT_IP.stream_name: replace(stream_config_for(HOT_IP), max_age=1)})
+        await _ensure(js, [HOT_IP])
+
+        result = await _ensure(js, [HOT_IP])
+
+        assert result == {HOT_IP.stream_name: "unchanged"}
+
+
+class TestAnImmutableDifferenceIsAConflict:
+    """Decision 2: "a difference in an immutable field (`retention`, `storage`) raises
+    `StreamConfigConflictError` and changes nothing"."""
+
+    @pytest.mark.parametrize(
+        ("field", "actual", "expected_plain", "actual_plain"),
+        [
+            pytest.param(
+                "retention",
+                api.RetentionPolicy.WORK_QUEUE,
+                "limits",
+                "workqueue",
+                id="retention-enum",
+            ),
+            pytest.param("retention", "workqueue", "limits", "workqueue", id="retention-string"),
+            pytest.param("storage", api.StorageType.MEMORY, "file", "memory", id="storage-enum"),
+            pytest.param("storage", "memory", "file", "memory", id="storage-string"),
+        ],
+    )
+    async def test_the_conflict_names_the_stream_field_expected_and_actual(
+        self, field: str, actual: object, expected_plain: str, actual_plain: str
+    ) -> None:
+        override: dict[str, Any] = {field: actual}
+        conflicting = replace(stream_config_for(HOT_IP), **override)
+        js = _FakeJetStream({HOT_IP.stream_name: conflicting})
+
+        with pytest.raises(StreamConfigConflictError) as excinfo:
+            await _ensure(js, [HOT_IP])
+
+        error = excinfo.value
+        # ASSUMPTION 2: the four fields of the `stream_conflict` record.
+        assert error.stream == HOT_IP.stream_name
+        assert error.field == field
+        assert _plain(error.expected) == expected_plain
+        assert _plain(error.actual) == actual_plain
+
+    async def test_a_conflict_changes_nothing(self) -> None:
+        # "and changes nothing": no `add_stream`, no `update_stream`, the
+        # server's config as it was.
+        conflicting = replace(stream_config_for(HOT_IP), storage=api.StorageType.MEMORY)
+        js = _FakeJetStream({HOT_IP.stream_name: conflicting})
+
+        with pytest.raises(StreamConfigConflictError):
+            await _ensure(js, [HOT_IP])
+
+        assert js.methods() == ["stream_info"]
+        assert js.existing[HOT_IP.stream_name] is conflicting
+
+    async def test_an_immutable_difference_wins_over_a_mutable_one(self) -> None:
+        # Both kinds differ: the immutable one is a conflict, and the mutable
+        # one is not reconciled on the way to it.
+        conflicting = replace(
+            stream_config_for(HOT_IP), retention=api.RetentionPolicy.WORK_QUEUE, max_age=1
+        )
+        js = _FakeJetStream({HOT_IP.stream_name: conflicting})
+
+        with pytest.raises(StreamConfigConflictError) as excinfo:
+            await _ensure(js, [HOT_IP])
+
+        assert excinfo.value.field == "retention"
+        assert js.arguments("update_stream") == []
+
+    async def test_the_conflict_is_the_exception_the_tool_and_the_bus_export(self) -> None:
+        # Decision 3's block: `class StreamConfigConflictError(Exception)`.
+        assert issubclass(StreamConfigConflictError, Exception)
+
+
+# --------------------------------------------------------------------------
+# inspect every stream first; one entry per spec
+# --------------------------------------------------------------------------
+
+
+class TestEveryStreamIsInspectedBeforeAnyIsChanged:
+    """Decision 2: "It inspects every stream in `specs` before it creates or updates any of
+    them, so a conflict on one stream changes nothing on any other either" (Amendment 1
+    ruling C9)."""
+
+    async def test_a_conflict_on_the_second_stream_leaves_the_first_uncreated(self) -> None:
+        # `[A (missing), B (conflict)]`: both inspected, nothing created, the
+        # error names B.
+        conflicting = replace(stream_config_for(HOT_IP), storage=api.StorageType.MEMORY)
+        js = _FakeJetStream({HOT_IP.stream_name: conflicting})
+
+        with pytest.raises(StreamConfigConflictError) as excinfo:
+            await _ensure(js, [OBSERVATIONS, HOT_IP])
+
+        assert excinfo.value.stream == HOT_IP.stream_name
+        assert js.methods() == ["stream_info", "stream_info"]
+        assert js.arguments("stream_info") == [OBSERVATIONS.stream_name, HOT_IP.stream_name]
+        assert js.arguments("add_stream") == []
+        assert OBSERVATIONS.stream_name not in js.existing
+
+    async def test_a_conflict_on_the_second_stream_leaves_the_first_unupdated(self) -> None:
+        # `[A (drift), B (conflict)]`: A's drift is not reconciled.
+        drifted = replace(stream_config_for(OBSERVATIONS), max_age=1)
+        conflicting = replace(stream_config_for(HOT_IP), retention=api.RetentionPolicy.WORK_QUEUE)
+        js = _FakeJetStream({OBSERVATIONS.stream_name: drifted, HOT_IP.stream_name: conflicting})
+
+        with pytest.raises(StreamConfigConflictError) as excinfo:
+            await _ensure(js, [OBSERVATIONS, HOT_IP])
+
+        assert excinfo.value.stream == HOT_IP.stream_name
+        assert js.arguments("update_stream") == []
+        assert js.existing[OBSERVATIONS.stream_name] is drifted
+
+    async def test_a_conflict_on_the_first_stream_leaves_the_second_uncreated(self) -> None:
+        # `[A (conflict), B (missing)]`: the order of `specs` does not matter --
+        # nothing on any other stream changes.
+        conflicting = replace(stream_config_for(OBSERVATIONS), storage=api.StorageType.MEMORY)
+        js = _FakeJetStream({OBSERVATIONS.stream_name: conflicting})
+
+        with pytest.raises(StreamConfigConflictError) as excinfo:
+            await _ensure(js, [OBSERVATIONS, HOT_IP])
+
+        assert excinfo.value.stream == OBSERVATIONS.stream_name
+        assert js.arguments("add_stream") == []
+        assert HOT_IP.stream_name not in js.existing
+
+    async def test_every_stream_info_precedes_every_create_and_update(self) -> None:
+        # The happy path shows the same phase order: all inspections, then all
+        # changes.
+        drifted = replace(stream_config_for(PREFIX_STATS), duplicate_window=1)
+        js = _FakeJetStream({PREFIX_STATS.stream_name: drifted})
+
+        result = await _ensure(js, [OBSERVATIONS, HOT_IP, PREFIX_STATS])
+
+        assert result == {
+            OBSERVATIONS.stream_name: "created",
+            HOT_IP.stream_name: "created",
+            PREFIX_STATS.stream_name: "updated",
+        }
+        methods = js.methods()
+        last_inspection = max(i for i, method in enumerate(methods) if method == "stream_info")
+        first_change = min(i for i, method in enumerate(methods) if method != "stream_info")
+        assert last_inspection < first_change
+        assert methods.count("stream_info") == 3
+
+
+class TestOneEntryPerSpec:
+    """Decision 2: "the result has one entry per spec"; the tool "runs `ensure_streams`
+    over `all_topics()`"."""
+
+    async def test_all_topics_on_an_empty_server_are_all_created(self) -> None:
+        js = _FakeJetStream()
+        specs = list(all_topics())
+
+        result = await _ensure(js, specs)
+
+        assert result == {spec.stream_name: "created" for spec in specs}
+        assert len(result) == len(specs) == 4
+        assert js.arguments("add_stream") == [stream_config_for(spec) for spec in specs]
+
+    async def test_all_topics_on_a_provisioned_server_are_all_unchanged(self) -> None:
+        specs = list(all_topics())
+        js = _FakeJetStream({spec.stream_name: stream_config_for(spec) for spec in specs})
+
+        result = await _ensure(js, specs)
+
+        assert result == {spec.stream_name: "unchanged" for spec in specs}
+        assert js.methods() == ["stream_info"] * len(specs)
+
+    async def test_a_mixed_server_reports_each_stream_by_its_own_action(self) -> None:
+        # The four topics of decision 1's table, looked up by name (the order
+        # `all_topics()` yields them in is not pinned).
+        reconciliation = TOPICS["hammertime.observations-reconciliation.v1"]
+        js = _FakeJetStream(
+            {
+                reconciliation.stream_name: stream_config_for(reconciliation),
+                HOT_IP.stream_name: replace(stream_config_for(HOT_IP), max_msgs=10),
+                PREFIX_STATS.stream_name: _server_form(stream_config_for(PREFIX_STATS)),
+            }
+        )
+
+        result = await _ensure(js, list(all_topics()))
+
+        assert result == {
+            OBSERVATIONS.stream_name: "created",
+            reconciliation.stream_name: "unchanged",
+            HOT_IP.stream_name: "updated",
+            PREFIX_STATS.stream_name: "unchanged",
+        }
+
+    async def test_specs_may_be_a_one_shot_iterable(self) -> None:
+        # The signature says `Iterable[TopicSpec]`, and inspect-all-then-apply
+        # walks the specs twice, so a generator must still yield one entry per
+        # spec.
+        js = _FakeJetStream()
+        specs = list(all_topics())
+
+        result = await _ensure(js, (spec for spec in specs))
+
+        assert result == {spec.stream_name: "created" for spec in specs}
+
+    async def test_no_specs_is_an_empty_result_and_no_call(self) -> None:
+        js = _FakeJetStream()
+
+        assert await _ensure(js, []) == {}
+        assert js.calls == []
+
+    async def test_the_result_values_are_the_three_action_words(self) -> None:
+        # `dict[str, str]` (stream name -> `"created" | "updated" | "unchanged"`).
+        js = _FakeJetStream(
+            {
+                HOT_IP.stream_name: stream_config_for(HOT_IP),
+                PREFIX_STATS.stream_name: replace(stream_config_for(PREFIX_STATS), max_age=1),
+            }
+        )
+
+        result = await _ensure(js, [OBSERVATIONS, HOT_IP, PREFIX_STATS])
+
+        assert set(result.values()) == {"created", "unchanged", "updated"}

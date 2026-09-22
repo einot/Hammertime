@@ -30,6 +30,7 @@ hammertime-agent-sim = { workspace = true }
 hammertime-agent-token = { workspace = true }
 hammertime-replay = { workspace = true }
 hammertime-trie-inspect = { workspace = true }
+hammertime-provision = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -38,13 +39,14 @@ dev = [
     "hammertime-agent-token",
     "hammertime-replay",
     "hammertime-trie-inspect",
+    "hammertime-provision",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "hypothesis>=6.100",
     "ruff>=0.6",
     "mypy>=1.11",
     "pytest-benchmark>=4",
-    "fakeredis>=2.20",
+    "fakeredis[lua]>=2.20",
     "types-jsonschema>=4.23",
     "httpx>=0.27",
 ]
@@ -71,12 +73,5 @@ mypy_path = [
     "tools/agent-token/src",
     "tools/replay/src",
     "tools/trie-inspect/src",
+    "tools/provision/src",
 ]
-
-[[tool.mypy.overrides]]
-# aiokafka ships no inline types and no third-party stub package; the Kafka
-# transport (packages/hammertime-bus/src/hammertime/bus/kafka.py) needs a
-# live broker to exercise (epic #17), so there is no unit-test pressure to
-# add local stubs either.
-module = "aiokafka.*"
-ignore_missing_imports = true

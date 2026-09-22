@@ -16,6 +16,7 @@ The interface under test is ADR-0011 decision 3:
         WINDOW_TOO_LONG = "window_too_long"
         MALFORMED = "malformed"
         UNCLAIMED = "unclaimed"
+        REDELIVERED = "redelivered"
 
     def classify_observation(
         *, window_start: int, window_seconds: int, now: int, config: DetectionConfig
@@ -33,9 +34,11 @@ and the checks it makes, **in this order**:
 5. otherwise `APPLIED`
 
 `MALFORMED` (a message that fails the codec or ADR-0004's one-IP-per-message
-invariant) and `UNCLAIMED` (a message whose `partition` this member does not
-hold -- ADR-0011 Amendment 5 item A19) are both worker outcomes, and neither
-is ever returned here.
+invariant), `UNCLAIMED` (a message whose `partition` this member does not
+hold -- ADR-0011 Amendment 5 item A19) and `REDELIVERED` (a message whose
+`offset` is below the claim's handled position -- ADR-0013 decision 8, the
+eighth outcome; ADR-0003 Amendment 3 item 1(c)) are all worker outcomes, and
+none of them is ever returned here.
 
 `now` is the service clock at processing time, not the envelope timestamp,
 so every case below is expressed as an age relative to a fixed `NOW`.
@@ -129,18 +132,19 @@ def _classify(
 
 
 class TestObservationOutcomeEnum:
-    """ADR-0011 decision 3, as Amendment 5 item A19 leaves it: seven outcomes,
-    on the wire as strings so that the counted ones can label `late_messages` /
-    `observations_rejected` (section 37). `APPLIED` and `UNCLAIMED` are not
-    labels of either series -- A19 counts an unclaimed message under no series
-    at all, and leaves `observations_rejected{reason}` at `window_too_long |
-    malformed`."""
+    """ADR-0011 decision 3, as Amendment 5 item A19 and ADR-0013 decision 8
+    leave it: eight outcomes, on the wire as strings so that the counted ones
+    can label `late_messages` / `observations_rejected` (section 37).
+    `APPLIED`, `UNCLAIMED` and `REDELIVERED` are not labels of either series
+    -- A19 counts an unclaimed message under no series at all, ADR-0013
+    assumption 21 says the same of a redelivered one, and
+    `observations_rejected{reason}` stays at `window_too_long | malformed`."""
 
     def test_it_is_a_str_enum(self) -> None:
         assert issubclass(ObservationOutcome, StrEnum)
         assert isinstance(ObservationOutcome.APPLIED, str)
 
-    def test_it_has_exactly_the_seven_documented_members(self) -> None:
+    def test_it_has_exactly_the_eight_documented_members(self) -> None:
         assert {member.name: member.value for member in ObservationOutcome} == {
             "APPLIED": "applied",
             "LATE": "late",
@@ -149,6 +153,7 @@ class TestObservationOutcomeEnum:
             "WINDOW_TOO_LONG": "window_too_long",
             "MALFORMED": "malformed",
             "UNCLAIMED": "unclaimed",
+            "REDELIVERED": "redelivered",
         }
 
     def test_the_metric_labels_are_the_member_values(self) -> None:
@@ -327,15 +332,18 @@ def test_the_check_order_holds_for_every_input(
 def test_the_worker_outcomes_are_never_returned(
     age: int, window_seconds: int, config: DetectionConfig
 ) -> None:
-    """`MALFORMED` (a message that fails the codec or ADR-0004's invariant) and
+    """`MALFORMED` (a message that fails the codec or ADR-0004's invariant),
     `UNCLAIMED` (a message on a partition this member does not hold, Amendment
-    5 item A19) are worker outcomes; the classifier cannot produce either."""
+    5 item A19) and `REDELIVERED` (a message below the handled position,
+    ADR-0013 decision 8) are worker outcomes; the classifier cannot produce
+    any of them."""
 
     outcome = classify_observation(
         window_start=NOW - age, window_seconds=window_seconds, now=NOW, config=config
     )
     assert outcome is not ObservationOutcome.MALFORMED
     assert outcome is not ObservationOutcome.UNCLAIMED
+    assert outcome is not ObservationOutcome.REDELIVERED
     assert outcome in (
         ObservationOutcome.APPLIED,
         ObservationOutcome.LATE,

@@ -1,14 +1,16 @@
-"""Store protocols: window counters, IP state, dedup high-water marks.
+"""Store protocols: window counters, IP state, dedup high-water marks, shard leases.
 
 Spec: section 20, section 23, section 26, section 32
 
 Two protocols so far. `DedupStore` (spec section 23, ADR-0003) is ingest's
 per-agent duplicate detection. `ShardStateStore` (spec section 20, section
 26, section 32; ADR-0011 decision 5) is the aggregator's durable per-shard
-HOT set and transition sequence counter. Sliding-window *counters* (spec
-section 26) remain in-memory only and have no protocol here: ADR-0011
-decision 5 keeps only the HOT set beyond a process, because window buckets
-self-heal within one `window_seconds` of a claim.
+HOT set and transition sequence counter, plus -- since ADR-0013 decision 7
+-- the per-shard lease by which two statically configured members that
+both claim a shard are detected and refused. Sliding-window *counters*
+(spec section 26) remain in-memory only and have no protocol here:
+ADR-0011 decision 5 keeps only the HOT set beyond a process, because
+window buckets self-heal within one `window_seconds` of a claim.
 
 Both mirror `hammertime.bus.interface`'s `Producer`/`Consumer` convention:
 `@runtime_checkable` async `Protocol`s so `memory.py` (in-process) and
@@ -174,5 +176,30 @@ class ShardStateStore(Protocol):
         abort the publish, because the opposite order can leave the trie
         holding an IP no owner knows about -- the permanent leak this store
         exists to close.
+        """
+        ...
+
+    async def acquire_lease(self, shard: int, owner: str, ttl_seconds: float) -> str | None:
+        """Take or renew shard's lease for owner. Returns None on success; otherwise the id of the
+        member that holds it. Atomic: a lease is granted iff no live lease exists or the live
+        lease is owner's own, in which case its expiry becomes now + ttl_seconds.
+
+        ADR-0013 decision 7: the lease is a *detection* mechanism for two
+        live members configured with overlapping static shard sets (#90),
+        not an assignment protocol -- it assigns nothing. It lives in this
+        store because every aggregator already has it and it is reachable
+        by every member; the lease key is separate from the HOT set, so
+        `record_transition`'s atomicity (ADR-0011 A2) is untouched. A
+        member acquires each shard's lease before loading it, renews every
+        maintenance interval, and treats a refusal as fatal.
+        """
+        ...
+
+    async def release_lease(self, shard: int, owner: str) -> None:
+        """Drop shard's lease iff owner holds it; a no-op otherwise.
+
+        Never raises for an unheld lease. A clean stop releases so the
+        shard's next owner can take it at once; a crashed member's lease
+        simply expires after its TTL.
         """
         ...

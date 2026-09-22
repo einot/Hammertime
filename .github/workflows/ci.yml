@@ -33,7 +33,7 @@ jobs:
       # Part of the merge bar in CLAUDE.md but previously not run by CI, so
       # a formatting regression could reach a branch with CI still green.
       - run: uv run ruff format --check .
-      - run: uv run mypy packages services
+      - run: uv run mypy packages services tools
       - run: uv run pytest -q
       # Tripwire for #52. The integration job below is disabled because
       # tests/integration and tests/e2e contain no collectable tests, so

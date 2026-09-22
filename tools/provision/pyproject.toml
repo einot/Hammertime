@@ -1,15 +1,12 @@
 [project]
-name = "hammertime-bus"
+name = "hammertime-provision"
 version = "0.1.0"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = [
-    "hammertime-core",
-    "nats-py>=2.16,<3",
-]
+dependencies = ["hammertime-core", "hammertime-bus"]
 
 [project.scripts]
-
+hammertime-provision = "hammertime.tools.provision.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

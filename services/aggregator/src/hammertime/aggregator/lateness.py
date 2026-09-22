@@ -41,6 +41,12 @@ class ObservationOutcome(StrEnum):
     #: A worker outcome for a message whose partition is not a shard this
     #: member holds (item A19); never returned by `classify_observation`.
     UNCLAIMED = "unclaimed"
+    #: A worker outcome for a message whose offset is below the claim's
+    #: handled position -- the log redelivering a delivered, unacknowledged
+    #: message after `ack_wait` (ADR-0013 decision 8; ADR-0003 Amendment 3
+    #: item 1(c)); acknowledged, never applied, never counted, and never
+    #: returned by `classify_observation`.
+    REDELIVERED = "redelivered"
 
 
 def classify_observation(

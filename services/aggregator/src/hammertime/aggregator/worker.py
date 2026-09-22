@@ -2,29 +2,29 @@
 
 Spec: section 19, section 20, section 24, section 30, section 37, section 39
 
-ADR-0011 decision 3 as amended by Amendment 5 item A19 and Amendment 6 item
-A20 (one observation, one of seven outcomes; everything the hot path cannot
-use goes to reconciliation, and a message is `UNCLAIMED` when this member
-does not hold its partition or holds it under a claim other than the one the
-message was fetched under), decision 6 as amended by A20 (maintenance order,
-commit cadence, shutdown; every commit names the handled position) and
+ADR-0011 decision 3 as amended by Amendment 5 item A19 and ADR-0013 decision
+8 (one observation, one of eight outcomes; everything the hot path cannot
+use goes to reconciliation, a message is `UNCLAIMED` when this member holds
+no window for its partition, and `REDELIVERED` when its offset is below the
+claim's handled position), decision 6 as ADR-0013 reworks it (maintenance
+order with the lease renewal first, acknowledgement cadence, shutdown) and
 decision 7 as amended by Amendment 3 item A12 (`apply_config` is
 unconditional; the version gate is `ConfigPoller.poll_once()`'s alone).
 
 One `asyncio.Lock` serialises everything that touches a `ShardWindow`:
 message handling, the maintenance sweep, the configuration pass, and the
-assignment callbacks. That is what makes ADR-0009's rule -- a new
+assignment callback. That is what makes ADR-0009's rule -- a new
 `config_version` is visible in emitted events only after the re-evaluation it
-triggered -- hold without qualification, and what keeps a rebalance from
-landing in the middle of a message.
+triggered -- hold without qualification.
 
 Consumption is at-least-once (ADR-0003). The counters are process-local, so a
 redelivery after a crash rebuilds counters that died with the process rather
 than double-counting them, and a redelivery after a handover lands in a
-window that never held the first copy -- including a handover back to this
-same member, because the copy fetched under the old claim is `UNCLAIMED`
-rather than applied to the new window (A20). The only state that survives is
-the HOT set, which is idempotent under redelivery.
+window that never held the first copy. A redelivery *within* a live claim --
+the log handing out a delivered, unacknowledged message again after
+`ack_wait` -- is recognised by its offset and acknowledged without being
+applied (ADR-0003 Amendment 3 item 1(c)). The only state that survives a
+process is the HOT set, which is idempotent under redelivery.
 """
 
 import asyncio
@@ -33,7 +33,7 @@ import logging
 import math
 import time
 from collections.abc import AsyncIterator, Callable
-from typing import Any, NamedTuple, Protocol
+from typing import Any
 
 from hammertime.aggregator.lateness import ObservationOutcome, classify_observation
 from hammertime.aggregator.metrics import AggregatorMetrics
@@ -41,7 +41,7 @@ from hammertime.aggregator.reevaluate import DEFAULT_BATCH_SIZE, reevaluate_shar
 from hammertime.aggregator.sharding.assignment import DEFAULT_MAX_TRACKED_IPS, ShardClaims
 from hammertime.aggregator.transitions import TransitionEmitter
 from hammertime.aggregator.window.store import ShardWindow
-from hammertime.bus.interface import ConsumedMessage, Consumer, Producer
+from hammertime.bus.interface import ConsumedMessage, MessageBus
 from hammertime.bus.topics import OBSERVATIONS, OBSERVATIONS_RECONCILIATION
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.errors import CodecError
@@ -63,6 +63,11 @@ CONSUMER_GROUP = "hammertime-aggregator"
 #: clock even when the service clock is a `ManualClock`.
 DEFAULT_COMMIT_INTERVAL_S = 1.0
 
+#: ADR-0013 decision 8's defaults for the lease keywords, so every existing
+#: construction stays valid; `build_service` passes the settings' values.
+DEFAULT_MEMBER_ID = "aggregator"
+DEFAULT_LEASE_TTL_S = 30.0
+
 #: `late_messages` takes these three; `observations_rejected` the other two.
 _LATE_OUTCOMES = frozenset(
     {
@@ -71,31 +76,6 @@ _LATE_OUTCOMES = frozenset(
         ObservationOutcome.EXPIRED_BUCKET,
     }
 )
-
-
-class _Fetched(NamedTuple):
-    """A fetched message and the claim it was fetched under (item A20).
-
-    The window is read in the same event-loop step in which the fetch
-    completed, so it is the `ShardWindow` the bus advanced the consumed
-    position under. `None` means the partition was already unclaimed then.
-    """
-
-    message: ConsumedMessage
-    window: ShardWindow | None
-
-
-class MessageBus(Protocol):
-    """What the worker needs from a bus: one producer and one group consumer.
-
-    `InMemoryBus` satisfies it directly; `service.py` adapts the Kafka
-    producer/consumer pair to it, so the object graph is identical either
-    way (ADR-0009 decision 3).
-    """
-
-    def producer(self) -> Producer: ...
-
-    def consumer(self, group_id: str) -> Consumer: ...
 
 
 class AggregatorWorker:
@@ -113,6 +93,8 @@ class AggregatorWorker:
         max_tracked_ips: int = DEFAULT_MAX_TRACKED_IPS,
         commit_interval_s: float = DEFAULT_COMMIT_INTERVAL_S,
         reevaluation_batch: int = DEFAULT_BATCH_SIZE,
+        member_id: str = DEFAULT_MEMBER_ID,
+        lease_ttl_s: float = DEFAULT_LEASE_TTL_S,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._clock = clock
@@ -130,16 +112,21 @@ class AggregatorWorker:
             consumer=self._consumer,
             clock=clock,
             config=config,
+            member_id=member_id,
+            lease_ttl_s=lease_ttl_s,
             max_tracked_ips=max_tracked_ips,
         )
         self._emitter = TransitionEmitter(
             producer=self._producer, state_store=state_store, clock=clock, metrics=metrics
         )
         # Item A13: the derived series are computed on read from the windows
-        # claimed at that moment, so a revoked shard's series vanish with it.
+        # claimed at that moment.
         metrics.bind_windows(self._claims.windows)
         self._lock = asyncio.Lock()
         self._stopping = asyncio.Event()
+        # `stop()` runs its sequence once; a later call takes the lock and
+        # returns (ADR-0013 decision 8 as amended by Amendment 4 ruling R4).
+        self._stopped = False
         self._stream: AsyncIterator[ConsumedMessage] | None = None
         self._last_commit = monotonic()
 
@@ -164,11 +151,16 @@ class AggregatorWorker:
     # --- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        """Subscribe and hold the initial shard claims (section 47.2 readiness).
+        """Subscribe and hold the shard claims and leases (section 47.2 readiness).
 
         `subscribe()` does not return until `on_assigned` has been awaited
-        with the initial assignment (ADR-0011 decision 1), so a caller that
-        has finished `start()` is holding its claims.
+        with the static set (ADR-0013 decision 3), so a caller that has
+        finished `start()` is holding its claims and their leases. A shard
+        another member holds is `ShardOwnedElsewhereError` out of here
+        (decision 7). `shard_ids=None` is passed through as `partitions=None`
+        -- every partition as the bus defines it, `{0}` on `InMemoryBus` --
+        which is the in-process test shape, never a production one (decision
+        6): `build_service` always passes the settings' explicit set.
         """
         if self._stream is not None:
             return
@@ -177,7 +169,20 @@ class AggregatorWorker:
         )
 
     async def run(self) -> None:
-        """Consume until `stop()`; the in-flight message is always finished."""
+        """Consume until `stop()`; the in-flight message is always finished.
+
+        On a wake-up in which the stop signal and a received message are
+        both complete, the message is not handed to `handle()`: it was
+        yielded, so the consumer's `close()` hands it to the next member
+        (ADR-0013 decision 8 as amended by Amendment 4 ruling R2, assumption
+        82). Handling it here would put it after the final commit.
+
+        That skip drops the *message* only. A receive that completed with an
+        *exception* in the same wake-up is re-raised as itself (Amendment 5
+        ruling 2; assumption 82 as narrowed): a message is redelivered, an
+        error is not, so swallowing it would let `run_exited` report a clean
+        stop for a process that lost its transport.
+        """
         stream = self._stream
         if stream is None:
             raise RuntimeError("start() must run before run()")
@@ -188,27 +193,64 @@ class AggregatorWorker:
                 done, _pending = await asyncio.wait(
                     {receive_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
                 )
-                if receive_task not in done:
-                    await _cancel(receive_task)
+                if stop_task in done:
+                    if not receive_task.done():
+                        await _cancel(receive_task)
+                    else:
+                        # Completed in the same wake-up: its message is
+                        # dropped (close() hands it to the next member), but
+                        # an exception is re-raised -- nothing redelivers an
+                        # error (Amendment 5 ruling 2). Reading it also marks
+                        # the outcome retrieved, so asyncio reports no
+                        # unretrieved exception at teardown.
+                        exc = receive_task.exception()
+                        if exc is not None:
+                            raise exc
                     return
-                fetched = receive_task.result()
-                if fetched is None:
+                message = receive_task.result()
+                if message is None:
                     return
-                await self._handle_fetched(fetched)
+                await self.handle(message)
                 await self._commit_if_due()
         finally:
             await _cancel(stop_task)
 
     async def stop(self) -> None:
-        """Stop fetching, finish the in-flight message, flush and commit.
+        """Stop fetching, finish the message in hand, `commit_handled()`, `release()`.
 
-        ADR-0009 decision 7 and ADR-0011 decision 6: always flush before
-        committing, so a committed position never precedes the transitions it
-        produced. Idempotent, and safe before `start()`.
+        ADR-0013 decision 8: the final flush-and-ack covers exactly what
+        `handle()` finished, and the lease release right after it is what
+        lets the next owner take the shards at once (decision 7). The
+        consumer is *not* closed here: closing is the service's step after
+        `stop()` returns, so the final acknowledgement goes out on a live
+        consumer and the `nak` of whatever was fetched but never yielded
+        follows it.
+
+        `stop()`'s order is total (Amendment 4 rulings R2 and R4): from the
+        moment the stop flag is set, every path that could act on a shard --
+        `handle()`, `run_maintenance()`, `apply_config()`, the periodic
+        commit -- checks it under the lock and stands down, so the
+        `commit_handled()` here is the last acknowledgement this worker
+        sends. The message in hand (a `_handle` holding the lock when the
+        flag is set) is finished and covered by it; one merely waiting for
+        the lock is not in hand and takes the `UNCLAIMED` path. The sequence
+        runs once, with `release()` in a `finally` so the leases are freed
+        even when the final acknowledgement fails (the exception propagates
+        after the release); a later call -- the runner's `_stop_quietly`
+        after a crash exit, by which time the bus is closed and `ack(())`
+        would raise -- takes the lock and returns without touching the bus
+        or the store. That is what "idempotent" means for it. Safe before
+        `start()`.
         """
         self._stopping.set()
         async with self._lock:
-            await self._flush_and_commit()
+            if self._stopped:
+                return
+            try:
+                await self._flush_and_ack()
+            finally:
+                self._stopped = True
+                await self._claims.release()
 
     # --- AssignmentListener (delegated to ShardClaims under the lock) ---------
 
@@ -216,28 +258,46 @@ class AggregatorWorker:
         async with self._lock:
             await self._claims.on_assigned(partitions)
 
-    async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None:
-        async with self._lock:
-            await self._claims.on_revoked(partitions)
-
     # --- the three coroutines the periodic loops and the tests share ---------
 
     async def handle(self, message: ConsumedMessage) -> ObservationOutcome:
-        """Apply one consumed message; decision 3's seven outcomes.
+        """Apply one consumed message; decision 3's outcomes, plus `REDELIVERED`.
 
-        A message passed in directly was not fetched by the consume loop, so
-        it is judged against the current claim alone (item A20).
+        After `stop()` has begun the outcome is `UNCLAIMED` whatever the
+        partition (ADR-0013 decision 8 as amended by Amendment 4 ruling R2):
+        the member holds no lease, so every partition is one it must not act
+        on. Not decoded, not applied, not emitted, not marked handled -- the
+        message stays unacknowledged and `close()` hands it to the next
+        member.
         """
         async with self._lock:
-            return await self._handle(message, self._claims.window(message.partition))
+            if self._stopping.is_set():
+                logger.warning(
+                    "unclaimed_partition topic=%s partition=%d offset=%d",
+                    message.topic,
+                    message.partition,
+                    message.offset,
+                )
+                return ObservationOutcome.UNCLAIMED
+            return await self._handle(message)
 
     async def run_maintenance(self) -> None:
-        """One expiry sweep, warm-up end and retention pass per claimed shard.
+        """Renew the leases, then one expiry sweep, warm-up end and retention pass per shard.
 
-        Decision 6's order is normative: expiring before evaluating is what
-        turns an expired count into a `HotIpRemoved` in the same sweep.
+        ADR-0013 decision 7 puts the renewal first, so a member that has lost
+        a shard emits nothing more for it (`ShardLeaseLostError` propagates
+        and the sweep never runs). Decision 6's order after that is
+        normative: expiring before evaluating is what turns an expired count
+        into a `HotIpRemoved` in the same sweep.
+
+        After `stop()` has begun this renews nothing and sweeps nothing: it
+        returns without touching the store, the windows or the producer
+        (Amendment 3 ruling (c); Amendment 4 ruling R2).
         """
         async with self._lock:
+            if self._stopping.is_set():
+                return
+            await self._claims.renew_leases()
             for window in self._claims.windows():
                 for change in window.expire_due():
                     if change.state is IpState.HOT:
@@ -267,8 +327,14 @@ class AggregatorWorker:
 
         Under the lock, so no observation is processed mid-pass and no event
         can carry the new version before the pass (spec section 47.3).
+
+        After `stop()` has begun it is a total no-op: the worker's `config`
+        is left as it was and no `config_reevaluated` is logged (Amendment 4
+        ruling R2, assumption 63).
         """
         async with self._lock:
+            if self._stopping.is_set():
+                return
             windows = self._claims.windows()
             for window in windows:
                 window.apply_config(config)
@@ -287,52 +353,24 @@ class AggregatorWorker:
 
     # --- internals -----------------------------------------------------------
 
-    async def _receive(self, stream: AsyncIterator[ConsumedMessage]) -> _Fetched | None:
-        """The next message and the claim it was fetched under; None at the end.
-
-        Item A20: the window is read in the *same event-loop step* in which
-        `anext` returned -- there must never be an `await` between the two
-        lines below. That step is the one in which the bus advanced the
-        consumed position past this message, so the window read here is
-        exactly the claim the message was fetched under; nothing, not a
-        rebalance callback and not the worker lock, can run in between and
-        make the reading stale. `_handle` then compares that object by
-        identity with the claim in force when it runs.
-        """
+    async def _receive(self, stream: AsyncIterator[ConsumedMessage]) -> ConsumedMessage | None:
+        """The next message; None once the subscription has ended."""
         try:
-            message = await anext(stream)
+            return await anext(stream)
         except StopAsyncIteration:
             return None
-        return _Fetched(message, self._claims.window(message.partition))
 
-    async def _handle_fetched(self, fetched: _Fetched) -> ObservationOutcome:
-        """`handle()` for a message the consume loop fetched (item A20)."""
-        async with self._lock:
-            return await self._handle(fetched.message, fetched.window)
-
-    async def _handle(
-        self, message: ConsumedMessage, fetched_under: ShardWindow | None
-    ) -> ObservationOutcome:
+    async def _handle(self, message: ConsumedMessage) -> ObservationOutcome:
         window = self._claims.window(message.partition)
-        if window is None or window is not fetched_under:
+        if window is None:
             # Decision 1: an IP's shard is its message's partition, so a
-            # message for a partition this member does not hold has nothing
-            # to be applied to. Item A19: the outcome is `UNCLAIMED` --
-            # reachable in normal operation, because a rebalance can revoke a
-            # partition between a message being fetched and being handled --
-            # and the message is logged and skipped, deliberately counted
-            # under no series, not decoded and not diverted. It belongs to
-            # whichever member holds the partition, not to this one.
-            #
-            # Item A20: the same holds when the partition is held again under
-            # a *different* claim. aiokafka's eager protocol revokes and
-            # reassigns every partition on every rebalance, so the common case
-            # is a handover back to this member with a fresh `ShardWindow`;
-            # applying the in-hand message to that window would double-count
-            # it, because the committed handled position precedes it and the
-            # broker redelivers it there. A re-claim always builds a new
-            # window (decision 5), so object identity is claim identity. The
-            # handled position is not advanced either way.
+            # message for a partition this member holds no window for has
+            # nothing to be applied to. Item A19: the outcome is `UNCLAIMED`
+            # -- reachable only through a direct `handle()` call under static
+            # assignment (ADR-0013 decision 8) -- and the message is logged
+            # and skipped, deliberately counted under no series, not decoded,
+            # not diverted and not marked handled: it belongs to whichever
+            # member holds the partition, not to this one.
             logger.warning(
                 "unclaimed_partition topic=%s partition=%d offset=%d",
                 message.topic,
@@ -341,11 +379,31 @@ class AggregatorWorker:
             )
             return ObservationOutcome.UNCLAIMED
 
+        position = self._claims.handled_position(message.partition)
+        if position is not None and message.offset < position:
+            # ADR-0013 decision 8 / ADR-0003 Amendment 3 item 1(c): delivery
+            # within a partition is in stream-sequence order, so a copy at
+            # or below the last handled offset is the log redelivering a
+            # delivered, unacknowledged message after `ack_wait`. It is
+            # marked handled so the copy is acknowledged at the next commit
+            # (the position, already past it, is unchanged) and otherwise
+            # untouched: not decoded, not classified, not diverted, not
+            # counted, the store untouched.
+            logger.warning(
+                "redelivered_observation topic=%s partition=%d offset=%d delivery_count=%d",
+                message.topic,
+                message.partition,
+                message.offset,
+                message.delivery_count,
+            )
+            self._claims.mark_handled(message)
+            return ObservationOutcome.REDELIVERED
+
         decoded = self._decode(message)
         if decoded is None:
             self._claims.mark_handled(message)
             return ObservationOutcome.MALFORMED
-        payload, entry = decoded
+        event_id, payload, entry = decoded
 
         # Item A9: the codec admits sub-second precision, which no
         # `bucket_seconds >= 1` can distinguish; the floor is what
@@ -358,7 +416,7 @@ class AggregatorWorker:
             config=self._config,
         )
         if outcome is not ObservationOutcome.APPLIED:
-            await self._divert(message, entry_ip=str(entry.ip), outcome=outcome)
+            await self._divert(message, entry_ip=str(entry.ip), event_id=event_id, outcome=outcome)
             self._claims.mark_handled(message)
             return outcome
 
@@ -375,8 +433,13 @@ class AggregatorWorker:
         self._claims.mark_handled(message)
         return ObservationOutcome.APPLIED
 
-    def _decode(self, message: ConsumedMessage) -> tuple[RequestObservation, Observation] | None:
+    def _decode(
+        self, message: ConsumedMessage
+    ) -> tuple[str, RequestObservation, Observation] | None:
         """Decode and check ADR-0004's producer invariant; None is `MALFORMED`.
+
+        Returns the envelope's `event_id` alongside the payload and its one
+        entry: a divert republishes under that id (ADR-0013 decision 4).
 
         Assumption 10: a message that fails the codec or the invariant cannot
         be trusted to name the IP it is keyed by, so it is dropped rather
@@ -406,7 +469,7 @@ class AggregatorWorker:
         if message.key != ip_text.encode("utf-8"):
             self._malformed(message, "message key does not name the entry's IP")
             return None
-        return payload, entry
+        return envelope.event_id, payload, entry
 
     def _malformed(self, message: ConsumedMessage, reason: str) -> None:
         logger.warning(
@@ -419,16 +482,26 @@ class AggregatorWorker:
         self._metrics.increment("observations_rejected", reason=ObservationOutcome.MALFORMED.value)
 
     async def _divert(
-        self, message: ConsumedMessage, *, entry_ip: str, outcome: ObservationOutcome
+        self,
+        message: ConsumedMessage,
+        *,
+        entry_ip: str,
+        event_id: str,
+        outcome: ObservationOutcome,
     ) -> None:
         """Republish the consumed bytes unchanged, under the same key (decision 3).
 
         The window store is not touched. Keeping the bytes -- and therefore
         the `event_id` -- lets a reconciliation consumer dedupe against the
-        hot path (assumption 9).
+        hot path (assumption 9); passing that `event_id` as the `message_id`
+        lets the log itself drop a second divert of the same observation
+        inside its duplicate window (ADR-0013 decision 4).
         """
         await self._producer.publish(
-            OBSERVATIONS_RECONCILIATION.name, key=entry_ip, value=message.value
+            OBSERVATIONS_RECONCILIATION.name,
+            key=entry_ip,
+            value=message.value,
+            message_id=event_id,
         )
         if outcome in _LATE_OUTCOMES:
             self._metrics.increment("late_messages", reason=outcome.value)
@@ -440,14 +513,18 @@ class AggregatorWorker:
         if now - self._last_commit < self._commit_interval_s:
             return
         async with self._lock:
-            await self._flush_and_commit()
+            if self._stopping.is_set():
+                # The commit inside `stop()` is the last acknowledgement
+                # this worker sends (Amendment 4 ruling R2, assumption 66).
+                return
+            await self._flush_and_ack()
 
-    async def _flush_and_commit(self) -> None:
-        """Flush, then commit every held partition's handled position (A20).
+    async def _flush_and_ack(self) -> None:
+        """Flush, then acknowledge every handled message (ADR-0013 decision 8).
 
-        `ShardClaims.commit_handled` is the only commit path: the periodic
-        commit and `stop()` arrive here, `on_revoked` calls it directly, so a
-        message in hand at a commit is never covered by it.
+        `ShardClaims.commit_handled` is the only acknowledgement path: the
+        periodic commit and `stop()` arrive here, so a message in hand at a
+        commit is never covered by it.
         """
         await self._claims.commit_handled()
         self._last_commit = self._monotonic()

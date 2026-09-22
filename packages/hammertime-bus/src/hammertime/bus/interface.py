@@ -1,49 +1,72 @@
-"""Producer/Consumer protocols: publish, subscribe, seek(sequence), commit.
+"""Producer/Consumer protocols: publish with dedup, subscribe, ack, close.
 
-Spec: section 19, section 32
+Spec: section 19, section 32, section 33
 
 These `Protocol`s are the boundary between the event-driven pipeline (spec
 section 19) and whatever durable log backs it. `memory.py` implements them
-in-process for tests; `kafka.py` implements them against a real broker. Both
-implementations MUST be interchangeable behind this interface -- code that
-depends only on `Producer`/`Consumer` should not care which one it got.
+in-process for tests; `nats.py` implements them against NATS JetStream
+(ADR-0013). Both implementations MUST be interchangeable behind this
+interface -- code that depends only on `Producer`/`Consumer` should not care
+which one it got.
+
+ADR-0013 decision 3 is the authority for this module. What it settled, and
+why the shape is what it is: the log has no offset-commit API -- progress is
+a per-message acknowledgement, so `Consumer.commit(offsets)` became
+`Consumer.ack(messages)`; a consumer's read position is fixed at creation,
+so `Consumer.seek` became the `start_offset` argument of `subscribe()`;
+nothing ever moves a partition between static members, so
+`AssignmentListener.on_revoked` is gone; and the log deduplicates by a
+client-supplied id inside a window, so `publish()` takes `message_id`.
 """
 
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
 class ConsumedMessage:
-    """One message read off the bus, with enough position info to seek/commit."""
+    """One message read off the bus, with enough position info to ack and replay.
+
+    It carries no acknowledgement handle: each `Consumer` implementation
+    retains whatever it needs to acknowledge a delivered message, keyed by
+    `(topic, partition, offset)`, keeping the most recent delivery when the
+    log redelivers (ADR-0013 decision 3).
+    """
 
     topic: str
+    #: The integer suffix of the subject the message is stored under
+    #: (ADR-0013 decision 1: partition `p` of topic `T` is subject `T.<p>`).
     partition: int
+    #: The stream sequence: unique and strictly increasing across the whole
+    #: topic, not contiguous per partition. On `InMemoryBus` it is the log
+    #: index.
     offset: int
     key: bytes | None
     value: bytes
+    #: JetStream `num_delivered`; always 1 on `InMemoryBus`. Greater than 1
+    #: means the log redelivered this message after `ack_wait` (ADR-0013
+    #: decision 5), which a consumer that keeps a handled position detects
+    #: as `offset <= <last handled offset>`.
+    delivery_count: int = 1
 
 
 @runtime_checkable
 class AssignmentListener(Protocol):
-    """Told which `(topic, partition)` pairs this consumer owns, and when.
+    """Told which `(topic, partition)` pairs this consumer owns.
 
     A partition of `hammertime.observations.v1` *is* a shard (spec section
-    20: `hash(IP) -> shard`, one owner per IP), so the consumer group's
-    assignment is the set of shard claims this member holds (ADR-0011
-    decision 1). Consumers never compute an IP hash of their own -- they
-    learn an IP's shard from `ConsumedMessage.partition` and learn which
-    shards are theirs from here.
+    20: `hash(IP) -> shard`, one owner per IP), so the set handed here is the
+    set of shard claims this member holds (ADR-0011 decision 1, as ADR-0013
+    reworked it for static assignment). Consumers never compute an IP hash
+    of their own -- they learn an IP's shard from `ConsumedMessage.partition`
+    and learn which shards are theirs from here.
 
-    Every rebalance calls `on_revoked` (before the partitions move) and then
-    `on_assigned` (after). Both are coroutines, so a listener may flush or
-    load durable per-shard state before the claim changes hands.
+    `on_assigned` is awaited exactly once, from inside `subscribe()`, before
+    it returns; there is no revocation (ADR-0013 decision 8): the way a
+    shard changes hands is a `close()` on one member and a `subscribe()` on
+    another.
     """
-
-    async def on_revoked(self, partitions: frozenset[tuple[str, int]]) -> None:
-        """Give up `partitions`; called before the broker moves them away."""
-        ...
 
     async def on_assigned(self, partitions: frozenset[tuple[str, int]]) -> None:
         """Take ownership of `partitions`; called once they are held."""
@@ -59,12 +82,30 @@ class Producer(Protocol):
     `topics.TOPICS[topic].key_selector(event)`, not raw domain objects.
     """
 
-    async def publish(self, topic: str, key: bytes | str, value: bytes) -> None:
-        """Append `value` to `topic`, routed to a partition derived from `key`."""
+    async def publish(
+        self, topic: str, key: bytes | str, value: bytes, *, message_id: str | None = None
+    ) -> None:
+        """Append `value` to `topic`, routed to `partition_for(key, <partitions>)`.
+
+        Returns only once the log has durably acknowledged the append: a
+        returned `publish` is a flushed publish (ADR-0011 decision 4 step 4,
+        ADR-0009 A11). With `message_id`, the log deduplicates: a second
+        publish to the same topic carrying an id the log has seen inside its
+        duplicate window is acknowledged and NOT appended, and this returns
+        normally. With `message_id=None` no deduplication is attempted. A
+        `str` key is encoded as UTF-8 before hashing and before it becomes
+        the message key. An unregistered topic is a `KeyError` from
+        `NatsProducer`; `MemoryProducer` creates topics on demand.
+        """
         ...
 
     async def flush(self) -> None:
-        """Wait until every message published so far is durably acknowledged."""
+        """Return once every `publish` that has returned has been acknowledged.
+
+        A no-op in both implementations (`publish` already awaits the
+        acknowledgement); retained because ADR-0009 decision 7's
+        flush-before-ack rule is stated against the interface (ADR-0009 A11).
+        """
         ...
 
 
@@ -74,11 +115,10 @@ def static_partitions(topic: str, partitions: Iterable[int]) -> frozenset[int]:
     Every `Consumer` implementation runs this before it touches a broker or
     calls an `AssignmentListener`, so `subscribe(topic, partitions=<empty>)`
     is refused identically on every transport (ADR-0011 amendment 1, item
-    A3). A static set is written configuration that no rebalance will ever
-    change, so an empty one is a permanently idle worker reporting itself
-    healthy -- far more likely a templating accident than an intent. Runtime
-    emptiness under group management (`partitions=None`, broker assigns
-    nothing) stays legal, because a later rebalance can still fill it.
+    A3; unchanged by ADR-0013). A static set is written configuration, so
+    an empty one is a permanently idle worker reporting itself healthy --
+    far more likely a templating accident than an intent. `partitions=None`
+    is the only way of saying "every partition of the topic".
 
     Returns the requested partitions, so a caller may pass a one-shot
     iterable without the set being consumed twice.
@@ -87,7 +127,7 @@ def static_partitions(topic: str, partitions: Iterable[int]) -> frozenset[int]:
     if not requested:
         raise ValueError(
             f"static partition set for {topic!r} is empty; pass partitions=None "
-            f"for group-managed assignment"
+            f"for every partition of the topic"
         )
     return requested
 
@@ -96,13 +136,12 @@ def static_partitions(topic: str, partitions: Iterable[int]) -> frozenset[int]:
 class Consumer(Protocol):
     """Reads messages from a topic as one member of a named consumer group.
 
-    A consumer group's read position is independent of every other group's
-    reading the same topic. `commit()` persists that position so that a new
-    `Consumer` constructed later for the same group resumes from the
-    committed position rather than the start of the log (spec section 23,
-    ADR-0003: aggregator consumers are at-least-once and must not re-apply
-    counters on redelivery, which depends on committed offsets being
-    meaningful across process restarts).
+    A group's read position is independent of every other group's reading
+    the same topic, is kept by the log under the group name, and is advanced
+    only by `ack()` -- the only "commit" there is (spec section 23, ADR-0003:
+    aggregator consumers are at-least-once and must not re-apply counters on
+    redelivery, which depends on acknowledged positions being meaningful
+    across process restarts).
     """
 
     async def subscribe(
@@ -111,56 +150,125 @@ class Consumer(Protocol):
         *,
         partitions: Iterable[int] | None = None,
         listener: AssignmentListener | None = None,
+        start_offset: int | None = None,
     ) -> AsyncIterator[ConsumedMessage]:
-        """Yield messages from `topic`, starting after this group's committed position.
+        """Claim partitions of `topic`, tell `listener`, then yield messages.
 
-        `partitions=None` is group-managed assignment: the broker decides
-        which partitions this member owns and may move them at any time --
-        including assigning none, which is a legal state a later rebalance
-        may change. Passing `partitions` is static assignment -- this member
-        owns exactly those partitions of `topic` and no group coordination
-        takes place, though offsets are still committed under the group name.
-        An empty static set is a `ValueError`, raised before any broker is
-        contacted and before `listener` is called (ADR-0011 amendment 1, item
-        A3); see `static_partitions`. A deployment MUST NOT mix static and
-        group-managed members in one group: the coordinator would hand a
-        statically owned partition to a dynamic member as well, giving an IP
-        two owners (ADR-0011 decision 1).
+        Exactly one call per `Consumer` instance; a second call raises
+        `RuntimeError`. The iterator yields messages of the subscribed
+        partitions in stream-sequence order within a partition (across
+        partitions of one topic the interleaving is unspecified) and ends
+        after `close()`.
 
-        When `listener` is given, this coroutine does not return until
-        `on_assigned` has been awaited with the initial assignment (which may
-        be empty under group management). That is what lets a service report
-        "shard claims held" as soon as `subscribe()` returns (spec section 47,
-        ADR-0009 readiness).
+        `partitions=None` means every partition of the topic: on
+        `NatsConsumer` one whole-topic durable, on `InMemoryBus` `{0}`.
+        There is no group-managed mode (ADR-0013: static assignment only).
+        `partitions=<iterable>` means exactly those partitions; an empty
+        iterable is a `ValueError` raised before any broker is contacted and
+        before `listener` is called (ADR-0011 A3); `InMemoryBus` has one
+        partition per topic, so any static set other than `{0}` is a
+        `ValueError` there.
+
+        When `listener` is given, `on_assigned` is awaited exactly once, with
+        the full set, before this returns -- that is what keeps ADR-0009's
+        "shard claims held" readiness observable at the end of `start()`. If
+        `on_assigned` raises, the exception propagates and the consumer is
+        left as if `subscribe()` had never been called.
+
+        `start_offset=None` is a durable subscription: the read position is
+        kept by the log under the group and advanced only by `ack()`; a
+        fresh `Consumer` for the same group and partitions is delivered every
+        message that was never acknowledged, in order. `start_offset=<int>`
+        is a positional subscription: delivery starts at the first message
+        whose `offset >= start_offset` (at the first retained message if that
+        sequence is no longer in the log), no position is kept anywhere, and
+        `ack()` on it is a `ValueError` (spec section 32, section 33: the
+        trie replays from its snapshot this way). `start_offset` MUST be
+        `>= 0`: a negative value is a `ValueError` raised before any broker
+        is contacted and before `listener` is called, on both
+        implementations. `start_offset=0` is the portable "from the first
+        retained message": it is the first index of the memory log and it
+        is below every JetStream sequence (they start at 1), so
+        `NatsConsumer` starts at `max(start_offset, 1)`.
+
+        An unregistered topic is a `KeyError` from `NatsConsumer` (there is
+        no stream to bind a consumer on), raised with the other argument
+        checks before the broker is contacted and before `listener` is
+        called; `MemoryConsumer` subscribes to any topic, which exists from
+        its first publish.
         """
         ...
 
-    async def seek(self, topic: str, partition: int, offset: int) -> None:
-        """Move this consumer's read position for `(topic, partition)` to `offset`.
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        """Acknowledge exactly `messages`, advancing the group's position past them.
 
-        Used for replay (spec section 32, section 33): the trie service seeks
-        back to a snapshot's `event_sequence` before resuming consumption.
+        Each message MUST have been delivered by this consumer instance under
+        its durable subscription and not yet acknowledged; anything else -- a
+        message of another topic or partition, one this instance never
+        delivered, one it already acknowledged, any message on a positional
+        subscription, or any call after `close()` -- is a `ValueError`,
+        raised before anything is acknowledged (the whole iterable is checked
+        first). An empty iterable returns normally without touching the
+        broker.
+
+        The checks are ordered: a closed consumer is a `ValueError`, then a
+        positional subscription is a `ValueError`, whatever the iterable
+        holds -- an empty one included; only after those does an empty
+        iterable return normally. An instance that has not subscribed yet
+        has delivered nothing, so it accepts exactly the empty iterable. A
+        message named more than once in one call is acknowledged once and
+        is not an error: `ConsumedMessage` is a value, the identity of an
+        acknowledgement is `(topic, partition, offset)`, and "already
+        acknowledged" means acknowledged by an *earlier* call. A caller
+        acknowledges what it has handled and nothing else (ADR-0011 A20's
+        requirement, now per message). On `NatsConsumer` an `ack()` that
+        has returned is durable (the server confirmed each ack).
         """
         ...
 
-    async def commit(self, offsets: Mapping[tuple[str, int], int] | None = None) -> None:
-        """Durably persist this consumer group's read position.
+    async def close(self) -> None:
+        """Stop delivery, end the iterator, and give back what was not acknowledged.
 
-        With no argument this commits the *consumed* position of every
-        partition this consumer holds -- its original meaning, unchanged.
+        Every message this instance delivered under a durable subscription
+        and did not acknowledge becomes deliverable to the next consumer for
+        the group without waiting for `ack_wait` (`NatsConsumer` sends a
+        negative acknowledgement for each; `MemoryConsumer` has nothing to
+        send). Idempotent and safe before `subscribe()`. After `close()`,
+        `ack()` is a `ValueError`.
+        """
+        ...
 
-        With `offsets` it commits exactly the given `(topic, partition) ->
-        next offset to read` pairs: those partitions only, at those offsets,
-        and nothing else. The value is the offset of the *next* message to
-        read, i.e. the last handled `offset + 1`. That lets a caller commit
-        what it has actually handled rather than what it has consumed -- the
-        two differ by the message in hand, which is how an at-least-once
-        consumer loses an observation at a rebalance (ADR-0011 amendment 6,
-        item A20).
 
-        An empty mapping is a no-op that returns normally without contacting
-        the broker. A partition this consumer does not hold is an error:
-        `ValueError` from `MemoryConsumer`, aiokafka's `IllegalStateError`
-        from `KafkaConsumer`.
+@runtime_checkable
+class MessageBus(Protocol):
+    """What a service needs from a bus: one producer and group consumers.
+
+    `InMemoryBus` and `NatsBus` both satisfy it, so a service's object graph
+    is identical either way (ADR-0009 decision 3). Moved here from
+    `hammertime.aggregator.worker` by ADR-0013 decision 3, which also puts
+    `end_offset` here so that the trie and the detector type their bus by
+    the interface rather than as `InMemoryBus | NatsBus`.
+    """
+
+    def producer(self) -> Producer: ...
+
+    def consumer(self, group_id: str) -> Consumer: ...
+
+    async def end_offset(self, topic: str) -> int:
+        """The log end of `topic`: the offset the next appended message will receive.
+
+        `1` for an empty JetStream stream (`state.last_seq + 1`), `0` for an
+        empty memory log (the log length) -- the one number with the same
+        meaning on a 1-based stream and a 0-based list (ADR-0013 decision 9,
+        assumptions 20 and 33). It is what ADR-0009 decision 4's readiness
+        ("replayed to the log end as it stood when `start()` began") reads
+        at `start()`: the service has replayed to the log end once every
+        delivered message with `offset < end_offset` has been applied, i.e.
+        once the last applied offset is `>= end_offset - 1`, or immediately
+        when `end_offset <= start_offset`. A positional subscription
+        filtered to a subset of partitions cannot use this test (the last
+        message in the stream may be on a subject it does not receive), so
+        the trie and the detector subscribe with `partitions=None`. `async`
+        on every implementation: on `NatsBus` it is a broker round trip.
         """
         ...

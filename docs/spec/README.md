@@ -9,7 +9,8 @@ adds pointer notes to §13 and §29, ADR-0011 adds pointer notes to §5, §20,
 §24, §26, §30, §34 and §37, ADR-0001 Amendment 1 — the consistency model
 for many aggregator shards feeding one trie — adds pointer notes to §21 and
 §22, and ADR-0012 — open-source-only components with named drop-ins — adds
-a pointer note to §43).
+a pointer note to §43; ADR-0013 — NATS JetStream as the event log, static
+shard assignment — rewords the §20, §22, §24, §33, §43 and §47.2 notes).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -43,9 +44,9 @@ Section index used throughout the code:
 | 13, 38 | `HOT_PREFIX` predicate (single implementation) | `core/state/prefix.py`, `services/detector/rules/baseline.py`, `services/trie/query`, `docs/adr/0010` |
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` |
-| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus`, `docs/adr/0004` |
-| 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py`), `packages/hammertime-store` (`ShardStateStore`), `services/ingest/publisher.py`, `docs/adr/0001` (Amendment 1), `docs/adr/0004`, `docs/adr/0011` |
-| 22 | Consistency model | `docs/adr/0001` (Amendment 1), `docs/adr/0003` (Amendment 2), `docs/adr/0011` (decisions 4, 5; A20), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
+| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013` |
+| 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py` incl. `partition_for`), `packages/hammertime-store` (`ShardStateStore`, incl. the shard lease), `services/ingest/publisher.py`, `docs/adr/0001` (Amendments 1, 2), `docs/adr/0004`, `docs/adr/0011`, `docs/adr/0013` (decisions 1, 6, 7) |
+| 22 | Consistency model | `docs/adr/0001` (Amendments 1, 2), `docs/adr/0003` (Amendments 2, 3), `docs/adr/0011` (decisions 4, 5), `docs/adr/0013` (decisions 4, 5, 7, 8), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
 | 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `services/aggregator/worker.py`, `core/time/buckets.py`, `docs/adr/0002` (Amendment 1), `docs/adr/0011` |
 | 26 | Memory / retention | `services/aggregator/window/store.py`, `packages/hammertime-store` (`ShardStateStore`), `docs/adr/0011` |
@@ -53,13 +54,13 @@ Section index used throughout the code:
 | 28 | Atomicity | `services/trie/worker.py` |
 | 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010` |
 | 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `core/state/transitions.py`, `docs/adr/0011` |
-| 32, 33 | Persistence & snapshots | `services/trie/snapshot` |
+| 32, 33 | Persistence & snapshots | `services/trie/snapshot`, `packages/hammertime-bus` (`ConsumedMessage.offset`, positional `subscribe`), `tools/provision`, `docs/adr/0010` (Amendment 1), `docs/adr/0013` (decisions 2, 9) |
 | 34 | Versioned configuration | `core/config`, `services/aggregator/reevaluate.py`, `docs/adr/0011` |
 | 35 | IPv6 readiness | `core/addressing` |
 | 36 | Security | `services/ingest/auth` |
 | 36.1-36.4 | Agent credentials (hashed tokens, rotation, provisioning) | `services/ingest/auth/agents.py`, `core/auth/tokens.py`, `tools/agent-token`, `schemas/agent_registry.v2.json`, `docs/adr/0006` |
 | 36.5-36.7 | Auth throttling, request cost, throttled responses | `services/ingest/auth`, `services/ingest/ratelimit`, `services/ingest/api/routes.py`, `docs/adr/0007`, `docs/adr/0008` |
 | 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `deploy/grafana` |
-| 43 | Recommended initial implementation; reference components (event log, store, images) and their licence policy | `deploy/docker-compose.yml`, `docs/adr/0012` |
+| 43 | Recommended initial implementation; reference components (event log, store, images) and their licence policy | `deploy/docker-compose.yml`, `docs/adr/0012` (Amendment 2), `docs/adr/0013` (decisions 11, 12) |
 | 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events`, `core/config`, `docs/adr/0005`, `docs/adr/0011` |
-| 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `docs/adr/0009`, `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |
+| 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `packages/hammertime-bus` (`nats.py` `bus_endpoints`, the §47.7 reduction of bus URLs for log records), `docs/adr/0009`, `docs/adr/0013` (Amendment 2), `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |

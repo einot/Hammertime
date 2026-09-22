@@ -31,7 +31,7 @@ log. The trie is a *derived* index: it can always be rebuilt by replaying
 | Path | What lives there |
 | --- | --- |
 | `packages/hammertime-core` | Address/prefix math, event models, config, the authoritative HOT/COLD state machine, bucket math, telemetry |
-| `packages/hammertime-bus` | Event-log abstraction (Kafka/Redpanda, in-memory for tests) |
+| `packages/hammertime-bus` | Event-log abstraction (NATS JetStream, in-memory for tests) |
 | `packages/hammertime-store` | Sliding-window and dedup state stores (memory, Redis) |
 | `packages/hammertime-testkit` | Generators, fixtures, invariant assertions |
 | `services/ingest` | Agent-facing API: TLS, auth, schema validation, rate limits, dedup, publish |
@@ -47,7 +47,7 @@ log. The trie is a *derived* index: it can always be rebuilt by replaying
 ```bash
 make setup         # uv sync the workspace
 make test          # unit + property tests
-make up            # docker compose: kafka, valkey, prometheus, all four services
+make up            # docker compose: nats, valkey, prometheus, all four services
 make load          # run the agent simulator against the local stack
 ```
 

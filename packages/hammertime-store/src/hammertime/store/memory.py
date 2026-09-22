@@ -147,11 +147,21 @@ class MemoryShardStateStore:
     sequence counter safe without any compare-and-set machinery -- the
     Redis backend, which has no such guarantee, needs a WATCH loop for the
     same three lines.
+
+    The per-shard lease (ADR-0013 decision 7) is `{shard: (owner,
+    expires_at)}` against the injected `clock`; an expired entry counts as
+    absent. `clock` defaults to `SystemClock()`, so every argument-free
+    construction is unchanged; a test passes a `ManualClock` to make a
+    lease lapse. `acquire_lease`/`release_lease` contain no `await` either,
+    so each is atomic in the same practical sense.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        self._clock: Clock = clock if clock is not None else SystemClock()
         self._hot_ips: dict[int, set[Address]] = {}
         self._next_sequence: dict[int, int] = {}
+        # shard -> (owner, expires_at as a UTC epoch second).
+        self._leases: dict[int, tuple[str, float]] = {}
 
     async def load(self, shard: int) -> ShardState:
         # `.get`, not `setdefault`: loading a never-seen shard must not
@@ -184,3 +194,28 @@ class MemoryShardStateStore:
         # this persisted counter, so a replayed or out-of-order transition
         # must not hand an already-used sequence back to the next caller.
         self._next_sequence[shard] = max(self._next_sequence.get(shard, 0), sequence + 1)
+
+    async def acquire_lease(self, shard: int, owner: str, ttl_seconds: float) -> str | None:
+        if ttl_seconds <= 0:
+            raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds!r}")
+        now = self._clock.now()
+        holder = self._live_holder(shard, now)
+        if holder is not None and holder != owner:
+            return holder
+        self._leases[shard] = (owner, now + ttl_seconds)
+        return None
+
+    async def release_lease(self, shard: int, owner: str) -> None:
+        if self._live_holder(shard, self._clock.now()) == owner:
+            del self._leases[shard]
+
+    def _live_holder(self, shard: int, now: float) -> str | None:
+        """The owner of `shard`'s lease if one is live at `now`; an expired one is absent."""
+        lease = self._leases.get(shard)
+        if lease is None:
+            return None
+        holder, expires_at = lease
+        if expires_at <= now:
+            del self._leases[shard]
+            return None
+        return holder

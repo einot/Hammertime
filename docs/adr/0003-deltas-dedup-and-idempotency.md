@@ -1,7 +1,11 @@
 # ADR 0003 — Time-bucketed deltas with per-agent sequence dedup
 
 Status: accepted; amended (event_id for internally-produced events; Amendment 2,
-2026-09-18, on how the aggregator satisfies the at-least-once consequence)
+2026-09-18, on how the aggregator satisfies the at-least-once consequence;
+Amendment 3, 2026-09-21, under ADR-0013: the log is NATS JetStream, a
+redelivery within one live claim is a supported input, and #88 is closed by
+`Nats-Msg-Id` deduplication — Amendment 2's items 1(b) and 3, its transport
+note and its "not a supported input" assumption are superseded in place)
 
 ## Context
 
@@ -112,6 +116,19 @@ aggregator meets it structurally:
    a revocation is left in the log for the next owner instead of being
    committed past.
 
+> Amended 2026-09-21 (ADR-0013; Amendment 3 below). The transport note in
+> the ruling paragraph ("`KafkaProducer` ... leaves aiokafka's
+> `enable_idempotence=False` default in place ... Whether to set
+> `enable_idempotence=True` instead is **not decided here**") is
+> superseded: every publish now carries `Nats-Msg-Id = event_id` and the
+> stream drops a second copy inside its 120 s duplicate window (ADR-0013
+> decision 4). Item 1(b)'s "Within one live claim the bus never hands the
+> same offset out twice" is false on JetStream (`ack_wait` redelivery) and
+> is superseded by item 1(c) in Amendment 3. Item 3's "committed offsets"
+> now means "the acknowledged messages are exactly the handled ones"; the
+> handled position survives as the offset test that identifies a
+> redelivery.
+
 What this costs, recorded so it is not mistaken for a gap later: after a
 crash, up to one commit interval (`HAMMERTIME_AGGREGATOR_COMMIT_INTERVAL_S`,
 default 1 s) of observations is replayed into empty rings, and after a
@@ -151,6 +168,11 @@ changes an observable default, so it needs its own decision and a
 absorbs duplicates; the question is only whether to also remove them at the
 source.
 
+> Amended 2026-09-21: the follow-up above is closed by ADR-0013 decision 4
+> (see Amendment 3). Duplicates are removed at the source by the log's
+> `Nats-Msg-Id` window, with no `acks=all` trade-off; the trie's
+> same-`event_id` no-op requirement stands for the window-bounded case.
+
 Assumptions (each a judgment call; push back individually):
 
 * **The original sentence was about double counting, not about the literal
@@ -180,3 +202,113 @@ Assumptions (each a judgment call; push back individually):
   observation the hot path did count.
 * **No CHANGES entry.** This amendment describes shipped behaviour; it
   changes no wire format, schema, config key or default.
+
+## Amendment 3 (2026-09-21) — redelivery within a live claim is a supported input; transport dedup by `Nats-Msg-Id` closes #88 (ADR-0013)
+
+Why: ADR-0013 replaces the event log with NATS JetStream. Two things
+Amendment 2 assumed of the transport no longer hold. First, JetStream
+redelivers a delivered, unacknowledged message to the *same live consumer*
+after `ack_wait` (30 s), so "a byte-identical message handed to `handle()`
+twice within one live claim" is not merely possible but the normal
+consequence of a stall (a long configuration re-evaluation pass holds the
+worker lock; ADR-0011 decision 7). Second, the transport now deduplicates
+at the source: every publish carries `Nats-Msg-Id = event_id`, and the
+stream refuses a second copy within its duplicate window, which is what
+#88 asked and what Amendment 2's follow-up left undecided. This amendment
+rules on both and touches nothing else; the requirement Amendment 2
+states — count every observation once in any `ShardWindow`, emit exactly
+one record with one `event_id` per transition — is unchanged.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Gained the Amendment 3 clause.
+* **Amendment 2, after item 3, a dated blockquote** naming what is
+  superseded (the transport note, item 1(b)'s sentence, item 3's meaning).
+  No sentence of Amendment 2 was rewritten.
+* **Amendment 2, after the follow-up paragraph, a dated blockquote** saying
+  the follow-up is closed.
+
+**Ruling.**
+
+1. **Item 1(b) is replaced by 1(c): a redelivery within a live claim is
+   recognised by offset and acknowledged without being applied.** Was:
+   "Within one live claim the bus never hands the same offset out twice."
+   Now: within one live claim the log MAY hand the same message out again
+   (`ack_wait` expired before the acknowledgement was sent; ADR-0013
+   decision 5). Delivery within a partition is in stream-sequence order,
+   so a redelivered copy always carries an `offset` at or below the
+   claim's handled position and a new message always carries one above it.
+   The worker tests `message.offset < claims.handled_position(partition)`
+   before decoding; a hit is the `REDELIVERED` outcome (ADR-0013 decision
+   8): logged `WARNING event=redelivered_observation` with topic,
+   partition, offset and `delivery_count`, marked handled so that the copy
+   is acknowledged at the next commit, and otherwise untouched — not
+   decoded, not classified, not diverted, not counted, the store
+   untouched. So "must not re-apply counters" is met for the in-claim case
+   by exactly the mechanism Amendment 2 said was not required — a
+   recognised redelivery declined — but with an integer comparison rather
+   than an `event_id` filter, because the log's own sequence makes the
+   comparison exact. Items 1(a) (after a crash) and the handover half of
+   1(b) (a fresh claim, a fresh window) stand.
+2. **Item 3 is restated for acknowledgements.** Was: "What the aggregator
+   commits, per `(topic, partition)`, is one past the last message
+   `handle()` finished under the current claim — `ShardClaims.commit_handled`,
+   the only commit path (A20) — never the consumed position." Now: what the
+   aggregator acknowledges is exactly the set of messages `handle()`
+   finished under the current claim — `ShardClaims.commit_handled`, still
+   the only path — and never a message merely fetched; the handled
+   position (`ShardClaims.handled_position`, one past the highest handled
+   offset) is kept for item 1(c)'s test, not for any commit. This is
+   ADR-0011 A20's requirement with its mechanism re-expressed (ADR-0011
+   Amendment 7).
+3. **The transport note and the follow-up are closed.** Was: "`KafkaProducer`
+   ... leaves aiokafka's `enable_idempotence=False` default in place ...
+   so the hot-ip log can hold two byte-identical copies of one record after
+   a producer retry. ... Whether to set `enable_idempotence=True` instead
+   is **not decided here**." Now: `NatsProducer.publish` sends
+   `Nats-Msg-Id = event_id` on every record that has one (every record
+   this repository publishes), and the stream acknowledges-and-drops a
+   second copy inside its 120 s duplicate window (ADR-0013 decisions 2 and
+   4). #88 is closed: the transport promise matches the emitter's within
+   the window, and no `acks=all`-style latency is paid because a JetStream
+   acknowledgement is already the durable append. Outside the window a
+   retried record is appended again with the same `event_id`, so the trie's
+   same-`event_id` no-op (ADR-0001 Amendment 1 clause 5; §46.5, §11) stays
+   a requirement; it is now the rare case, not the retry path. No producer
+   in this repository retries a failed publish today; the header is what
+   makes adding one safe (ADR-0013 Consequences names it as a follow-up).
+4. **The "not a supported input" assumption is withdrawn.** Was: "A
+   byte-identical message handed to `handle()` twice within one live claim
+   is not a supported input. The bus never produces it ..., so the
+   aggregator does not guard against it, and no test should pin what
+   happens if a caller does it directly." Now it is a supported input with
+   the behaviour of item 1(c), and tests SHOULD pin it: handing `handle()`
+   a message whose offset is below the handled position returns
+   `REDELIVERED`, applies nothing, and leaves the counters and the store as
+   they were. A message with a *new* offset but identical bytes (the same
+   `event_id` published twice outside the dedup window) is a distinct
+   message and is applied — that is the crash/handover redelivery the rest
+   of Amendment 2 already accounts for, and is correct for the same
+   reason.
+
+The "fencing a zombie owner" assumption is narrowed, not withdrawn:
+ADR-0013 decision 7's lease stops a member within one maintenance interval
+of losing a shard; the store still has no fencing token. The "scope is the
+aggregator" assumption gains one clause for the detector: ADR-0013
+decision 9 requires it to apply a `PrefixStatsChanged` only if its
+`sequence` is newer than the one it holds, because a durable subscription
+can redeliver an older event after a newer one following a crash.
+
+Assumptions made by this amendment (push back individually):
+
+* **Offset comparison rather than an `event_id` filter for the in-claim
+  redelivery.** A per-claim `event_id` set would also work and would
+  catch the outside-the-window duplicate too; it costs memory per handled
+  message until the claim ends, for a case the counters absorb correctly
+  anyway (a distinct message in a window that never counted it — only if
+  the same `event_id` is republished, which only a retry the repository
+  does not perform could cause). The offset test is O(1) and exact.
+* **`REDELIVERED` is not counted.** Same reasoning as ADR-0011 A19 for
+  `UNCLAIMED`; ADR-0013 assumption 21.
+* **No CHANGES entry from this amendment**; ADR-0013's implementing change
+  carries the redelivery and dedup lines.

@@ -5,7 +5,24 @@ end — the Class 1 inventory and the Class 4 pinning summary are brought to
 the state of the compose change brief C1 produced, decision 9's description
 of the override file is corrected in place, and the Context and
 Consequences statements that the two breaches are live gain dated notes.
-No decision changes in substance).
+No decision changes in substance); amended 2026-09-21 (see "Amendment 2"
+— under ADR-0013 the reference event log is NATS JetStream: decision 2
+gains item 5, under which a wire-protocol-unique, foundation-governed
+component confined behind one in-repo interface may be the reference with
+no drop-in; decision 9 is rewritten in place; the Class 1, Class 2 and
+Class 4 inventories are updated — `nats` and `nats-py` in, Apache Kafka,
+Redpanda and `aiokafka` out; assumptions 5 and 14 are superseded. The
+`nats` row's `compliant` is **conditional** on the CNCF/Synadia settlement
+terms being verified against the CNCF announcement, which this environment
+cannot reach); amended 2026-09-21 (see "Amendment 3" — `lupa` enters the
+Class 2 inventory through the `fakeredis[lua]` extra that ADR-0013
+Amendment 1 adds to the `dev` group: MIT, test process only); amended
+2026-09-22 (see "Amendment 4" — decision 5 item 2's "every `Dockerfile`
+`FROM` line" is read to cover `COPY --from=` image references as well,
+which Amendment 1's pinning sweep did not see; the `ghcr.io/astral-sh/uv`
+image the five `Dockerfile`s copy the `uv` binary from is pinned to
+`0.12.17` by the ADR-0013 change and enters the Class 4 table; ADR-0013
+Amendment 4 ruling R9).
 
 Scope note: this ADR records a policy the repository owner gave verbatim
 and turns it into a rule that can be checked in review: which licences
@@ -141,6 +158,23 @@ the reference deployment runs that is not built from this repository.
    definition), never data, ordering or a service's ability to start. Every
    such exception is listed by name in the inventory with the reason. Today
    the list is Grafana OSS (decision 8).
+5. *(Added 2026-09-21, Amendment 2.)* A component whose wire protocol has
+   no second implementation MAY be the reference with no drop-in named,
+   when **all** of the following hold: (a) it is open source (item 1);
+   (b) it is foundation-governed — its licence and trademarks are held by
+   a foundation, so that no single vendor can relicense it, which is
+   definition 1's single-vendor test coming out negative — and the fact is
+   verified against a primary source or, until it can be, recorded as an
+   assumption with the verdict marked conditional; (c) every use of it in
+   this repository is confined behind one in-repo interface that has an
+   in-process implementation the whole test suite runs against, so that
+   replacing it is a bounded change to one package and to `deploy/`,
+   never to the services — a code-level exit rather than a deployment-level
+   drop-in, named in the ADR that adopts the component. Under item 5 "no
+   drop-in" is a recorded cost in the inventory, not a breach. If (b)
+   turns out false, the component is single-vendor with a paid tier and
+   no drop-in: non-compliant under items 1-2, and decision 7 applies.
+   Today the list is NATS JetStream (decision 9, ADR-0013).
 
 Strong-copyleft licences (GPL, AGPL) are acceptable in this class. The
 services connect to these components over a network protocol; they do not
@@ -212,7 +246,13 @@ root `pyproject.toml`, and the build backend.
    finding. Rationale: a licence change applies to versions released after
    it, so an unpinned tag is the path by which a licence change reaches a
    running deployment silently — which is exactly how `redis:7-alpine`
-   became RSALv2 without a diff.
+   became RSALv2 without a diff. *Amended 2026-09-22 (Amendment 4): "every
+   `Dockerfile` `FROM` line" reads "every image reference in a
+   `Dockerfile`, `FROM` and `COPY --from=` alike" — an image a build stage
+   copies from is pulled and its contents executed exactly as a base image
+   is, and the five `Dockerfile`s' `COPY --from=ghcr.io/astral-sh/uv:latest`
+   was the unpinned reference Amendment 1's `FROM`-only sweep did not
+   see.*
 3. Bumping a pinned image is a dependency change under decision 6: the PR
    states the licence of the *new* version, because that is when a licence
    change becomes visible.
@@ -269,44 +309,56 @@ a drop-in. Note that `deploy/grafana/README.md` describes a
 `hammertime.json` that does not exist yet and no Grafana service is in the
 compose file; the ruling applies when it is added.
 
-### 9. Reference broker: Apache Kafka; Redpanda a documented substitute
+### 9. Reference event log: NATS JetStream, with no drop-in, under decision 2 item 5
 
-The reference broker is **Apache Kafka** (Apache-2.0, ASF), run from the
-foundation's own image `apache/kafka`, pinned to a 4.x release, in KRaft
-combined mode (one container acting as broker and controller; Kafka 4.0
-removed ZooKeeper). The compose service is named `broker` and the
-application services reach it as `broker:9092`, so `HAMMERTIME_BUS_BROKERS`
-is the same under every broker.
+> Rewritten in place 2026-09-21 (ADR-0013; Amendment 2). The previous text
+> of this decision — Apache Kafka as the reference broker with Redpanda as
+> a documented, deployment-only substitute — is quoted in full under
+> Amendment 2. It held from 2026-09-18 to 2026-09-21 and was never started
+> on any host (inventory preamble).
 
-Redpanda is kept as a **documented substitute**, not removed: an override
-file `deploy/docker-compose.redpanda.yml` redefines only the `broker`
-service (image `redpandadata/redpanda:v26.2.3`; `environment: !reset {}`
-so that none of the reference's `KAFKA_*` variables reach it; its
-`redpanda start` command; no healthcheck today, because healthchecks are
-ADR-0009 decision 10's and #17's — when #17 adds a broker healthcheck the
-override must carry a Redpanda-appropriate one of its own, since `!reset`
-covers only `environment` and the Kafka probe would otherwise be inherited).
-Starting the stack with both files is the drop-in demonstration — the diff between the two brokers is confined to
-that file, and nothing under `packages/`, `services/`, `tools/` or `.env*`
-differs. The broker-backed integration suite (#52) runs against the
-reference (Kafka). Running it against the override is not required by
-this ADR; if a later change makes Redpanda-specific behaviour matter
-(ADR-0001 Amendment 1 notes that its per-partition ordering is asserted of
-Redpanda only via protocol compatibility), that is when the override earns
-a CI run.
+The reference event log is **NATS JetStream**: the NATS server
+(Apache-2.0; `nats-io/nats-server`), run from the Docker Official Image
+`nats`, pinned to `2.15.0-alpine`, with `-js -sd /data -m 8222`. The compose
+service is named `nats`; the application services reach it as
+`nats://nats:4222` (`HAMMERTIME_BUS_BROKERS`), and its monitoring endpoint
+`http://nats:8222/healthz?js-enabled-only=true` is the healthcheck. The
+Python client is `nats-py` (Apache-2.0; `nats-io/nats.py`), which replaces
+`aiokafka` in `packages/hammertime-bus`. Streams are created by
+`hammertime-provision` before the services start (ADR-0013 decision 2).
 
-Consequences for earlier text: ADR-0001 Amendment 1's Redpanda bullet
-("the reference deployment's broker is Redpanda, and the citation above is
-Kafka's") is resolved in Kafka's favour once the compose change lands — the
-citation and the deployment then agree. ADR-0009 decision 10 names `rpk
-cluster health` as the broker healthcheck; under Kafka that becomes the
-Kafka CLI's own probe (e.g. `kafka-broker-api-versions.sh
---bootstrap-server localhost:9092`). Neither ADR is edited here.
+**There is no drop-in.** No second implementation of the NATS wire
+protocol and JetStream API exists, so the drop-in rule of decision 2 item
+2 cannot be met and item 3's "documented substitute" has nothing to name.
+NATS is nevertheless the reference under decision 2 item 5, on three
+grounds, each of which the inventory row records:
 
-> Amended 2026-09-18: the override paragraph above originally said the
-> override carried "its own healthcheck", which contradicted brief C1's
-> "Do not: add healthchecks" and the file as landed. Corrected in place;
-> see Amendment 1.
+1. It is open source: the server and the client are Apache-2.0
+   (verified from `LICENSE` and PyPI metadata; Sources).
+2. It is foundation-governed. The server's README states it is a CNCF
+   project (verified). That its trademarks are held by the Linux
+   Foundation, its domain and repositories sit with CNCF, and the 2025
+   proposal to relicense under BUSL was withdrawn, is **not yet verified
+   from a primary source** — the CNCF announcement is unreachable from
+   this environment — and is recorded as ADR-0013 assumption 1. **The
+   `compliant` verdict for `nats` is conditional on that verification.**
+   Should it fail, NATS is a single-vendor component (Synadia sells a
+   commercial tier) with no drop-in, non-compliant under items 1-2, and
+   decision 7's pre-1.0 remediation — replace before 1.0 — applies.
+3. It is confined. Every use of NATS in this repository is behind
+   `hammertime.bus` (`interface.py`), which `memory.py` implements in
+   process for every unit test; the services depend only on the
+   interface. The exit, should one be needed, is a new `hammertime.bus`
+   backend plus `deploy/` — the shape ADR-0013 itself takes to move off
+   Kafka — and no service source file. That is the code-level exit item 5
+   asks the adopting ADR to name.
+
+Consequences for earlier text: ADR-0001 Amendment 1's Redpanda bullet and
+its Kafka ordering citation are superseded by ADR-0001 Amendment 2;
+ADR-0009 decision 10's healthcheck names are corrected by ADR-0009
+Amendment 4. `deploy/docker-compose.redpanda.yml` is deleted by the change
+that implements ADR-0013; until then it is dead configuration for a broker
+the services no longer speak to.
 
 ### 10. Reference store: Valkey; Redis 8 (AGPLv3) and Redis 7.2 as alternatives
 
@@ -369,12 +421,18 @@ runtime proof, and the broker-backed integration suite (#52) is what will
 exercise the reference images in CI. Until then the Status column's
 `compliant` is a licence-and-pin statement, not a "has run" statement.
 
-### Class 1 — runtime infrastructure (`deploy/docker-compose.yml` and the `deploy/docker-compose.redpanda.yml` override)
+> Amended 2026-09-21 (Amendment 2): the tables below describe the
+> deployment ADR-0013 decision 11 specifies; the rows are written as
+> "to be deployed by the ADR-0013 change" until it lands, and the `nats`
+> row's status is conditional as decision 9 says.
+
+### Class 1 — runtime infrastructure (`deploy/docker-compose.yml`)
 
 | Component | Image as deployed | Licence | Single-vendor, paid tier | Drop-in | Status | Pin | Verified |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Redpanda | `redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml` line 4; override only, applied with a second `-f`) | BUSL-1.1, change to Apache-2.0 four years after each release; enterprise features separately licensed | yes (Redpanda Data: Enterprise, Cloud) | Apache Kafka (the reference) | substitute (decision 9): not OSI, so never the reference; kept as a pinned, deployment-only override | `major.minor.patch` | licence: `licenses/bsl.md` on the `dev` branch — the source repository returns 404 for every path at tag `v26.2.3`, so the licence is **not** verified at the pinned tag; tag: yes (Docker Hub, newest `vXX.Y.Z`); runtime: not exercised (`docker compose config` only) |
-| Apache Kafka (reference, decision 9) | `apache/kafka:4.3.1` (`deploy/docker-compose.yml` line 8; single-node KRaft combined mode) | Apache-2.0 | no (ASF) | n/a; Redpanda is the substitute | compliant | `major.minor.patch` | licence: yes (`LICENSE` at tag `4.3.1`; Docker Hub publisher = The Apache Software Foundation); tag: yes (newest non-rc 4.x on Docker Hub); runtime: not exercised — `docker compose config` plus a match of the `KAFKA_*` set against the ASF's own single-node example for 4.3.1; pending first `make up` / #52 |
+| NATS server with JetStream (reference, decision 9; ADR-0013) | `nats:2.15.0-alpine` (to be deployed by the ADR-0013 change as service `nats`, `-js -sd /data -m 8222`; linux/amd64 digest `sha256:eda962d67930eda338222072d9a9f3818855d922ad224c399b0b01d251e9b91b`) | Apache-2.0 | no, **assumed**: CNCF project (README verified); trademarks with the Linux Foundation and the BUSL relicensing withdrawn per the May 2025 CNCF/Synadia settlement, **not primary-verified** (ADR-0013 assumption 1); Synadia sells a commercial tier | none exists (no second implementation of the wire protocol); admitted under decision 2 item 5 — exit is a new `hammertime.bus` backend plus `deploy/` | **compliant, conditional** on the settlement terms being verified against `https://www.cncf.io/announcements/2025/05/01/cncf-and-synadia-align-on-securing-the-future-of-the-nats-io-project/`; `non-compliant` under decision 7 if they are not | `major.minor.patch` | licence: yes (`nats-io/nats-server` `main` `LICENSE`, Apache-2.0, read 2026-09-21; not read at tag `v2.15.0`); tag: yes (Docker Hub v2 API, pushed 2026-09-18); runtime: not exercised in this repository — nats-server 2.15.0 *built from source* was run for ADR-0013's measurements, not the image |
+| Apache Kafka | not deployed since 2026-09-21 (was `apache/kafka:4.3.1` as service `broker`, 2026-09-18 to 2026-09-21; replaced by NATS JetStream under decision 9 as rewritten) | Apache-2.0 | no (ASF) | n/a | replaced (decision 9) | n/a (not deployed) | licence: yes (`LICENSE` at tag `4.3.1`), kept for the record; runtime: never started from the image; a bare-JVM 4.3.1 was measured for ADR-0013 (cold start 5.1-5.8 s) |
+| Redpanda | not deployed since 2026-09-21 (was the `deploy/docker-compose.redpanda.yml` override, `redpandadata/redpanda:v26.2.3`; the file is deleted by the ADR-0013 change) | BUSL-1.1, change to Apache-2.0 four years after each release | yes (Redpanda Data: Enterprise, Cloud) | n/a | removed (decision 9; ADR-0013 removes the broker drop-in altogether) | n/a (not deployed) | licence: `licenses/bsl.md` on the `dev` branch only (404 at the tag), kept for the record; runtime: never started |
 | Redis | not deployed since 2026-09-18 (was `redis:7-alpine`, resolving to 7.4.11-alpine; replaced by Valkey under decision 10) | RSALv2 OR SSPLv1 (7.4.x–7.8.x); BSD-3-Clause up to 7.2.x; RSALv2 OR SSPLv1 OR AGPLv3 from 8.0 | yes (Redis Ltd: Enterprise, Cloud) | Valkey | replaced (decision 10); Redis 8.x under AGPLv3 remains the recorded drop-in for Valkey in the other direction | n/a (not deployed) | licence: yes (branch `LICENSE.txt`/`COPYING`; Docker Hub tag map), kept for the record |
 | Valkey (reference, decision 10) | `valkey/valkey:9.1.2-alpine` (`deploy/docker-compose.yml` line 30; `--maxmemory-policy noeviction`) | BSD-3-Clause | no (Linux Foundation) | Redis 8.x under AGPLv3; Redis 7.2 | compliant | `major.minor.patch` | licence: yes (`COPYING` at tag `9.1.2`; Docker Hub publisher = Valkey community); tag: yes (newest stable on Docker Hub); runtime: not exercised (`docker compose config` only; pending first `make up` / #52) |
 | Prometheus | `prom/prometheus:v3.14.0` (`deploy/docker-compose.yml` line 69) | Apache-2.0 | no (CNCF) | n/a | compliant | `major.minor.patch` | licence: yes (`LICENSE` at tag `v3.14.0`); tag: yes (newest non-rc on Docker Hub); runtime: not exercised (`docker compose config` only) |
@@ -385,7 +443,8 @@ exercise the reference images in CI. Until then the Status column's
 
 | Package | Version | Licence (PyPI `license_expression` / `license`) | Maintainer with paid tier | Status |
 | --- | --- | --- | --- | --- |
-| aiokafka | 0.14.0 | Apache-2.0 | no | compliant |
+| nats-py (replaces aiokafka, 2026-09-21; to be added to `packages/hammertime-bus/pyproject.toml` by the ADR-0013 change) | 2.16.0 on PyPI | Apache-2.0 — carried in `license_expression` and `license_files=["LICENSE"]`; the legacy `license` field is `null`, so a tool reading only that field reports "no licence" | no (NATS project; same governance caveat as the Class 1 `nats` row) | compliant (licence unconditional; governance conditional as above) |
+| aiokafka | removed 2026-09-21 (was 0.14.0) | Apache-2.0 | no | removed (ADR-0013) |
 | fastapi | 0.141.1 | MIT | no | compliant |
 | uvicorn | 0.53.0 | BSD-3-Clause | no | compliant |
 | jsonschema | 4.26.0 | MIT | no | compliant |
@@ -398,12 +457,13 @@ exercise the reference images in CI. Until then the Status column's
 | pytest | 9.1.1 | MIT | no | compliant |
 | pytest-asyncio | 1.4.0 | Apache-2.0 | no | compliant |
 | pytest-benchmark | 5.3.0 | BSD-2-Clause | no | compliant |
-| fakeredis | 2.38.0 | BSD-3-Clause | no | compliant |
+| fakeredis (installed as `fakeredis[lua]` since 2026-09-21, Amendment 3; `dev` group) | 2.38.0 | BSD-3-Clause | no | compliant |
+| lupa (pulled by `fakeredis[lua]` as `lupa>=2.1`; test process only — it exists so the in-process fake can run the Lua `EVAL` of `RedisShardStateStore`'s lease, ADR-0013 decision 7; added 2026-09-21, Amendment 3) | 2.8 (locked in `uv.lock` by the C1-followup change, recorded 2026-09-21; CI installs the `cp312-manylinux_2_17_x86_64` wheel, and PyPI also carries an sdist) | MIT — the legacy `license` field reads `"MIT style"` and there is no `license_expression`; `license_files = ["LICENSE.txt"]`, which carries the MIT notice for Lupa ("Copyright (c) 2010-2017 Stefan Behnel") followed by the MIT licence of the bundled Lua ("Copyright © 1994–2017 Lua.org, PUC-Rio") | no (single maintainer; no paid tier) | compliant (test process only; see Amendment 3 assumption 2, corrected 2026-09-21) |
 | types-jsonschema | 4.26.0.20260518 | Apache-2.0 | no | compliant |
 | ruff | 0.16.7 (lock; 0.16.8 on PyPI) | MIT | yes (Astral) — irrelevant under decision 3 | compliant |
 | mypy | 2.3.1 | MIT | no | compliant |
 | hatchling (build backend) | 1.32.3 on PyPI | MIT | no | compliant |
-| uv (package manager) | 0.12.16 on PyPI | MIT OR Apache-2.0 | yes (Astral) — class 3; `pip` + `venv` are the non-drop-in fallback (a lockfile regeneration, no code) | compliant |
+| uv (package manager) | 0.12.16 on PyPI (0.12.17 on 2026-09-22, Amendment 4; the image tag the `Dockerfile`s pin is that version — Class 4 table) | MIT OR Apache-2.0 | yes (Astral) — class 3; `pip` + `venv` are the non-drop-in fallback (a lockfile regeneration, no code) | compliant |
 
 Transitive dependencies (e.g. starlette, pydantic-core, anyio, attrs) are
 not itemised here; decision 3 item 4 audits them at release time.
@@ -422,14 +482,24 @@ not itemised here; decision 3 item 4 audits them at release time.
 
 As of Amendment 1 every image reference in `deploy/` and every `Dockerfile`
 `FROM` line is pinned; no action remains open under decision 5 item 2.
+Amendment 2 (2026-09-21) replaces the two broker rows with the `nats` row
+the ADR-0013 change will land; the provisioner image it adds
+(`tools/provision/Dockerfile`) builds `FROM python:3.12-slim` like the
+service images. *Corrected 2026-09-22 (Amendment 4): the `FROM`-only
+sweep missed the `COPY --from=ghcr.io/astral-sh/uv:latest` line every
+`Dockerfile` carries (the four service files since C1; the provisioner
+file, written to the same shape, since the ADR-0013 change); the
+ADR-0013 change pins all five to `0.12.17`, and the row below records
+it. Until that change lands the `:latest` reference is a live decision 5
+item 2 breach in five files, not a settled inventory.*
 
 | Reference | Pinned? | Action |
 | --- | --- | --- |
-| `apache/kafka:4.3.1` (`deploy/docker-compose.yml`) | `major.minor.patch` | done — replaced `redpandadata/redpanda:latest` as the reference (decision 9) |
-| `redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml`) | `major.minor.patch` | done — substitute override (decision 9) |
+| `nats:2.15.0-alpine` (`deploy/docker-compose.yml`, by the ADR-0013 change) | `major.minor.patch` | replaces `apache/kafka:4.3.1` as the reference event log (decision 9 as rewritten); `deploy/docker-compose.redpanda.yml` deleted |
 | `valkey/valkey:9.1.2-alpine` (`deploy/docker-compose.yml`) | `major.minor.patch` | done — replaced `redis:7-alpine` (decision 10) |
 | `prom/prometheus:v3.14.0` (`deploy/docker-compose.yml`) | `major.minor.patch` | done |
-| `python:3.12-slim` × 4 (`services/*/Dockerfile`) | `major.minor` | none |
+| `python:3.12-slim` × 4 (`services/*/Dockerfile`) — × 5 with `tools/provision/Dockerfile` since the ADR-0013 change | `major.minor` | none |
+| `ghcr.io/astral-sh/uv:0.12.17` × 5 (`COPY --from=` in `services/*/Dockerfile` and `tools/provision/Dockerfile`; build stage only — the binary is copied, the image is not run) — MIT OR Apache-2.0 (PyPI `license_expression` for `uv` 0.12.17); provenance (a), published by the project (Astral) on GHCR; added 2026-09-22, Amendment 4 | `major.minor.patch` | pinned by the ADR-0013 change (was `:latest` in all five; ADR-0013 Amendment 4 ruling R9); the tag form and the "pin to a specific uv version" guidance are uv's own Docker guide (Sources, Amendment 4) |
 
 ## Assumptions
 
@@ -466,7 +536,9 @@ earlier ADRs do not make. Push back on them individually.
 5. **Redpanda is kept as an override rather than deleted.** The owner named
    it; a developer who wants its faster cold start can have it with one
    extra `-f`. Cost: a second file to keep pinned. Push back if one broker
-   is simpler.
+   is simpler. *(Superseded 2026-09-21, Amendment 2: the override is deleted
+   with the broker it substituted for; there is one event log and no
+   substitute.)*
 6. **`major.minor` is the pinning floor; exact patch recommended.** An
    exact patch pin is safest but turns every security release into a PR.
    `major.minor` held the line in the only licence change that has
@@ -520,7 +592,11 @@ earlier ADRs do not make. Push back on them individually.
     chose 60 s "to cover Redpanda's cold start in CI comfortably"; Kafka in
     KRaft combined mode is assumed to start within that on a CI runner. If
     #52 finds otherwise, the deadline is ADR-0009's to amend, not this
-    ADR's.
+    ADR's. *(Measured 2026-09-21, no longer an assumption: 5.1-5.8 s from
+    `kafka-storage format` to "Kafka Server started", bare JVM on a 4
+    vCPU host, three cold runs — ADR-0013 Context, prerequisite 5. The
+    claim held; it is superseded only because Kafka is no longer
+    deployed, Amendment 2.)*
 15. **Kafka versions.** "A 4.x release" is required rather than a specific
     patch because Docker Hub's `apache/kafka` page lists only `latest` by
     name; ADR-0001 Amendment 1 cites 4.3.1's documentation, so 4.3.1 is
@@ -539,6 +615,14 @@ earlier ADRs do not make. Push back on them individually.
 > the "today" and "with the compose PR" statements in this section
 > describe the pre-change state. Runtime is still unexercised (see the
 > inventory preamble).
+
+> Amended 2026-09-21 (Amendment 2): the first, fourth and sixth bullets
+> below (Kafka heavier than Redpanda; two compose files; the topic
+> auto-creation gap) are superseded by ADR-0013 — one event log, one
+> compose file, and streams provisioned explicitly before the services
+> start. The "earlier ADRs mention the old images" bullet is now
+> discharged by ADR-0001 Amendment 2 and ADR-0009 Amendment 4. The
+> remaining bullets stand.
 
 * **Apache Kafka is heavier than Redpanda.** A JVM broker image several
   times Redpanda's size and a slower cold start, paid on every `make up`
@@ -804,6 +888,51 @@ by the architect rather than taken from the C1 report):
 * `deploy/docker-compose.yml` lines 8, 30, 69 and
   `deploy/docker-compose.redpanda.yml` line 4 (image references as landed).
 
+Read on 2026-09-21 for Amendment 2 (the NATS rows); the full set of NATS
+sources, including the blocked hosts, is in ADR-0013's Sources:
+
+* `https://raw.githubusercontent.com/nats-io/nats-server/main/LICENSE` —
+  "Apache License / Version 2.0, January 2004" (the `main` branch; the
+  `v2.15.0` tag was not fetched).
+* `https://raw.githubusercontent.com/nats-io/nats-server/main/README.md`
+  line 5 (top-level session, 2026-09-21) — "NATS is part of the Cloud
+  Native Computing Foundation ([CNCF](https://cncf.io))".
+* `https://pypi.org/pypi/nats-py/json` — version 2.16.0,
+  `license_expression` "Apache-2.0", `license_files` `["LICENSE"]`,
+  `license` `null` (top-level session's direct read; the architect's
+  summarised fetch agreed on the expression and files).
+* `https://hub.docker.com/v2/repositories/library/nats/tags/2.15.0-alpine`
+  — pushed 2026-09-18T01:57:51Z, 11 481 954 bytes, linux/amd64 digest
+  `sha256:eda962d67930eda338222072d9a9f3818855d922ad224c399b0b01d251e9b91b`.
+* `https://www.cncf.io/announcements/2025/05/01/cncf-and-synadia-align-on-securing-the-future-of-the-nats-io-project/`
+  — **EGRESS_BLOCKED** from this environment; not read. Also blocked:
+  `www.synadia.com`, `www.linuxfoundation.org`, `lists.cncf.io`,
+  `docs.nats.io`, `nats.io`, `nats-io.github.io`, `web.archive.org`.
+
+Read on 2026-09-21 for Amendment 3 (the `lupa` row):
+
+* `https://pypi.org/pypi/fakeredis/json` — version 2.38.0,
+  `license_expression` `BSD-3-Clause`, `provides_extra` `bf, cf, json,
+  lua, probabilistic, valkey, vectorset`, `requires_dist` carries
+  `lupa>=2.1; extra == "lua"`.
+* `https://pypi.org/pypi/lupa/json` — version 2.8, legacy `license`
+  `"MIT style"`, `license_expression` absent, `license_files
+  ["LICENSE.txt"]`, author Stefan Behnel, `requires_python >=3.8`,
+  homepage `https://github.com/scoder/lupa`.
+  `https://pypi.org/pypi/lupa/2.8/json` — wheels
+  `lupa-2.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl`
+  and the `aarch64` equivalent (uploaded 2026-04-15); no sdist listed.
+  *Corrected 2026-09-21: the page does list an sdist, `lupa-2.8.tar.gz`
+  (sha256 `d8022641...`, 6 156 370 bytes, uploaded 2026-04-15, per
+  `uv.lock` as recorded by the C1-followup coder; the architect's re-read
+  of the page the same day confirms the filename). The summarised fetch
+  behind the original reading omitted it — Amendment 3 assumption 2.*
+* `https://raw.githubusercontent.com/scoder/lupa/master/LICENSE.txt`
+  (summarised by the fetch tool; `master`, not the 2.8 tag) — the MIT
+  licence, "Copyright (c) 2010-2017 Stefan Behnel. All rights reserved.",
+  followed by the MIT licence of the bundled Lua, "Copyright © 1994–2017
+  Lua.org, PUC-Rio" (`https://www.lua.org/license.html`).
+
 ## Amendment 1 (2026-09-18) — inventory brought to the post-C1 state; decision 9's override description corrected
 
 Why: decision 6 makes this ADR's inventory the living record and requires
@@ -966,3 +1095,281 @@ spec or an earlier ADR; push back individually):
    The images' licences are verified; what is unverified is that the
    compose files start. That belongs to #52 and the first `make up`, and is
    recorded per row rather than by demoting `compliant`.
+
+## Amendment 2 (2026-09-21) — NATS JetStream as the reference event log; a rule for a component with no drop-in (ADR-0013)
+
+Why: ADR-0013 replaces Apache Kafka with NATS JetStream. NATS has no
+wire-compatible second implementation, so the drop-in rule of decision 2
+item 2 cannot be met, and item 4's exception — scoped to components whose
+loss costs "only an operator convenience ... never data, ordering or a
+service's ability to start" — is the opposite of what an event log is. The
+owner's direction quoted in Context uses "Redpanda and Kafka" as its
+exemplar, so adopting NATS needs a rule, not a table edit: decision 2
+gains item 5. Decision 9 is rewritten in place (the Kafka text is quoted
+below), the inventory is updated, and two assumptions are superseded. The
+compliance verdict for `nats` is **conditional**: the governance facts item
+5(b) requires could not be primary-verified from this environment
+(ADR-0013 Context, prerequisite 3), and this amendment says so in the
+Status line, in decision 9, and in the inventory row rather than
+presenting an unverified fact as a verified one.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended the "amended 2026-09-21" clause.
+* **Decision 2, new item 5.** Added after item 4; items 1-4 unchanged.
+* **Decision 9, rewritten in place** under a new heading with a dated
+  blockquote. The superseded text in full:
+
+  > ### 9. Reference broker: Apache Kafka; Redpanda a documented substitute
+  >
+  > The reference broker is **Apache Kafka** (Apache-2.0, ASF), run from the
+  > foundation's own image `apache/kafka`, pinned to a 4.x release, in KRaft
+  > combined mode (one container acting as broker and controller; Kafka 4.0
+  > removed ZooKeeper). The compose service is named `broker` and the
+  > application services reach it as `broker:9092`, so `HAMMERTIME_BUS_BROKERS`
+  > is the same under every broker.
+  >
+  > Redpanda is kept as a **documented substitute**, not removed: an override
+  > file `deploy/docker-compose.redpanda.yml` redefines only the `broker`
+  > service (image `redpandadata/redpanda:v26.2.3`; `environment: !reset {}`
+  > so that none of the reference's `KAFKA_*` variables reach it; its
+  > `redpanda start` command; no healthcheck today, because healthchecks are
+  > ADR-0009 decision 10's and #17's — when #17 adds a broker healthcheck the
+  > override must carry a Redpanda-appropriate one of its own, since `!reset`
+  > covers only `environment` and the Kafka probe would otherwise be inherited).
+  > Starting the stack with both files is the drop-in demonstration — the diff between the two brokers is confined to
+  > that file, and nothing under `packages/`, `services/`, `tools/` or `.env*`
+  > differs. The broker-backed integration suite (#52) runs against the
+  > reference (Kafka). Running it against the override is not required by
+  > this ADR; if a later change makes Redpanda-specific behaviour matter
+  > (ADR-0001 Amendment 1 notes that its per-partition ordering is asserted of
+  > Redpanda only via protocol compatibility), that is when the override earns
+  > a CI run.
+  >
+  > Consequences for earlier text: ADR-0001 Amendment 1's Redpanda bullet
+  > ("the reference deployment's broker is Redpanda, and the citation above is
+  > Kafka's") is resolved in Kafka's favour once the compose change lands — the
+  > citation and the deployment then agree. ADR-0009 decision 10 names `rpk
+  > cluster health` as the broker healthcheck; under Kafka that becomes the
+  > Kafka CLI's own probe (e.g. `kafka-broker-api-versions.sh
+  > --bootstrap-server localhost:9092`). Neither ADR is edited here.
+  >
+  > > Amended 2026-09-18: the override paragraph above originally said the
+  > > override carried "its own healthcheck", which contradicted brief C1's
+  > > "Do not: add healthchecks" and the file as landed. Corrected in place;
+  > > see Amendment 1.
+
+* **Inventory, a dated blockquote before the Class 1 heading**, and the
+  Class 1 heading — was "(`deploy/docker-compose.yml` and the
+  `deploy/docker-compose.redpanda.yml` override)", now
+  "(`deploy/docker-compose.yml`)".
+* **Class 1 table.** The Redpanda and Apache Kafka rows are replaced by
+  "not deployed since 2026-09-21" rows in the shape Amendment 1 gave the
+  Redis row, and a NATS row is added first. Superseded rows: Redpanda —
+  "`redpandadata/redpanda:v26.2.3` (`deploy/docker-compose.redpanda.yml`
+  line 4; override only, applied with a second `-f`) | BUSL-1.1, change to
+  Apache-2.0 four years after each release; enterprise features separately
+  licensed | yes (Redpanda Data: Enterprise, Cloud) | Apache Kafka (the
+  reference) | substitute (decision 9): not OSI, so never the reference;
+  kept as a pinned, deployment-only override | `major.minor.patch` |
+  licence: `licenses/bsl.md` on the `dev` branch — the source repository
+  returns 404 for every path at tag `v26.2.3`, so the licence is **not**
+  verified at the pinned tag; tag: yes (Docker Hub, newest `vXX.Y.Z`);
+  runtime: not exercised (`docker compose config` only)". Apache Kafka —
+  "`apache/kafka:4.3.1` (`deploy/docker-compose.yml` line 8; single-node
+  KRaft combined mode) | Apache-2.0 | no (ASF) | n/a; Redpanda is the
+  substitute | compliant | `major.minor.patch` | licence: yes (`LICENSE`
+  at tag `4.3.1`; Docker Hub publisher = The Apache Software Foundation);
+  tag: yes (newest non-rc 4.x on Docker Hub); runtime: not exercised —
+  `docker compose config` plus a match of the `KAFKA_*` set against the
+  ASF's own single-node example for 4.3.1; pending first `make up` / #52".
+  The Redis, Valkey, Prometheus, Grafana and CPython rows are unchanged.
+* **Class 2 table.** The `aiokafka` row — was "aiokafka | 0.14.0 |
+  Apache-2.0 | no | compliant" — becomes a "removed 2026-09-21" row, and a
+  `nats-py` row precedes it with the `license`-is-`null` note the epic
+  asked for.
+* **Class 4 table and its preamble sentence.** The `apache/kafka:4.3.1`
+  and `redpandadata/redpanda:v26.2.3` rows — "done — replaced
+  `redpandadata/redpanda:latest` as the reference (decision 9)" and "done
+  — substitute override (decision 9)" — are replaced by one
+  `nats:2.15.0-alpine` row; a sentence names the provisioner image's base.
+* **Assumptions 5 and 14** gained a trailing parenthetical each (5
+  superseded; 14 measured and moot). Their original text is unchanged.
+* **Consequences, a second dated blockquote** naming the superseded
+  bullets.
+* **Sources, a dated block** for this amendment.
+
+Decision 7 item 1's worked example still reads "the broker image and the
+store image (decisions 9 and 10)"; as Amendment 1 said, its "current" is
+anchored by the acceptance date and it is left as written. Decision 2
+item 4's "Today the list is Grafana OSS" is likewise anchored and stands;
+item 5 has its own "Today the list is NATS JetStream".
+
+Assumptions made by this amendment (push back individually):
+
+1. **Item 5's three conditions are the right shape for the rule.** They
+   are written so that Kafka would also have satisfied them (Apache-2.0,
+   ASF, confined behind `hammertime.bus`) — which is the test that the
+   rule is not special pleading for NATS — while Redpanda would not
+   (BUSL), and Grafana would not (not confined behind an interface with
+   an in-process double). The owner's "there is always a free open source
+   drop-in" is read as a rule against vendor lock-in; item 5 keeps that
+   purpose by requiring foundation governance and a bounded code exit
+   where a wire drop-in cannot exist.
+2. **"Conditional compliant" as a status.** The legend's five values plus
+   Amendment 1's "substitute" do not cover "compliant if a governance fact
+   holds"; the row spells the condition and the consequence rather than
+   inventing a seventh value.
+3. **The `nats` licence is verified at `main`, not at `v2.15.0`.** Same
+   posture Amendment 1 took for Redpanda; a tag read is a follow-up for
+   whoever can reach it.
+4. **`nats-py`'s governance caveat is the server's.** The client is a
+   NATS-project repository; if the settlement terms fail, both rows move
+   together.
+5. **No `CHANGES` entry for this amendment**; the deployment change that
+   implements ADR-0013 carries the `BREAKING` broker line (assumption 16's
+   rule: an ADR is not a user-visible change; a changed reference
+   component is, and this one is `BREAKING` because `HAMMERTIME_BUS_KIND`
+   and `HAMMERTIME_BUS_BROKERS` change meaning).
+
+## Amendment 3 (2026-09-21) — `lupa`, via `fakeredis[lua]`, enters Class 2 (ADR-0013 Amendment 1)
+
+Why: ADR-0013 decision 7 implements the per-shard lease as one Lua `EVAL`
+per call on `RedisShardStateStore`. fakeredis 2.38 without its `lua`
+extra answers `EVAL` with `unknown command 'eval'`, which is why every
+Redis lease test failed when T1's tests were run against C1's code.
+ADR-0013 Amendment 1 (ruling C5.1) keeps the Lua form and adds
+`fakeredis[lua]` to the root `pyproject.toml`'s `dev` group, which pulls
+`lupa>=2.1`. Decision 6 requires the inventory to be updated in the same
+change set as any dependency change, by architect amendment (assumption
+11); this is that amendment. `lupa` is a Class 2 dependency (the `dev`
+group is in scope by decision 3's first sentence) and is imported into the
+test process, so decision 3 item 2's permissive-or-weak-copyleft rule
+applies; MIT satisfies it.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended the "amended 2026-09-21 (see "Amendment 3"
+  ...)" clause.
+* **Class 2 table, `fakeredis` row.** Was: "| fakeredis | 2.38.0 |
+  BSD-3-Clause | no | compliant |". Now the package cell says it is
+  installed as `fakeredis[lua]` since this amendment; the other cells are
+  unchanged.
+* **Class 2 table, new `lupa` row** after it.
+* **Sources.** A dated block for this amendment.
+
+Assumptions made by this amendment (push back individually):
+
+1. **MIT is taken from `LICENSE.txt` at `master`, not at the 2.8 tag,
+   and from a summarised fetch.** The PyPI legacy field says only "MIT
+   style" and there is no `license_expression`, so the licence file is
+   the evidence; the same tag-versus-branch posture Amendments 1 and 2
+   took for Redpanda and `nats`. The bundled Lua is MIT under its own
+   notice, so the wheel carries two MIT notices and no other licence.
+2. **A wheel on the supported platforms is enough for a test
+   dependency.** *(Corrected 2026-09-21; the original text is quoted
+   below.)* PyPI does list an sdist for lupa 2.8 — `lupa-2.8.tar.gz`,
+   sha256 `d8022641...`, 6 156 370 bytes, uploaded 2026-04-15, as recorded
+   in `uv.lock` by the C1-followup change and reported by its coder; the
+   architect's own re-read of `https://pypi.org/pypi/lupa/2.8/json` on
+   2026-09-21 confirms the filename (the fetch tool truncated the digest
+   and size) — so a platform without a matching wheel builds it from
+   source (a C extension: a compiler and Lua headers, or the bundled Lua)
+   rather than failing to install. `uv.lock` resolves lupa 2.8; CI
+   (`ubuntu-latest`, x86_64, CPython 3.12) installs the
+   `cp312-manylinux_2_17_x86_64` wheel, and the service images never
+   install the `dev` group. A contributor whose platform lacks a wheel
+   gets a source build; if that fails the fallback is to pin an older
+   lupa, not to relax the lease to `WATCH`/`MULTI`. Original text: "PyPI
+   lists no sdist for lupa 2.8, so a platform without a matching wheel
+   cannot install it at all rather than compiling it. CI (`ubuntu-latest`,
+   x86_64, CPython 3.12) and the developer platforms the repository
+   supports have wheels; the service images never install the `dev`
+   group. If a contributor's platform lacks a wheel, the fallback is to
+   pin an older lupa with an sdist, not to relax the lease to
+   `WATCH`/`MULTI`." The earlier "no sdist" reading came from a
+   summarised fetch of the same PyPI page that omitted the sdist entry;
+   ADR-0013 assumption 30 repeated it and is corrected the same day.
+3. **Not single-vendor.** One maintainer, no company, no paid tier;
+   irrelevant under decision 3 in any case.
+4. **The locked version is not recorded here.** The architect cannot run
+   `uv lock`; the `C1-followup` PR's `Licences` line (decision 6) states
+   the version `uv.lock` resolves, and the row's "2.8 on PyPI" is to be
+   replaced by it at the next amendment that touches this table.
+   *Done 2026-09-21: the C1-followup coder reported the lock resolves
+   lupa 2.8 (and recorded the sdist that assumption 2 had missed); the
+   row now says so.*
+5. **No `CHANGES` entry.** A test-only dependency has no user-visible
+   effect (`CLAUDE.md`'s `CHANGES` rule: dependency bumps with no
+   observable effect are not recorded).
+
+## Amendment 4 (2026-09-22) — `COPY --from=` image references are pinned too; the `uv` image enters Class 4 (ADR-0013 Amendment 4 ruling R9)
+
+Why: the R1 review of the ADR-0013 epic branch found
+`tools/provision/Dockerfile` copying the `uv` binary from
+`ghcr.io/astral-sh/uv:latest`, and the S1 audit noted the same line in
+all four `services/*/Dockerfile`s. Decision 5 item 2 pins "every
+`Dockerfile` `FROM` line", and Amendment 1 recorded every `FROM` line as
+pinned — both true and both blind to `COPY --from=`, which pulls an image
+and copies from it exactly as a base image is pulled. The provisioner
+file is in the ADR-0013 diff, so decision 6 ("every image reference in
+the diff is pinned") binds that change; ADR-0013 Amendment 4 ruling R9
+pins all five files in the same change set rather than leave four
+unpinned beside one pinned. This amendment makes the rule's wording
+cover the case and records the image.
+
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Appended the "amended 2026-09-22 (see "Amendment 4"
+  ...)" clause.
+* **Decision 5, item 2.** Appended the italic reading of "every
+  `Dockerfile` `FROM` line". Items 1 and 3 unchanged.
+* **Class 2 table, `uv` row.** The version cell — was "0.12.16 on PyPI" —
+  gained the parenthetical "(0.12.17 on 2026-09-22, Amendment 4; the
+  image tag the `Dockerfile`s pin is that version — Class 4 table)".
+* **Class 4 table and its preamble.** The preamble gained the italic
+  correction; the `python:3.12-slim` row's reference cell — was
+  "`python:3.12-slim` × 4 (`services/*/Dockerfile`)" — now notes the
+  fifth file; a `ghcr.io/astral-sh/uv:0.12.17` row is added last.
+
+Assumptions made by this amendment (push back individually):
+
+1. **A `COPY --from=` reference is in scope of decision 5 item 2 by
+   reading, not by a new rule.** The item's rationale (a licence change
+   reaches a build silently through an unpinned tag) applies without
+   change; the wording named `FROM` because that was the only form in the
+   tree when it was written.
+2. **Provenance class (a).** `ghcr.io/astral-sh/uv` is published by the
+   project (Astral) under the project's own organisation; the licence is
+   PyPI's `license_expression` for the same version of the same binary,
+   not read from the image itself, which the architect cannot pull.
+3. **The tag `0.12.17` is taken from uv's Docker guide's own example and
+   PyPI's current version**, not from a registry listing (`docs.astral.sh`
+   is blocked; the GitHub releases API answered 403). If the tag does not
+   resolve at build time, the coder reports it; `0.12` (`major.minor`) is
+   the documented next-narrowest tag and `python:3.12-slim`'s precedent.
+4. **Single-vendor, no paid tier for `uv` itself.** Astral is one company;
+   whether it sells a paid product around `uv` is not established here
+   and is irrelevant under decision 4 (Class 3 tooling) — the Class 4 row
+   asks only provenance and a pin.
+5. **No `CHANGES` entry.** A build-input pin with no observable effect on
+   a running deployment.
+
+Read on 2026-09-22 for Amendment 4:
+
+* `https://pypi.org/pypi/uv/json`: version `0.12.17`, `license_expression`
+  `MIT OR Apache-2.0`, `license_files` `["LICENSE-APACHE", "LICENSE-MIT"]`,
+  author "Astral Software Inc.", repository
+  `https://github.com/astral-sh/uv`.
+* `https://raw.githubusercontent.com/astral-sh/uv/main/docs/guides/integration/docker.md`
+  (summarised by the fetch tool): "Available images" —
+  `ghcr.io/astral-sh/uv:latest`, `ghcr.io/astral-sh/uv:{major}.{minor}.{patch}`
+  (e.g. `0.12.17`), `ghcr.io/astral-sh/uv:{major}.{minor}` (e.g. `0.12`),
+  plus Alpine/Debian/Python-based variants; "Installing uv" — `COPY
+  --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/`, and "it is best
+  practice to pin to a specific uv version, e.g., with: `COPY
+  --from=ghcr.io/astral-sh/uv:0.12.17 /uv /uvx /bin/`"; a SHA256 digest
+  pin is also recommended "as tags can be moved across different commit
+  SHAs".
+* Repository facts: the five `Dockerfile`s' line 2; ADR-0013 Amendment 4
+  ruling R9.

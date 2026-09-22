@@ -212,6 +212,15 @@ Re-enable when all three of these hold:
    passes even when every container dies on startup, so restoring the job
    unchanged would buy a green check that proves nothing.
 
+   Progress 2026-09-21 (epic #95, ADR-0013): the compose side is ready for
+   it. `deploy/docker-compose.yml` now gives every container a healthcheck,
+   runs a one-shot `provision` job the services wait on, and `make up` runs
+   `docker compose up --build -d --wait`. The CI step itself still lacks the
+   flag and stays as it is until the job is re-enabled, when condition 3 is
+   closed by adding it. Conditions 1 and 2 remain open under #52; until the
+   trie and detector are implemented `make up` fails under `--wait`, which
+   is the intended behaviour.
+
 A guard step in the `check` job fails the build the moment either
 directory starts collecting tests, printing exactly what to turn back on.
 That tripwire, not this paragraph, is what makes the disable impossible to

@@ -40,7 +40,7 @@ import json
 import os
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -423,8 +423,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # `func` is whatever set_defaults stored, so `args.func` is Any to mypy;
+    # naming its type here is what makes `main`'s return an int.
+    command: Callable[[argparse.Namespace], int] = args.func
     try:
-        return args.func(args)
+        return command(args)
     except HammertimeError as exc:
         print(f"hammertime-agent-token: error: {exc}", file=sys.stderr)
         return 1
