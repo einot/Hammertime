@@ -2842,6 +2842,20 @@ len(record)        == hot_count(root)          per address family
 > mutator returned. An absent `attributes` is stored as
 > `{"attributes_version": 1}`, and no stored document is ever interpreted.
 
+> **ADR-0015 Amendment 5 (2026-09-23, issue #116):** each record also holds
+> `request_count`, the `window_count` of the most recent `HotIpAdded` applied
+> for the address. The same step writes it with the document on every
+> `HotIpAdded`, a redundant one included, just as `record[ip] = attributes`
+> replaces the document, and deletes it with the document on `HotIpRemoved`.
+> It is not part of the attribute document, which stays exactly Section
+> 46.2's. The map is now a `Mapping[Address, IpRecord]`: `records[ip]` is an
+> `IpRecord` whose `attributes` is the document and whose `request_count` is
+> the count. The `Mapping[Address, IpAttributes]` of the note above therefore
+> now describes `records[ip].attributes`. The two invariant lines are
+> unchanged: they compare keys, and the count lives in the record's own
+> entry. `GET /ip/{addr}` returns the count as `request_count`
+> (`docs/protocol/read-api-v1.md`).
+
 Because attributes are reconstructed from the same event replay as the trie
 (Section 32), they require no separate durability or consistency mechanism.
 
@@ -2908,6 +2922,12 @@ attributes_rejected       documents rejected for size or shape
 > map, the validator or the codec. A document rejected by the record map does
 > not stop its HOT transition from being applied (Section 46.1): the worker
 > applies it again with no document, which stores the default.
+
+> **ADR-0015 Amendment 5 (2026-09-23, issue #116):** `ip_attribute_bytes`
+> counts the stored attribute documents only, as the validator measures them.
+> A record's `request_count` adds nothing to it. A snapshot's records include
+> each record's `request_count`, so that loading one and replaying yields the
+> same counts as a full replay.
 
 ## 46.9 Security
 

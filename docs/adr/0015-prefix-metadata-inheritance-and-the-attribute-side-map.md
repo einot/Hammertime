@@ -39,7 +39,15 @@ answers without decoding the record); amended 2026-09-23 by ADR-0016 (see
 "Amendment 4" at the end — the schemas' `minimum` and `maximum`, which
 Amendment 3 ruling 3 did not add, are now enforced by the codec on decode
 and on encode; two places in Amendment 3 gain dated notes, and nothing is
-reworded)
+reworded); amended a fifth time the same day (see "Amendment 5" at the end —
+issue #116, the owner's ruling that each HOT address's record holds its
+`request_count` beside its canonical attribute text: `IpAttributeRecords`
+becomes a `Mapping[Address, IpRecord]`, `record()` and `apply_hot_ip_added()`
+take a required keyword-only `request_count`, `ip_attribute_bytes` still counts
+the attribute text only, the invariant checkers and the trie's metrics do not
+change, and `schemas/hot_ip_event.v1.json` now requires `window_count`, as the
+codec already did. Assumption 25 is superseded. Merged text gains dated notes
+and is not reworded)
 
 Scope note: this ADR settles the interfaces epic #9 ("Metadata inheritance &
 hot-count aggregation") implements against —
@@ -58,7 +66,14 @@ from this module and names the seam. *(Widened 2026-09-23, Amendment 3 ruling
 fields and `capacity` on decode and what its encoder refuses. That defect
 predates epic #9 and is not about attributes. It is ruled here because it
 broke decision 5's "`CodecError` only" row, and no other ADR rules the codec's
-scalar fields. Assumption 64.)*
+scalar fields. Assumption 64.)* *(Widened 2026-09-23, Amendment 5: this ADR
+also rules what `GET /ip/{addr}`'s `request_count` holds, and makes
+`window_count` required in `schemas/hot_ip_event.v1.json`. It still designs
+neither the worker nor the read API. The worker's two `apply_hot_ip_added`
+calls gain one keyword argument, carrying the `window_count` that ADR-0017
+decision 17 said they would pass, and one bullet of `read-api-v1.md` is
+reworded. ADR-0014 and ADR-0017 gain pointer
+notes; their rulings are unchanged.)*
 
 It amends no prior ADR. It **implements** two that bind it: ADR-0005 decision 5
 ("the trie validates shape and size before storing") and ADR-0014 decision 9
@@ -523,6 +538,14 @@ class IpAttributeRecords(Mapping[Address, IpAttributes]):
     def __len__(self) -> int: ...
 ```
 
+*(Amended 2026-09-23, Amendment 5. Where this sketch differs from Amendment
+5's, Amendment 5's holds. `IpAttributeRecords` is a `Mapping[Address,
+IpRecord]`, so `__getitem__` returns an `IpRecord` whose `attributes` is the
+document this decision describes. `record()` takes a required keyword-only
+`request_count`. `IpRecord` is new. The heading's `Mapping[Address,
+IpAttributes]` now describes `records[a].attributes`. Nothing below about
+validation, the canonical text or the rules changes.)*
+
 **That the map validates is a requirement, not a choice made here.** ADR-0005
 decision 5 says "the trie validates shape and size before storing", ADR-0014
 decision 9 gives this epic "the map, its schema validation, and its
@@ -727,6 +750,13 @@ apply_hot_ip_removed
     ValueError (families)
 ```
 
+*(Amended 2026-09-23, Amendment 5: `IpAttributeRecords.record` and
+`apply_hot_ip_added` also raise `TypeError` for a `request_count` that is not
+an exact `int`, and `ValueError` for a negative one. Both are checked after the
+family and before the document, so before anything changes. Neither is caused
+by the document, so "the document itself can cause no exception but
+`InvalidAttributesError`" stands.)*
+
 There is **no blanket `except Exception`**: nothing converts an arbitrary
 exception into `InvalidAttributesError`. `MemoryError` and the
 `BaseException`s that are not `Exception`s (`KeyboardInterrupt`, `SystemExit`)
@@ -797,7 +827,11 @@ The record map itself:
   comes before the map changes, so a rejected call leaves the map, its length,
   its byte total and any earlier record for that address exactly as they were.
   *(Amended 2026-09-23, Amendment 2 rulings A and D; the superseded bullet is
-  quoted there.)*
+  quoted there.)* *(Amended 2026-09-23, Amendment 5: `record()` also takes a
+  required keyword-only `request_count`, checked after the family and before
+  the document: `TypeError` unless it is an exact `int`, `ValueError` if it is
+  negative. The text and the count then replace any earlier record together.
+  A rejected call leaves the earlier record's count as it was, too.)*
 * **The map keeps each record as its canonical text, and decodes a fresh
   document on every read.** Per address it holds the compact JSON text that
   `canonicalize_ip_attributes` returned, and nothing else of the document.
@@ -814,14 +848,20 @@ The record map itself:
   keys and decodes nothing: `False` for anything that is not an `Address`,
   the family `ValueError` for an `Address` of the other family, and otherwise
   whether a record is stored. *(Added 2026-09-23, Amendment 3 ruling 4;
-  assumption 68.)*
+  assumption 68.)* *(Amended 2026-09-23, Amendment 5: per address the map also
+  holds the record's `request_count`, in the same entry as the text, and
+  nothing else. `records[a]` returns an `IpRecord`. Its `attributes` is the
+  read-only view over a freshly decoded document described above, and its
+  `request_count` is an exact `int`. `discard` and `clear` remove both.)*
 * **`serialized_bytes` is §46.8's `ip_attribute_bytes`**: the total length of
   the stored canonical texts — each the size S6 measured — so a default record
   counts 24 bytes, the length of `{"attributes_version":1}`; kept up to date by
   every replace, `discard` and `clear`, and O(1) to read. §46.8's
   `ip_attribute_records` is `len(records)`. *(Amended 2026-09-23, Amendment 2
   ruling D; was: "the sum of the sizes `validate_ip_attributes` returned for
-  the records currently stored".)*
+  the records currently stored".)* *(Amended 2026-09-23, Amendment 5: a
+  record's `request_count` adds nothing to it. The total is still the length of
+  the attribute texts.)*
 * **`discard` never raises** for an address with no record (the family check
   aside); it returns whether one was removed. A `HotIpRemoved` for an IP the
   trie does not hold (ADR-0011, ADR-0014 decision 3) therefore deletes nothing
@@ -860,6 +900,10 @@ def apply_hot_ip_removed(
 ) -> bool: ...
 ```
 
+*(Amended 2026-09-23, Amendment 5: `apply_hot_ip_added` also takes
+`request_count: int`, keyword-only and required, after `attributes`.
+`apply_hot_ip_removed` is unchanged.)*
+
 They are the whole of "never independently" (§46.5, ADR-0005 decision 4), and
 nothing else. `apply_hot_ip_added` runs in exactly this order:
 
@@ -887,6 +931,11 @@ nothing else. `apply_hot_ip_added` runs in exactly this order:
    what a no-op event emits — a question ADR-0011's Consequences and ADR-0010
    decision 3 leave to the worker epic, and this ADR does not take.
 
+*(Amended 2026-09-23, Amendment 5: clause 1 also checks `request_count`, after
+the families: `TypeError` unless it is an exact `int`, `ValueError` if it is
+negative. Clause 4 writes the prepared text and the count together. The order
+is therefore the families, the count, the document, the trie, the record.)*
+
 Every exception therefore leaves the trie and the map exactly as they were: a
 family mismatch or a rejected document because nothing has been touched yet,
 an `InvariantViolation` because A12 guarantees the trie is unchanged and the
@@ -908,7 +957,10 @@ words: `False` does not mean "ignore the event"; a redelivered `HotIpAdded`
 replaces the record while leaving every count untouched, and a `HotIpRemoved`
 for an unknown address deletes whatever is there. Deleting unconditionally is
 also self-healing: a stray record for a COLD address is removed by the next
-removal for it.
+removal for it. *(Amended 2026-09-23, Amendment 5: the record written or
+deleted includes its `request_count`. A redelivered `HotIpAdded` writes its own
+`window_count` again, and a new owner's `HotIpAdded` for an address already
+HOT replaces the count with its own.)*
 
 **What each exception means to the worker (#10).** The mechanism is the worker
 epic's; these are the constraints it inherits:
@@ -939,11 +991,25 @@ document-caused failure in it — including one produced by a document whose
 types override every method they have. *(Added 2026-09-23, Amendment 2 ruling
 C.)*
 
+*(Amended 2026-09-23, Amendment 5: the recovery call passes the event's count,
+`apply_hot_ip_added(trie, records, ip, None, request_count=...)`, so the
+default document is stored with the count the rejected call carried. The
+`ValueError` row also covers a negative `request_count`, and a `request_count`
+that is not an exact `int` is a `TypeError`. Neither can come from a decoded
+event (Amendment 3 ruling 3; ADR-0016 decision 1). Both are bugs, and the
+worker lets both propagate, as ADR-0017 decision 7 has it do with the family
+`ValueError`. Neither is caused by the document, so the paragraph above
+stands.)*
+
 They take `(address, attributes)` rather than a `HotIpAdded`/`HotIpRemoved`
 object: the pair is everything §46.5 uses, it keeps this module independent of
 the event models (`hammertime.core.events.models`), and it is also the shape
 the snapshot epic's restore path has (an address and a stored document, with no
-event anywhere). The worker passes `event.ip, event.attributes`.
+event anywhere). The worker passes `event.ip, event.attributes`. *(Amended
+2026-09-23, Amendment 5: `apply_hot_ip_added` now takes the address, the
+document and `request_count`, and still no event, for the reasons above. The
+snapshot's restore passes a stored count. The worker passes `event.ip,
+event.attributes, request_count=event.window_count`.)*
 
 Everything else about applying an event stays outside: ordering, the event
 loop, sequence numbers, publishing `PrefixStatsChanged`, choosing which
@@ -984,7 +1050,8 @@ existing `Spec:` docstring line, extended where this ADR adds a section, and
 cites ADR-0015. *(Layout rows for `events/attributes.py` and `events/codec.py`
 amended 2026-09-23, Amendment 2 ruling A; they read "validate_ip_attributes —
 the §46.2 rules, once" and "calls validate_ip_attributes; its private copies of
-the rules are removed".)*
+the rules are removed".)* *(Amended 2026-09-23, Amendment 5: `ip_attributes.py`
+also defines `IpRecord`, which `__init__.py` re-exports with the rest.)*
 
 ### 8. Neither store is thread-safe, and neither is snapshot-shaped by this epic
 
@@ -1003,6 +1070,10 @@ because it is not symmetric:
   snapshot file is never a way around §46.2; what the loader does when one is
   rejected — refuse the snapshot and replay from the log, or restore that
   address with the default document — is the snapshot epic's decision.
+  *(Amended 2026-09-23, Amendment 5: a record now includes its
+  `request_count`, so the snapshot persists each count with its text and
+  passes it back to `record()` or `apply_hot_ip_added()`, both of which
+  require it. ADR-0017 decision 16 already lists it.)*
 * **The local metadata store is not derived state and is not part of a §33
   snapshot.** It is operator-declared configuration; a replay of
   `hammertime.hot-ip.v1` neither creates nor destroys a declaration, and a
@@ -1194,7 +1265,14 @@ not dictate. Push back on them individually.
     kept it to that. The query epic therefore needs a decision: widen this
     record (an amendment here) or hold a second per-IP map with the same
     lifetime (two things to keep in step). I recommend the amendment, and
-    flag it rather than pre-empting it.
+    flag it rather than pre-empting it. *(Superseded 2026-09-23 by Amendment
+    5. The repository owner ruled on issue #116 for the amendment recommended
+    here: each HOT address's record holds `request_count` beside its
+    canonical attribute text, not inside the document, and there is no second
+    per-IP map. "`request_count` is not stored by this epic" and "The query
+    epic therefore needs a decision" no longer hold. The reasons given for
+    keeping the count out of the `IpAttributes` document still hold: §46.3
+    registers no such name, and `weight` is not a raw count.)*
 26. **The local metadata store is excluded from the §33 snapshot** (decision
     8). It follows from the store holding configuration rather than derived
     state, but nothing said so, and a snapshot epic could reasonably have
@@ -1225,6 +1303,10 @@ not dictate. Push back on them individually.
     and the record map consumes them, and neither authors anything in
     `schemas/`. S4's data-model rule is what the schema's JSON types already
     mean once a document can arrive as Python objects rather than JSON text.
+    *(Qualified 2026-09-23, Amendment 5: `schemas/hot_ip_event.v1.json`
+    changes. `window_count` joins its `required` list and gains a description
+    (assumptions 80 and 81). `schemas/ip_attributes.v1.json` is still
+    unchanged.)*
 29. **`Tags.of(*names)` exists as a convenience constructor.** Pure ergonomics
     — `Tags.of("internal")` against `Tags(frozenset({"internal"}))` — and one
     line.
@@ -1334,7 +1416,10 @@ not dictate. Push back on them individually.
     event does not carry. I routed the recovery through a second call, rather
     than a flag on `apply_hot_ip_added` or a richer return value, so that the
     function stays strict and all-or-nothing and counting and logging stay with
-    the caller (assumption 37).
+    the caller (assumption 37). *(Amended 2026-09-23, Amendment 5: the second
+    call also passes the event's `request_count`, so the default document
+    replaces the record together with the event's count. The document was
+    rejected, not the count.)*
 39. **Reads raise `ValueError` for an address of the other family.** A
     `Mapping` conventionally answers "absent" for a key it does not hold, and
     `KeyError` / `False` / `None` would be defensible here — an IPv6 address is
@@ -1631,6 +1716,11 @@ not dictate. Push back on them individually.
     copy. The view is kept so that decision 5's read-only top level stays true
     for existing callers and tests, and so that `records[a]["weight"] = …` stays
     the loud mistake it was, rather than a silent write to a throwaway copy.
+    *(Amended 2026-09-23, Amendment 5: `records[a]` now returns an
+    `IpRecord`, and the `MappingProxyType` is its `attributes`. Both mistakes
+    stay loud: `records[a]["weight"] = …` fails because an `IpRecord` supports
+    no item assignment, and `records[a].attributes["weight"] = …` fails
+    through the view.)*
 59. **The canonical text is a fixed point, so the snapshot epic needs no
     accessor.** For every text `t` the function returns,
     `json.dumps(json.loads(t), separators=(",", ":")) == t`, and canonicalizing
@@ -1941,6 +2031,189 @@ not dictate. Push back on them individually.
     implementing change does not have to re-derive it, as assumption 27 did
     for epic #9.
 
+Assumptions 70-84 were added by Amendment 5 (issue #116, `request_count`).
+What they build on is not an assumption: the owner's ruling (the count lives
+in the record, beside the canonical text and not inside the document; one
+map; written and removed in the coupled step), ADR-0017 decision 17 (what the
+count means; the worker passes `window_count` to both calls), and the terms
+#116 was dispatched with, as relayed to this amendment by the coordinating
+session (the count is trusted; `ip_attribute_bytes` keeps counting the
+attribute text only; the count survives the apply-time retry; #115's events
+get a count too). The issue's own text was not available to this amendment.
+Each judgment call made on top of those is below.
+
+70. **`records[a]` returns the whole record, not the document** (Amendment 5
+    ruling 2). The alternative was to keep `IpAttributeRecords` a
+    `Mapping[Address, IpAttributes]`, keep `records[a]` as the document, and
+    add a reader such as `records.request_count(a)`. It had real merits.
+    Every statement about the map's reads would have stayed true word for
+    word: ADR-0005 decision 4's `ip -> IpAttributes`, §46.5 and §46.6's
+    `record[ip]`, ADR-0014 decision 9, decision 5's reads bullet, assumption
+    58. Reading the count would have decoded nothing. And about forty test
+    assertions would not have moved. I did not take it, for four reasons.
+    * *The owner widened the record.* In this ADR the record is what
+      `records[a]` returns. A read that leaves out the count does not return
+      the widened record.
+    * *Both designed readers want both fields together.* `GET /ip/{addr}`
+      (ADR-0017 decision 15) and the snapshot (ADR-0017 decision 16) each need
+      an address's document and count in one synchronous section. One read
+      gives them one typed value.
+    * *Walking the map carries the count.* `records.items()` and `values()`
+      yield whole records. With the alternative, a snapshot writer that
+      walked `items()` would have written no counts, with no error at write
+      time.
+    * *Now is the cheapest time.* No production code reads `records[a]`: the
+      read API is ADR-0017's slice 3, and the snapshot is a later epic. The
+      cost falls on tests alone, and `make typecheck` finds every read that
+      still treats a record as a mapping.
+
+    The texts that named `Mapping[Address, IpAttributes]` or a read's view get
+    dated notes instead: §46.5's ADR-0015 note, ADR-0014 decision 9, decision
+    5 and assumption 58. Push back here if the smaller change is preferred.
+    It is a mechanical swap before any production reader exists, and much
+    more expensive after.
+71. **`IpRecord`: its name, its shape, and no checks of its own** (ruling 2).
+    Nothing specified a name. `IpAttributeRecord`, the singular of the
+    container, would call the count an attribute, which the owner's ruling
+    says it is not. The container keeps its name, `IpAttributeRecords`:
+    renaming it would touch `hammertime.trie.state`, ADR-0017 and every test,
+    and would buy only an accurate name. A frozen, slotted dataclass follows
+    `PrefixStats` and ADR-0017's `FamilyState`. A `NamedTuple` would also be
+    iterable and indexable, and `dict(records[a])` could then half-work on a
+    two-key document instead of failing. `IpRecord` checks nothing, because
+    the map is its only producer and builds it only from what a write
+    accepted. `PrefixStats` checks its count (decision 2) because anyone may
+    build one for publication, which is not the case here. Hashability is not
+    promised, because the view over the document is not hashable.
+72. **`request_count` is a required keyword-only argument of both writers**
+    (ruling 3). A default of `0` would keep every existing call working. It
+    would also let a writer that forgot the count store `0` without a sound:
+    the worker's retry, whose count #116's terms require to survive, #115's
+    path, or the snapshot's restore. A positional parameter after
+    `attributes` would need a default. One before `attributes` would turn
+    every existing positional call's document into a count. Keyword-only and
+    required makes forgetting it a `TypeError` at the first call, which any
+    test that reaches the call finds. `record()` takes it too, although only
+    `apply_hot_ip_added` has a production caller. Decision 8 names `record()`
+    as a path the snapshot epic may restore through, and a record written
+    without a count would break ruling 2, under which every record holds one.
+73. **The parameter is named `request_count`, not `window_count`** (ruling 3).
+    The store names what it holds, which is also what `GET /ip` calls it. It
+    knows nothing of events: that is decision 6's reason for taking an
+    address and a document rather than a `HotIpAdded`. The two names meet at
+    the worker's call site, `request_count=payload.window_count`.
+74. **The count is checked on every write, although it is trusted: an exact
+    `int`, `>= 0`, no maximum** (ruling 3). Nothing asked for a check, and the
+    value comes from the aggregator through the codec. I added one for two
+    reasons. The store's readers can then rely on what they read:
+    `GET /ip` renders the count as a JSON integer, and the snapshot writes
+    it. And a wrong value is better refused at the write that made it than met
+    at a read far from it, which is assumption 47's reason for `declare`.
+    * *An exact `int`, rather than "an `int` that is not a `bool`".* Every
+      producer of a count yields an exact `int`: the codec's decode
+      (Amendment 3 ruling 3) and any JSON snapshot loader. Refusing
+      subclasses guarantees an exact `int` is stored, and runs no subclass
+      code, without decision 5's base-slot reads. Decision 3's
+      `Bitmask.bits` and the encoder's integer fields (assumption 66) do
+      accept `int` subclasses. Those take values this project's own code
+      builds on the way out; a count arrives from a decode. If a caller ever
+      needs to pass an `IntEnum`, reading subclasses through `int`'s own
+      slot is a small change, to be made by amendment.
+    * *`TypeError` and `ValueError`*, by assumption 44's convention: the
+      wrong type, or the right type with a bad value.
+    * *No maximum.* The schema states none, ADR-0016 decision 1 adds none
+      where the schema states none, and ADR-0016 assumption 6 rejected
+      capping the window count. After ADR-0016 a real count cannot come near
+      the interpreter's integer-string limit. How the snapshot writes a count
+      is the snapshot epic's choice.
+    * *`0` is accepted, whether or not the address is HOT.* The schema's
+      minimum is 0. An aggregator whose `hot_threshold` is at least 1 never
+      sends a `HotIpAdded` with a `window_count` of 0, but the store does not
+      judge that. `GET /ip` would then show `HOT` with a `request_count` of 0.
+75. **The count is checked after the family and before the document**
+    (ruling 3). The family comes first, so that ADR-0014 decision 1's rule
+    that the family is checked before any other argument still holds. The
+    count comes before the document so that a bug is never reported as a
+    rejected document. `InvalidAttributesError` sends the worker down
+    decision 6's recovery path and counts in `attributes_rejected`. A call
+    with a bad count and a bad document, checked the other way round, would
+    first be counted as a rejected document and retried, and only then fail
+    as the bug it is. Both checks run before the trie, so decision 6's "Every exception
+    therefore leaves the trie and the map exactly as they were" needs no new
+    case.
+76. **A count error's message names `request_count` and never contains the
+    value** (ruling 3). ADR-0016 decision 1 set that rule for the codec's
+    range errors. Here it also keeps the error path from failing itself:
+    rendering a negative integer longer than the interpreter's integer-string
+    limit raises `ValueError` while the message is built.
+77. **Neither invariant checker changes, and neither gains a clause about the
+    count** (ruling 6). ADR-0017 decision 1 lists "the invariant checkers"
+    among #116's contents, so a change was expected. None is needed. The
+    count is stored in the record's own entry, so it cannot outlive or
+    predate its record. That a count exists for exactly the HOT addresses is
+    therefore §46.5's key-set equality restated, and a count of the wrong
+    type or sign is refused at the write. A clause that read values would
+    also have to know the record type, and ADR-0014 decisions 9 and 10 keep
+    that out of both checkers: `hammertime.trie.structure` imports nothing
+    from `hammertime.trie.metadata`, and testkit imports nothing from a
+    service.
+78. **No metric for the count** (ruling 10). §37 and §46.8 name none, and no
+    reader has asked for one. A sum or a histogram of counts would be a
+    series nothing specifies.
+79. **`read-api-v1.md`'s `request_count` bullet is reworded, rather than left
+    as it was with the answer given here** (ruling 1). The text is what a
+    client reads, and the difference shows. Until #115, an add whose
+    attributes the codec rejects is skipped, yet the bullet as written
+    promised that add's count. The new text says "applied", and says that
+    only a `HotIpAdded` sets the count. It also says the count can be
+    replaced while the IP stays HOT (ruling 4), which "at transition time"
+    alone could be read to exclude.
+80. **`window_count` is required on both event types, and the codec is taken
+    to be right** (ruling 8). `hammertime.core.events.models` calls the
+    schema files "authoritative", which argues for the schema. That word is
+    about the models mirroring the schemas, though. On this field the codec,
+    both models, the only producer (the aggregator), the integration
+    scenarios and now the trie all treat the field as required. Saying so in
+    the schema documents what has always been enforced. Relaxing the codec
+    would change behaviour to match a document, and would leave an add with
+    no count to store. The field is required on `HotIpRemoved` as well,
+    although the trie does not use its value there. The aggregator writes it,
+    the codec requires it, `integration-scenarios.md` §3 step 8 pins it, and
+    a conditional `required` would leave the codec stricter than the schema
+    for removals.
+81. **The schema's `window_count` gains a description** (ruling 8). Only
+    `attributes` had one. A producer reading the schema now sees what the
+    field is and what the trie does with it. It adds no constraint.
+82. **No `CHANGES` entry** (ruling 11). Nothing a deployment can observe
+    changes until ADR-0017's slice 3 serves `GET /ip/{addr}`: no endpoint, log
+    record, metric or configuration key exposes the count. The schema's new
+    `required` entry matches what every build that decodes hot-ip events
+    already enforced, so no running build accepts or refuses anything it did
+    not before. `CLAUDE.md` lists changed event schemas among the things to
+    record. I read that as a change to what the system accepts or emits, and
+    this changes neither. Under its "if you are unsure whether a change
+    qualifies, it does not", no line is written. Push back if the file
+    itself counts.
+83. **Pointer notes, not amendments, in ADR-0014 and ADR-0017. None in
+    ADR-0005, or in spec §29, §46.6 or §46.7.** ADR-0014's and ADR-0017's
+    rulings are unchanged. Their text names a type or a call that has grown,
+    which is the shape of ADR-0017 Amendment 1's erratum (its assumption 39),
+    so neither gains a status clause or an amendment section. ADR-0005
+    decision 4's `ip -> IpAttributes` and §46.6's `attributes(ip) =
+    record[ip]` describe the attribute document, which is still what they
+    say it is, now reached as `records[ip].attributes`; §46.5's new note says
+    so. §29 and §46.7 show `request_count` in examples and define nothing.
+    `read-api-v1.md`, which §29's note names as the full contract, defines
+    it. `docs/spec/README.md`'s §19 and §29 rows name this amendment.
+84. **Merged ADR and spec text is not reworded; three documents are edited in
+    place** (the edit list at the end of Amendment 5). Amendments 1-3 rewrote
+    some merged text and quoted what they replaced. Amendment 4's correction
+    and ADR-0017 Amendment 1 insert dated notes and reword nothing, and this
+    amendment follows them. `docs/protocol/read-api-v1.md`,
+    `docs/spec/README.md`'s index and `schemas/hot_ip_event.v1.json` have no
+    dated-note convention: ADR-0017 edited the first two in place. Each is
+    edited in place here, and the edit list quotes what it replaced.
+
 ## Consequences
 
 * Epic #9 becomes implementable against a fixed surface: four modules, three
@@ -1993,6 +2266,10 @@ not dictate. Push back on them individually.
   on `GET /ip/{addr}`. It still owns `evaluate_prefix_state`
   (`hammertime.core.state.prefix`, which does not exist yet), any caching of
   `prefix_state`, and the `request_count` decision of assumption 25.
+  *(Amended 2026-09-23, Amendment 5: the `request_count` decision is made.
+  `IpAttributeRecords.get(ip)` returns an `IpRecord`, or `None` while the IP
+  is COLD. Its `attributes` is §46.7's `attributes`, and its `request_count`
+  is `GET /ip/{addr}`'s.)*
 * **The snapshot epic** must persist the record map (§46.8) and must not
   persist the metadata store (decision 8). Every document it restores is
   validated by `record()` or `apply_hot_ip_added()` (decision 5); it decides
@@ -2011,7 +2288,10 @@ not dictate. Push back on them individually.
   encoder no longer writes a non-finite number. Still no schema or
   wire-format change. There is now one `CHANGES` entry, because the second
   narrowing changes what the running aggregator does with such a message;
-  assumptions 62 and 69.)*
+  assumptions 62 and 69.)* *(Amended 2026-09-23, Amendment 5: one schema
+  changes. `schemas/hot_ip_event.v1.json` now requires `window_count`, which
+  the codec already required. It is not a wire-format change, and it has no
+  `CHANGES` entry; assumptions 80 and 82.)*
 * Spec pointer notes added by this ADR: §9 (where `local_metadata` lives), §12
   (what is combined upward, and that `hot_ratio` is not), §16 and §17 (the
   prefix-keyed store and the two fold directions), §46.5 (the module that holds
@@ -2023,13 +2303,17 @@ not dictate. Push back on them individually.
   README's list of ADR-0015's notes now includes §46.2. The README's §19 row
   also names this ADR, for ruling 3's rules on the codec's integer fields.
   §19 itself gets no note, because it says nothing about wire types.)*
+  *(Amended 2026-09-23, Amendment 5: §46.5 and §46.8 each gain a second
+  ADR-0015 note, and the README's §19 and §29 rows name Amendment 5.)*
 * **Open, and deliberately not settled here:** how an operator declares prefix
   metadata, and whether declarations are durable (assumption 7) — that is a
   config/protocol design of its own, and until it exists the store has no
   production caller; whether `request_count` joins the per-IP record
   (assumption 25); and whether a `HotIpAdded` whose document fails validation
   at decode should still deliver its transition, which would change the
-  codec's contract (assumption 42).
+  codec's contract (assumption 42). *(Amended 2026-09-23, Amendment 5:
+  whether `request_count` joins the per-IP record is settled. It does, by the
+  repository owner's ruling on #116.)*
 
 ## Amendment 1 (2026-09-23) — the three gaps `test-author` hit writing epic #9's tests, and four more found while ruling them
 
@@ -2746,3 +3030,364 @@ Assumptions made by these corrections (push back individually):
   nothing in this ADR is reworded. Push back if a reworded note, with the
   old sentence quoted, is preferred.
 * **No `CHANGES` entry.** Wording only; the codec's behaviour is unchanged.
+
+## Amendment 5 (2026-09-23) — `request_count` joins the per-IP record (#116): `IpRecord`, a required count on every write, byte totals that stay attribute-only, and `window_count` required by the hot-ip schema
+
+Why: issue #116. `GET /ip/{addr}` returns `request_count`
+(`docs/protocol/read-api-v1.md`), and assumption 25 left open where the trie
+keeps it: widen this record, or hold a second per-IP map with the same
+lifetime. The repository owner ruled on 2026-09-23 (recorded in ADR-0017
+decision 17):
+
+* each HOT address's record holds `request_count` beside its canonical
+  attribute text;
+* both are written and removed in the same single-writer step as the trie's
+  `hot_count`;
+* the count is not put inside the attribute document;
+* there is no second per-IP map.
+
+The count comes from `HotIpAdded.window_count`, which the aggregator
+computes, so it is trusted data. The ruling left the following to this ADR,
+and each is ruled below: what `request_count` means against the read API's
+text; the record's type, and how a read exposes the document and the count;
+the writers' signatures; replace-on-add; the byte total; the invariant
+checkers; the worker's two calls; the codec and
+`schemas/hot_ip_event.v1.json` disagreeing on `window_count`; #115; and the
+metrics. Assumptions 70-84 are the judgment calls. The paragraph before them
+says what they build on.
+
+**1. What `request_count` means.** ADR-0017 decision 17 gives the meaning,
+and this ADR adopts it unchanged:
+
+* it is the `window_count` of the most recent `HotIpAdded` the trie has
+  applied for the address;
+* every applied `HotIpAdded` replaces it, whatever `add_hot_ip` returned. That
+  includes a redelivered one, and one that a shard's new owner emits for an
+  address the trie already holds (ADR-0001 Amendment 1 clause 5; ruling 4);
+* `HotIpRemoved` deletes it with the record, and the read API renders "no
+  record" as `0`;
+* only a `HotIpAdded` sets it.
+
+It is not live. §18 makes the transition the only coupling, and the
+aggregator publishes nothing between transitions (ADR-0005's Context;
+ADR-0011 assumption 6). A live count would need a new event type or a
+cross-service query, and neither is designed.
+
+"Applied" matters in one place. `read-api-v1.md` said "the `window_count`
+carried on the IP's most recent `HotIpAdded`". A `HotIpAdded` the worker
+skips sets nothing. Until #115 lands, that includes one whose attributes the
+codec rejects (ADR-0017 decision 17's interim). For such an event the text
+promised a count the trie does not hold. The bullet now says "the most recent
+`HotIpAdded` the trie has applied", says that only a `HotIpAdded` sets it,
+and keeps "at transition time, not a live value" (assumption 79). Nothing
+else in the API text promised more than the stream supplies: `0` while COLD
+and the count at transition time are exactly what the trie holds.
+`integration-scenarios.md` §3 steps 6-8 and §6 step 4 already pin this
+reading, and are not edited.
+
+**2. The record: `IpRecord`, and `IpAttributeRecords` becomes a
+`Mapping[Address, IpRecord]`** (assumptions 70 and 71). Per address, the map
+holds one entry: decision 5's canonical attribute text, and the
+`request_count`. It keeps nothing else, and nothing else is keyed by address:
+no second map, index or parallel dictionary (the owner's ruling). A read
+returns the whole record:
+
+```python
+# hammertime.trie.metadata.ip_attributes    Spec: §46.2, §46.5-§46.9     (Amendment 5)
+IpAttributes = Mapping[str, object]                                        # unchanged
+DEFAULT_ATTRIBUTES: Final[IpAttributes] = MappingProxyType({"attributes_version": 1})   # unchanged
+
+
+@dataclass(frozen=True, slots=True)
+class IpRecord:
+    """One address's record, as read: its attribute document and its request_count."""
+    attributes: IpAttributes   # read-only view over a document decoded afresh for this read
+    request_count: int         # exact int >= 0: window_count of the most recent HotIpAdded applied
+
+
+class IpAttributeRecords(Mapping[Address, IpRecord]):
+    def __init__(self, family: AddressFamily) -> None: ...
+    @property
+    def family(self) -> AddressFamily: ...
+    @property
+    def serialized_bytes(self) -> int: ...          # §46.8 ip_attribute_bytes: attribute texts only
+
+    # Mutation — §46.5. Single writer (§28); not thread-safe.
+    def record(
+        self,
+        address: Address,
+        attributes: Mapping[str, object] | None = None,
+        *,
+        request_count: int,
+    ) -> None: ...
+    def discard(self, address: Address) -> bool: ...    # removes the whole record, count included
+    def clear(self) -> None: ...
+
+    # Mapping — get, keys, items, values come from the ABC.
+    def __getitem__(self, address: Address) -> IpRecord: ...
+    def __contains__(self, key: object) -> bool: ...    # decodes nothing (Amendment 3)
+    def __iter__(self) -> Iterator[Address]: ...
+    def __len__(self) -> int: ...
+
+
+def apply_hot_ip_added(
+    trie: HotTrie,
+    records: IpAttributeRecords,
+    address: Address,
+    attributes: Mapping[str, object] | None = None,
+    *,
+    request_count: int,
+) -> bool: ...
+
+def apply_hot_ip_removed(
+    trie: HotTrie, records: IpAttributeRecords, address: Address
+) -> bool: ...                                          # unchanged
+```
+
+* **`records[a]`** makes the checks it made before. A key that is not an
+  `Address` is a `KeyError`, an `Address` of the other family is the family
+  `ValueError`, and an absent address is a `KeyError`. It then returns a new
+  `IpRecord` on every call. The record's `attributes` is exactly what decision
+  5 says a read returns: a `MappingProxyType` over a document decoded afresh
+  from the stored text, exact built-in types throughout, which nothing a
+  reader does can carry back into the map. Its `request_count` is an exact
+  `int`. `get`, `values` and `items` go through `__getitem__`, so
+  `records.get(a)` is an `IpRecord` or `None`. `a in records` is unchanged,
+  and still decodes nothing.
+* **`IpRecord`** is a frozen, slotted dataclass, so assigning to either field
+  raises `dataclasses.FrozenInstanceError`. It checks nothing itself: the map
+  builds one only from what a write accepted. Its equality is the dataclass's,
+  field by field. It is not promised to be hashable.
+* **The document stays §46.2's.** `request_count` is not a key of it, is not
+  seen by `canonicalize_ip_attributes`, and is not in its text.
+  `records[a].attributes` is everything §46.5-§46.7 mean by an address's
+  `IpAttributes`. `IpAttributes` and `DEFAULT_ATTRIBUTES` are unchanged.
+* **`discard` and `clear`** remove whole records: the count goes with the
+  document.
+
+**3. Every write takes the count as a required keyword-only argument,
+checked after the family and before the document** (assumptions 72-76).
+
+* **Signature.** `record()` and `apply_hot_ip_added()` both take
+  `request_count` after `*`, with no default. A call without it, or with the
+  count passed positionally, is Python's own `TypeError`, raised before the
+  function runs.
+* **Rule.** `type(request_count)` must be `int`, else `TypeError`. A `bool`,
+  an `int` subclass and an integral `float` are all refused. The value must be
+  `>= 0`, else `ValueError`. There is no maximum. The message names
+  `request_count` and never contains the value.
+* **Order in `record()`.** The family (`ValueError`); the count (`TypeError`,
+  then `ValueError`); the document (`InvalidAttributesError`); then the map
+  changes.
+* **Order in `apply_hot_ip_added()`.** Decision 6's clause 1 gains the count
+  after the families. The order is: the families; the count; the document
+  (clause 2); the trie (clause 3, `InvariantViolation`); the record (clause
+  4, which cannot raise). Everything that can raise still runs before
+  anything changes. Every exception therefore still leaves the trie and the
+  map, every document and every count, as they were.
+* **From the bus, neither count error can happen.** The codec decodes
+  `window_count` as an exact `int`: an `int` is returned as it is, and an
+  integral `float` is converted with `int()` (Amendment 3 ruling 3). It
+  refuses one below 0 (ADR-0016 decision 1). A count error therefore means a
+  bug, like decision 6's family `ValueError`, and the worker lets it propagate
+  (ADR-0017 decision 7). It is not an attributes rejection: it never takes
+  decision 6's `attributes=None` retry, and it is never counted in
+  `attributes_rejected`.
+
+**4. Replace-on-add covers the count, and so does the recovery.** Decision 6's
+clause 4 writes the prepared text and the count together. They replace the
+whole earlier record, whatever `add_hot_ip` returned (ADR-0014 decision 3).
+
+* A redelivered `HotIpAdded` writes the same values again.
+* An `UNCHANGED` one from a shard's new owner writes that owner's document and
+  its `window_count`.
+* `HotIpRemoved` deletes both. One for an address with no record deletes
+  nothing.
+
+§46.5's reason for replace-on-add holds for the count as it does for the
+document (assumption 38). After a replay, each record is the most recent
+applied `HotIpAdded`'s, whatever was stored before. Loading a snapshot and
+replaying therefore reaches the same records, counts included, as a full
+replay (§46.8).
+
+When `apply_hot_ip_added` raises `InvalidAttributesError`, nothing has
+changed: any earlier record stays, count included. The worker then applies
+the transition again with `attributes=None` and the same `request_count`.
+That stores the default document with the event's count. The document was
+rejected, not the count (ADR-0017 decision 17).
+
+**5. `serialized_bytes`, §46.8's `ip_attribute_bytes`, counts the attribute
+texts only**, as #116's terms require. It is still the total length of the
+stored canonical texts. A record's `request_count` adds nothing to it, and a
+write that changes only the count leaves it where it was. A default record
+still counts 24 bytes. The total stays what §46.8 names, the size of the
+stored §46.2 documents, and so stays bounded by 1024 bytes per record (§46.2;
+ADR-0005's Consequences). An integer has no serialized size until someone
+chooses a format for it.
+
+**6. The invariant checkers do not change** (assumption 77).
+`check_attribute_records` (ADR-0014 decision 9) and testkit's
+`assert_attribute_records_match` (ADR-0014 decision 10) take any
+`Collection[Address]`. A `Mapping[Address, IpRecord]` is one, so both take
+the widened map exactly as they took the old one. Neither reads a value, and
+neither gains a clause about the count. The count lives in the record's own
+entry, so it exists for exactly the addresses §46.5's two lines already
+compare. Its type and sign are checked on every write.
+
+**7. The worker passes the count to both calls** (ADR-0017 decisions 6, 7 and
+17). In decision 6 step 4, a `HotIpAdded` is applied as:
+
+```python
+changed = apply_hot_ip_added(
+    fs.trie, fs.records, payload.ip, payload.attributes, request_count=payload.window_count
+)
+# on InvalidAttributesError: count attributes_rejected{stage="apply"}, log it, then
+changed = apply_hot_ip_added(
+    fs.trie, fs.records, payload.ip, None, request_count=payload.window_count
+)
+```
+
+Both calls are synchronous and stay inside R1's section. The `HotIpRemoved`
+call is unchanged; that event's `window_count` is decoded and not used.
+Nothing else in the worker changes: no outcome, reason token, log record or
+`except` clause is added.
+
+**8. `schemas/hot_ip_event.v1.json` requires `window_count`: the codec was
+right** (assumptions 80 and 81). The schema listed `window_count` among its
+properties but not in `required`. Everything else already treated it as
+required:
+
+* the codec, whose decode refuses a hot-ip payload without it (`missing
+  required field: window_count`, a `CodecError`) and whose encode always
+  writes it (`hammertime.core.events.codec`, read in this repository);
+* `HotIpAdded` and `HotIpRemoved`, which declare `window_count: int` with no
+  default;
+* the aggregator, which sets it on every transition it emits (ADR-0011
+  decision 4);
+* the trie, which from this amendment stores it.
+
+The schema now lists `window_count` in `required`, for both event types, and
+gives it a description. The other way to agree, relaxing the codec, would
+leave an add with no count, and so a record whose `request_count` has no
+value. Relaxing it for `HotIpRemoved` alone would need a conditional schema
+and a second codec rule, for a field every producer writes anyway.
+
+This is not a wire-format change. The bytes every producer writes are
+unchanged, and every build that decodes hot-ip events already refused a
+payload without `window_count`. It changes what a third party that validates
+against the schema accepts, and only so that it matches what the codec
+already accepts.
+
+**9. #115 stays compatible.** #115 (the owner's ruling, ADR-0017 decision
+17) will apply the HOT change of a `HotIpAdded` whose attributes are rejected
+at decode, with the default attributes. That event's `window_count` is
+trusted like any other's, so its record gets a `request_count` too. This
+amendment designs nothing of #115. It asks two things of it:
+
+* whatever #115's decode result looks like, it carries the event's
+  `window_count`, decoded under the codec's integer rules;
+* the worker applies such an event with
+  `apply_hot_ip_added(fs.trie, fs.records, payload.ip, None, request_count=payload.window_count)`.
+
+The codec decodes a hot-ip payload's scalar fields before its attributes
+(`_decode_hot_ip_event`, read in this repository). A `CodecError` caused by an
+`InvalidAttributesError` therefore always belongs to an event whose
+`window_count` decoded. An event whose `window_count` fails is `MALFORMED`
+for another reason, and #115 does not apply it. If #115 lands before #116's
+implementation, that implementation passes the keyword on #115's call too.
+
+**10. No trie metric changes** (assumption 78). `ip_attribute_records` is
+still `len(records)`, `ip_attribute_bytes` is still `records.serialized_bytes`
+(ruling 5), and `attributes_rejected` counts what it counted before (ruling
+3). No series is added for the count.
+
+**11. No `CHANGES` entry** (assumption 82), for this amendment or for the
+change that implements it. The count first becomes visible with ADR-0017's
+slice 3, whose `GET /ip/{addr}` entry covers it. That entry should say that
+`request_count` is the count at the IP's most recent applied transition, not
+a live one, so that no reader takes it for a live count.
+
+### Follow-ups (for the top-level session to dispatch)
+
+* `test-author`: rulings 1-7 and 10 in `test_metadata.py`, `test_worker.py`
+  and `test_metrics.py` under `services/trie/src/hammertime/trie/tests/`, and
+  ruling 8 in `packages/hammertime-core/src/hammertime/core/tests/test_codec.py`.
+  The existing tests of the record map and the coupled step pass a count and
+  read documents through `.attributes`. Ruling 9 is #115's to test, once #115
+  exists.
+* `coder`: `IpRecord`, `IpAttributeRecords` and `apply_hot_ip_added` in
+  `hammertime.trie.metadata.ip_attributes`, the re-export, and the worker's
+  two calls. No `CHANGES` line.
+* `reviewer`, after both. No security audit is needed: #116 adds no input
+  path, no output and no trust decision. `window_count` was already decoded,
+  type-checked and bounded before it reached the worker, and nothing exposes
+  the count until slice 3.
+
+### Every edit outside this section
+
+Every edit to ADR and spec text is an insertion: a dated note, added beside
+unchanged text (assumption 84). The in-place edits to three documents that
+have no dated-note convention quote what they replaced.
+
+In this ADR:
+
+* **Status line.** Gains the clause for this amendment.
+* **Scope note.** Gains a dated note after the Amendment 3 note.
+* **Decision 5.** A dated note after the interface sketch, covering the
+  heading's `Mapping[Address, IpAttributes]` as well. A dated note after the
+  "What can come out" table. Dated notes at the end of the `record()` bullet,
+  of the reads bullet ("The map keeps each record as its canonical text …")
+  and of the `serialized_bytes` bullet.
+* **Decision 6.** A dated note after the signature block, and one after
+  clause 5 covering clauses 1 and 4. Dated notes at the end of the paragraph
+  "The record is written, or deleted, unconditionally …" and at the end of
+  the paragraph "They take `(address, attributes)` …". A dated note after the
+  paragraph that follows the worker's exception table ("No exception outside
+  these three …"), covering the table's `ValueError` and
+  `InvalidAttributesError` rows.
+* **Decision 7.** A dated note at the end of the import paragraph.
+* **Decision 8.** A dated note at the end of the attribute-records bullet.
+* **Assumptions 25, 28, 38 and 58.** A dated note each. 25 is superseded; 28,
+  38 and 58 are qualified.
+* **Assumptions 70-84**, and the paragraph introducing them, are new. They
+  follow assumption 69.
+* **Consequences.** Dated notes at the end of the query-epic bullet, the "No
+  schema changes" bullet, the "Spec pointer notes" bullet and the "Open"
+  bullet.
+
+In other documents:
+
+* **`docs/adr/0014-trie-structure-binary-oracle-patricia-and-arena.md`.** A
+  dated blockquote after decision 3's paragraph "**`False` does not mean
+  "ignore the event".**", and one after decision 9's paragraph beginning
+  "`Collection[Address]` is the entire coupling." No status clause and no
+  amendment section (assumption 83).
+* **`docs/adr/0017-trie-service-positional-replay-worker.md`.** Dated
+  blockquotes after decision 1's bullets, after decision 6's paragraph
+  "Steps 4 and 5 are one synchronous section …", after decision 7's "The
+  worker catches no bare `Exception` anywhere.", and after decision 17's
+  bullet "**For #116's attention:** …". No status clause and no amendment
+  section (assumption 83).
+* **`docs/spec/hammertime_spec_1.md`.** §46.5 and §46.8 each gain a second
+  ADR-0015 note, after the first.
+* **`docs/protocol/read-api-v1.md`**, `GET /ip/{addr}`. The `request_count`
+  bullet was: "`request_count` — the `window_count` carried on the IP's most
+  recent `HotIpAdded`; `0` while COLD. The trie keeps no counters (§18), so
+  this is the count *at transition time*, not a live value." It now says
+  "the most recent `HotIpAdded` the trie has applied for the IP", that one
+  applied while the IP is already HOT replaces it, and that only a
+  `HotIpAdded` sets it. It gives the aggregator's silence between
+  transitions as a second reason the count is not live, and cites this
+  amendment.
+* **`docs/spec/README.md`.** The §19 row's "`docs/adr/0015` (Amendment 3
+  ruling 3: the codec's integer fields)" now also names "Amendment 5:
+  `window_count` is required on hot-ip events". The §29 row, which read
+  "`services/trie/query`, `services/detector/api.py`,
+  `docs/protocol/read-api-v1.md`, `docs/adr/0010`, `docs/adr/0017` (decisions
+  9 and 15)", gains "`docs/adr/0015` (Amendment 5: `request_count` on
+  `GET /ip`)" before ADR-0017.
+* **`schemas/hot_ip_event.v1.json`.** `required` was `["type", "ip",
+  "timestamp", "sequence", "config_version"]`. It is now `["type", "ip",
+  "timestamp", "sequence", "window_count", "config_version"]`. The
+  `window_count` property was `{ "type": "integer", "minimum": 0 }`. It keeps
+  both keywords and gains a `description`. No other property changes.
