@@ -28,7 +28,12 @@ plus two smaller points raised alongside them. Amendment 4 pins the order of
 follow-up list. Every amendment rewrites
 decision bodies in place to state the rule now in force directly; each
 amendment's opening lists every such edit, and quotes the superseded
-wording, so the before/after is recoverable from this document alone)
+wording, so the before/after is recoverable from this document alone);
+amended 2026-09-23 by ADR-0016 (see "Amendment 8" at the end — a
+transition's envelope is now built and encoded before the durable HOT set
+is written, so an encoding failure persists nothing, and step 1's decode
+now refuses an integer field outside its schema's bounds; decisions 3 and
+4 each gain a dated note, and nothing is reworded)
 
 Scope note: this ADR settles the interfaces milestone M3 (epics #5, #6, #7
 and issue #48) implements against — what the aggregator keeps per IP, how
@@ -504,6 +509,18 @@ redelivery: an IP the store already has as HOT is not re-announced.
 > member" clause is likewise moot; the rest of it stands with
 > "handover" for "rebalance".
 
+> Amended 2026-09-23 (ADR-0016 decisions 1 and 4; Amendment 8). Step 1's
+> `codec.decode` now also refuses, as a `CodecError`, an integer field
+> outside the `minimum` and `maximum` its schema states. An observation
+> whose `request_count` (0 to 1000000000), `sequence` (0 to 2\*\*63 − 1) or
+> `window_seconds` (1 to 3600) is out of range is therefore `MALFORMED`:
+> logged, counted, not diverted and acknowledged. Two consequences follow.
+> Decision 2's `ValueError` for a negative delta can no longer be reached
+> from the bus. And `WINDOW_TOO_LONG` (step 2) covers a `window_seconds`
+> above `config.window_seconds` only up to 3600; above that the message is
+> `MALFORMED` and is not diverted. The worker itself is unchanged: it still
+> catches only `CodecError`.
+
 ### 4. Transitions: one call site for `evaluate_ip_state`, persist before publish, `weight` from core
 
 ```python
@@ -568,6 +585,15 @@ side effects — while `window.in_warmup and window.is_inherited(ip)`
    `hammertime.core.state.transitions.StateTransition(previous=previous,
    current=new)` — the value type core already ships for exactly this edge
    (A14).
+
+> Amended 2026-09-23 (ADR-0016 decision 3; Amendment 8). The payload and
+> the envelope of steps 3 and 4 are now built, and the envelope encoded,
+> between steps 1 and 2; only the publish stays after `record_transition`,
+> and it sends the bytes encoded before step 2. A `CodecError` from
+> encoding therefore propagates with nothing persisted, nothing published,
+> the state in memory unchanged and nothing counted. The sequence number is
+> consumed, as for a store failure. Persist before publish, its rationale
+> below, and steps 1, 2 and 5 are unchanged.
 
 Identity follows the ADR-0003 amendment and ADR-0004: `agent_id` is the
 producing shard, `sequence` is the shard's own counter (persisted, decision
@@ -3629,3 +3655,47 @@ Assumptions made by this amendment (push back individually):
   handled-position requirement exists.
 * **No CHANGES entry**: ADR-0013's implementing change carries every
   observable line.
+
+## Amendment 8 (2026-09-23) — by ADR-0016: an out-of-range observation is `MALFORMED` at decode, and a transition is encoded before it is persisted
+
+Why: issue #112. An observation message with a negative `request_count`
+passed the codec, and `IpCounter.observe` then raised out of `handle()`. The
+service exited 1. The message was never acknowledged, so it came back to
+every restart: a crash loop. A large enough `request_count` did the same
+from `TransitionEmitter.evaluate`: its `encode` failed after
+`record_transition` had already written HOT.
+
+ADR-0016 is the design. Its decisions 1 and 2 make the codec enforce the
+schemas' numeric bounds, and its decision 3 makes the emitter encode before
+it persists. This amendment follows Amendment 7's convention: dated
+blockquotes in place, the replacement text in the other ADR, and nothing
+reworded.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended 2026-09-23 by ADR-0016" clause.
+* **Decision 3, a blockquote after the 2026-09-21 note.** Step 1's decode
+  now refuses integer fields outside their schema bounds, so such an
+  observation is `MALFORMED`. A negative delta can no longer reach decision
+  2's `ValueError` from the bus. `WINDOW_TOO_LONG` ends at a `window_seconds`
+  of 3600.
+* **Decision 4, a blockquote after step 5.** The build-and-encode moves
+  ahead of `record_transition`; the publish sends the bytes encoded before
+  it.
+
+What is **not** changed:
+
+* decision 3's eight outcomes, their order, and step 1's "Any failure,
+  including `CodecError`, is `MALFORMED`";
+* decision 4's persist-before-publish rule, its rationale, the identity
+  fields (`agent_id`, `sequence`, `subject`), and steps 1, 2 and 5;
+* decision 2's `ValueError` for a negative delta;
+* assumption 7: a store failure aborts the transition. An encoding failure
+  now does too, before the store is touched;
+* assumption 10: `MALFORMED` is dropped, not diverted.
+
+This amendment makes no assumptions of its own. ADR-0016's assumptions 5
+(`window_seconds` above 3600), 6 (the step order) and 7 (the sequence number
+consumed) are the judgment calls behind the two notes. **No `CHANGES` entry**
+for this amendment by itself: ADR-0016's implementing change carries the one
+line (its assumption 12).
