@@ -149,10 +149,10 @@ above are unchanged.
 
 > Amended 2026-09-23 (ADR-0017; Amendment 4 below): in clause 4, "for the
 > trie, its own count of hot-ip events applied so far" now reads "for the
-> trie, its position in the hot-ip log: one past the stream offset of the
-> last record it has handled". The number only grows, across restarts
-> too, and it is not a count (ADR-0017 decision 8). The rest of clause 4
-> stands, the detector's half included.
+> trie, its position in the hot-ip log: the stream offset of the next
+> record it will read". The number only grows, across restarts too, and
+> it is not a count (ADR-0017 decision 8). The rest of clause 4 stands,
+> the detector's half included.
 
 **What is deliberately not promised.** Strong consistency between
 `GET /ip/{addr}` and `GET /prefix/{cidr}`; agreement at any instant between a
@@ -472,8 +472,8 @@ Why: ADR-0017 designs the trie service (epic #10). Its decision 8 records
 the answer to the question ADR-0010 Amendment 1 left open: the trie's
 `event_sequence` and the hot-ip log's stream sequence are one number. The
 repository owner decided that on 2026-09-23, on ADR-0017's
-recommendation. In ADR-0017's form, `event_sequence` is one past the
-stream offset of the last record the trie has handled. Two statements in
+recommendation. In ADR-0017's form, `event_sequence` is the stream
+offset of the next record the trie will read. Two statements in
 this ADR describe the value as something else, and each now carries a
 dated note. The model itself —
 eventually consistent across IPs, ordered per IP — is unchanged, and so is

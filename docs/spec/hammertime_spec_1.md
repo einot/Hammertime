@@ -1127,8 +1127,8 @@ The system SHOULD expose timestamps/version numbers for derived classifications 
 > never published), never a reordering; across IPs there is no ordering,
 > and a prefix aggregate catches up as transitions are applied. Every trie
 > and detector response carries `as_of`, `event_sequence` (for the trie,
-> its position in the hot-ip log — one past the stream offset of the last
-> record it has handled, so the number only grows, across restarts too; the
+> its position in the hot-ip log — the stream offset of the next record it
+> will read, so the number only grows, across restarts too; the
 > detector reports that number as carried on the newest
 > `PrefixStatsChanged` it applied; reworded 2026-09-23, ADR-0017) and
 > `config_version`
@@ -1666,11 +1666,14 @@ After loading a snapshot, events after its sequence number are replayed.
 > Amendment 1).
 
 > ADR-0017: that integer is the offset of the last hot-ip record the trie
-> handled, whether it applied the record or skipped it. The trie's
-> `event_sequence` (Section 22) is that offset plus one, so this section's
-> "event sequence number" and the read API's `event_sequence` are one
-> number. A trie with no snapshot replays from the first record the log
-> still retains, and does so inside the startup deadline (Section 47.2).
+> handled, whether it applied the record or skipped it, or the last offset
+> it passed at startup because the log no longer held a record there. The
+> trie's `event_sequence` (Section 22) is that offset plus one, the offset
+> of the next record it will read, so this section's "event sequence
+> number" and the read API's `event_sequence` are one number. A trie with
+> no snapshot replays from the first record the log still retains, and
+> does so inside the startup deadline (Section 47.2). A log that retains
+> no record is replayed at once.
 
 ---
 

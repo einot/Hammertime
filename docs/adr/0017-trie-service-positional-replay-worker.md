@@ -2,11 +2,17 @@
 
 Status: accepted 2026-09-23 (epic #10). It amends three earlier ADRs, each
 at a dated note in place plus a short amendment section listing its notes:
-ADR-0001 (Amendment 4), ADR-0010 (Amendment 2) and ADR-0013 (Amendment 9).
-Spec §22's note is reworded, and §28, §33 and §35 gain notes.
+ADR-0001 (Amendment 4), ADR-0010 (Amendment 2) and ADR-0013 (Amendments 9
+and 10). Spec §22's note is reworded, and §28, §33 and §35 gain notes.
 `docs/protocol/read-api-v1.md`, `docs/spec/integration-scenarios.md` §5,
 `docs/runbook.md` and `docs/spec/README.md` are edited in step. "Edits to
 other documents" at the end lists every edit and quotes what it replaced.
+Revised in place on 2026-09-23, before merge, for the two findings of the
+slice-1 security audit: a hot-ip log that holds nothing to replay no longer
+holds readiness back (decision 4 step 3; ADR-0013 Amendment 10 adds
+`MessageBus.first_offset`), and the admin app serves no generated API
+documentation (decision 13). "Revision 2026-09-23" at the end lists every
+edit of this revision and quotes what it replaced.
 
 Scope note. This ADR settles what epic #10 ("Trie worker, publisher &
 read-side query API") is built against. It splits the epic into slices
@@ -107,7 +113,7 @@ What was open, and blocks anyone who wants to write a test or a module:
 
 | Slice | Contents | Depends on |
 | --- | --- | --- |
-| 1 | `config.py`, `state.py` (new), `metrics.py` (new), `worker.py`, `service.py` (new, ADR-0009 decision 3), `__main__.py`, `query/app.py` (the three admin endpoints only); `.env.example`; `CHANGES` | — |
+| 1 | `config.py`, `state.py` (new), `metrics.py` (new), `worker.py`, `service.py` (new, ADR-0009 decision 3), `__main__.py`, `query/app.py` (the three admin endpoints only); `.env.example`; `CHANGES`; in `hammertime-bus`, `MessageBus.first_offset` on both buses (ADR-0013 Amendment 10) | — |
 | #116 | the owner's `request_count` ruling: an ADR-0015 amendment, `IpAttributeRecords`, `apply_hot_ip_added`, the invariant checkers, and the worker's two `apply_hot_ip_added` calls (decision 17) | slice 1 |
 | 2 | `publisher.py` and its wiring into the worker and the service; in `hammertime-core`, `PrefixStatsChanged.hot_ratio` in the model and the codec; `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` | slice 1 |
 | 3 | in `hammertime-core`, `state/prefix.py` (`evaluate_prefix_state`, ADR-0010 decision 1); `query/app.py`'s read routes and `query/views.py`; `prefix_queries` | slice 1, #116 |
@@ -172,13 +178,14 @@ class TrieState:
     @property
     def config(self) -> DetectionConfig: ...                  # the configuration in force at the trie
     @property
-    def position(self) -> int | None: ...                     # offset of the last hot-ip record handled; None before the first
+    def position(self) -> int | None: ...                     # the last offset handled or passed (decision 8); None before the first
     @property
     def event_sequence(self) -> int: ...                      # 0 if position is None else position + 1 (decision 8)
     @property
     def as_of(self) -> datetime | None: ...                   # the newest timestamp among applied events (decision 8)
     def note_handled(self, offset: int) -> None: ...
     def note_applied(self, offset: int, timestamp: datetime) -> None: ...
+    def note_passed(self, offset: int) -> None: ...
     def adopt_config(self, config: DetectionConfig) -> None: ...
 ```
 
@@ -190,13 +197,17 @@ class TrieState:
 * **`note_applied(offset, timestamp)`** sets `position = offset`, and sets
   `as_of` to `timestamp` when `as_of` is `None` and to
   `max(as_of, timestamp)` otherwise.
-* **What both refuse.** An `offset` below 0, or not greater than
-  `position`, is a `ValueError`, and nothing changes. `note_applied` also
-  refuses a naive `timestamp` in the same way.
+* **`note_passed(offset)`** sets `position = offset`, and nothing else:
+  the log holds no record at or below `offset` that the trie has not
+  read (decision 4 step 3). `as_of` does not move.
+* **What all three refuse.** An `offset` below 0, or not greater than
+  `position`, is a `ValueError` from `note_handled`, `note_applied` and
+  `note_passed`, and nothing changes. `note_applied` also refuses a naive
+  `timestamp` in the same way.
 * **`adopt_config(config)`** replaces `config`. It compares no versions
   (decision 10).
 * **Who writes it.** The worker is the only production caller of the
-  three mutators. The snapshot epic restores a `TrieState` by its own
+  four mutators. The snapshot epic restores a `TrieState` by its own
   means (decision 16), and nothing else writes one.
 
 ### 3. Consumption: one positional, whole-topic subscription, never acknowledged
@@ -208,11 +219,15 @@ class TrieState:
   broker (ADR-0010 Amendment 1 ruling 1).
 * **The subscription.** It is `subscribe(HOT_IP.name, start_offset=S)`,
   with `partitions=None` and no listener:
-  * `S` is `0` when `state.position` is `None`, and `state.position + 1`
+  * `S` is `state.event_sequence` as it stands after decision 4 step 3:
+    `0` when `state.position` is `None`, and `state.position + 1`
     otherwise;
   * a fresh `TrieState` has no position, so in slice 1 every start
-    replays from the first record the log retains (`start_offset=0`,
-    ADR-0013 decision 9 as amended);
+    replays from the first record the log retains. On the memory bus
+    that is `start_offset=0`. On JetStream, step 3 has passed the offsets
+    below the first retained record, so `S` is that record's offset, or
+    the log's end when it retains none (ADR-0013 decision 9 as amended by
+    Amendment 10);
   * the snapshot epic restores a `TrieState` whose `position` is its
     `replay_position`, and so gets `S = replay_position + 1` with no
     change here.
@@ -230,15 +245,69 @@ class TrieState:
 `TrieWorker.start()` takes these steps:
 
 1. If it has already subscribed, it returns.
-2. It reads `end = await bus.end_offset(HOT_IP.name)` *before*
-   subscribing, and keeps it as `replay_target`.
-3. It subscribes (decision 3).
-4. It takes the next message and awaits `handle()` on it, until the
-   worker is *caught up*. Caught up means `end <= S`, or
-   `state.event_sequence >= end` (which is `state.position >= end - 1`).
+2. It reads `end = await bus.end_offset(HOT_IP.name)`, then
+   `first = await bus.first_offset(HOT_IP.name)`: both *before*
+   subscribing, and in that order. It keeps `end` as `replay_target`.
+3. **It passes what the log no longer holds.** If `first >
+   state.event_sequence`, the log retains no record between the trie's
+   position and `first`: those records aged out, were purged, or never
+   existed (JetStream has no offset 0). The worker takes its lock and,
+   unless `stop()` has begun, calls `state.note_passed(first - 1)`, so
+   that `event_sequence` becomes `first`.
+4. It subscribes (decision 3), from `S = state.event_sequence`.
+5. It takes the next message and awaits `handle()` on it, until the
+   worker is *caught up*: `state.event_sequence >= end`.
    * If the iterator ends before that, `start()` raises `RuntimeError`.
    * If `stop()` has begun, `start()` returns without being caught up.
-5. It logs `replay_complete` (decision 12).
+6. It logs `replay_complete` (decision 12).
+
+`caught_up` is `False` until `start()` has subscribed, and
+`state.event_sequence >= replay_target` from then on. Because the
+subscription starts at `event_sequence`, this is the earlier test
+"`end <= S`, or `event_sequence >= end`" with the passed offsets counted.
+
+**What step 3 covers.**
+
+* *A stream nothing has been written to.* `end` and `first` are both
+  `1`. Without step 3 the trie waited, until the startup deadline, for a
+  record to move its position, and the stream holds none. `make up` on a
+  fresh deployment does this, because provisioning creates the stream
+  empty.
+* *A stream whose every record has aged out or been purged.* `first` is
+  `end`, because the stream keeps its last sequence (Sources).
+  `max_age` is 30 days for `hammertime.hot-ip.v1`, so any trie that
+  restarts after 30 quiet days meets this.
+* *A stream whose head has aged out.* `0 < first < end`. The replay
+  reads `[first, end)`, as it did before, but subscribes from `first`.
+
+On the memory bus `first_offset` is always `0`, because that bus never
+discards (ADR-0013 decision 3, as amended by Amendment 10). Step 3
+therefore never runs there, and nothing the memory bus shows changes.
+
+**Why `end` is read first.** JetStream assigns offsets in increasing
+order, and never one at or below the stream's last. So once a `first`
+read after `end` is `>= end`, no record below `end` can be delivered.
+If a record ages out between the two reads, this order counts it as
+gone. The other order would count it as present, and the replay would
+wait for it. `first` can exceed `end` when records are appended and the
+head ages out between the two reads. Step 3 then passes those offsets as
+well, and the trie is caught up at once.
+
+**Why step 3 moves the position, and does not only relax the test.**
+Suppose the empty case were simply counted as caught up, with
+`event_sequence` left at `0`. A trie that had handled the record at
+`end - 1` reports `end`. Restarted after that record aged out, it would
+report `0` until the next record arrived: backwards, against decision 8
+and `read-api-v1.md`. After step 3, `event_sequence` is the offset of the
+next record the trie will read in every case. The subscription starts
+there, and the snapshot epic's `replay_position` records it
+(assumption 26).
+
+**A restored state.** In slice 1 the state is always fresh. For a state
+restored from a snapshot, `first > S` means that records after the
+snapshot are gone, which is decision 16's first gap case. Step 3 must
+not pass them silently, so the snapshot epic runs its gap check before
+step 3 (decision 16).
 
 `TrieService.start()` does three things in order:
 
@@ -378,7 +447,7 @@ that producer, and the trie does not guess which is meant
 | `apply_*` | `ValueError` | Cannot happen: the worker routes by family (decision 5). If it does, it is a bug, and it propagates. |
 | `apply_*` | `InvariantViolation` | Log `trie_invariant_violation` and propagate: out of `handle()`, then out of `start()` (`start_failed`, exit 1) or `run()` (`run_exited`, exit 1). The trie and the records are unchanged (ADR-0014 A12 clause 2) and `position` has not moved. The orchestrator restarts the process, and the new process rebuilds its state from the snapshot plus replay — in slice 1, from replay alone. That is ADR-0014 A12 clause 5's rebuild, done by restarting the process. |
 | the subscription's iterator | any exception | Propagates out of `start()` or `run()`, exit 1. The bus already absorbs a fetch timeout (ADR-0013 decision 5, as amended). |
-| `bus.end_offset`, `subscribe` | any exception | Propagates out of `start()`: `start_failed`, exit 1. Not retried: the bus answered a moment before, at `NatsBus.start()`. |
+| `bus.end_offset`, `bus.first_offset`, `subscribe` | any exception | Propagates out of `start()`: `start_failed`, exit 1. Not retried: the bus answered a moment before, at `NatsBus.start()`. |
 
 The worker catches no bare `Exception` anywhere.
 
@@ -386,11 +455,15 @@ The worker catches no bare `Exception` anywhere.
 
 **The definitions.**
 
-* `position` is the offset of the last hot-ip record the worker has
-  *handled* — a record whose outcome was `APPLIED`, `UNCHANGED`,
-  `MALFORMED` or `FAMILY_NOT_SERVED`. It is `None` before the first.
-  `REDELIVERED` and `STOPPED` do not move it, and neither does an
-  `InvariantViolation`.
+* `position` is the last offset the worker has *handled* or *passed*.
+  * A record is handled when its outcome is `APPLIED`, `UNCHANGED`,
+    `MALFORMED` or `FAMILY_NOT_SERVED`.
+  * The offsets below the first record the log retains are passed when
+    `start()` finds that the trie has not read that far. Their records
+    aged out, were purged, or never existed (decision 4 step 3).
+
+  It is `None` before the first of either. `REDELIVERED` and `STOPPED` do
+  not move it, and neither does an `InvariantViolation`.
 * `event_sequence` is `0` when `position` is `None`, and `position + 1`
   otherwise: the offset of the next record the trie will read.
 
@@ -398,17 +471,18 @@ This answers ADR-0010 Amendment 1 ruling 3: the trie's `event_sequence`
 and the log's stream sequence are one number. It is what every read
 response and every `PrefixStatsChanged.sequence` carries. The snapshot's
 `replay_position` is `position`. ADR-0010 Amendment 1 ruling 2 said
-"applied"; a skipped record is handled too, and need not be read again.
+"applied"; a skipped record is handled too, and need not be read again,
+and a passed offset has nothing to read.
 
 **Who decided.** The repository owner decided on 2026-09-23, on this
 ADR's recommendation, that the trie's `event_sequence` is its log
 position and not a count of applied events. The reasons below are that
 recommendation's. The form the position takes here — `position + 1`,
-with `position` counting handled records — is this ADR's own
-(assumption 9). ADR-0010 Amendment 1 had raised the question for the
-owner (its assumption "Two numbers rather than one"), while ADR-0013
-decision 9 left it to the trie epic. The owner's decision makes that
-disagreement moot.
+with `position` counting handled records and passed offsets — is this
+ADR's own (assumptions 9 and 26). ADR-0010 Amendment 1 had raised the
+question for the owner (its assumption "Two numbers rather than one"),
+while ADR-0013 decision 9 left it to the trie epic. The owner's decision
+makes that disagreement moot.
 
 **Why one number rather than a count of applied events.**
 
@@ -423,8 +497,10 @@ disagreement moot.
     `sequence` is greater than the one it holds (ADR-0013 decision 9). It
     would then refuse every later stat for every prefix it has seen.
 
-  A log position re-derives the same value for the same record wherever
-  the replay starts, as long as the stream exists.
+  A log position re-derives the same value wherever the replay starts,
+  as long as the stream exists. It comes from the last record the log
+  still holds, or from the log's first retained offset when the log
+  holds nothing the trie has not read (decision 4 step 3).
 * *§33 names one "event sequence number".* ADR-0013's Context item 3 chose
   JetStream partly for "one monotonic stream sequence". With one number,
   the snapshot records one integer, and the replay's `start_offset` is the
@@ -439,17 +515,22 @@ disagreement moot.
 **What it costs.** The value is not a count, and not dense: it moves past
 records the trie skips, and it stays put while the log is quiet. The same
 history gives different values on `InMemoryBus`, whose offsets start at
-0, and on JetStream, whose sequences start at 1. Only `read-api-v1.md`'s
-preamble promised a client a count, and it is edited here.
+0, and on JetStream, whose sequences start at 1. JetStream's offset 0
+holds no record, so a trie started there passes it. Once `start()` has
+read the log's bounds, its `event_sequence` is at least `1`, even on a
+stream nothing has been written to (decision 4 step 3). Only
+`read-api-v1.md`'s preamble promised a client a count, and it is edited
+here.
 
 **Why `position + 1` and not `position`.**
 
-* `0` then means "nothing handled" on both buses.
+* `0` then means "nothing read yet" on both buses: nothing handled and
+  nothing passed.
 * It is `end_offset`'s own convention — the next offset to read — so
   readiness is `event_sequence >= end_offset` (decision 4).
-* On the memory log it equals the number of records the trie has passed.
-  That keeps `docs/spec/integration-scenarios.md` §5's `256` and `257`
-  exact.
+* On the memory log, which never discards, it equals the number of
+  records the trie has handled. That keeps
+  `docs/spec/integration-scenarios.md` §5's `256` and `257` exact.
 
 **`as_of`.**
 
@@ -477,10 +558,12 @@ Amendment 4).
 its mechanisms. The trie uses both, and states them as three rules.
 
 * **R1 — writes.** The worker changes `TrieState` only in `handle()`
-  (decision 6, steps 2-5) and in `apply_config()`. For one event, no
-  `await` separates the first write from the last. The first is
-  `apply_hot_ip_added` or `apply_hot_ip_removed`, both synchronous
-  functions (ADR-0015 decision 6); the last is `note_applied`.
+  (decision 6, steps 2-5), in `apply_config()`, and in step 3 of
+  `start()` (decision 4), which is one `note_passed` call under the lock.
+  For one event, no `await` separates the first write from the last. The
+  first is `apply_hot_ip_added` or `apply_hot_ip_removed`, both
+  synchronous functions (ADR-0015 decision 6); the last is
+  `note_applied`.
 * **R2 — reads.** Every reader of `TrieState` takes everything it reports
   without an `await` between its first read and its last, and
   materializes it before it yields. The readers are:
@@ -633,7 +716,7 @@ through the runner's `exception` field.
 | `family_not_served` | warning the first time per family per process, debug after | `family`, `topic`, `partition`, `offset` |
 | `redelivered_hot_ip_event` | warning | `topic`, `partition`, `offset`, `position` |
 | `trie_invariant_violation` | error | `family`, `topic`, `partition`, `offset` |
-| `replay_complete` | info | `start_offset`, `replay_target`, `event_sequence` |
+| `replay_complete` | info | `start_offset`, `first_offset`, `replay_target`, `event_sequence` |
 
 ### 13. Lifecycle and shutdown
 
@@ -701,7 +784,8 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
   lock, so that a message in hand is finished first. It then marks the
   worker stopped. It is idempotent and safe before `start()`, and it does
   not close the consumer. After it has begun:
-  * `handle()` returns `STOPPED`, and `apply_config()` changes nothing;
+  * `handle()` returns `STOPPED`, `apply_config()` changes nothing, and
+    `start()`'s step 3 passes nothing (decision 4);
   * `run()` returns at its next wake-up. A message that arrived in that
     same wake-up is not handed to `handle()`; the next start reads it
     again, from `position + 1`.
@@ -724,6 +808,18 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
   is `async def` (R3). It sets `app.state.readiness`, and registers a
   `ServiceNotReady` handler that renders `not_ready_response`, so slice
   3's routes need only raise it.
+
+  It builds the app as `FastAPI(title="hammertime-trie", openapi_url=None,
+  docs_url=None, redoc_url=None)`, so the app serves the routes it
+  declares and nothing else. FastAPI's defaults would add
+  `/openapi.json`, `/docs`, `/docs/oauth2-redirect` and `/redoc`
+  (Sources). The two pages load their scripts from a CDN, at a floating
+  major version, into the operator's browser, and the port has no
+  authentication (Consequences, *Security posture*). Those four paths
+  answer FastAPI's 404, like any other path the app does not declare.
+  Slice 3 adds its read routes to this app under the same rule:
+  `docs/protocol/read-api-v1.md` is their contract, not a generated
+  schema (assumption 31).
 * **`__main__.main()`** is `raise SystemExit(run_service(SERVICE_NAME,
   lambda: build_service(load_settings())))`, in ADR-0009 decision 1's
   form.
@@ -850,6 +946,12 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
 
   The epic must refuse such a snapshot or rebuild. A silent start is not
   acceptable.
+
+  Decision 4 step 3 passes every offset below `first_offset` that the
+  trie has not read. For a restored state, `first_offset > S` is the
+  first case, seen before any record is delivered, and seen even when the
+  log has no record left to deliver. The epic runs its gap check before
+  step 3, so that step 3 never passes a gap silently.
 * **The compose file.** `deploy/docker-compose.yml` mounts
   `trie-snapshots` at `/snapshots`, while `.env.example`'s `./snapshots`
   resolves to `/app/snapshots` in the image. The compose service must set
@@ -930,6 +1032,16 @@ written and removed in the same step.
   build one directly rather than read it off a bus. A positional
   subscription acknowledges nothing, so nothing requires the message to
   come from the worker's own consumer — unlike the aggregator's tests.
+* **The log's bounds.** `InMemoryBus` never discards: its `first_offset`
+  is always `0`, and an empty memory log's `end_offset` is `0`. It
+  therefore cannot show decision 4 step 3. A JetStream log that holds
+  nothing to replay (`end_offset` `1` and no record, or every record aged
+  out), or one whose head has aged out, is modelled by a bus double. Its
+  `end_offset` and `first_offset` return what the test chooses, and its
+  subscription yields what the test queues.
+* **The admin app.** `TrieService.app` can be served in-process through
+  `httpx.ASGITransport`, so a test can request any path, including those
+  decision 13 says the app does not serve.
 
 ## Questions this ADR closes
 
@@ -996,15 +1108,16 @@ ADRs do not make. Push back on them individually.
    Issue #115's text asks for the same ("no attacker content"). The
    choice does not rest on it.
 9. **The log position's form: `position` counts handled records, skipped
-   ones included, and `event_sequence` is `position + 1`.** That
-   `event_sequence` is the log position at all, and not a count, is not
-   an assumption: the repository owner decided it on 2026-09-23, on this
-   ADR's recommendation (decision 8). The form is this ADR's. "Handled"
-   rather than "applied" means a skipped record is not read again after a
-   restore, and readiness can pass a malformed record at the tail of the
-   log. `position + 1` rather than `position` makes `0` mean "nothing
-   handled" on both buses and matches `end_offset`'s convention
-   (decision 8).
+   ones included, and the offsets `start()` passes; `event_sequence` is
+   `position + 1`.** That `event_sequence` is the log position at all,
+   and not a count, is not an assumption: the repository owner decided it
+   on 2026-09-23, on this ADR's recommendation (decision 8). The form is
+   this ADR's. "Handled" rather than "applied" means a skipped record is
+   not read again after a restore, and a malformed record at the tail of
+   the log does not hold readiness back. `position + 1` rather than
+   `position` makes `0` mean "nothing read yet" on both buses and matches
+   `end_offset`'s convention (decision 8). Counting passed offsets is
+   assumption 26.
 10. **`as_of` is the greatest applied event timestamp, and `null` before
     the first.** Two alternatives were rejected. The response time is
     always true, but says nothing about how fresh the data is. The apply
@@ -1042,19 +1155,30 @@ ADRs do not make. Push back on them individually.
 18. **The replay stays under the startup deadline.** ADR-0009 put it in
     `start()`. Moving it out would mean a service that is live but not
     ready for longer than the deadline, which ADR-0009 A4 does not model.
-19. **The readiness residuals are recorded, not closed.**
-    * If the record at `end_offset - 1` is one the transport skips,
-      `start()` waits for the next record, and fails the start if none
-      comes in time. A malformed subject is such a record; only a
-      principal publishing to the stream directly can produce one
-      (ADR-0013 assumption 13).
-    * Records purged between reading the log end and replaying it are
-      handled the same way. A purge keeps the stream's last sequence
-      (Sources), so the next record's offset is past the old end.
+19. **The readiness residuals are recorded, not closed.** Decision 4
+    step 3 closes the cases a stream reaches before the trie starts,
+    whether on its own or by a full purge: nothing written, every record
+    aged out, everything purged. Three cases remain. In each, `start()`
+    waits for a record that does not come, and fails the start at the
+    deadline.
+    * The record at `end_offset - 1` is one the transport skips. A
+      malformed subject is such a record; only a principal publishing to
+      the stream directly can produce one (ADR-0013 assumption 13).
+    * Every record left below the end is removed after `start()` has read
+      the log's bounds and before the replay reaches it: by a full purge,
+      or by retention at the age limit. A purge keeps the stream's last
+      sequence (Sources), so the next record's offset is past the old end.
+    * Records at the end of the log are removed while earlier ones remain.
+      Only deleting single messages, or a purge filtered by subject, does
+      that. Both are administrative operations on the stream, and
+      `first_offset` cannot see a hole behind a retained record.
 
-    Closing either needs a bus signal such as "nothing pending", which
-    `hammertime.bus` does not have. That is a follow-up for the bus, not
-    the trie.
+    A restart clears the second case, because it reads the bounds again.
+    The first and third recur on every start until a record is appended
+    after them. Closing them needs a bus signal such as "nothing pending
+    below this offset", which `hammertime.bus` does not have. JetStream
+    reports a pending count with every delivery (ADR-0013 Amendment 10,
+    Sources). Adding the signal is a follow-up for the bus, not the trie.
 20. **No cap on the hot set.** The trie mirrors what the aggregators hold
     HOT. Refusing a `HotIpAdded` at a cap would break §12 against the true
     hot set, and the aggregator does not evict HOT IPs either (ADR-0011
@@ -1076,12 +1200,67 @@ ADRs do not make. Push back on them individually.
 25. **No `CHANGES` entry from this ADR.** It changes documents only. Slice
     1's implementing change writes the three lines under Consequences.
 
+Assumptions 26-32 were added by the revision of 2026-09-23 (see
+"Revision 2026-09-23").
+
+26. **`start()` moves the position past what the log no longer holds. It
+    does not only count such a log as caught up.** The security audit
+    proposed the test `end <= max(S, first)`. On its own, that test leaves
+    `event_sequence` at `0` on a log that holds nothing to replay. A
+    restarted trie would then report `0` where its predecessor reported
+    `end`, which goes backwards, against decision 8 and `read-api-v1.md`.
+    Moving the position makes the one test `event_sequence >= end` hold in
+    every case, and keeps `event_sequence` "the offset of the next record
+    the trie will read". The cost: `position` can name an offset whose
+    record the trie never handled, and on JetStream a started trie
+    reports at least `1` before it has read anything.
+27. **Step 3 runs whenever `first > event_sequence`, not only when the log
+    holds nothing below `end`.** Passing a head that has aged out changes
+    nothing the replay delivers: a subscription from `0` starts at the
+    first retained record anyway (ADR-0013 decision 3). It keeps one rule
+    instead of two, because the subscription always starts at
+    `event_sequence`. The narrower rule was the alternative. During the
+    replay of such a log it leaves `event_sequence` at `0`, which only a
+    reader before readiness could see.
+28. **`end_offset` first, then `first_offset`, as two calls.** A single
+    call returning both from one `stream_info` would be atomic on
+    JetStream. The reading order already gives the property that matters
+    (decision 4, "Why `end` is read first"), and a second method leaves
+    `end_offset` and its tests as they are (ADR-0013 Amendment 10,
+    assumption 133). The cost is a second broker round trip per start.
+29. **The pass takes the worker's lock, and is skipped once `stop()` has
+    begun.** It writes `TrieState`. Once `stop()` has begun, neither
+    `handle()` nor `apply_config()` changes the state (decision 13), and
+    the pass follows the same rule in the same way as `apply_config`. A
+    worker stopped before `start()` therefore stays not caught up on a
+    log that holds nothing to replay.
+30. **`replay_complete` carries `first_offset`.** An operator can then
+    see why a replay took no records, or started past `0`, without
+    another record. The pass itself writes no record.
+31. **The trie's app serves no generated API documentation, in any
+    slice, and all three URLs are `None`.** The security audit asked for
+    this (finding 2). The admin port has no authentication. The two
+    documentation pages would load third-party scripts, at a floating
+    major version, into an operator's browser. And `read-api-v1.md` is
+    already the contract. In FastAPI 0.141.1, `openapi_url=None` alone
+    also disables the two pages (Sources). Naming all three keeps the
+    intent visible in the code, and does not rest on that coupling.
+32. **No `CHANGES` change from the revision.** The slice-1 lines are not
+    on master yet. The second line already says the trie reports ready
+    once its replay has reached the log end as it stood at startup, and a
+    log with nothing to replay is at its end. The first line already
+    names the only three routes the trie serves. `first_offset` is
+    internal to the repository. Nothing that a released build does
+    changes.
+
 ## Consequences
 
 * **Slice 1 lets the trie start.** The container starts under
   `docker compose` and reports ready once its replay reaches the log end.
-  That is the trie's share of the `integration` job's first re-enable
-  condition (#52; `CLAUDE.md`, "Disabled CI coverage").
+  On a fresh deployment that is at once, because the provisioned hot-ip
+  stream is empty (decision 4 step 3). That is the trie's share of the
+  `integration` job's first re-enable condition (#52; `CLAUDE.md`,
+  "Disabled CI coverage").
 * **Until the snapshot epic lands, every start replays the whole retained
   hot-ip log,** inside `HAMMERTIME_STARTUP_TIMEOUT_S` (60 s by default). A
   log that takes longer fails the start with exit 1, and raising the
@@ -1114,6 +1293,9 @@ ADRs do not make. Push back on them individually.
   * Slice 1 exposes no domain endpoint. The compose file publishes the
     admin port 8081 on every interface; ADR-0013 Amendment 4 leaves that
     question with the owner.
+  * The admin app serves its three routes and nothing else: no OpenAPI
+    schema, and no documentation page that loads scripts from a CDN
+    (decision 13).
 
 ## Sources
 
@@ -1142,6 +1324,54 @@ ADRs do not make. Push back on them individually.
   reference deployment uses (ADR-0013 decision 2) was not checked. Taken
   from it: assumption 19's claim that a purge does not rewind the offsets
   readiness waits for. That claim is only as good as this reading.
+
+  Read again on 2026-09-23 for the revision, through the same tool, which
+  quoted two more places. In `storeRawMsg`: `if ms.state.Msgs == 0 {
+  ms.state.FirstSeq = seq ... }`, and later `ms.state.LastSeq = seq`. In
+  `updateFirstSeq`, when no message remains: `// Like purge.`, then
+  `ms.state.FirstSeq = ms.state.LastSeq + 1`. The tool reported no
+  assignment of either field when a store is created, unless the stream's
+  configured first sequence is above 0. So a stream nothing has been
+  written to reports both as `0`, and one that expiry or a purge has
+  emptied reports `first_seq = last_seq + 1`. Taken from it: decision 4's
+  three cases, and why ADR-0013 Amendment 10 tests for emptiness with the
+  message count and not with `first_seq`.
+* nats-server, `server/filestore.go` on `main`, read 2026-09-23 through
+  the same tool. Its excerpt did not reach `purge` or `selectNextFirst`.
+  It quoted `expireMsgsOnRecover`: the state is reset
+  (`fs.state.FirstSeq, fs.state.LastSeq = 0, 0`), the last block's
+  `last.seq` is kept, and when no block remains the store calls
+  `fs.writeTombstone(last.seq, last.ts)`. The tool concluded that the last
+  sequence survives a server restart through that tombstone. Only this
+  excerpt was read; the file store's purge was not.
+* FastAPI 0.141.1 as installed (`uv.lock`), read 2026-09-23 in
+  `.venv/lib/python3.12/site-packages/fastapi/`:
+  * `applications.py`: `openapi_url` defaults to `"/openapi.json"`, and
+    its docstring says "If you set it to `None`, no OpenAPI schema will
+    be served publicly, and the default automatic endpoints `/docs` and
+    `/redoc` will also be disabled." `docs_url` defaults to `"/docs"`,
+    `redoc_url` to `"/redoc"`, and `swagger_ui_oauth2_redirect_url` to
+    `"/docs/oauth2-redirect"`. `setup()` adds the schema route only `if
+    self.openapi_url`, the Swagger UI page and its OAuth2 redirect only
+    `if self.openapi_url and self.docs_url`, and the ReDoc page only `if
+    self.openapi_url and self.redoc_url`.
+  * `openapi/docs.py`: the pages' script defaults are
+    `https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js`,
+    with `swagger-ui.css` from the same `swagger-ui-dist@5` path, and
+    `https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js`.
+    These are major-version tags, which the CDN resolves when the page
+    loads.
+
+  Taken from it: decision 13's rule and assumption 31.
+* nats-py 2.16.0 as installed, read 2026-09-23. `nats/js/api.py`:
+  `StreamState(messages: int, bytes: int, first_seq: int, last_seq: int,
+  consumer_count: int, ...)`. `nats/aio/msg.py`: `Msg.Metadata.num_pending`,
+  documented as "the number of available messages in the Stream that have
+  not been consumed yet". Taken from it: the fields ADR-0013 Amendment
+  10's `first_offset_of` reads, and assumption 19's note that JetStream
+  reports a pending count with every delivery.
+* Blocked on 2026-09-23 by this environment's egress proxy: `docs.nats.io`
+  and `www.synadia.com`. The source code above was read in their place.
 
 ## Edits to other documents
 
@@ -1211,3 +1441,229 @@ replaces are quoted.
   deadline, and the `trie_invariant_violation` exit. The paragraph itself
   is unchanged. Under decision 8 its "replays ... from the snapshot's
   `event_sequence`" is exactly right.
+
+Added by the revision of 2026-09-23. On master are `docs/adr/0013`
+decisions 3 and 9, its assumption 20 and its Consequences, and
+`docs/adr/0010` Amendment 1 ruling 4; each gains a dated note. Everything
+else below was written by this ADR's own change set, which is not on
+master, and is edited in place.
+
+* **`docs/adr/0013-nats-jetstream-event-log-static-shards.md`** (Amendment
+  10):
+  * the status line gains the tenth clause;
+  * decision 3 gains `first_offset` in the interface block, a paragraph
+    defining it after the "Added:" line, `first_offset` and
+    `first_offset_of` in the `NatsBus` block, and an italic sentence in
+    the `hammertime.bus.memory` paragraph;
+  * decision 9's readiness bullet, assumption 20 and the Consequences bus
+    bullet each gain a dated italic note;
+  * a new "Amendment 10" section at the end lists these.
+
+  In this change set's own text there, decision 9's italic sentence dated
+  2026-09-23 said "one past the offset of the last hot-ip record it has
+  handled", and Amendment 9's "Why" said "one past the stream offset of
+  the last hot-ip record it has handled". Both now say "the (stream)
+  offset of the next hot-ip record it will read". Amendment 9's
+  assumption 131 gains an italic sentence.
+* **`docs/adr/0010-read-apis-and-shared-prefix-predicate.md`**:
+  * Amendment 1 ruling 4 gains a dated blockquote after its 2026-09-21
+    one;
+  * in Amendment 2, which this change set wrote:
+    * the status clause gains "Amendment 1's readiness test also reads the
+      log's first retained offset";
+    * the section title gains "; readiness reads the first retained
+      offset";
+    * "Why" said "ADR-0017 designs the trie service (epic #10) and answers
+      three questions this ADR left open or stated too loosely:". It now
+      adds that ADR-0017 "corrects one test this ADR restated", and gains
+      a fourth bullet;
+    * "Decisions 3 and 4 and Amendment 1 ruling 3 carry dated notes"
+      became "Decisions 3 and 4 and Amendment 1 rulings 3 and 4 carry
+      dated notes";
+    * the edit list's ruling 3 entry says "handled or passed", and a
+      ruling 4 entry is added;
+  * decision 4's 2026-09-23 note said "one past the stream offset of the
+    last record it has handled", and now says "the stream offset of the
+    next record it will read";
+  * ruling 3's nested 2026-09-23 note said "`replay_position + 1`, one
+    past the offset of the last hot-ip record the trie has handled" and
+    "now reads "handled": a record the trie skips (malformed, or of a
+    family it does not serve) is handled too, and is not read again after
+    a restore". It now says "the offset of the next hot-ip record the trie
+    will read" and "handled or passed", and says what a passed offset is.
+* **`docs/adr/0001-single-logical-trie.md`**: clause 4's 2026-09-23 note
+  said "one past the stream offset of the last record it has handled",
+  and Amendment 4's "Why" said "one past the stream offset of the last
+  record the trie has handled". Both now say "the stream offset of the
+  next record" it or the trie "will read".
+* **`docs/spec/hammertime_spec_1.md`**:
+  * §22's note said "one past the stream offset of the last record it has
+    handled", and now says "the stream offset of the next record it will
+    read";
+  * §33's ADR-0017 note said "that integer is the offset of the last
+    hot-ip record the trie handled, whether it applied the record or
+    skipped it. The trie's `event_sequence` (Section 22) is that offset
+    plus one, so". It now also names "the last offset it passed at startup
+    because the log no longer held a record there", calls
+    `event_sequence` "the offset of the next record it will read", and
+    ends with "A log that retains no record is replayed at once."
+* **`docs/protocol/read-api-v1.md`**:
+  * the preamble's trie bullet said "one past the stream offset of the
+    last hot-ip record it has handled. It only grows, across restarts too,
+    and it is not a count of events (ADR-0017 decision 8);". It now
+    defines the value as the offset of the next record the trie will read,
+    says that offsets whose records are gone at start are skipped over,
+    says the value is at least 1 on the reference deployment, bounds "only
+    grows" by "while the stream exists" (decision 8's own condition), and
+    cites decisions 4 and 8;
+  * a new paragraph after the admin section's 404/405 paragraph says the
+    trie serves no generated API documentation.
+* **`docs/spec/README.md`**: the §32/33 row gains "`MessageBus.end_offset`
+  and `first_offset`" and ADR-0013 "Amendment 10". In the §47 row, "the
+  trie's settings, readiness and drain" became "the trie's settings,
+  readiness, admin routes and drain".
+
+## Revision 2026-09-23 (before merge) — the slice-1 security audit's two findings
+
+Why: `security-auditor` reviewed slice 1 as committed on branch
+`claude/eager-gates-lyihfk` (5d5c544) and returned two findings against
+this ADR's design.
+
+1. **Medium, availability.** Take a JetStream hot-ip stream that holds no
+   record at or after the fresh start offset: never written, or every
+   record aged out or purged. On it, `caught_up` could never become true.
+   `start()` waited until `HAMMERTIME_STARTUP_TIMEOUT_S`, and the trie
+   exited 1 instead of reporting ready. `make up` on a fresh deployment
+   reaches this, because provisioning creates the stream empty:
+   `end_offset` is `1`, and a fresh trie subscribes from `0`. It needs no
+   attacker. It contradicted Consequences ("reports ready") and ADR-0013
+   decision 9's claim that one readiness test works on both buses.
+   Assumption 19 had recorded the wait only for a transport-skipped tail
+   record and a purge during the replay.
+2. **Low, attack surface.** `create_app` built `FastAPI` with its default
+   `openapi_url`, `docs_url` and `redoc_url`. The unauthenticated admin
+   port therefore also served `/openapi.json`, `/docs`,
+   `/docs/oauth2-redirect` and `/redoc`, beyond decision 13's three
+   endpoints, and the two pages load scripts from a CDN into an operator's
+   browser.
+
+**Rulings.**
+
+* *Finding 1.* Decision 4 gains step 3, and ADR-0013 Amendment 10 adds
+  `MessageBus.first_offset`. Before subscribing, the worker reads the
+  log's first retained offset after its end, and passes every offset
+  below it that it has not read; caught up is then `event_sequence >=
+  end`. This takes the audit's direction, "treat `end <= max(S, first)`
+  as caught up", and extends it: the position moves as well
+  (assumption 26).
+* *Coherence of `event_sequence` and the resume offset when the first
+  retained offset is above 0* (asked by the dispatching session). After
+  step 3 they are one number in every case.
+  * A fresh replay of a log whose head has aged out subscribes from
+    `first`. Each record it handles sets `event_sequence` to one past that
+    record: the value a trie that had read the whole log would hold.
+  * A log that holds nothing to replay leaves `event_sequence` at `first`,
+    which is at least `end`, and so at least what the trie's predecessor
+    reported. It is not `0`.
+  * The resume offset is `event_sequence` by construction (decision 3),
+    and the snapshot's `replay_position` is `event_sequence - 1`.
+  * A restored state whose `replay_position + 1` is below `first` is
+    decision 16's first gap. Decision 16 now says the snapshot epic
+    checks for it before step 3.
+* *Finding 2.* Confirmed. Decision 13 now pins `openapi_url=None,
+  docs_url=None, redoc_url=None` (assumption 31).
+
+**Convention.** This ADR is committed on this branch and is not on
+master, so none of its text is superseded merged text. It is edited in
+place, and this section lists each edit with the words it replaced, so
+that the audited text can be recovered. Text that is on master is amended
+by dated notes: ADR-0013 decisions 3 and 9, its assumption 20 and
+Consequences (ADR-0013 Amendment 10), and ADR-0010 Amendment 1 ruling 4
+(ADR-0010 Amendment 2). Text that this ADR's change set wrote in other
+documents is edited in place, and is listed under "Edits to other
+documents".
+
+**Scope.** Ingest's FastAPI app keeps the same four default paths. The
+dispatching instruction left it out of scope, and nothing here rules on
+it. The detector's readiness on its durable subscription is named in
+ADR-0013 Amendment 10, and is not ruled.
+
+**Edits in this ADR**, with the words they replaced:
+
+* **Status line.** "ADR-0013 (Amendment 9)" became "ADR-0013 (Amendments
+  9 and 10)", and the closing sentences on this revision were added.
+* **Decision 1.** Slice 1's row gained "; in `hammertime-bus`,
+  `MessageBus.first_offset` on both buses (ADR-0013 Amendment 10)".
+* **Decision 2.** `position`'s comment was "offset of the last hot-ip
+  record handled; None before the first". `note_passed` was added to the
+  block, with its own bullet. "**What both refuse.** An `offset` below 0,
+  or not greater than `position`, is a `ValueError`, and nothing changes."
+  became "What all three refuse", naming the three methods. "the only
+  production caller of the three mutators" became "four mutators".
+* **Decision 3.** The subscription's bullets were "`S` is `0` when
+  `state.position` is `None`, and `state.position + 1` otherwise;" and "a
+  fresh `TrieState` has no position, so in slice 1 every start replays
+  from the first record the log retains (`start_offset=0`, ADR-0013
+  decision 9 as amended);".
+* **Decision 4.** Steps 2 to 5 were: "2. It reads `end = await
+  bus.end_offset(HOT_IP.name)` *before* subscribing, and keeps it as
+  `replay_target`. 3. It subscribes (decision 3). 4. It takes the next
+  message and awaits `handle()` on it, until the worker is *caught up*.
+  Caught up means `end <= S`, or `state.event_sequence >= end` (which is
+  `state.position >= end - 1`)." — followed by the two sub-bullets that
+  are now under step 5 — "5. It logs `replay_complete` (decision 12)."
+  They are now steps 2 to 6. The paragraphs from "`caught_up` is `False`
+  until" to "A restored state" are new.
+* **Decision 7.** The table row "`bus.end_offset`, `subscribe`" gained
+  `bus.first_offset`.
+* **Decision 8.**
+  * The `position` bullet was: "`position` is the offset of the last
+    hot-ip record the worker has *handled* — a record whose outcome was
+    `APPLIED`, `UNCHANGED`, `MALFORMED` or `FAMILY_NOT_SERVED`. It is
+    `None` before the first."
+  * "a skipped record is handled too, and need not be read again" gained
+    "and a passed offset has nothing to read".
+  * "with `position` counting handled records — is this ADR's own
+    (assumption 9)" became "counting handled records and passed offsets —
+    is this ADR's own (assumptions 9 and 26)".
+  * "A log position re-derives the same value for the same record
+    wherever the replay starts, as long as the stream exists." was
+    replaced by three sentences.
+  * *What it costs* gained the three sentences on JetStream's offset 0.
+  * *Why `position + 1`*: "`0` then means "nothing handled" on both
+    buses." and "On the memory log it equals the number of records the
+    trie has passed." were replaced.
+* **Decision 9.** R1's "The worker changes `TrieState` only in `handle()`
+  (decision 6, steps 2-5) and in `apply_config()`." now names step 3 of
+  `start()` as well.
+* **Decision 12.** `replay_complete`'s fields were "`start_offset`,
+  `replay_target`, `event_sequence`".
+* **Decision 13.** In the `TrieWorker.stop()` bullet, "`handle()` returns
+  `STOPPED`, and `apply_config()` changes nothing;" now also says that
+  `start()`'s step 3 passes nothing. The `create_app` bullet gained its
+  second paragraph.
+* **Decision 16.** "Gaps" gained its last paragraph.
+* **Test seams.** "The log's bounds" and "The admin app" were added.
+* **Assumption 9.** Its title was "The log position's form: `position`
+  counts handled records, skipped ones included, and `event_sequence` is
+  `position + 1`." In its body, "and readiness can pass a malformed record
+  at the tail of the log" and "makes `0` mean "nothing handled"" were
+  replaced, and the closing sentence pointing to assumption 26 was added.
+* **Assumption 19** was: "**The readiness residuals are recorded, not
+  closed.** * If the record at `end_offset - 1` is one the transport
+  skips, `start()` waits for the next record, and fails the start if none
+  comes in time. A malformed subject is such a record; only a principal
+  publishing to the stream directly can produce one (ADR-0013 assumption
+  13). * Records purged between reading the log end and replaying it are
+  handled the same way. A purge keeps the stream's last sequence
+  (Sources), so the next record's offset is past the old end. Closing
+  either needs a bus signal such as "nothing pending", which
+  `hammertime.bus` does not have. That is a follow-up for the bus, not
+  the trie."
+* **Assumptions 26 to 32**, and the sentence introducing them, were added.
+* **Consequences.** The first bullet gained "On a fresh deployment that is
+  at once, because the provisioned hot-ip stream is empty (decision 4
+  step 3)." *Security posture* gained its last bullet.
+* **Sources.** The `memstore.go` entry gained a second paragraph. The
+  `filestore.go`, FastAPI, nats-py and blocked-sites entries were added.
+* **Edits to other documents.** The revision's entries were added.
