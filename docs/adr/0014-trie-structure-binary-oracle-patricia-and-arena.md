@@ -1,6 +1,8 @@
 # ADR 0014 — The trie structure package: one trie per family, an unshared binary oracle, an arena-backed Patricia trie, and the invariants both satisfy
 
-Status: accepted
+Status: accepted, amended 2026-09-23 (Amendment 1 — the arena's name, what makes
+the accounting checks non-vacuous, structural versus derived observables, no
+transient over-allocation, the derived node counts)
 
 Scope note: this ADR settles the interfaces epic #8 implements against —
 `services/trie/src/hammertime/trie/structure/{__init__,node,binary_trie,patricia,arena,invariants}.py`
@@ -83,7 +85,12 @@ Open, and blocking anyone who wants to write a test or a module:
 family, and expose `family` and `bit_length` (32 or 128, from
 `AddressFamily.bit_length`). Nothing in the package is family-agnostic at
 runtime: an `Address` or `Prefix` of the other family passed to any method is a
-`ValueError` naming both families, and changes nothing.
+`ValueError` naming both families, and changes nothing. "Any method" is every
+method of `HotTrie` that takes one — `add_hot_ip`, `remove_hot_ip`, `contains`,
+`hot_count`, `ancestor_counts` and `longest_matching_prefix` — not only the two
+mutators; a query is as much a routing bug as an update. The family is checked
+before any other argument, so `ancestor_counts(other_family_address,
+min_length=99)` reports the family (Amendment 1, A9).
 
 This follows ADR-0001 ("a single-writer process per address family"), the
 `core/addressing` docstring ("IPv4 and IPv6 use the same type and separate trie
@@ -170,7 +177,10 @@ Semantics, in the order a reader needs them:
   describe; `remove` decrements the same path and prunes (decision 4).
 * **`contains(address)`** is `hot_count(address as a /bit_length prefix) == 1`.
   There is no separate membership set: §12's leaf rule *is* the membership
-  test, so the count and the set cannot drift apart.
+  test, so the count and the set cannot drift apart. (`contains` is therefore
+  count-derived while `iter_hot_addresses()` is structural — in an intact trie
+  a leaf exists exactly when its count is 1, and where the two disagree the
+  trie is corrupt and `check_hot_counts` says so. Amendment 1, A3.)
 * **`hot_count(prefix)`** is the number of currently HOT addresses under
   `prefix`, and is `0` for a prefix with no node — which is the trie's positive
   statement that nothing beneath it is hot (ADR-0010 decision 4: a zero-valued
@@ -194,16 +204,45 @@ Semantics, in the order a reader needs them:
   node set; for the Patricia trie it is the node set with every compressed edge
   expanded back into the prefixes it stands for. Decision 6 makes the two
   sequences identical, and that identity is what carries §27's "the logical
-  model MUST remain equivalent to the binary trie".
+  model MUST remain equivalent to the binary trie". Descent is by child link:
+  the stored count decides only whether a prefix is *yielded*, never whether
+  the walk continues past it, so a node whose count has been corrupted to zero
+  hides its own prefixes and nothing else (Amendment 1, A3).
 * **`iter_hot_addresses()`** yields the currently HOT addresses in ascending
   numeric order (the same DFS, at leaf level). It is what the snapshot epic
-  serializes and what the invariants recompute from.
+  serializes and what the invariants recompute from. It is **structural**: it
+  yields the address of every materialized node at `length == bit_length`
+  reachable from the root and never consults `hot_count` to decide what to
+  yield or where to descend. That is what makes `check_hot_counts` a comparison
+  of two independent sources rather than of the stored counts with themselves
+  (Amendment 1, A3).
 * **`iter_nodes()`** yields the *materialized* nodes in the same DFS order —
   the representation, not the logical model. The two implementations
   deliberately differ here, and only the invariant checks and `trie-inspect`
-  should care.
+  should care. It is structural in the same sense: **every** node reachable
+  from the root is yielded, whatever its stored count, and `NodeView.hot_count`
+  reports that stored count verbatim — including `0` or a negative value. A
+  live node whose count has been zeroed is therefore visible to
+  `check_no_orphaned_nodes`, which is the only way that corruption can be
+  caught at all (Amendment 1, A3).
+* **Stored versus derived (§9's "stored state SHOULD be distinguishable from
+  derived state").** The only stored state is the node record — `child[0]`,
+  `child[1]`, `hot_count`, as `TrieNode` above and as the arena's parallel
+  lists in decision 5 — plus the root reference. Everything else on `HotTrie`
+  is derived from it. In particular `hot_ip_count` is **never** a maintained
+  counter: it is `0` for an empty trie and otherwise the root node's stored
+  `hot_count` (`arena.hot_count[root]` for the Patricia trie), read on each
+  call, which is why a root count corrupted to `-1` surfaces as
+  `hot_ip_count == -1`. `node_count` is *defined* as the number of materialized
+  nodes reachable from the root, so `len(list(iter_nodes())) == node_count`
+  always; unlike `hot_ip_count` it **may** be cached or maintained in O(1)
+  (`arena.live_count` for the Patricia trie), because `check_no_orphaned_nodes`
+  and `check_patricia` both cross-check it against an independent count of the
+  reachable nodes and so keep a maintained value honest (Amendment 1, A2 and
+  A3).
 * **`clear()`** empties the trie: `hot_ip_count == 0`, `node_count == 0`, and
-  the arena is reset (decision 5).
+  the arena is reset in place (decision 5; the same `NodeArena` object is kept,
+  so a reference held across `clear()` stays valid).
 
 ### 3. A redundant add or remove is a no-op that returns `False`, never an error
 
@@ -253,7 +292,11 @@ set and rebuild.
 ### 5. The arena: integer ids into parallel lists, a LIFO free list, capacity bounded by peak live nodes
 
 `NodeArena` (`structure/arena.py`) is the Patricia trie's storage and only the
-Patricia trie's (decision 7).
+Patricia trie's (decision 7). `PatriciaTrie` exposes it as the public attribute
+**`arena`**, constructed in `__init__` and never replaced (Amendment 1, A1);
+together with `root` (decision 6) that is the whole of the Patricia trie's
+public storage surface, and it is what `check_patricia`, `tools/trie-inspect`
+and the structure's tests read and write.
 
 ```python
 # hammertime.trie.structure.arena         Spec: §11, §27
@@ -291,7 +334,12 @@ What it promises:
    test (see Assumptions).
 2. **`allocate` reuses before it grows.** Released ids go on a LIFO free list
    and are handed back first; the slab grows only when the free list is empty,
-   i.e. only when `live_count == capacity`. Therefore, exactly:
+   i.e. only when `live_count == capacity`, and then by **exactly one node's
+   worth of slots** — one entry appended to `network`, `length` and
+   `hot_count`, two to `child` — so `capacity` rises by exactly 1 per growth
+   and `capacity == len(network) == len(length) == len(hot_count) ==
+   len(child) // 2` at all times. A fresh arena pre-allocates nothing
+   (`capacity == 0`). Therefore, exactly:
 
    ```text
    capacity == the maximum number of simultaneously live nodes
@@ -303,24 +351,49 @@ What it promises:
    and the only thing that can grow it is genuinely holding more nodes at once
    than ever before. There is no compaction and the slab never shrinks except
    on `clear()`.
+
+   **No operation allocates a node it does not keep** (Amendment 1, A4).
+   `add_hot_ip` only allocates and `remove_hot_ip` only releases; neither does
+   both, and neither takes a scratch node. The node sets before and after a
+   single operation are therefore nested, and `live_count` never exceeds
+   `max(live_count before, live_count after)` at any instant *within* an
+   operation. That is what makes "the maximum number of simultaneously live
+   nodes" a quantity a caller can measure: sampling `node_count` at operation
+   boundaries and taking the running maximum gives the same number, exactly,
+   and `arena.capacity` must equal it.
 3. **A released slot is detectably dead.** `release` writes `-1` into
    `length`, so `is_live` is one comparison, a double `release` is a
    `ValueError`, and the invariant checks can assert that every reachable child
    id is live. A released slot's other fields are stale by design and must not
    be read.
-4. **`clear()` resets the slab to empty** — `capacity == 0` — so a trie reused
-   after `clear()` re-establishes the bound above from scratch.
+4. **`clear()` resets the slab to empty** — `capacity == 0`, `live_count == 0`,
+   `free_count == 0`, every storage list truncated — so a trie reused after
+   `clear()` re-establishes the bound above from scratch. It resets the
+   existing `NodeArena` in place rather than constructing a new one.
 
 ### 6. The Patricia representation, stated exactly enough to be equivalent
 
 Each node stores the prefix it represents (`network` with host bits zeroed,
-`length`), its `hot_count`, and two child ids. `PatriciaTrie.root` is a
-`NodeId` (or `NO_NODE`), so the topmost node may sit at any length; there is no
-permanent `/0` node. Invariants (decision 8) pin the shape: every node is
-either a leaf at `length == bit_length` with no children, or an internal node
-with **exactly two** children whose prefixes both strictly extend it and differ
-at bit `length`; no node has exactly one child (that is the compression), and
+`length`), its `hot_count`, and two child ids, in `PatriciaTrie.arena`
+(decision 5). `PatriciaTrie.root` is a `NodeId` (or `NO_NODE`), so the topmost
+node may sit at any length; there is no permanent `/0` node. Invariants
+(decision 8) pin the shape: every node is either a leaf at
+`length == bit_length` with no children, or an internal node with **exactly
+two** children whose prefixes both strictly extend it and differ at bit
+`length`; no node has exactly one child (that is the compression), and
 `hot_count` is the sum of the children for an internal node and `1` for a leaf.
+
+That shape fixes the size exactly (Amendment 1, A8): the leaves are in
+bijection with the HOT addresses and every internal node is binary, so
+
+```text
+node_count == 2 * hot_ip_count - 1     for hot_ip_count >= 1
+node_count == 0                        for an empty trie (root == NO_NODE)
+```
+
+One HOT address is therefore one node — §27's compressed edge, stated as a
+number — and `iter_nodes()` yields a single `NodeView(prefix=/bit_length,
+hot_count=1, children=())` for it.
 
 Every query resolves against the *logical* prefix set, not the node set. Let
 `c = common_prefix_length(node.network, target, bit_length)` at each step:
@@ -354,7 +427,15 @@ Patricia edge compression").
 `binary_trie.py` is the bit-by-bit reference of §10/§11/§39: plain `TrieNode`
 objects, one node per bit level, a child reference per branch. It does **not**
 use `NodeArena`, and no counting, walking or pruning logic is shared between it
-and `patricia.py`. The only code both import is `hammertime.core.addressing`
+and `patricia.py`. Unlike `PatriciaTrie.root` / `PatriciaTrie.arena`, its
+storage is **not** part of the contract: no attribute name is promised, nothing
+outside `binary_trie.py` may reach into its nodes, and everything anyone is
+entitled to know about it is on the `HotTrie` surface (Amendment 1, A5). Its
+node set *is* its positive-count prefix set, so `node_count ==
+len(list(iter_prefix_counts()))` and the `NodeView.prefix` sequence of
+`iter_nodes()` equals the `PrefixCount.prefix` sequence of
+`iter_prefix_counts()`, element for element — 33 nodes for one HOT IPv4
+address, 129 for one IPv6 (Amendment 1, A8). The only code both import is `hammertime.core.addressing`
 and the type declarations in `node.py`, neither of which contains a traversal.
 
 A differential test is worth exactly as much as the independence of its oracle.
@@ -395,15 +476,39 @@ side-effect free and never repair anything.
 * **`check_no_orphaned_nodes`** requires every count yielded by
   `iter_prefix_counts()` to be greater than zero (decision 4: a zero-count node
   is an orphan by construction) and every node yielded by `iter_nodes()` to
-  have a positive count.
+  have a positive count, and requires `len(list(iter_nodes())) == node_count`.
 * **`check_patricia`** adds the representation checks of decision 6 — exactly
   two children or none, children strictly extending and branching correctly,
-  leaves at `bit_length`, sum-of-children — plus the arena accounting:
-  `live_count == node_count`, `capacity == live_count + free_count`, every
-  reachable child id live, no id reachable twice.
-* **`check_trie`** runs `check_hot_counts` and `check_no_orphaned_nodes`, and
-  additionally `check_patricia` when handed a `PatriciaTrie`. It is the one
-  entry point a debug build or the inspect tool calls.
+  leaves at `bit_length`, sum-of-children — plus the arena accounting. It
+  computes the reachable node set **itself**, by walking `arena.child` from
+  `PatriciaTrie.root`, and never through `iter_nodes()`, `node_count` or
+  `live_count`; a check that took the implementation's own answer for the
+  quantity it is checking would pass by construction (Amendment 1, A2). Writing
+  `R` for the ids that walk reaches, it requires:
+
+  ```text
+  root == NO_NODE  <->  R is empty  <->  live_count == 0  <->  node_count == 0
+  every id in R is in range [0, capacity) and arena.is_live(id)
+  no id is reached twice                    (no cycle, no shared subtree)
+  len(R) == node_count                      (iter_nodes / the metric agree with reachability)
+  len(R) == arena.live_count                (no live slot is unreachable: a leak)
+  capacity == live_count + free_count       (the free list accounts for the rest)
+  len(R) == 2 * leaves - 1                  (non-empty trie; leaves counted by the walk)
+  leaves == hot_ip_count                    (non-empty trie)
+  ```
+
+  An id that is out of range, not live, or reached twice is an
+  `InvariantViolation` — never an `IndexError`, a `ValueError` or a hang: the
+  walk tests liveness before reading any field and carries a visited set.
+* **`check_trie`** runs `check_patricia` **first** when handed a
+  `PatriciaTrie`, then `check_hot_counts` and `check_no_orphaned_nodes`. The
+  order matters: the logical checks traverse the structure, and their behaviour
+  on a trie whose *representation* is broken — a released id still linked in, a
+  cycle — is undefined, so the representation check goes first and reports it
+  as an `InvariantViolation` (Amendment 1, A2). Corruption of a *count* alone
+  leaves every traversal well defined, and every check remains meaningful on
+  it. `check_trie` is the one entry point a debug build or the inspect tool
+  calls.
 
 Cost is O(hot_ip_count × bit_length), which is why the module docstring's
 "cheap enough for debug builds" is honest for a trie whose size §26 bounds by
@@ -418,10 +523,18 @@ def check_attribute_records(trie: HotTrie, records: Collection[Address]) -> None
 asserts, for one address family:
 
 ```text
+every address in records has family == trie.family     §46.5 "per address family"
 len(records) == trie.hot_ip_count                      §46.5, ADR-0005 decision 4
 set(records) == set(trie.iter_hot_addresses())         §46.5's first line
-every address in records has family == trie.family     §46.5 "per address family"
 ```
+
+in that order. The family clause is deliberately first and is a **diagnostic**
+refinement, not an independently falsifiable one: an `Address` carries its
+family as part of its identity, so a record of the wrong family can never equal
+a HOT address of this trie and always breaks the set comparison too. Checking
+it first is what makes the message say "these records belong to the other
+family" instead of "these records are missing and those are extra"
+(Amendment 1, A7).
 
 `Collection[Address]` is the entire coupling. A `Mapping[Address, IpAttributes]`
 — which is what epic #9 will actually hold — *is* a `Collection[Address]`: it
@@ -511,7 +624,9 @@ Tests (epic #8, written from this ADR and the spec, never from the modules):
 ## Assumptions
 
 Each of these is a judgment call that the epic, the spec and the prior ADRs do
-not dictate. Push back on them individually.
+not dictate. Push back on them individually. Amendment 1 adds ten more, stated
+inside the item each informs (A1-A10) rather than appended here, so that a
+reader sees the assumption next to the ruling it is an assumption of.
 
 1. **`HotTrie` lives in `node.py` rather than a new `structure/interface.py`.**
    `hammertime-store` and `hammertime-bus` both put their Protocols in an
@@ -593,6 +708,11 @@ not dictate. Push back on them individually.
     bound. It follows from "grow only when the free list is empty" and makes a
     sharper test; if a future implementation pre-allocates a slab, this becomes
     `<=` and the test changes with it.
+
+    > Amended 2026-09-23: "peak live" left open whether the peak is taken over
+    > every instant or over operation boundaries. Amendment 1 A4 closes it —
+    > no operation allocates a node it does not keep, so the two readings
+    > coincide and a caller can measure the peak between operations.
 17. **O(1) node access is discharged structurally, not by a timing test.** A
     wall-clock assertion on a garbage-collected interpreter in CI is a flake
     generator. `tests/bench/test_throughput.py` (§40) is where numbers belong,
@@ -621,6 +741,9 @@ not dictate. Push back on them individually.
 22. **Node identity is not part of the contract.** Nothing outside the package
     may hold a `NodeId` across a mutation: pruning recycles ids. `NodeView` and
     `PrefixCount` are values, which is why the checks and the tool take those.
+    Amendment 1 A1 names `PatriciaTrie.arena` and so makes ids *readable* from
+    outside; it does not make them stable. Read `root`, walk, and use the
+    result before the next `add_hot_ip` or `remove_hot_ip`.
 23. **The family check is per call, not per event batch.** One comparison
     against a `StrEnum` per operation is noise against an O(32) walk.
 24. **Both implementations ship, permanently.** The oracle is not scaffolding
@@ -647,8 +770,9 @@ not dictate. Push back on them individually.
   list(binary.iter_prefix_counts())` plus agreement on every point query and on
   every `add`/`remove` return value; (2) `check_trie` after every step of a
   randomized sequence, with "no orphaned nodes" meaning "no yielded count is
-  zero" (decision 4); (3) `arena.capacity == peak live node count` and
-  `node_count == 0` after removing everything.
+  zero" (decision 4); (3) `arena.capacity == peak live node count` — the
+  running maximum of `node_count` sampled between operations, which Amendment 1
+  A4 makes exact — and `node_count == 0` after removing everything.
 * **The snapshot epic (§33) can store the hot set alone** and rebuild the
   structure by replaying adds, because decision 4 makes the structure a pure
   function of that set. It still needs the attribute records (§46.8) and the
@@ -680,3 +804,452 @@ not dictate. Push back on them individually.
   (ADR-0010 Amendment 1, assumption "Two numbers rather than one") — it touches
   the read protocol, not the structure; and what the worker does with an event
   for the family it does not serve (decision 1).
+
+## Amendment 1 (2026-09-23) — the arena's name, what makes the accounting checks non-vacuous, structural versus derived observables, no transient over-allocation, and the derived node counts
+
+Why: the `test-author` writing epic #8's tests
+(`services/trie/src/hammertime/trie/tests/test_invariants.py`,
+`test_patricia_equivalence.py`, `tests/property/test_trie_properties.py`, and
+the testkit content in
+`packages/hammertime-testkit/src/hammertime/testkit/{invariants,generators}.py`)
+worked from decisions 1-10 and surfaced ten places where the text either did
+not decide a case, decided it only by implication, or left a check that could
+be satisfied vacuously. Five of them (A1, A2, A3, A4, A8) determine what
+`coder` must implement and are ruled below; the other five are recorded with
+the classification they deserve so that the next reader does not have to
+re-derive them. Each item says whether the point was (a) already determined by
+this ADR as written, (b) genuinely unspecified and ruled now, or (c)
+deliberately left open, and whether it changes any shipped code. **None
+changes shipped code**: `services/trie/src/hammertime/trie/structure/` is still
+six docstring-only stubs (grepped for a module-level `class` or `def`: none),
+so every ruling binds the epic #8 `coder` brief rather than correcting code.
+The test files named above are consistent with every ruling; where a ruling
+goes beyond what they assert, the gap is listed under *Follow-ups*.
+
+As with the amendments to ADR-0011 and ADR-0013, decision bodies were rewritten
+in place so that a reader sees the rule now in force. Every edit outside this
+section, with the superseded wording quoted:
+
+* **Status line.** Was "Status: accepted". Now names this amendment.
+* **Decision 1, first paragraph, closing sentence.** Was: "an `Address` or
+  `Prefix` of the other family passed to any method is a `ValueError` naming
+  both families, and changes nothing." Now adds the explicit list of methods
+  that covers, and that the family is checked before any other argument (A9).
+* **Decision 2, `contains` bullet.** Gains a parenthesis: `contains` is
+  count-derived and `iter_hot_addresses()` structural, and where the two
+  disagree the trie is corrupt (A3).
+* **Decision 2, `iter_prefix_counts` bullet.** Gains a closing sentence:
+  descent is by child link and the stored count decides only whether a prefix
+  is yielded (A3).
+* **Decision 2, `iter_hot_addresses` bullet.** Gains: it is structural — every
+  materialized node at `length == bit_length`, `hot_count` never consulted —
+  and why that is what makes `check_hot_counts` a comparison of two
+  independent sources (A3).
+* **Decision 2, `iter_nodes` bullet.** Was: "yields the *materialized* nodes in
+  the same DFS order — the representation, not the logical model. The two
+  implementations deliberately differ here, and only the invariant checks and
+  `trie-inspect` should care." Now adds that *every* reachable node is yielded
+  whatever its stored count and that `NodeView.hot_count` reports that count
+  verbatim (A3).
+* **Decision 2, new bullet "Stored versus derived (§9's …)"**, before the
+  `clear()` bullet: what is stored, that `hot_ip_count` and `node_count` are
+  derived and never separately maintained counters (A2, A3).
+* **Decision 2, `clear()` bullet.** Was: "`clear()` empties the trie:
+  `hot_ip_count == 0`, `node_count == 0`, and the arena is reset (decision 5)."
+  Now says the arena is reset *in place* and a held reference stays valid (A1).
+* **Decision 5, opening sentence.** Was: "`NodeArena` (`structure/arena.py`) is
+  the Patricia trie's storage and only the Patricia trie's (decision 7)." Now
+  also names the attribute `PatriciaTrie.arena` and says what reads it (A1).
+* **Decision 5, promise 2.** Was: "Released ids go on a LIFO free list and are
+  handed back first; the slab grows only when the free list is empty, i.e. only
+  when `live_count == capacity`. Therefore, exactly:" Now adds that a growth
+  appends exactly one node's worth of slots, the storage-list length identity,
+  that a fresh arena pre-allocates nothing, and a closing paragraph "**No
+  operation allocates a node it does not keep**" (A4).
+* **Decision 5, promise 4.** Was: "**`clear()` resets the slab to empty** —
+  `capacity == 0` — so a trie reused after `clear()` re-establishes the bound
+  above from scratch." Now also gives `live_count`, `free_count` and the list
+  truncation, and says the reset is in place (A1, A4).
+* **Decision 6, first paragraph and a new block after it.** Was: "Each node
+  stores the prefix it represents (`network` with host bits zeroed, `length`),
+  its `hot_count`, and two child ids." Now says where they are stored
+  (`PatriciaTrie.arena`) and adds the exact node count `2 * hot_ip_count - 1`
+  (or `0`) with the single-address `NodeView` (A1, A8).
+* **Decision 7, first paragraph.** Gains: the binary trie's storage is *not*
+  part of the contract and no attribute name is promised, plus its own derived
+  counts — `node_count == len(list(iter_prefix_counts()))`, the
+  element-for-element prefix identity between `iter_nodes` and
+  `iter_prefix_counts`, 33 nodes for one HOT IPv4 address and 129 for one IPv6
+  (A5, A8).
+* **Decision 8, `check_no_orphaned_nodes` bullet.** Was: "requires every count
+  yielded by `iter_prefix_counts()` to be greater than zero (decision 4: a
+  zero-count node is an orphan by construction) and every node yielded by
+  `iter_nodes()` to have a positive count." Now also requires
+  `len(list(iter_nodes())) == node_count` (A8).
+* **Decision 8, `check_patricia` bullet.** Was: "plus the arena accounting:
+  `live_count == node_count`, `capacity == live_count + free_count`, every
+  reachable child id live, no id reachable twice." Now requires the check to
+  compute the reachable set itself from `root` and `arena.child`, lists the
+  equalities it discharges against it, and requires `InvariantViolation` rather
+  than `IndexError`, `ValueError` or a hang for a bad id (A2, A8).
+* **Decision 8, `check_trie` bullet.** Was: "runs `check_hot_counts` and
+  `check_no_orphaned_nodes`, and additionally `check_patricia` when handed a
+  `PatriciaTrie`." Now runs `check_patricia` **first**, with the reason (A2).
+* **Decision 9, the three-line assertion block.** The family clause was listed
+  third; it is now first, followed by a paragraph saying it is a diagnostic
+  refinement and cannot be violated on its own (A7).
+* **Assumptions, preamble** — a pointer to A1-A10. **Assumption 16** — a dated
+  blockquote pointing to A4. **Assumption 22** — two sentences saying
+  Amendment 1 makes node ids readable but not stable (A1).
+* **Consequences, acceptance-criteria bullet, clause (3).** Was:
+  "`arena.capacity == peak live node count` and `node_count == 0` after
+  removing everything." Now names the measurement that makes "peak" well
+  defined (A4).
+
+### A1. The Patricia trie's arena is the public attribute `PatriciaTrie.arena`
+
+**Classification: (b), genuinely unspecified.** Decision 5 made the arena's
+storage lists public and said the Patricia trie owns them, and decision 6 named
+`PatriciaTrie.root`, but nothing named the arena itself. Every corruption and
+capacity test needs a name, and so does `tools/trie-inspect`.
+
+Ruling: `PatriciaTrie.arena` is a public attribute of type `NodeArena`,
+constructed in `__init__` and never rebound. With `root` it is the whole of the
+Patricia trie's public storage surface; `BinaryTrie` has no counterpart (A5).
+`clear()` resets that same arena in place rather than constructing a new one,
+so a reference taken before a `clear()` is still the trie's arena after it.
+
+Assumptions:
+
+* **`arena`, not `_arena` or `nodes`.** Decision 5 already argued the storage
+  is public because the invariant checks and the tool must read it; a private
+  name would contradict that and force every reader through a convention. The
+  name matches the module (`arena.py`) and the type (`NodeArena`).
+* **Never rebound, and `clear()` resets in place.** Nothing required this — the
+  alternative (allocate a fresh `NodeArena` on `clear()`) is equally correct
+  for a caller that re-reads `trie.arena`. I chose stability because a
+  debugging session or an inspect tool that holds the arena across a `clear()`
+  otherwise silently watches a dead object, and because truncating four lists
+  is no more work than allocating them.
+* **Writable, not read-only.** The tests inject corruption by writing
+  `arena.hot_count[...]` and calling `arena.allocate`/`release` directly. That
+  is the intended way to test a check that exists to catch corruption; there is
+  no other way to produce a corrupted trie through the public API. It follows
+  from decision 5's "this *is* the arena's interface" but had never been said
+  of a *writer* outside the package.
+
+### A2. `check_patricia` computes reachability itself; `node_count` is defined by reachability
+
+**Classification: (b).** Decision 8 required `live_count == node_count` without
+saying where `node_count` comes from. If an implementation defines
+`PatriciaTrie.node_count` as `arena.live_count` — the obvious O(1) choice — the
+check compares a value with itself and passes on a trie with an arbitrary
+number of leaked live slots. Epic #8's third acceptance criterion depends on
+exactly that accounting.
+
+Ruling, in two parts.
+
+1. **`node_count` is defined as the number of materialized nodes reachable from
+   the root**, for both implementations, and therefore
+   `len(list(iter_nodes())) == node_count` identically. An implementation may
+   still compute it in O(1) — the binary trie by maintaining a counter, the
+   Patricia trie by returning `arena.live_count` — but only because those
+   values *equal* the reachable count in an intact trie; the definition is
+   reachability, and where the two disagree the implementation is wrong. That
+   permission is safe only because two checks now cross-examine it:
+   `check_no_orphaned_nodes` requires `len(list(iter_nodes())) == node_count`
+   for any trie, and `check_patricia` requires both to equal the size of its
+   own reachability walk. `hot_ip_count` gets no such permission (A3) — nothing
+   independently recomputes a hot-address counter except `check_hot_counts`,
+   which is a debug-build check rather than an always-on one.
+2. **`check_patricia` does its own walk.** It starts at `PatriciaTrie.root`,
+   follows `arena.child`, and reaches the set `R` without calling
+   `iter_nodes()`, reading `node_count` or reading `live_count` for the
+   traversal. It then discharges, against `R`:
+
+   ```text
+   root == NO_NODE  <->  R empty  <->  live_count == 0  <->  node_count == 0
+   every id in R in range [0, capacity) and arena.is_live(id)
+   no id reached twice
+   len(R) == node_count
+   len(R) == arena.live_count
+   capacity == arena.live_count + arena.free_count
+   len(R) == 2 * leaves - 1  and  leaves == hot_ip_count   (non-empty trie)
+   ```
+
+   `len(R) == arena.live_count` is the clause that catches a live slot nobody
+   links to, which is what `arena.allocate(...)` on an otherwise healthy trie
+   produces. A reachable id that is out of range, released, or already visited
+   raises `InvariantViolation`; the walk tests `is_live` before reading any
+   field and carries a visited set, so a corrupted arena is a diagnosed failure
+   and never an `IndexError`, a stale-field misreading or a non-terminating
+   walk.
+
+   Because the logical checks traverse the structure too, and their behaviour
+   on a broken *representation* is undefined, `check_trie` runs `check_patricia`
+   first for a `PatriciaTrie`.
+
+Assumptions:
+
+* **Reachability, not `live_count`, is the definition of `node_count`.** The
+  other way round — define `node_count` as `live_count` and have the check
+  compare `live_count` against a reachability walk — discharges the same
+  obligation. I chose reachability because `node_count` is §37's `trie_nodes`,
+  an operator-facing metric, and "nodes the trie is actually using" is the
+  number an operator means; a leaked slot inflating the published metric would
+  be the bug reporting itself as capacity.
+* **The `leaves == hot_ip_count` and `2 * leaves - 1` clauses are in
+  `check_patricia`.** They are redundant given the shape checks it already
+  performs, and nothing asked for them. I included them because the traversal
+  has already counted the leaves, so they cost nothing, and because they turn a
+  shape bug into a one-line message naming two integers.
+* **Visited-set traversal rather than a recursion depth limit.** A cycle in
+  `child` is the corruption a recycled-while-referenced id produces, which
+  decision 7 names as one of the bug classes this package exists to catch; a
+  `RecursionError` from a 128-deep trie would not distinguish it from a deep
+  one.
+
+### A3. What the observables do on a corrupted trie: structural iterators, derived counts
+
+**Classification: (b).** The corruption tests inject a bad count and then ask a
+check to catch it. Whether that works depends on which observables read the
+stored counts and which do not — and the ADR never said. If
+`iter_hot_addresses()` filtered leaves on `hot_count == 1`, `check_hot_counts`
+would be comparing the stored counts with themselves; if `iter_nodes()` skipped
+zero-count nodes, `check_no_orphaned_nodes` could never see one.
+
+Ruling: the package has exactly one source of truth — the stored node records
+(§9: `child[0]`, `child[1]`, `hot_count`) and the root reference — and the
+observables split cleanly into those that read the *links* and those that read
+the *counts*.
+
+```text
+structural (links only, counts never consulted for what to yield or where to descend):
+    iter_nodes()          every materialized node reachable from the root,
+                          pre-order DFS, NodeView.hot_count verbatim
+                          (0 and negative values are yielded, not hidden)
+    iter_hot_addresses()  every materialized node at length == bit_length,
+                          same order
+    node_count            == len(list(iter_nodes()))
+
+count-derived (report the stored counts; descent is still by link):
+    hot_count(prefix), ancestor_counts(), contains()
+    iter_prefix_counts()  the count decides only whether a prefix is yielded
+    hot_ip_count          0 for an empty trie, else the root node's stored
+                          hot_count -- never a separate counter
+```
+
+That split is what makes the checks meaningful: `check_hot_counts` recomputes
+§12 from the structural side and compares against the count-derived side, so a
+count corrupted anywhere shows up as a disagreement. It also fixes the three
+corruption behaviours the tests depend on — a live node whose count is zeroed
+is still yielded by `iter_nodes()` (caught by `check_no_orphaned_nodes`); a
+root count of `-1` is visible as `hot_ip_count == -1` (caught by
+`check_hot_counts` and by testkit's `assert_no_negative_counts`); and a node
+whose count is corrupted to zero or below hides its own expanded prefixes from
+`iter_prefix_counts()` but not its descendants', so the corruption reads as a
+*missing prefix* rather than as an empty trie.
+
+Assumptions:
+
+* **`hot_ip_count` is derived from the root's stored count rather than
+  maintained.** A maintained integer would be O(1) either way and would survive
+  a corrupted root — but that is precisely the problem: it would be a second
+  source of truth that could drift from the counts, and §9 asks for stored and
+  derived state to be distinguishable. One list index is not a cost.
+* **Undefined behaviour is scoped to representation corruption only.** I define
+  the observables' behaviour when a *count* is wrong, because that is
+  cheap and the checks depend on it. I explicitly do **not** define what
+  `iter_nodes()` or any other traversal does when a *link* is wrong — a
+  released id still linked in, a cycle — because making every traversal robust
+  to that would cost a liveness test per step on the hot path. `check_patricia`
+  is the diagnosis for that class, which is why A2 puts it first in
+  `check_trie`.
+* **`NodeView.hot_count` is verbatim, not clamped.** Clamping a negative count
+  to zero in the view would hide exactly the §11 violation the view exists to
+  surface.
+
+### A4. No operation allocates a node it does not keep, so `capacity == peak live` is measurable between operations
+
+**Classification: (b).** Decision 5's "capacity == the maximum number of
+simultaneously live nodes" reads on every instant. A test can only sample
+between operations. An implementation that allocated a replacement node before
+releasing the one it replaces would satisfy the ADR's wording and permanently
+carry a slab one or two slots wider than anything the caller can observe — and
+epic #8's third acceptance criterion would be unfalsifiable.
+
+Ruling: transient over-allocation within an operation is **not allowed**.
+`add_hot_ip` performs allocations and no releases; `remove_hot_ip` performs
+releases and no allocations; neither takes a scratch node. The node sets before
+and after one operation are therefore nested, `live_count` never exceeds
+`max(live_count before, live_count after)` at any instant inside the operation,
+and the two readings of "peak" coincide. A caller may take the running maximum
+of `node_count` sampled at operation boundaries and require `arena.capacity` to
+equal it exactly.
+
+This costs nothing, because decision 6's algorithms need no scratch node: a
+split allocates the new internal node and the new leaf and keeps both; a
+collapse releases the emptied leaf and its now-single-child parent and relinks
+the surviving sibling, which is an existing node, into the grandparent.
+
+**The existing tests match this ruling** and need no change:
+`tests/property/test_trie_properties.py::test_every_step_keeps_every_invariant`
+compares `arena.capacity` with the running maximum of `node_count` sampled
+after each operation, and `test_oscillation_never_grows_the_arena` pins
+`(node_count, capacity)` to `(1, 1)`, `(3, 3)` and `(5, 5)` at the operation
+boundaries — which additionally requires the "grow by exactly one slot, and
+pre-allocate nothing" clause now added to decision 5's promise 2. That test
+file's module docstring already flags the gap and says an implementation that
+over-allocated transiently "would satisfy the ADR's wording and fail this test,
+and that would be worth raising, not hiding". It was right to raise it; this
+item rules that the test, not the permissive wording, is what `coder` builds
+to.
+
+Assumptions:
+
+* **The strict reading, not the permissive one.** Saying instead "the bound is
+  measured between operations" would also have made the test correct and would
+  have left implementers freer. I rejected it because the freedom has no use
+  here — no algorithm in decision 6 wants a scratch node — and because the
+  looser rule would let the slab exceed every number an operator can see, which
+  is a memory-bound promise that cannot be audited. If some future operation
+  genuinely needs a temporary node, this is the clause to amend, and the
+  amendment should say by how much.
+* **Growth is by exactly one slot.** Nothing asked for it, and the natural
+  `list.append` gives it; but a chunked or doubling growth is the other obvious
+  way to write a slab and would break the equality outright. Stated so that it
+  is a rule rather than an accident of implementation.
+* **A fresh arena pre-allocates nothing.** Assumption 16 already anticipated
+  the opposite ("if a future implementation pre-allocates a slab, this becomes
+  `<=`"); this makes the current state explicit rather than implied.
+
+### A5. `BinaryTrie` has no documented storage, deliberately
+
+**Classification: (a), already determined; stated explicitly now.** Decision 7
+said the binary trie uses plain `TrieNode` objects and decision 5 gave the
+arena to the Patricia trie alone, so there was never a promised binary-trie
+attribute. Decision 7 now says so in as many words: no attribute name is
+promised, and everything a caller is entitled to know is on the `HotTrie`
+surface. The asymmetry with `PatriciaTrie.root` / `.arena` is intended — the
+Patricia trie's storage is exposed because §27's accounting claims are about
+the storage, and the binary trie makes no such claim.
+
+Consequently the tests are right to corrupt the binary trie only through
+observables (`test_invariants.py`'s `_DoctoredView`, which overrides one
+`HotTrie` observable and delegates the rest). No change to the ADR beyond the
+sentence, and none to the tests. Shipped code: none affected.
+
+### A6. §27's example is 32 bits; the brief that called it IPv6 was wrong
+
+**Classification: (a), and a correction to a brief rather than to this ADR.**
+`docs/spec/hammertime_spec_1.md` §27 (lines 1296-1302) gives
+
+```text
+00000000000000000000000011001010
+```
+
+— 24 zero bits then `11001010` — and says it "can be represented as a
+compressed edge rather than 32 individual nodes". That is 32 bits, i.e. the
+IPv4 address `0.0.0.202`. This ADR never claimed otherwise; the epic brief that
+described the example as IPv6 was mistaken, and the `ipv4-section-27-zero-run`
+scenario in `test_patricia_equivalence.py` (`0.0.0.202`, `0.0.0.203`,
+`0.0.0.0`) is the faithful reading. Its IPv6 companions (`0:ca::`, `::ca`) are
+a reasonable extrapolation and are labelled as one in that file's docstring;
+they are not in the spec and nothing requires them. No ADR change, no test
+change, no spec change.
+
+### A7. A record of the other family is not isolable, and does not need to be
+
+**Classification: (a).** Decision 9's three clauses stand. Because an
+`Address`'s family is part of its identity, a records collection containing an
+address of the other family can never equal `set(trie.iter_hot_addresses())`,
+so the family clause is never the *only* clause a bad collection violates. That
+is a property of the type, not a gap.
+
+Ruling, as a refinement only: the family clause is evaluated **first**, so the
+failure message names the family error instead of reporting the same records as
+simultaneously missing and extra. `packages/hammertime-testkit`'s
+`assert_attribute_records_match` already does this; decision 9's assertion
+block is reordered to match, and now says why. The tests are right to require
+only that such a collection is rejected. Shipped code: none affected (the
+testkit file already conforms).
+
+### A8. The derived counts, stated as equalities a test may assert
+
+**Classification: (b) as statements, (a) as derivations.** Each follows from
+decisions 2, 4, 6 and 7, but none was written down as a number, so a test
+asserting them was asserting something the ADR only implied. They are now in
+the decisions themselves; collected here for review:
+
+```text
+both:      len(list(iter_nodes())) == node_count                       (A2)
+           node_count == 0  <->  hot_ip_count == 0                     (decision 4)
+binary:    node_count == len(list(iter_prefix_counts()))
+           [nv.prefix for nv in iter_nodes()] == [pc.prefix for pc in iter_prefix_counts()]
+           node_count == 33 (IPv4) / 129 (IPv6) for one HOT address
+patricia:  node_count == 2 * hot_ip_count - 1   (hot_ip_count >= 1)
+           node_count == 0                      (hot_ip_count == 0)
+           arena.live_count == node_count
+           arena.capacity == arena.live_count + arena.free_count
+           iter_nodes() of a one-address trie == [NodeView(/bit_length, 1, ())]
+```
+
+The binary identity holds because decision 4 prunes every zero-count node and
+the binary trie materializes one node per prefix on each HOT address's path, so
+its node set *is* its positive-count prefix set — which is also why the same
+DFS order makes the two prefix sequences equal element for element. The
+Patricia identity holds because decision 6 admits only leaves and two-child
+internal nodes, and the leaves are in bijection with the HOT addresses.
+
+Assumptions:
+
+* **These are contract, not commentary.** I state them as equalities the tests
+  may assert rather than as consequences a reader may derive, because a test
+  that asserts `2n - 1` is pinning a *shape* decision (decision 6's "no node
+  has exactly one child") through a number, and a later implementer who relaxed
+  the shape would otherwise see only a mysterious failing arithmetic assertion.
+* **The binary trie's 33 / 129 are named.** Nothing required a per-family
+  number; it is the most direct test of §27's compression claim (33 nodes
+  against 1) and §27's own example is exactly this case (A6).
+
+### A9. Decision 1's `ValueError` covers the queries too
+
+**Classification: (a).** Decision 1 said "any method", which already includes
+`contains`, `hot_count`, `ancestor_counts` and `longest_matching_prefix`; the
+tests exercise it only on `add_hot_ip` and `remove_hot_ip`. Decision 1 now
+lists the methods explicitly so nothing rests on the reader's parse of "any",
+and adds that the family is validated before any other argument, so a call that
+is wrong in two ways reports the family. That ordering is new (there was no
+rule) and is a judgment call: the family mismatch is the caller's more serious
+bug, being a routing error rather than a bad parameter.
+
+The missing coverage is a test gap, not a test error — see *Follow-ups*.
+
+### A10. The cost of the IPv6 equivalence sweep is test-author's call, not the ADR's
+
+**Classification: (c), deliberately left open.** Nothing in this ADR fixes a
+test budget, and nothing in it requires every ancestor length of every probe to
+be queried after every operation; `_assert_equivalent`'s 129-length sweep is
+one faithful way to compare the two implementations, and sampling lengths (say
+`/0`, the divergence points, and `/bit_length`) would be another. I have no
+`Bash` tool and did not run or time the suite, so I am not in a position to say
+whether it is actually slow. If it is, narrowing the per-step sweep and keeping
+one exhaustive sweep at the end of each sequence is consistent with every
+decision here. Shipped code: none affected.
+
+### Follow-ups (not part of this amendment; for the top-level session to dispatch)
+
+* `test-author`: decision 1's `ValueError` is asserted only for `add_hot_ip`
+  and `remove_hot_ip`. Add the other-family case for `contains`, `hot_count`,
+  `ancestor_counts` and `longest_matching_prefix`, and the case where the
+  family and `min_length` are both wrong (the family must be reported) (A9).
+* `test-author`: no test pins `arena.capacity == len(arena.network) ==
+  len(arena.child) // 2`, or that a growth adds exactly one slot, other than
+  indirectly through `test_oscillation_never_grows_the_arena`'s
+  `(node_count, capacity)` pairs (A4).
+* `test-author`: `check_patricia`'s cycle clause ("no id reached twice") has no
+  test; a `child` pointer rewritten to an ancestor would exercise it (A2).
+* `test-author`, optional: the module docstrings of the three test files list
+  the assumptions A1-A4 and A8 as unpinned. They are pinned now, and the
+  docstrings could cite the amendment instead — cosmetic, and only worth a pass
+  if those files are being edited anyway.
