@@ -1,6 +1,7 @@
 """Encode/decode events; schema-version negotiation and forward compatibility.
 
-Spec: section 19, section 32, section 46.2; ADR-0015 decision 5
+Spec: section 19, section 32, section 46.2; ADR-0015 decision 5 and
+Amendment 2 (ruling A)
 
 The wire format is JSON. Every message is an `EventEnvelope` (see
 `envelope.py`) with a `payload` object whose field names match the relevant
@@ -18,12 +19,15 @@ literal), or `hammertime.core.errors.InvalidAddressError` (from a malformed
 unknown/unsupported `schema_version`, or malformed bytes -- surfaces as
 `CodecError`.
 
-A `HotIpAdded`/`HotIpRemoved` payload's `attributes` document is checked by
-`hammertime.core.events.attributes.validate_ip_attributes`, the one
+A `HotIpAdded`/`HotIpRemoved` payload's `attributes` document goes through
+`hammertime.core.events.attributes.canonicalize_ip_attributes`, the one
 implementation of the section 46.2 rules, on encode and on decode (ADR-0015
-decision 5). Its `InvalidAttributesError` becomes a `CodecError` chained
-`from` it, so `CodecError.__cause__` identifies every attributes rejection
-(ADR-0015 assumption 32).
+decision 5). What is kept is its canonical copy, never the payload's own
+object: encode puts the copy into the envelope it sends, and decode puts it
+into the event it returns, so the bytes on the wire are the bytes that were
+checked (ADR-0015 Amendment 2 ruling A). An `InvalidAttributesError` becomes a
+`CodecError` chained `from` it, so `CodecError.__cause__` identifies every
+attributes rejection (ADR-0015 assumption 32).
 """
 
 import json
@@ -32,7 +36,7 @@ from typing import Any
 
 from hammertime.core.addressing.address import Address
 from hammertime.core.errors import CodecError, InvalidAddressError, InvalidAttributesError
-from hammertime.core.events.attributes import validate_ip_attributes
+from hammertime.core.events.attributes import canonicalize_ip_attributes
 from hammertime.core.events.envelope import SCHEMA_VERSION, EventEnvelope
 from hammertime.core.events.models import (
     HotIpAdded,
@@ -123,14 +127,15 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
         raise CodecError(f"malformed RequestObservation payload: {data!r}") from exc
 
 
-def _check_attributes(attributes: object) -> None:
-    """Apply the section 46.2 rules (ADR-0015 decision 5) as a `CodecError`.
+def _canonical_attributes(attributes: object) -> dict[str, object]:
+    """The canonical copy of `attributes` (ADR-0015 decision 5, Amendment 2).
 
-    The validator's message never contains a document value, so repeating it
-    here is safe; the `InvalidAttributesError` itself is the cause.
+    Every section 46.2 violation is a `CodecError`. The validator's message
+    never contains a document value, so repeating it here is safe; the
+    `InvalidAttributesError` itself is the cause.
     """
     try:
-        validate_ip_attributes(attributes)
+        return canonicalize_ip_attributes(attributes).document
     except InvalidAttributesError as exc:
         raise CodecError(f"invalid attributes: {exc}") from exc
 
@@ -146,8 +151,7 @@ def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) ->
         "config_version": payload.config_version,
     }
     if payload.attributes is not None:
-        _check_attributes(payload.attributes)
-        document["attributes"] = payload.attributes
+        document["attributes"] = _canonical_attributes(payload.attributes)
     return document
 
 
@@ -174,8 +178,7 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
         # a document that is not a JSON object (S1), and goes through the
         # validator like every other rejection so that its CodecError carries
         # the InvalidAttributesError cause too (ADR-0015 decision 5).
-        _check_attributes(raw_attributes)
-        attributes = raw_attributes
+        attributes = _canonical_attributes(raw_attributes)
 
     if event_type == "HotIpAdded":
         return HotIpAdded(

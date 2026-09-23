@@ -1,31 +1,55 @@
 """The per-IP attribute document's rules, implemented once.
 
 Spec: section 46.2, section 46.3, section 46.9; ADR-0015 decision 5
-(assumptions 31-36). Schema: `schemas/ip_attributes.v1.json`.
+(assumptions 31-36, 49-56, 59) and Amendment 2 (rulings A-C). Schema:
+`schemas/ip_attributes.v1.json`.
 
-`validate_ip_attributes` is the only place in the repo that states the
+`canonicalize_ip_attributes` is the only place in the repo that states the
 1024-byte cap, the 16-key cap, the registered-name set and the `x_` grammar.
-Both enforcement points call it: the event codec, on encode and on decode
-(`hammertime.core.events.codec`, which re-raises as `CodecError` chained from
-the `InvalidAttributesError`), and the trie service's record map, on every
-write (`hammertime.trie.metadata.ip_attributes`).
+Both enforcement points call it and keep what it returns, never their own
+argument: the event codec, on encode and on decode
+(`hammertime.core.events.codec`, which sends and decodes the canonical copy
+and re-raises as `CodecError` chained from the `InvalidAttributesError`), and
+the trie service's record map, on every write
+(`hammertime.trie.metadata.ip_attributes`, which stores the canonical text).
+`validate_ip_attributes` is its measuring form, for checking only.
 
-The rules (ADR-0015 decision 5). Structural, on every document whatever its
-`attributes_version`:
+One read, into the copy that is used (Amendment 2 ruling A). A document is
+read exactly once, into a new tree of exact built-in types. What a value is
+comes from `type(value)` tested with `issubclass` (`bool` and `None` are
+exact, and tested first); a subclass instance is read only through the base
+type's own slot functions -- `dict.__len__` / `dict.items`, `list.__len__` /
+`list.__iter__`, `str.__len__` / `str.__str__`, `int.__int__` /
+`int.bit_length`, `float.__float__` -- so nothing the value's own class
+defines ever runs. Keys are read the same way. The rules below are applied to
+that copy, and the compact text is produced from it.
 
-* S1 the document is a JSON object (a `dict`);
+Bounded work (ruling B). While reading, a running lower bound on the copy's
+compact size is kept, and the document is rejected under S6 the moment it
+passes 1024: every length is checked through the base `__len__` before the
+value is read, and an `int` is judged by its bit length before it is
+converted. The read is iterative, so at most about 1024 values are ever read,
+whatever the input's size, sharing or nesting.
+
+The rules (ADR-0015 decision 5), on the copy. Structural, on every document
+whatever its `attributes_version`:
+
+* S1 the document is a JSON object: a `dict`, a subclass read as one; any
+  other mapping is refused;
 * S2 at most 16 top-level keys;
 * S3 `attributes_version` is present, a JSON integer (an `int` that is not a
   `bool`, or an integral finite `float`) and `>= 1`;
 * S4 every value at every depth is in the JSON data model -- `dict` with `str`
-  keys, `list`, `str`, `int`, finite `float`, `bool`, `None`; subclasses pass
-  as their base type (assumption 33);
+  keys, `list`, `str`, `int`, finite `float`, `bool`, `None`; a subclass of
+  `dict`, `list`, `str`, `int` or `float` is copied as its base type; the keys
+  of one object are distinct as text;
 * S5 no `str`, key or value, at any depth, holds an unpaired UTF-16
   surrogate;
-* S6 the compact, ASCII-escaped serialization is at most 1024 bytes -- the
-  size this function returns (assumption 35);
-* S7 nesting too deep to walk, and a self-referencing structure, are
-  rejections, never a `RecursionError` or `ValueError`.
+* S6 the compact, ASCII-escaped serialization of the copy is at most 1024
+  bytes -- the size returned;
+* S7 nesting too deep, a self-referencing structure and a shared subtree
+  repeated past the cap are rejections, never a `RecursionError` or
+  `ValueError`.
 
 Registry, only when `attributes_version <= 1` (the highest version this build
 interprets; a higher one is stored and echoed verbatim, section 46.2):
@@ -35,22 +59,25 @@ interprets; a higher one is stored and echoed verbatim, section 46.2):
 * R2 `weight`, if present, is a JSON integer (not a `bool`) in
   `[0, 1000000]`.
 
-Every violation is an `InvalidAttributesError` and nothing else escapes. A
-message names the rule broken and, where it helps, the top-level key involved
--- at most its first 64 characters -- and never a value from the document
-(section 46.9, assumption 36). The order the rules are checked in is not part
-of the contract.
+What can come out (ruling C): a result, or `InvalidAttributesError`. There is
+no blanket `except Exception`; the one conversion kept is of a
+`RecursionError` or `ValueError` from the final serialization of the copy. A
+message is composed from the copy only: it names the rule broken and, where
+it helps, a key -- at most its first 64 characters -- and never a value from
+the document (section 46.9, assumption 36). The order the rules are checked in
+is not part of the contract.
 """
 
 import json
 import math
 import re
-from typing import Final, TypeGuard
+from collections.abc import Iterator
+from typing import Any, Final, NamedTuple, TypeGuard
 
 from hammertime.core.errors import InvalidAttributesError
 
 #: schemas/ip_attributes.v1.json: the whole document's serialized-size cap
-#: (section 46.2), measured as `_serialized_size` does.
+#: (section 46.2), measured on the canonical copy's compact text.
 _MAX_BYTES: Final = 1024
 #: schemas/ip_attributes.v1.json maxProperties.
 _MAX_KEYS: Final = 16
@@ -66,65 +93,251 @@ _REGISTERED_KEYS: Final = frozenset({"attributes_version", "weight"})
 _EXPERIMENTAL_KEY: Final = re.compile(r"^x_[a-z0-9_]{1,48}$")
 #: At most this many characters of a key appear in a message (assumption 36).
 _QUOTED_KEY_CHARS: Final = 64
-#: Every container level costs at least two bytes of the compact form (`[]`
-#: or `{}`), so a document nested deeper than this is necessarily over
-#: `_MAX_BYTES`: refusing it early is S6, not a new rule, and it bounds the
-#: walk below regardless of the interpreter's recursion limit (S7).
-_MAX_DEPTH: Final = _MAX_BYTES // 2
+#: S5: a UTF-16 surrogate code point, valid in a Python str, not in UTF-8.
+_SURROGATE: Final = re.compile("[\ud800-\udfff]")
+#: A lower bound on log10(2), scaled by 100000, for counting an integer's
+#: decimal digits from its bit length without ever over-counting.
+_LOG10_2_FLOOR: Final = 30102
+
+
+class CanonicalAttributes(NamedTuple):
+    """A document's canonical copy and its compact JSON text (Amendment 2).
+
+    `document` holds exact built-in types only, in a tree no caller has held;
+    `text` is `json.dumps(document, separators=(",", ":"))` with json's
+    default `ensure_ascii`, so ASCII only, and a fixed point of `json.loads`
+    followed by that same `json.dumps` (assumption 59).
+    """
+
+    document: dict[str, object]
+    text: str
+
+    @property
+    def size(self) -> int:
+        """The S6 size, in bytes: the text is ASCII, so one byte per character."""
+        return len(self.text)
+
+
+def canonicalize_ip_attributes(document: object) -> CanonicalAttributes:
+    """Read `document` once into a canonical copy, check it, and return it with its text.
+
+    Raises `InvalidAttributesError` for every section 46.2 violation, and no
+    other exception can be caused by the document.
+    """
+    copy = _Reader().read(document)
+    _check_version_and_registry(copy)
+    try:
+        text = json.dumps(copy, separators=(",", ":"))
+    except RecursionError:
+        # Only a caller already at the edge of the stack: the copy is at most
+        # about 512 levels deep (every level costs two bytes of S6).
+        raise InvalidAttributesError("attributes is nested too deeply to serialize") from None
+    except ValueError:
+        # Only an interpreter whose integer-to-string limit is below the
+        # digits S6 admits (assumption 54).
+        raise InvalidAttributesError(
+            f"attributes cannot be serialized within {_MAX_BYTES} bytes"
+        ) from None
+    size = len(text)
+    if size > _MAX_BYTES:
+        raise InvalidAttributesError(
+            f"attributes is {size} bytes serialized, more than the maximum of {_MAX_BYTES}"
+        )
+    return CanonicalAttributes(document=copy, text=text)
 
 
 def validate_ip_attributes(document: object) -> int:
     """Check `document` against the section 46.2 rules; return its size.
 
-    The size is `len(json.dumps(document, separators=(",", ":")).encode())`
-    with json's default `ensure_ascii` -- the compact form the codec writes,
-    and section 46.8's per-record `ip_attribute_bytes`.
+    `canonicalize_ip_attributes(document).size`: the compact, ASCII-escaped
+    size of the canonical copy, section 46.8's per-record `ip_attribute_bytes`.
+    For checking and measuring only -- anything that stores or sends a
+    document keeps the canonical copy instead.
 
     Raises `InvalidAttributesError` for every violation, and nothing else.
     """
-    try:
-        return _validate(document)
-    except RecursionError:
-        # S7's backstop. The walk is iterative and depth-bounded, so this is
-        # only reachable from a caller already at the edge of the stack.
-        # `from None`: the internal error's text is not ours to vouch for,
-        # and a message here must never carry a document value.
-        raise InvalidAttributesError("attributes is nested too deeply to validate") from None
-    except (TypeError, ValueError):
-        raise InvalidAttributesError("attributes could not be validated") from None
+    return canonicalize_ip_attributes(document).size
 
 
-def _validate(document: object) -> int:
-    # S1
-    if not isinstance(document, dict):
+class _Frame(NamedTuple):
+    """One container being copied: the source's entries still to read."""
+
+    #: `dict.items` or `list.__iter__` of the source, never its own methods.
+    entries: Iterator[Any]
+    #: The copy being filled: a `dict[str, object]` when `keyed`, else a
+    #: `list[object]`.
+    target: Any
+    keyed: bool
+    #: The copied top-level key this container sits under; None for the root.
+    top: str | None
+    #: id() of the source container, for naming a self-reference (S7).
+    source_id: int
+
+
+class _Reader:
+    """The one read of a document (ruling A), under the running bound (ruling B).
+
+    `total` is a lower bound on the compact size of the whole document, given
+    what has been read so far: every value not yet read is counted at its
+    smallest possible encoding (1 byte, and 2 for a key, `""`), and replaced
+    by a larger figure once it is. Nothing here calls a method of a value
+    from the document; every read goes through a base type's slot function.
+    """
+
+    def __init__(self) -> None:
+        self.total = 0
+
+    def read(self, document: object) -> dict[str, object]:
+        if not issubclass(type(document), dict):
+            raise InvalidAttributesError(
+                f"attributes must be a JSON object, got {_describe(document)}"
+            )
+        source: Any = document
+        count = dict.__len__(source)
+        # S2
+        if count > _MAX_KEYS:
+            raise InvalidAttributesError(
+                f"attributes has {count} keys, more than the maximum of {_MAX_KEYS}"
+            )
+        self._charge(_dict_minimum(count), None)
+        root: dict[str, object] = {}
+        stack = [_Frame(iter(dict.items(source)), root, True, None, id(source))]
+        on_path = {id(source)}
+        while stack:
+            frame = stack[-1]
+            entry: Any = next(frame.entries, _END)
+            if entry is _END:
+                stack.pop()
+                on_path.discard(frame.source_id)
+                continue
+            if frame.keyed:
+                # dict.items yields exact (key, value) tuples.
+                raw_key, raw_value = entry
+                key = self._key(raw_key, frame.top)
+                if key in frame.target:
+                    raise InvalidAttributesError(
+                        f"attributes has two keys spelt {_quote(key)}{_under(frame.top)}"
+                    )
+                top = key if frame.top is None else frame.top
+                value, child = self._value(raw_value, top, on_path)
+                frame.target[key] = value
+            else:
+                # Only the root has no top-level key, and the root is a dict.
+                top = frame.top or ""
+                value, child = self._value(entry, top, on_path)
+                frame.target.append(value)
+            if child is not None:
+                stack.append(child)
+                on_path.add(child.source_id)
+        return root
+
+    def _key(self, raw: Any, top: str | None) -> str:
+        if not issubclass(type(raw), str):
+            raise InvalidAttributesError(f"attributes has a key that is not a string{_under(top)}")
+        # The container's minimum counted this key as `""`.
+        self._charge(str.__len__(raw), top)
+        key = str.__str__(raw)
+        if _SURROGATE.search(key):
+            raise InvalidAttributesError(
+                f"attributes has a key holding an unpaired UTF-16 surrogate{_under(top)}"
+            )
+        return key
+
+    def _value(self, raw: Any, top: str, on_path: set[int]) -> tuple[object, _Frame | None]:
+        """Copy one value; a container comes back empty, with the frame that fills it.
+
+        The enclosing container's minimum already counted this value at one
+        byte; each branch charges the rest.
+        """
+        if raw is None:
+            self._charge(3, top)
+            return None, None
+        kind = type(raw)
+        if kind is bool:
+            self._charge(3 if raw else 4, top)
+            return raw, None
+        if issubclass(kind, str):
+            self._charge(str.__len__(raw) + 1, top)
+            text = str.__str__(raw)
+            if _SURROGATE.search(text):
+                raise InvalidAttributesError(
+                    f"attributes has a string value holding an unpaired UTF-16 "
+                    f"surrogate{_under(top)}"
+                )
+            return text, None
+        if issubclass(kind, int):
+            # Judged by bit length before any conversion (ruling B.3): a value
+            # of b >= 1 bits is at least 2**(b-1), which has at least
+            # floor((b-1) * log10(2)) + 1 digits.
+            bits = int.bit_length(raw)
+            self._charge(max(bits - 1, 0) * _LOG10_2_FLOOR // 100_000, top)
+            number = int.__int__(raw)
+            if number < 0:
+                self._charge(1, top)
+            return number, None
+        if issubclass(kind, float):
+            real = float.__float__(raw)
+            if not math.isfinite(real):
+                raise InvalidAttributesError(
+                    f"attributes contains a non-finite number{_under(top)}, not valid JSON"
+                )
+            self._charge(len(float.__repr__(real)) - 1, top)
+            return real, None
+        if issubclass(kind, list):
+            self._container(id(raw), top, on_path)
+            self._charge(_list_minimum(list.__len__(raw)) - 1, top)
+            items: list[object] = []
+            return items, _Frame(list.__iter__(raw), items, False, top, id(raw))
+        if issubclass(kind, dict):
+            self._container(id(raw), top, on_path)
+            self._charge(_dict_minimum(dict.__len__(raw)) - 1, top)
+            entries: dict[str, object] = {}
+            return entries, _Frame(iter(dict.items(raw)), entries, True, top, id(raw))
         raise InvalidAttributesError(
-            f"attributes must be a JSON object, got {_type_name(document)}"
+            f"attributes contains a value{_under(top)} that is not in the JSON data model"
         )
-    # S2
-    if len(document) > _MAX_KEYS:
-        raise InvalidAttributesError(
-            f"attributes has {len(document)} keys, more than the maximum of {_MAX_KEYS}"
-        )
+
+    @staticmethod
+    def _container(identity: int, top: str, on_path: set[int]) -> None:
+        # S7. The bound would reject a cycle anyway; this only names it.
+        if identity in on_path:
+            raise InvalidAttributesError(f"attributes refers to itself{_under(top)}")
+
+    def _charge(self, amount: int, top: str | None) -> None:
+        """Raise the running lower bound; reject under S6 the moment it passes the cap."""
+        self.total += amount
+        if self.total > _MAX_BYTES:
+            raise InvalidAttributesError(
+                f"attributes is more than {_MAX_BYTES} bytes serialized{_under(top)}"
+            )
+
+
+#: Sentinel for an exhausted frame.
+_END: Final = object()
+
+
+def _list_minimum(count: int) -> int:
+    """The smallest compact encoding of a list of `count` items: `[]`, or
+    brackets, `count - 1` commas and one byte per item."""
+    return 2 if count == 0 else 2 * count + 1
+
+
+def _dict_minimum(count: int) -> int:
+    """The smallest compact encoding of a dict of `count` entries: `{}`, or
+    braces, `count - 1` commas, and per entry `""`, a colon and one byte."""
+    return 2 if count == 0 else 5 * count + 1
+
+
+def _check_version_and_registry(document: dict[str, object]) -> None:
+    """S3, R1 and R2, on the canonical copy: every value here is an exact type."""
     # S3
     if "attributes_version" not in document:
         raise InvalidAttributesError("attributes is missing the required attributes_version")
     version = document["attributes_version"]
     if not _is_json_integer(version) or version < 1:
         raise InvalidAttributesError("attributes_version must be a JSON integer >= 1")
-    # S4, S5, S7 -- before the registry, so that R1 only ever sees str keys.
-    _walk(document)
-    if version <= _KNOWN_VERSION:
-        _check_registry(document)
-    # S6
-    size = _serialized_size(document)
-    if size > _MAX_BYTES:
-        raise InvalidAttributesError(
-            f"attributes is {size} bytes serialized, more than the maximum of {_MAX_BYTES}"
-        )
-    return size
-
-
-def _check_registry(document: dict[str, object]) -> None:
+    if version > _KNOWN_VERSION:
+        return
     # R1
     for key in document:
         if key in _REGISTERED_KEYS or _EXPERIMENTAL_KEY.fullmatch(key):
@@ -140,87 +353,30 @@ def _check_registry(document: dict[str, object]) -> None:
             raise InvalidAttributesError(f"weight must be a JSON integer in [0, {_MAX_WEIGHT}]")
 
 
-def _walk(document: dict[object, object]) -> None:
-    """S4, S5 and S7 over every key and value, iteratively.
-
-    `on_path` holds the ids of the containers between the top level and the
-    value being visited, so a container met again while it is still on the
-    path is a cycle; one merely shared between two branches is not. Each
-    stack entry is `(value, depth, top-level key it sits under, leaving)`.
-    """
-    on_path: set[int] = set()
-    stack: list[tuple[object, int, str | None, bool]] = [(document, 1, None, False)]
-    while stack:
-        value, depth, top, leaving = stack.pop()
-        if leaving:
-            on_path.discard(id(value))
-        elif isinstance(value, str):
-            _check_text(value, "a string value", top)
-        elif value is None or isinstance(value, int):
-            # int includes bool; both are JSON as they stand.
-            continue
-        elif isinstance(value, float):
-            if not math.isfinite(value):
-                raise InvalidAttributesError(
-                    f"attributes contains a non-finite number{_under(top)}, not valid JSON"
-                )
-        elif isinstance(value, dict | list):
-            if depth > _MAX_DEPTH:
-                raise InvalidAttributesError(f"attributes is nested too deeply{_under(top)}")
-            if id(value) in on_path:
-                raise InvalidAttributesError(f"attributes refers to itself{_under(top)}")
-            on_path.add(id(value))
-            # Pushed first, so popped only after the whole subtree.
-            stack.append((value, depth, top, True))
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    if not isinstance(key, str):
-                        raise InvalidAttributesError(
-                            f"attributes has a {_type_name(key)} key{_under(top)}, not a string"
-                        )
-                    item_top = key if depth == 1 else top
-                    _check_text(key, "a key", item_top)
-                    stack.append((item, depth + 1, item_top, False))
-            else:
-                stack.extend((item, depth + 1, top, False) for item in value)
-        else:
-            raise InvalidAttributesError(
-                f"attributes contains a {_type_name(value)}{_under(top)}, "
-                "which is not in the JSON data model"
-            )
-
-
-def _check_text(text: str, what: str, top: str | None) -> None:
-    # S5: valid in a Python str, not encodable as UTF-8.
-    if any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
-        raise InvalidAttributesError(
-            f"attributes has {what} holding an unpaired UTF-16 surrogate{_under(top)}"
-        )
-
-
-def _serialized_size(document: dict[str, object]) -> int:
-    try:
-        encoded = json.dumps(document, separators=(",", ":"))
-    except (TypeError, ValueError):
-        # After the walk, only an integer past CPython's int-to-str digit
-        # limit gets here -- thousands of digits, so necessarily over S6.
-        raise InvalidAttributesError(
-            f"attributes cannot be serialized within {_MAX_BYTES} bytes"
-        ) from None
-    return len(encoded.encode("utf-8"))
-
-
 def _is_json_integer(value: object) -> TypeGuard[int | float]:
-    """JSON Schema's `"type": "integer"`: any number with no fractional part.
+    """JSON Schema's `"type": "integer"`, on an exact-typed copy.
 
-    `1.0` qualifies although `isinstance(1.0, int)` is False; `bool` does not
-    although `isinstance(True, int)` is True.
+    `1.0` qualifies; `True` does not, since its type is `bool`, not `int`.
     """
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
+    if type(value) is int:
         return True
-    return isinstance(value, float) and math.isfinite(value) and value.is_integer()
+    return type(value) is float and math.isfinite(value) and value.is_integer()
+
+
+def _describe(value: object) -> str:
+    """What a top-level value is, from its type alone, without reading it."""
+    if value is None:
+        return "null"
+    kind = type(value)
+    if kind is bool:
+        return "a boolean"
+    if issubclass(kind, str):
+        return "a string"
+    if issubclass(kind, int | float):
+        return "a number"
+    if issubclass(kind, list):
+        return "an array"
+    return "a value that is not a dict"
 
 
 def _under(top: str | None) -> str:
@@ -228,12 +384,6 @@ def _under(top: str | None) -> str:
 
 
 def _quote(key: str) -> str:
-    # The base-class methods, so that a `str` subclass cannot put anything
-    # but the key's own first characters into a message.
-    head = str.__getitem__(key, slice(0, _QUOTED_KEY_CHARS))
+    # `key` is always an exact str from the canonical copy.
     suffix = "..." if len(key) > _QUOTED_KEY_CHARS else ""
-    return str.__repr__(head) + suffix
-
-
-def _type_name(value: object) -> str:
-    return type(value).__name__[:_QUOTED_KEY_CHARS]
+    return repr(key[:_QUOTED_KEY_CHARS]) + suffix

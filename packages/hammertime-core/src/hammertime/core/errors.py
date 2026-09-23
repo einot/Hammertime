@@ -16,8 +16,9 @@ class InvalidPrefixError(HammertimeError):
 class InvalidAttributesError(HammertimeError):
     """A per-IP attribute document breaks a spec section 46.2 rule.
 
-    Raised by `hammertime.core.events.attributes.validate_ip_attributes`, the
-    one implementation of those rules (ADR-0015 decision 5). Deliberately
+    Raised by `hammertime.core.events.attributes.canonicalize_ip_attributes`
+    (and so by `validate_ip_attributes`, its measuring form), the one
+    implementation of those rules (ADR-0015 decision 5). Deliberately
     neither a `ValueError` nor a `CodecError` (ADR-0015 assumption 31): it is
     bad *input*, which a caller must be able to tell from a bad call (a
     family-mismatch `ValueError`), and a record-map rejection involves no
