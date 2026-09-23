@@ -27,6 +27,12 @@ The interface under test is ADR-0015 decisions 1-8, as re-exported from
   and is all-or-nothing; `apply_hot_ip_added` validates, then mutates the
   trie, then the record, so the section 46.5 invariant holds after every
   step and after every exception.
+* E (Amendment 1 rulings 3-7, assumptions 44-48): what the metadata surface
+  refuses -- `declare`'s malformed document (`TypeError`), a non-`Prefix`
+  given to `in` (`False`), a value built with a wrong field type
+  (`TypeError`), a key given two kinds on one path (`ValueError` at
+  `declare`), and a combine operand that is not one of the three kinds
+  (`TypeError`, checked before any key is combined).
 
 ADR-0014 (decisions 1-4, 8, 9; A1, A3, A5, A12) supplies the trie surface, and
 its A12 clause 4 forbids comparing implementations, or running the checks, on
@@ -46,20 +52,21 @@ Choices of this file's own, not dictated by the spec or ADR-0015:
   appears case-insensitively. "Naming both families" is read as the
   `AddressFamily` values `ipv4` / `ipv6`, case-insensitively, as in
   `test_invariants.py`.
-* Decision 4's "a `Prefix` or `Address` of the other family is a
-  `ValueError`" is applied to `PrefixMetadataStore.__contains__` as well as to
-  the other methods: the ADR states it without exception, and decision 5 does
-  the same for `a in records`. The only "other argument" that can also be
-  wrong is `declare`'s document, so that is the combined case.
+* Decision 4's family `ValueError` is applied to
+  `PrefixMetadataStore.__contains__` as well as to the other methods, as
+  ADR-0015 Amendment 1 ruling 2 (assumption 43) states. The only "other
+  argument" that can also be wrong is `declare`'s document, so that is the
+  combined case.
 * In the hypothesis strategies each metadata key has one fixed kind, so a
   random document never mixes kinds under a key (that is a separate,
-  explicit test).
-* ADR-0015 decision 2 motivates `PrefixStats` with a `/23` whose `/24`
-  children are at 50 % and 0 %, calling the parent's 25 % "neither the sum nor
-  the mean" -- but the mean of 50 % and 0 % *is* 25 %. The worked example is
-  pinned exactly as stated (Fraction(128, 512)), and ratio-averaging is ruled
-  out separately with parts of unequal size, where sum, mean and the true
-  ratio all differ.
+  explicit test) -- except in the ruling 6 property test, which draws kinds
+  freely on purpose.
+* "Names the key" is only meaningful for a key unlikely to occur in a message
+  by accident, so wherever an Amendment 1 test pins a key in a message the
+  key is a word (`flags`, `zone_marking`, `stray_policy`), never a single
+  letter like `k`. "Naming that prefix" (ruling 6) is read as the prefix's
+  CIDR text as `Prefix.parse` reads it, e.g. `10.0.0.0/8`, and is pinned for
+  IPv4 prefixes only.
 * Snapshots of the record map deep-copy every record, so a later nested
   mutation by the code under test could not make "before" and "after" agree
   by aliasing.
@@ -70,6 +77,7 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Callable, Iterable, Mapping
+from enum import IntEnum
 from fractions import Fraction
 from typing import Any
 
@@ -863,6 +871,9 @@ class TestAggregate:
         assert parent.hot_ratio_exact != sum(c.hot_ratio_exact for c in children)
 
     def test_ratios_are_neither_summed_nor_averaged(self) -> None:
+        """Decision 2's unequal-parts example (Amendment 1 ruling 1): a /24 at
+        128 beside a /25 at 64 under a /23 is 37.5 %, not the sum or the mean."""
+
         # Parts of unequal size, both at 1/2: sum 1, mean 1/2, true ratio 3/8.
         parts = [_stats(Prefix.parse("10.0.0.0/24"), 128), _stats(Prefix.parse("10.0.1.0/25"), 64)]
         assert [p.hot_ratio_exact for p in parts] == [Fraction(1, 2), Fraction(1, 2)]
@@ -1490,3 +1501,519 @@ def test_prefix_metadata_and_ip_attributes_share_no_namespace() -> None:
     assert dict(store.effective(elsewhere)) == {}
     assert dict(store.local(HOST_ROUTE)) == {}
     assert len(store) == 1
+
+
+# ==========================================================================
+# E. What the metadata surface refuses (ADR-0015 Amendment 1, rulings 3-7).
+# ==========================================================================
+
+StoreState = tuple[int, list[tuple[Prefix, dict[str, Value]]], dict[str, Value]]
+
+
+def _store_state(store: PrefixMetadataStore, prefix: Prefix) -> StoreState:
+    """Everything a refused `declare` must leave alone (decision 4)."""
+
+    return len(store), _declared(store), dict(store.local(prefix))
+
+
+def _other(family: AddressFamily) -> AddressFamily:
+    return IPV6 if family is IPV4 else IPV4
+
+
+def _covers(outer: Prefix, inner: Prefix) -> bool:
+    """`outer` contains `inner` or is it: same family, no longer, same leading bits."""
+
+    if outer.family is not inner.family or outer.length > inner.length:
+        return False
+    shift = outer.family.bit_length - outer.length
+    return (outer.network >> shift) == (inner.network >> shift)
+
+
+def _sibling(prefix: Prefix) -> Prefix:
+    """The other half of `prefix`'s parent: same length, last network bit flipped."""
+
+    flip = 1 << (prefix.family.bit_length - prefix.length)
+    return Prefix(family=prefix.family, network=prefix.network ^ flip, length=prefix.length)
+
+
+# --- Ruling 3: `declare` refuses a document that is not `Metadata`. --------
+
+# (document, the `str` key whose value is at fault -- or None when the fault
+# is not a value under a `str` key)
+MALFORMED_DOCUMENTS = [
+    pytest.param(42, None, id="int"),
+    pytest.param(None, None, id="none"),
+    pytest.param("labels", None, id="str"),
+    pytest.param([("labels", Tags.of("x"))], None, id="list-of-pairs"),
+    pytest.param({1: Tags.of("x")}, None, id="non-str-key"),
+    pytest.param({"flags": 3}, "flags", id="bare-int"),
+    pytest.param({"policy": "deny"}, "policy", id="bare-str"),
+    pytest.param({"policy": None}, "policy", id="bare-none"),
+    pytest.param({"labels": {"internal"}}, "labels", id="bare-set"),
+    pytest.param({"labels": frozenset({"internal"})}, "labels", id="bare-frozenset"),
+    pytest.param({"zone": {"labels": Tags.of("x")}}, "zone", id="nested-document"),
+    pytest.param({"labels": Tags.of("ok"), "flags": 3}, "flags", id="one-bad-value-of-two"),
+]
+
+
+@pytest.mark.parametrize(("document", "key"), MALFORMED_DOCUMENTS)
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "populated"])
+@pytest.mark.parametrize("family", FAMILIES)
+def test_declare_refuses_a_malformed_document_and_changes_nothing(
+    family: AddressFamily, populated: bool, document: object, key: str | None
+) -> None:
+    """Decision 4 / Amendment 1 ruling 3 (assumption 44): a non-mapping (`None`
+    and a list of pairs included), a non-`str` key, or a value that is not a
+    `Tags`, `Bitmask` or `Override` is a `TypeError`; the message names a
+    faulty value's key; the store's length, its declarations and any earlier
+    declaration on the prefix are exactly as they were."""
+
+    target = _prefix_of(SAMPLE[family], 16)
+    store = PrefixMetadataStore(family)
+    if populated:
+        store.declare(target, {"labels": Tags.of("kept"), "flags": Bitmask(1)})
+        store.declare(_prefix_of(OTHER_SAMPLE[family], 24), {"policy": Override("deny")})
+    before = _store_state(store, target)
+
+    malformed: Any = document
+    with pytest.raises(TypeError) as excinfo:
+        store.declare(target, malformed)
+    if key is not None:
+        assert key in str(excinfo.value), str(excinfo.value)
+    assert _store_state(store, target) == before
+
+
+def test_a_malformed_document_is_a_type_error_even_when_it_would_also_conflict() -> None:
+    """Decision 4: the path check (ruling 6) runs after the document check
+    (ruling 3), so a document that fails both is the `TypeError`."""
+
+    store = PrefixMetadataStore(IPV4)
+    store.declare(SLASH_8, {"k": Tags.of("a")})
+    before = _store_state(store, SLASH_24)
+    document: Any = {"k": Bitmask(1), "j": 3}
+    with pytest.raises(TypeError):
+        store.declare(SLASH_24, document)
+    assert _store_state(store, SLASH_24) == before
+
+
+# --- Ruling 4: anything that is not a `Prefix` is absent from the store. ----
+
+
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "populated"])
+@pytest.mark.parametrize("family", FAMILIES)
+def test_anything_that_is_not_a_prefix_is_simply_absent(
+    family: AddressFamily, populated: bool
+) -> None:
+    """Decision 4 / Amendment 1 ruling 4 (assumption 45): `False`, never an
+    exception -- an `Address` of either family, a `str`, `None`, an
+    unhashable object -- and the store is unchanged."""
+
+    address = SAMPLE[family]
+    host_route = _prefix_of(address, family.bit_length)
+    store = PrefixMetadataStore(family)
+    if populated:
+        store.declare(_root(family), {"labels": Tags.of("root")})
+        store.declare(host_route, {"flags": Bitmask(1)})
+    before = (len(store), _declared(store))
+
+    probes: list[object] = [
+        address,
+        SAMPLE[_other(family)],
+        "10.0.0.0/8",
+        str(_root(family)),
+        str(host_route),
+        None,
+        42,
+        [],
+        {},
+    ]
+    for probe in probes:
+        assert probe not in store, probe
+        assert (len(store), _declared(store)) == before
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_an_address_is_not_read_as_its_host_route(family: AddressFamily) -> None:
+    """Amendment 1 ruling 4: "An `Address` is not read as its host route"."""
+
+    address = SAMPLE[family]
+    host_route = _prefix_of(address, family.bit_length)
+    store = PrefixMetadataStore(family)
+    store.declare(host_route, {"labels": Tags.of("host")})
+    assert host_route in store
+    # Through `Any`: mypy's strict equality may (rightly) flag the lookup.
+    untyped: Any = store
+    assert address not in untyped
+    assert len(store) == 1
+    assert _declared(store) == [(host_route, {"labels": Tags.of("host")})]
+
+
+# --- Ruling 5: each value type checks its field's type when it is built. ---
+
+
+class _Level(IntEnum):
+    HIGH = 2
+
+
+REFUSED_CONSTRUCTIONS = [
+    pytest.param(Tags, (frozenset({1}),), id="tags-frozenset-of-int"),
+    pytest.param(Tags, (frozenset({"a", 1}),), id="tags-frozenset-with-an-int"),
+    pytest.param(Tags, ({"a"},), id="tags-set"),
+    pytest.param(Tags, (["a"],), id="tags-list"),
+    pytest.param(Tags, ("abc",), id="tags-str"),
+    pytest.param(Tags, (None,), id="tags-none"),
+    pytest.param(Tags.of, ("a", 1), id="tags-of-with-an-int"),
+    pytest.param(Bitmask, ("3",), id="bitmask-str"),
+    pytest.param(Bitmask, ("-1",), id="bitmask-negative-str"),
+    pytest.param(Bitmask, (1.0,), id="bitmask-float"),
+    pytest.param(Bitmask, (None,), id="bitmask-none"),
+    pytest.param(Bitmask, (True,), id="bitmask-true"),
+    pytest.param(Bitmask, (False,), id="bitmask-false"),
+    pytest.param(Override, (None,), id="override-none"),
+    pytest.param(Override, ([1],), id="override-list"),
+    pytest.param(Override, (("a",),), id="override-tuple"),
+    pytest.param(Override, ({"a"},), id="override-set"),
+    pytest.param(Override, (frozenset({"a"}),), id="override-frozenset"),
+    pytest.param(Override, ({"k": 1},), id="override-dict"),
+    pytest.param(Override, (1.5,), id="override-float"),
+    pytest.param(Override, (b"x",), id="override-bytes"),
+]
+
+
+@pytest.mark.parametrize(("factory", "arguments"), REFUSED_CONSTRUCTIONS)
+def test_a_value_built_with_a_wrong_field_type_is_a_type_error(
+    factory: Callable[..., object], arguments: tuple[object, ...]
+) -> None:
+    """Decision 3 / Amendment 1 ruling 5 (assumptions 3, 5, 46): `Tags.values`
+    is a `frozenset` of `str`, `Bitmask.bits` an `int` that is not a `bool`,
+    `Override.value` a `str` or an `int`. Messages are not pinned."""
+
+    with pytest.raises(TypeError):
+        factory(*arguments)
+
+
+def test_the_edge_values_of_tags_and_bitmask_are_accepted() -> None:
+    """Ruling 5: an empty `frozenset`, the empty string as a tag, a zero mask."""
+
+    assert Tags(frozenset()).values == frozenset()
+    assert Tags.of().values == frozenset()
+    assert Tags.of("").values == frozenset({""})
+    assert Bitmask(0).bits == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("", id="empty-str"),
+        pytest.param(0, id="zero"),
+        pytest.param(-3, id="negative-int"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param(_Level.HIGH, id="int-enum-member"),
+    ],
+)
+def test_override_accepts_every_str_and_int_bool_and_subclasses_included(
+    value: str | int,
+) -> None:
+    """Ruling 5 / assumption 46: "a `bool` included", "subclasses included"."""
+
+    assert Override(value).value == value
+
+
+# --- Ruling 6: `declare` refuses a key with two kinds on one path. ---------
+
+CONFLICT_KEY = "zone_marking"
+
+
+def _assert_names_the_conflict(
+    error: BaseException, kinds: tuple[str, str], prefix_text: str | None = None
+) -> None:
+    """Ruling 6: the key verbatim, both kinds (case-insensitively) and the
+    conflicting prefix."""
+
+    message = str(error)
+    assert CONFLICT_KEY in message, message
+    for kind in kinds:
+        assert kind in message.lower(), message
+    if prefix_text is not None:
+        assert prefix_text in message, message
+
+
+def test_a_descendant_may_not_give_an_ancestors_key_another_kind() -> None:
+    store = PrefixMetadataStore(IPV4)
+    store.declare(SLASH_8, {CONFLICT_KEY: Tags.of("a")})
+    before = _store_state(store, SLASH_24)
+
+    with pytest.raises(ValueError) as excinfo:
+        store.declare(SLASH_24, {CONFLICT_KEY: Bitmask(1)})
+    _assert_names_the_conflict(excinfo.value, ("tags", "bitmask"), "10.0.0.0/8")
+    assert _store_state(store, SLASH_24) == before
+    assert dict(store.effective(HOST)) == {CONFLICT_KEY: Tags.of("a")}
+
+
+def test_an_ancestor_may_not_give_a_descendants_key_another_kind() -> None:
+    store = PrefixMetadataStore(IPV4)
+    store.declare(SLASH_24, {CONFLICT_KEY: Tags.of("a")})
+    before = _store_state(store, SLASH_8)
+
+    with pytest.raises(ValueError) as excinfo:
+        store.declare(SLASH_8, {CONFLICT_KEY: Override("a")})
+    _assert_names_the_conflict(excinfo.value, ("tags", "override"), "10.20.30.0/24")
+    assert _store_state(store, SLASH_8) == before
+    assert dict(store.effective(HOST)) == {CONFLICT_KEY: Tags.of("a")}
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_the_whole_path_is_compared_from_slash_0_to_the_host_route(
+    family: AddressFamily,
+) -> None:
+    root = _root(family)
+    host_route = _prefix_of(SAMPLE[family], family.bit_length)
+    store = PrefixMetadataStore(family)
+    store.declare(root, {CONFLICT_KEY: Override("deny")})
+    before = _store_state(store, host_route)
+
+    with pytest.raises(ValueError) as excinfo:
+        store.declare(host_route, {CONFLICT_KEY: Tags.of("a")})
+    _assert_names_the_conflict(excinfo.value, ("override", "tags"))
+    assert _store_state(store, host_route) == before
+    assert dict(store.effective(SAMPLE[family])) == {CONFLICT_KEY: Override("deny")}
+
+
+def test_a_replaced_declaration_is_not_compared_with_its_replacement() -> None:
+    """Ruling 6: "`P`'s own current declaration, which the call would replace,
+    is not compared"."""
+
+    store = PrefixMetadataStore(IPV4)
+    store.declare(SLASH_24, {CONFLICT_KEY: Tags.of("a")})
+    store.declare(SLASH_24, {CONFLICT_KEY: Bitmask(1)})
+    assert dict(store.local(SLASH_24)) == {CONFLICT_KEY: Bitmask(1)}
+    assert len(store) == 1
+    assert dict(store.effective(HOST)) == {CONFLICT_KEY: Bitmask(1)}
+
+
+def test_a_replacement_is_still_compared_with_the_rest_of_its_path() -> None:
+    store = PrefixMetadataStore(IPV4)
+    store.declare(SLASH_8, {CONFLICT_KEY: Tags.of("root")})
+    store.declare(SLASH_24, {CONFLICT_KEY: Tags.of("a")})
+    before = _store_state(store, SLASH_24)
+
+    with pytest.raises(ValueError) as excinfo:
+        store.declare(SLASH_24, {CONFLICT_KEY: Bitmask(1)})
+    _assert_names_the_conflict(excinfo.value, ("tags", "bitmask"), "10.0.0.0/8")
+    assert _store_state(store, SLASH_24) == before
+    assert dict(store.local(SLASH_24)) == {CONFLICT_KEY: Tags.of("a")}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(Tags.of("a"), id="tags"),
+        pytest.param(Bitmask(1), id="bitmask"),
+        pytest.param(Override("a"), id="override"),
+    ],
+)
+def test_disjoint_prefixes_may_differ_but_nothing_containing_both_may_declare_the_key(
+    value: Value,
+) -> None:
+    """Ruling 6: no path passes through two prefixes neither of which contains
+    the other, so they may differ -- and a later declaration of that key on a
+    prefix containing both must conflict with one of them."""
+
+    left = SLASH_16
+    right = Prefix.parse("10.21.0.0/16")
+    store = PrefixMetadataStore(IPV4)
+    store.declare(left, {CONFLICT_KEY: Tags.of("left")})
+    store.declare(right, {CONFLICT_KEY: Bitmask(2)})
+    assert len(store) == 2
+
+    assert dict(store.effective(Address.parse("10.20.1.1"))) == {CONFLICT_KEY: Tags.of("left")}
+    assert dict(store.effective(Address.parse("10.21.1.1"))) == {CONFLICT_KEY: Bitmask(2)}
+    assert dict(store.effective_for_prefix(SLASH_24)) == {CONFLICT_KEY: Tags.of("left")}
+    assert dict(store.inherited(Prefix.parse("10.21.7.0/24"))) == {CONFLICT_KEY: Bitmask(2)}
+    assert dict(store.effective(Address.parse("10.22.0.1"))) == {}
+    assert dict(store.effective_for_prefix(SLASH_8)) == {}
+
+    before = _store_state(store, SLASH_8)
+    with pytest.raises(ValueError) as excinfo:
+        store.declare(SLASH_8, {CONFLICT_KEY: value})
+    assert CONFLICT_KEY in str(excinfo.value), str(excinfo.value)
+    assert _store_state(store, SLASH_8) == before
+
+
+_ANY_KIND: st.SearchStrategy[Value] = st.one_of(_TAGS, _BITMASKS, _OVERRIDES)
+# Kinds drawn freely: "k" and "j" may each be any kind in any document.
+FREE_DOCUMENTS: st.SearchStrategy[dict[str, Value]] = st.dictionaries(
+    st.sampled_from(("k", "j")), _ANY_KIND, max_size=2
+)
+
+
+def _conflicts(
+    model: Mapping[Prefix, Mapping[str, Value]], target: Prefix, document: Mapping[str, Value]
+) -> bool:
+    """Ruling 6 spelled out: another declared prefix on `target`'s path holds a
+    key of `document` with a different kind."""
+
+    for other, declared in model.items():
+        if other == target or not (_covers(other, target) or _covers(target, other)):
+            continue
+        for key, value in document.items():
+            if key in declared and type(declared[key]) is not type(value):
+                return True
+    return False
+
+
+def _assert_reads_match_the_model(
+    store: PrefixMetadataStore,
+    model: Mapping[Prefix, dict[str, Value]],
+    probe_prefixes: Iterable[Prefix],
+    probe_addresses: Iterable[Address],
+) -> None:
+    by_length = sorted(model, key=lambda p: p.length)
+    for prefix in probe_prefixes:
+        path = [q for q in by_length if _covers(q, prefix)]
+        assert dict(store.local(prefix)) == model.get(prefix, {})
+        assert dict(store.inherited(prefix)) == _fold(model[q] for q in path if q != prefix)
+        assert dict(store.effective_for_prefix(prefix)) == _fold(model[q] for q in path)
+    for address in probe_addresses:
+        host_route = _prefix_of(address, address.bit_length)
+        path = [q for q in by_length if _covers(q, host_route)]
+        assert dict(store.effective(address)) == _fold(model[q] for q in path)
+    assert _declared(store) == [
+        (p, model[p]) for p in sorted(model, key=lambda q: (q.length, q.network))
+    ]
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+@settings(deadline=None, max_examples=80)
+@given(data=st.data())
+def test_declare_refuses_exactly_what_would_give_a_key_two_kinds_on_a_path(
+    family: AddressFamily, data: st.DataObject
+) -> None:
+    """Ruling 6 against a model: a declaration is accepted exactly when no
+    other declared prefix containing, or contained by, its target holds a
+    shared key with a different kind; a refusal changes nothing; and after
+    every step every read returns without raising and matches the section 16
+    fold of what was accepted."""
+
+    bits = family.bit_length
+    probe = data.draw(addresses(family))
+    lengths = data.draw(st.sets(st.integers(min_value=0, max_value=bits), min_size=1, max_size=5))
+    on_path = [_prefix_of(probe, length) for length in sorted(lengths)]
+    siblings = [_sibling(p) for p in on_path if p.length > 0]
+    elsewhere = data.draw(st.lists(prefixes(family), max_size=2))
+    pool = [*on_path, *siblings, *elsewhere]
+    steps = data.draw(st.lists(st.tuples(st.sampled_from(pool), FREE_DOCUMENTS), max_size=10))
+
+    probe_prefixes = [*pool, _root(family), _prefix_of(probe, bits)]
+    probe_addresses = [probe, *(Address(family=family, value=p.network) for p in pool)]
+
+    store = PrefixMetadataStore(family)
+    model: dict[Prefix, dict[str, Value]] = {}
+    for target, document in steps:
+        before = (len(store), _declared(store))
+        if _conflicts(model, target, document):
+            with pytest.raises(ValueError):
+                store.declare(target, document)
+            assert (len(store), _declared(store)) == before
+        else:
+            store.declare(target, document)
+            model[target] = document
+        _assert_reads_match_the_model(store, model, probe_prefixes, probe_addresses)
+
+
+# --- Ruling 7: the combine functions check their operands' shape first. ----
+
+NOT_A_KIND = [
+    pytest.param(Tags.of("a"), 1, id="tags-and-int"),
+    pytest.param(1, Tags.of("a"), id="int-and-tags"),
+    pytest.param(1, 1, id="int-and-int"),
+    pytest.param(None, Bitmask(1), id="none-and-bitmask"),
+    pytest.param(Bitmask(1), None, id="bitmask-and-none"),
+    pytest.param("x", Override("x"), id="str-and-override"),
+    pytest.param({"a"}, Tags.of("a"), id="set-and-tags"),
+    pytest.param(frozenset({"a"}), Tags.of("a"), id="frozenset-and-tags"),
+]
+
+
+@pytest.mark.parametrize(("less", "more"), NOT_A_KIND)
+def test_combine_values_refuses_an_operand_that_is_not_a_kind(less: object, more: object) -> None:
+    """Decision 3 / Amendment 1 ruling 7: a `TypeError` whatever the other
+    operand is -- never the mixed-kind `ValueError`."""
+
+    untyped_less: Any = less
+    untyped_more: Any = more
+    with pytest.raises(TypeError):
+        combine_values(untyped_less, untyped_more)
+
+
+# (less, more, the `str` key whose value is at fault -- or None)
+MALFORMED_OPERANDS = [
+    pytest.param({"stray_flags": 1}, {}, "stray_flags", id="bare-value-in-less"),
+    pytest.param({}, {"stray_flags": 1}, "stray_flags", id="bare-value-in-more"),
+    pytest.param(
+        {"labels": Tags.of("a")},
+        {"stray_policy": "x"},
+        "stray_policy",
+        id="bare-value-under-a-key-one-operand-holds",
+    ),
+    pytest.param(42, {}, None, id="int-document"),
+    pytest.param({}, None, None, id="none-document"),
+    pytest.param([("labels", Tags.of("a"))], {}, None, id="list-of-pairs"),
+    pytest.param({1: Tags.of("a")}, {}, None, id="non-str-key"),
+]
+
+
+@pytest.mark.parametrize(("less", "more", "key"), MALFORMED_OPERANDS)
+def test_combine_refuses_a_malformed_document(less: object, more: object, key: str | None) -> None:
+    """Ruling 7: both documents are checked whole, by `declare`'s rule, so a
+    malformed entry under a key only one operand holds is refused rather than
+    carried into the result; the message names a faulty value's key."""
+
+    untyped_less: Any = less
+    untyped_more: Any = more
+    with pytest.raises(TypeError) as excinfo:
+        combine(untyped_less, untyped_more)
+    if key is not None:
+        assert key in str(excinfo.value), str(excinfo.value)
+
+
+@pytest.mark.parametrize("mirrored", [False, True], ids=["malformed-first", "malformed-second"])
+def test_a_pair_both_malformed_and_mixed_kind_is_the_type_error(mirrored: bool) -> None:
+    """Ruling 7: shape is checked before any key is combined."""
+
+    malformed: Any = {"a": Tags.of("x"), "b": 3}
+    well_formed: Any = {"a": Bitmask(1)}
+    less, more = (well_formed, malformed) if mirrored else (malformed, well_formed)
+    with pytest.raises(TypeError):
+        combine(less, more)
+
+
+@pytest.mark.parametrize(
+    "documents",
+    [
+        pytest.param([{"k": Tags.of("a")}, {"j": 3}], id="bare-value"),
+        pytest.param([{"k": Tags.of("a")}, 42], id="int-document"),
+        pytest.param([None], id="none-document"),
+    ],
+)
+def test_combine_path_refuses_a_malformed_document(documents: list[object]) -> None:
+    untyped: Any = documents
+    with pytest.raises(TypeError):
+        combine_path(untyped)
+
+
+def test_combine_path_raises_at_its_first_failing_step() -> None:
+    """Ruling 7: `combine_path` is the left fold of `combine`, so it raises at
+    the first step that fails, in iteration order -- a generator included."""
+
+    mixed_first: Any = [{"k": Tags.of("a")}, {"k": Bitmask(1)}, 42]
+    malformed_first: Any = [{"k": Tags.of("a")}, 42, {"k": Bitmask(1)}]
+    with pytest.raises(ValueError):
+        combine_path(mixed_first)
+    with pytest.raises(ValueError):
+        combine_path(iter(mixed_first))
+    with pytest.raises(TypeError):
+        combine_path(malformed_first)
+    with pytest.raises(TypeError):
+        combine_path(iter(malformed_first))
