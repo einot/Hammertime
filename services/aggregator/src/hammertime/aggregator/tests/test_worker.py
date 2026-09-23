@@ -193,6 +193,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -2037,11 +2038,48 @@ class TestTheInstanceToken:
         assert first.claims.lease_owner != second.claims.lease_owner
 
 
+def _observation_schema_bounds(*pointer: str) -> tuple[int, int]:
+    """`(minimum, maximum)` of one integer property of `schemas/observation.v1.json`.
+
+    ADR-0016 assumption 10: the tests read each bound from the schema file,
+    found by walking up from this file the way `test_codec.py` does, so a
+    schema edit moves these tests with it. `pointer` is the key path to the
+    property; both bounds must be stated there as JSON integers.
+    """
+
+    for parent in Path(__file__).resolve().parents:
+        schema = parent / "schemas" / "observation.v1.json"
+        if schema.is_file():
+            break
+    else:
+        raise AssertionError("no schemas/observation.v1.json above this test file")
+    target: Any = json.loads(schema.read_text(encoding="utf-8"))
+    for key in pointer:
+        assert key in target, f"observation.v1.json: {key!r} missing on the way to {pointer!r}"
+        target = target[key]
+    minimum = target.get("minimum")
+    maximum = target.get("maximum")
+    assert type(minimum) is int, (pointer, minimum)
+    assert type(maximum) is int, (pointer, maximum)
+    return minimum, maximum
+
+
+_REQUEST_COUNT_MIN, _REQUEST_COUNT_MAX = _observation_schema_bounds(
+    "properties", "observations", "items", "properties", "request_count"
+)
+_WINDOW_SECONDS_MIN, _WINDOW_SECONDS_MAX = _observation_schema_bounds(
+    "properties", "window_seconds"
+)
+_SEQUENCE_MIN, _SEQUENCE_MAX = _observation_schema_bounds("properties", "sequence")
+
+
 class TestOutOfRangeObservationFields:
     """ADR-0016 decision 4 (issue #112): with decision 1's bounds in the codec,
-    an observation whose `request_count` (0 to 1000000000), payload `sequence`
-    (0 to 2**63 - 1) or `window_seconds` (1 to 3600) is out of range is
-    `MALFORMED` through the worker's existing `_decode` -- logged, counted in
+    an observation whose `request_count`, payload `sequence` or
+    `window_seconds` is outside the inclusive `minimum`/`maximum` that
+    `schemas/observation.v1.json` states -- read from the file by
+    `_observation_schema_bounds`, not restated here -- is `MALFORMED` through
+    the worker's existing `_decode`: logged, counted in
     `observations_rejected{reason="malformed"}`, not diverted (ADR-0011
     assumption 10), not applied, and marked handled so it is acknowledged at
     the next commit. The consumer carries on (ADR-0011 decision 3 step 1, as
@@ -2068,7 +2106,9 @@ class TestOutOfRangeObservationFields:
     ) -> None:
         # ADR-0016 context, defect 1 -- the issue's repro. Before the fix the
         # decoded -1 reached `IpCounter.observe`, whose `ValueError` escaped
-        # `handle()` and stopped the consumer.
+        # `handle()` and stopped the consumer. -1 is the issue's own input; it
+        # is out of range only because the schema's minimum is above it.
+        assert _REQUEST_COUNT_MIN > -1
         clock = ManualClock(initial=BASE)
         bus = _TappedBus()
         metrics = AggregatorMetrics()
@@ -2101,6 +2141,7 @@ class TestOutOfRangeObservationFields:
         # acknowledged on one of ADR-0013 decision 8's paths, so decision 5's
         # `max_deliver = -1` premise holds -- the message is not handed to the
         # next member of the group, which is what made the crash loop.
+        assert _REQUEST_COUNT_MIN > -1
         clock = ManualClock(initial=BASE)
         bus = _TappedBus()
         metrics = AggregatorMetrics()
@@ -2122,10 +2163,10 @@ class TestOutOfRangeObservationFields:
         assert message.key == str(IP_B).encode()
 
     async def test_one_above_the_request_count_maximum_is_malformed(self) -> None:
-        # ADR-0016 decision 1: the maximum 1000000000 is inclusive, so
-        # 1000000001 is out of range.
+        # ADR-0016 decision 1: the schema's maximum (1000000000) is inclusive,
+        # so one above it is out of range.
         bus, metrics, outcome, window = await self._handle(
-            value=_out_of_range_observation(IP_A, request_count=1_000_000_001)
+            value=_out_of_range_observation(IP_A, request_count=_REQUEST_COUNT_MAX + 1)
         )
 
         assert outcome is ObservationOutcome.MALFORMED
@@ -2135,14 +2176,15 @@ class TestOutOfRangeObservationFields:
         assert _counter(metrics, "observations_rejected", reason="malformed") == 1
 
     async def test_the_request_count_maximum_is_applied_and_promotes_the_ip(self) -> None:
-        # ADR-0016 decision 1: 1000000000 is in range. Under the defaults
-        # (`hot_threshold` 1000) it makes the IP HOT.
+        # ADR-0016 decision 1: the schema's maximum (1000000000) is in range.
+        # Under the defaults (`hot_threshold` 1000) it makes the IP HOT.
+        assert DEFAULTS.hot_threshold <= _REQUEST_COUNT_MAX
         bus, metrics, outcome, window = await self._handle(
-            value=_observation(IP_A, 1_000_000_000, window_start=BASE)
+            value=_observation(IP_A, _REQUEST_COUNT_MAX, window_start=BASE)
         )
 
         assert outcome is ObservationOutcome.APPLIED
-        assert window.total(IP_A) == 1_000_000_000
+        assert window.total(IP_A) == _REQUEST_COUNT_MAX
         assert window.state(IP_A) is IpState.HOT
         assert [envelope.event_type for _key, envelope in _decoded(bus)] == ["HotIpAdded"]
         assert _counter(metrics, "observations_rejected", reason="malformed") == 0
@@ -2155,6 +2197,7 @@ class TestOutOfRangeObservationFields:
         # that default. Before the fix the window total became `10**4300`,
         # the store recorded HOT, and encoding the `HotIpAdded` raised out of
         # `handle()`. Now the second message is `MALFORMED` and nothing moves.
+        assert _REQUEST_COUNT_MAX < 10**4300 - 1
         clock = ManualClock(initial=BASE)
         bus = _TappedBus()
         metrics = AggregatorMetrics()
@@ -2190,14 +2233,18 @@ class TestOutOfRangeObservationFields:
             assert following is ObservationOutcome.APPLIED
             assert window.total(IP_B) == 5
 
-    @pytest.mark.parametrize("window_seconds", [0, 3601], ids=["zero", "3601"])
+    @pytest.mark.parametrize(
+        "window_seconds",
+        [_WINDOW_SECONDS_MIN - 1, _WINDOW_SECONDS_MAX + 1],
+        ids=["minimum-minus-1", "maximum-plus-1"],
+    )
     async def test_a_window_seconds_outside_the_schema_is_malformed_not_diverted(
         self, window_seconds: int
     ) -> None:
-        # ADR-0016 decision 4 and assumption 5: below 1 or above 3600 is
-        # `MALFORMED` -- dropped and counted as malformed. Before the fix, 0 was
-        # applied and 3601 (> the 300 s configured window) was diverted as
-        # `WINDOW_TOO_LONG`.
+        # ADR-0016 decision 4 and assumption 5: below the schema's minimum (1)
+        # or above its maximum (3600) is `MALFORMED` -- dropped and counted as
+        # malformed. Before the fix, 0 was applied and 3601 (> the 300 s
+        # configured window) was diverted as `WINDOW_TOO_LONG`.
         bus, metrics, outcome, window = await self._handle(
             value=_out_of_range_observation(IP_A, window_seconds=window_seconds)
         )
@@ -2211,8 +2258,12 @@ class TestOutOfRangeObservationFields:
 
     async def test_the_window_seconds_maximum_is_still_window_too_long(self) -> None:
         # ADR-0016 decision 4: `WINDOW_TOO_LONG` "still covers every
-        # `window_seconds` above `config.window_seconds` up to 3600".
-        value = _observation(IP_A, 1200, window_start=BASE, window_seconds=3600)
+        # `window_seconds` above `config.window_seconds` up to 3600". This case
+        # exists only while the schema's maximum exceeds the configured window
+        # `_handle`'s worker runs with (300 s); at or below it, the maximum
+        # would be applied, not diverted.
+        assert DEFAULTS.window_seconds < _WINDOW_SECONDS_MAX
+        value = _observation(IP_A, 1200, window_start=BASE, window_seconds=_WINDOW_SECONDS_MAX)
 
         bus, metrics, outcome, window = await self._handle(value=value)
 
@@ -2222,12 +2273,16 @@ class TestOutOfRangeObservationFields:
         assert _counter(metrics, "observations_rejected", reason="window_too_long") == 1
         assert _counter(metrics, "observations_rejected", reason="malformed") == 0
 
-    @pytest.mark.parametrize("payload_sequence", [-1, 2**63], ids=["minus-1", "2-to-the-63"])
+    @pytest.mark.parametrize(
+        "payload_sequence",
+        [_SEQUENCE_MIN - 1, _SEQUENCE_MAX + 1],
+        ids=["minimum-minus-1", "maximum-plus-1"],
+    )
     async def test_a_payload_sequence_outside_the_schema_is_malformed(
         self, payload_sequence: int
     ) -> None:
         # ADR-0016 decision 4: "A payload `sequence` below 0 or above 2**63 - 1
-        # is `MALFORMED`. It used to be applied".
+        # is `MALFORMED`. It used to be applied". Both bounds are the schema's.
         bus, metrics, outcome, window = await self._handle(
             value=_out_of_range_observation(IP_A, payload_sequence=payload_sequence)
         )
@@ -2238,11 +2293,11 @@ class TestOutOfRangeObservationFields:
         assert _counter(metrics, "observations_rejected", reason="malformed") == 1
 
     async def test_the_payload_sequence_maximum_is_applied(self) -> None:
-        # ADR-0016 decision 1: 2**63 - 1 is the inclusive maximum. Edited in
-        # the payload only, like the out-of-range cases, so the envelope is
-        # the same shape in all three.
+        # ADR-0016 decision 1: the schema's maximum (2**63 - 1) is inclusive.
+        # Edited in the payload only, like the out-of-range cases, so the
+        # envelope is the same shape in all three.
         bus, metrics, outcome, window = await self._handle(
-            value=_out_of_range_observation(IP_A, payload_sequence=2**63 - 1)
+            value=_out_of_range_observation(IP_A, payload_sequence=_SEQUENCE_MAX)
         )
 
         assert outcome is ObservationOutcome.APPLIED

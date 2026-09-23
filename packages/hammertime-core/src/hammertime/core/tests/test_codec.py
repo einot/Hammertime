@@ -1074,3 +1074,92 @@ def test_decode_refuses_a_request_count_of_4300_digits() -> None:
 
     with pytest.raises(CodecError):
         decode(tampered)
+
+
+# ADR-0016 decision 1, "Messages": "The range check's own text names the field
+# and the bound it broke, never the value". The wording itself "is not part of
+# the contract", so only the value's absence is asserted. Each value has a
+# digit pattern no bound, field name or other part of a message can contain by
+# chance. The 4,000-digit ones stay under CPython's default integer-string
+# limit, so `json.dumps`/`json.loads` handle them and the refusal is the
+# range check's, not the limit's.
+_LEAK_DIGITS = "98765432109876543210"  # 20 digits: above every schema maximum
+_LEAK_LONG_DIGITS = "1234567890" * 400  # 4,000 digits
+
+
+def _leak_id(value: int) -> str:
+    sign = "minus-" if value < 0 else ""
+    return f"{sign}{len(str(abs(value)))}-digits"
+
+
+_LEAK_CASES: list[Any] = []
+for _b in _BOUNDED_FIELDS:
+    _min, _max = _schema_bounds(_b)
+    _candidates = [-int(_LEAK_DIGITS), -int(_LEAK_LONG_DIGITS)]
+    if _max is not None:
+        # "where applicable": above the maximum only where the schema has one.
+        _candidates += [int(_LEAK_DIGITS), int(_LEAK_LONG_DIGITS)]
+    for _v in _candidates:
+        _LEAK_CASES.append(pytest.param(_b, _v, id=f"{_bound_id(_b)}-{_leak_id(_v)}"))
+
+
+def _assert_out_of_range(bound: _Bound, value: int) -> None:
+    """Guard: the case really is outside the schema's bounds."""
+
+    minimum, maximum = _schema_bounds(bound)
+    below = minimum is not None and value < minimum
+    above = maximum is not None and value > maximum
+    assert below or above, (bound, minimum, maximum)
+
+
+def _assert_value_not_named(message: str, value: int) -> None:
+    """Neither the value nor its first 20 digits appear in `message`, so a
+    truncated rendering of a 4,000-digit value is caught as well."""
+
+    digits = str(abs(value))
+    assert digits[:20] not in message, f"the refused value appears in {message[:200]!r}"
+
+
+def test_the_leak_cases_cover_every_schema_file() -> None:
+    """At least one field per schema file, and both directions where a
+    maximum exists."""
+
+    schemas = {param.values[0].schema for param in _LEAK_CASES}
+    assert schemas == {"observation.v1.json", "hot_ip_event.v1.json", "prefix_stats_event.v1.json"}
+    assert any(param.values[1] > 0 for param in _LEAK_CASES)
+
+
+@pytest.mark.parametrize(("bound", "value"), _LEAK_CASES)
+def test_encode_range_error_does_not_name_the_refused_value(bound: _Bound, value: int) -> None:
+    """ADR-0016 decisions 1 and 2: an out-of-range value set through the model
+    constructor is a `CodecError` whose text does not contain the value."""
+
+    _assert_out_of_range(bound, value)
+    envelope = _bounds_envelope(bound.event_type, bound.where, bound.field, value)
+
+    with pytest.raises(CodecError) as excinfo:
+        encode(envelope)
+
+    _assert_value_not_named(str(excinfo.value), value)
+
+
+@pytest.mark.parametrize(("bound", "value"), _LEAK_CASES)
+def test_decode_range_error_does_not_name_the_refused_value(bound: _Bound, value: int) -> None:
+    """ADR-0016 decision 1: the range check's own text does not contain the
+    value. On decode a wrapper may embed the whole entry or payload (for
+    example `malformed observation entry: ...`); bounding that is ADR-0015
+    Amendment 3's open item (ADR-0016 assumption 11), so the wrapper's own
+    text is not asserted on. The range check raises its own error inside the
+    existing try blocks, which re-raise `CodecError` from it, so the range
+    check's text is the `__cause__`."""
+
+    _assert_out_of_range(bound, value)
+    data = encode(_bounds_envelope(bound.event_type))
+    assert type(_wire_value(data, bound.path)) is int
+    tampered = _tamper_field(data, bound.path, value)
+
+    with pytest.raises(CodecError) as excinfo:
+        decode(tampered)
+
+    assert excinfo.value.__cause__ is not None
+    _assert_value_not_named(str(excinfo.value.__cause__), value)
