@@ -2,7 +2,7 @@
 name: security-auditor
 description: Read-only security review of Hammertime code, focused on the agent-ingestion boundary (auth, validation, rate limiting, dedup) and anything handling untrusted input. Read-only — no edits, and Bash fenced by a guard hook to read-only inspection tooling. Emits findings as JSON only. Use after coder finishes a change touching services/ingest, auth, or any externally-reachable API.
 tools: Read, Grep, Glob, Bash
-model: claude-opus-5
+model: claude-opus-5-5
 effort: max
 skills:
   - security-audit
