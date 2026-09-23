@@ -13,6 +13,13 @@ holds readiness back (decision 4 step 3; ADR-0013 Amendment 10 adds
 `MessageBus.first_offset`), and the admin app serves no generated API
 documentation (decision 13). "Revision 2026-09-23" at the end lists every
 edit of this revision and quotes what it replaced.
+Amended 2026-09-23, after merge (see "Amendment 1" at the end), for four
+items flagged during slice 1: assumption 19 gains a fourth readiness case,
+the hot-ip stream deleted while `start()` runs; `docs/runbook.md` says for
+which of assumption 19's cases a longer deadline does not help; ADR-0010
+Amendment 1 ruling 1 gains a note on its stale `start_offset=1`; and
+ADR-0013 Amendment 11 rules which of their two errors `NatsBus`'s offset
+reads raise when both apply.
 
 Scope note. This ADR settles what epic #10 ("Trie worker, publisher &
 read-side query API") is built against. It splits the epic into slices
@@ -1179,6 +1186,51 @@ ADRs do not make. Push back on them individually.
     below this offset", which `hammertime.bus` does not have. JetStream
     reports a pending count with every delivery (ADR-0013 Amendment 10,
     Sources). Adding the signal is a follow-up for the bus, not the trie.
+
+    > Amended 2026-09-23 (Amendment 1): a fourth case, raised by the
+    > security re-audit of slice 1. The hot-ip stream is deleted after
+    > `start()` has read the log's bounds and before the replay reaches
+    > the end. The second case rests on a purge keeping the stream's last
+    > sequence, so that the next record lands past the old end. A deleted
+    > stream keeps nothing. One provisioned again by `hammertime-provision`
+    > numbers its records from 1 (ADR-0013 decision 3), because
+    > `stream_config_for` sets no first sequence.
+    >
+    > * *Gone when `start()` reads `first_offset` or subscribes.* The read
+    >   or `subscribe()` raises, and the start fails at once (decision 7).
+    >   A stream already provisioned again by then gives the wait of the
+    >   next bullet.
+    > * *Deleted during the replay, and provisioned again.* nats-py finds
+    >   the subscription's consumer gone within 20 s. Every 10 s it tries
+    >   to recreate it on the stream of the same name, from one past the
+    >   last offset it received (Amendment 1, Sources), and it succeeds
+    >   once the stream exists again. That offset is in the old numbering.
+    >   The trie applies none of the new stream's records at or below its
+    >   position: the server either does not deliver them, or the worker
+    >   skips them as `REDELIVERED` (decision 6 step 1). The replay
+    >   therefore waits until the new stream grows back to the old end, or
+    >   until the deadline. After the deadline, the restart reads the new
+    >   stream's bounds, and in slice 1, where every start is a full
+    >   replay, that clears the case. If the new stream reaches the old end
+    >   first, the start completes. The trie then keeps what it applied
+    >   from the old stream and lacks the new stream's records up to its
+    >   position, until it restarts.
+    > * *Deleted during the replay, and not provisioned again.* Every
+    >   attempt to recreate the consumer fails and is logged as
+    >   `nats_client_error` (ADR-0013 decision 3). The replay waits,
+    >   and the start fails at the deadline. A restart does not clear this
+    >   case. The next start waits in `NatsBus.start()` for the missing
+    >   stream, with `dependency_unavailable dependency=bus` records, and
+    >   fails at the deadline too (ADR-0013 decision 2), until the stream
+    >   is provisioned again.
+    >
+    > Decision 16's recreated-log case does not cover this. It is a check
+    > on a restored state, made once before step 3, and it cannot see a
+    > stream recreated after the bounds were read. Deleting a stream is an
+    > administrative operation, open to any principal that reaches the bus
+    > (ADR-0013 assumption 13). The same recreation under a trie that has
+    > finished `start()` is not a readiness case, and is not ruled here
+    > (assumption 36).
 20. **No cap on the hot set.** The trie mirrors what the aggregators hold
     HOT. Refusing a `HotIpAdded` at a cap would break §12 against the true
     hot set, and the aggregator does not evict HOT IPs either (ADR-0011
@@ -1667,3 +1719,134 @@ ADR-0013 Amendment 10, and is not ruled.
 * **Sources.** The `memstore.go` entry gained a second paragraph. The
   `filestore.go`, FastAPI, nats-py and blocked-sites entries were added.
 * **Edits to other documents.** The revision's entries were added.
+
+## Amendment 1 (2026-09-23) — four follow-ups from slice 1: a fourth readiness case, the runbook's deadline advice, a stale restatement in ADR-0010, and the offset reads' error order
+
+Why: four items were flagged while slice 1 was reviewed and audited, and
+were left for a change to documents only, after this ADR merged. This ADR
+and the texts below are on master, so nothing merged is rewritten. Each
+item is a dated note, or a paragraph added beside unchanged text.
+
+1. **A fourth readiness case.** The security re-audit of slice 1 raised a
+   case that assumption 19 does not list: the hot-ip stream deleted while
+   `start()` runs, whether it is provisioned again or not. Assumption 19's
+   second case relies on a purge keeping the stream's last sequence, and a
+   deleted stream keeps nothing. Decision 16's recreated-log case does not
+   cover it, because that is a check on a restored state, made before
+   step 3.
+2. **The runbook's deadline advice.** `docs/runbook.md` tells an operator
+   whose trie keeps failing its start at the deadline to raise the
+   deadline. Assumption 19's first and third cases recur on every start
+   until the next hot-ip transition, and for them a longer deadline does
+   not help.
+3. **A stale restatement in ADR-0010.** ADR-0010 Amendment 1 ruling 1
+   restates ADR-0013 decision 9 with "`start_offset=1` with no snapshot".
+   ADR-0013 Amendment 1 (ruling C5.7) corrected decision 9 to
+   `start_offset=0` on 2026-09-21, and the restatement was not updated.
+4. **The offset reads' error order.** ADR-0013 decision 3 says that
+   `NatsBus.end_offset` and `first_offset` raise `KeyError` for an
+   unregistered topic, and `RuntimeError` before `start()`. It does not
+   say which they raise when both apply. The bus tests pin `KeyError` as
+   their own assumption. ADR-0013 Amendment 11 confirms it.
+
+**Edits in this ADR.**
+
+* **Status line.** Gained the closing sentence on this amendment.
+* **Assumption 19.** A dated blockquote after its last paragraph records
+  the fourth case. The assumption's own text is unchanged.
+
+**Edits to other documents.** None of them replaces wording.
+
+* **`docs/adr/0010-read-apis-and-shared-prefix-predicate.md`.** Amendment 1
+  ruling 1 gains a dated blockquote: its "`start_offset=1` with no
+  snapshot" is stale, ADR-0013 Amendment 1 ruling C5.7 changed it to
+  `start_offset=0`, and decision 3 of this ADR gives the trie's start as
+  built. ADR-0010 gains no status clause and no amendment section
+  (assumption 39).
+* **`docs/runbook.md`**, "Trie service restart", the "Its deadline" bullet.
+  A second paragraph names assumption 19's first and third cases by what
+  an operator sees. It says that only the next hot-ip transition ends the
+  wait, and that a longer `HAMMERTIME_STARTUP_TIMEOUT_S` does not help in
+  those cases. The bullet's first paragraph is unchanged.
+* **`docs/adr/0013-nats-jetstream-event-log-static-shards.md`**
+  (Amendment 11). The status line gains the eleventh clause. Decision 3
+  gains a dated italic paragraph after the `first_offset` paragraph. A new
+  "Amendment 11" section at the end records the ruling and its
+  assumptions.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+33. **The fourth case is recorded, not closed,** like the other three.
+    Closing it needs a way to tell that the stream being read was
+    recreated, and the trie has none. The offsets it is handed keep
+    rising across the recreation. Designing a signal is left to a
+    follow-up.
+34. **The consumer's behaviour is read from code, not observed.** The
+    note follows nats-py 2.16.0's ordered consumer as installed (Sources
+    below). Two details belong to that version: the check every 10 s, and
+    the restart one past the last offset received. How the server places
+    a consumer whose start lies past a new stream's end was not read. The
+    note therefore claims only what holds either way: the trie applies
+    none of the new stream's records at or below its position. Nothing was
+    run against a server. The integration job (#52) is where the case can
+    be observed.
+35. **A re-provisioned stream numbers from 1.** This rests on ADR-0013
+    decision 3 ("they start at 1") and on `stream_config_for` setting no
+    first sequence. nats-server's stream creation was not read for this
+    amendment.
+36. **A running trie is named, not ruled.** When the stream is recreated
+    under a trie that has finished `start()`, its consumer resumes in the
+    same way. That is not a readiness case, and this amendment was asked
+    only about `start()`.
+37. **The runbook names only the first and third cases.** They are the two
+    that keep failing the start in the same way as a slow replay, which is
+    the failure the bullet's advice is written for. The second clears on a
+    restart. The fourth either clears on a restart or shows records of its
+    own: `nats_client_error` during the wait, then `dependency_unavailable
+    dependency=bus` at every later start.
+38. **"Does not help" is written for the operator.** A longer deadline
+    helps only if the next hot-ip transition happens to arrive inside it,
+    and an operator cannot plan on that. The runbook says what ends the
+    wait instead.
+39. **ADR-0010's note is an erratum, with no amendment section of its
+    own.** It brings a restatement into line with a ruling made on
+    2026-09-21, and rules nothing. It is listed here with the rest of this
+    change set, and ADR-0010 gains no Amendment 3 for it.
+40. **No `CHANGES` entry.** Only documents change. Nothing that a released
+    build does changes.
+
+Read on 2026-09-23 for this amendment. No web source was consulted.
+
+* nats-py 2.16.0 as installed (`uv.lock`), in
+  `.venv/lib/python3.12/site-packages/nats/`:
+  * `js/client.py`, `JetStreamContext.subscribe`: with `stream` given and
+    no `durable`, it calls `self._jsm.add_consumer(stream, config=config)`
+    directly. For `ordered_consumer=True` it sets `config.idle_heartbeat`
+    to `config.idle_heartbeat or 5` when the caller gives none.
+    `subscribe_bind` starts `_JSI.activity_check` when
+    `config.idle_heartbeat` is set.
+  * `js/client.py`, `_JSI.activity_check`: it sleeps `self._hbi *
+    hbc_threshold`, with `hbc_threshold = 2`. If no message or heartbeat
+    arrived in that time, it calls `reset_ordered_consumer(self._sseq +
+    1)`. `reset_ordered_consumer` sets `deliver_policy =
+    BY_START_SEQUENCE` and `opt_start_seq = sseq`, and starts
+    `recreate_consumer`. That calls `add_consumer(self._stream, ...)` and
+    passes any exception to `self._conn._error_cb(err)`.
+  * `aio/client.py`, `_process_msg`: any message on the subscription sets
+    `jsi._active = True`. For an ordered consumer, each in-order data
+    message sets `jsi._sseq = sseq`, the stream sequence of the last
+    message the client received.
+  * `js/manager.py`: `add_consumer` sends its request through
+    `_api_request`, which raises `APIError.from_error(resp["error"])` on
+    an error response.
+
+  Taken from it: the fourth case's bullets, and assumption 34's caution.
+* Repository facts. In `packages/hammertime-bus/src/hammertime/bus/nats.py`:
+  `_open_positional` subscribes with `ordered_consumer=True` and sets no
+  `idle_heartbeat`; `_pump_push` treats a `next_msg` timeout as an idle
+  log and loops; `_client_error`, the client's `error_cb`, logs
+  `nats_client_error`; `stream_config_for` sets no first sequence. In
+  `packages/hammertime-core/src/hammertime/core/runtime.py`, `run_service`
+  logs `start_failed reason=startup_timeout` when `start()` outlasts the
+  deadline, which is the record the runbook names.
