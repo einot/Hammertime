@@ -1643,6 +1643,124 @@ class TestApplyTimeAttributesRejection:
         assert _stored(worker, IP_A) == (DEFAULT_DOCUMENT, 1501)
 
 
+_COUNT_ERRORS = [
+    pytest.param(ValueError("request_count must be at least 0"), id="ValueError"),
+    pytest.param(TypeError("request_count must be an int"), id="TypeError"),
+]
+
+
+class TestApplyTimeRequestCountError:
+    """ADR-0015 Amendment 5 ruling 3: "A count error therefore means a bug,
+    like decision 6's family `ValueError`, and the worker lets it propagate
+    (ADR-0017 decision 7). It is not an attributes rejection: it never takes
+    decision 6's `attributes=None` retry, and it is never counted in
+    `attributes_rejected`." Assumption 75: "The count comes before the
+    document so that a bug is never reported as a rejected document."
+
+    ADR-0017 decision 7, as noted for Amendment 5: `apply_hot_ip_added` raises
+    "`TypeError` for a `request_count` that is not an exact `int`, and
+    `ValueError` for a negative one, before the document and the trie. ...
+    Either is a bug and propagates, as the `apply_*` `ValueError` row says.
+    Neither is an attributes rejection, so neither takes the `attributes=None`
+    retry or counts in `attributes_rejected`." Decision 8: `position` moves
+    only for a handled record, and a propagated exception handles nothing.
+
+    The codec never delivers a bad `window_count`, so the error is raised by a
+    stand-in reached through the module global the Test seams paragraph
+    names, as `TestApplyTimeAttributesRejection` does."""
+
+    @staticmethod
+    def _raising(
+        error: Exception, seen: list[tuple[object, dict[str, Any]]]
+    ) -> Callable[..., bool]:
+        """A stand-in for `apply_hot_ip_added` that records each call's
+        document and keyword arguments, then raises `error` -- on every call,
+        so a retry would show up as a second entry in `seen`. It raises
+        before touching anything, as ruling 3's order requires of the real
+        function."""
+
+        def raising(
+            trie: Any,
+            records: Any,
+            address: Address,
+            attributes: Any = None,
+            *args: Any,
+            **kwargs: Any,
+        ) -> bool:
+            seen.append((attributes, dict(kwargs)))
+            raise error
+
+        return raising
+
+    @pytest.mark.parametrize("error", _COUNT_ERRORS)
+    async def test_on_an_empty_trie_it_propagates_and_changes_nothing(
+        self, error: Exception, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[tuple[object, dict[str, Any]]] = []
+        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", self._raising(error, seen))
+        worker = _worker()
+        before = _view(worker)
+        # A document that would be retried if the error were taken for an
+        # attributes rejection.
+        document = {"attributes_version": 1, "weight": 5}
+
+        with pytest.raises(type(error), match="request_count") as excinfo:
+            await worker.handle(_msg(_envelope(IP_A, 0, attributes=document, window_count=1437), 0))
+
+        # The stand-in's own exception, not a wrapper or a later one.
+        assert excinfo.value is error
+        # Exactly one call: no `attributes=None` retry.
+        assert seen == [(document, {"request_count": 1437})]
+        assert _rejected(worker, "apply") == 0
+        assert _rejected(worker, "decode") == 0
+        assert _updates_total(worker) == 0
+        assert worker.state.position is None
+        assert worker.state.event_sequence == 0
+        assert worker.state.as_of is None
+        assert _view(worker) == before
+        assert len(worker.state.of(IPV4).records) == 0
+        assert worker.state.of(IPV4).trie.hot_ip_count == 0
+
+    @pytest.mark.parametrize("error", _COUNT_ERRORS)
+    async def test_over_a_hot_ip_it_propagates_and_leaves_the_earlier_record(
+        self, error: Exception, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker = _worker()
+        earlier = {"attributes_version": 1, "weight": 9}
+        first = _msg(_envelope(IP_A, 0, attributes=earlier, window_count=1200), 0)
+        assert await worker.handle(first) is HotIpOutcome.APPLIED
+        before = (
+            _view(worker),
+            worker.state.position,
+            worker.state.event_sequence,
+            worker.state.as_of,
+            _updates_total(worker),
+        )
+        seen: list[tuple[object, dict[str, Any]]] = []
+        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", self._raising(error, seen))
+        document = {"attributes_version": 1, "weight": 5}
+
+        with pytest.raises(type(error), match="request_count") as excinfo:
+            await worker.handle(_msg(_envelope(IP_A, 1, attributes=document, window_count=1501), 1))
+
+        assert excinfo.value is error
+        assert seen == [(document, {"request_count": 1501})]
+        assert _rejected(worker, "apply") == 0
+        assert _rejected(worker, "decode") == 0
+        # Only the first event's update was counted.
+        assert _updates_total(worker) == 1
+        assert (
+            _view(worker),
+            worker.state.position,
+            worker.state.event_sequence,
+            worker.state.as_of,
+            _updates_total(worker),
+        ) == before
+        assert worker.state.position == 0
+        assert worker.state.event_sequence == 1
+        assert _stored(worker, IP_A) == (earlier, 1200)
+
+
 def _key_mismatched_add(ip: Address, n: int, window_count: int) -> tuple[bytes, bytes | None]:
     """A `HotIpAdded` for `ip` keyed by another IP: MALFORMED [key_mismatch]."""
 
