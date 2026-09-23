@@ -1,7 +1,7 @@
 """Runtime invariant checks, cheap enough for debug builds and the inspect tool.
 
 Spec: section 11, section 12, section 46.5; ADR-0014 decisions 8 and 9 (and
-Amendment 1, A2, A7 and A8).
+Amendment 1, A2, A7 and A8; Amendment 2, A11).
 
 hot_count(node) == number of currently HOT /32 addresses in its subtree, and
 hot_count(node) == hot_count(child[0]) + hot_count(child[1]).
@@ -10,8 +10,10 @@ This invariant matters more than any cached prefix_state (section 12).
 Every check returns `None` or raises `InvariantViolation` naming the spec
 section, the prefix or node id at fault and the two values that disagree.
 They are side-effect free and never repair anything. Cost is
-O(hot_ip_count * bit_length), which is why nothing on the hot path calls
-them unconditionally.
+O(hot_ip_count * bit_length), plus O(capacity) for `check_patricia`'s scan of
+the arena's `length` list against its free list (Amendment 2, A11; capacity
+is the peak live node count, so bounded by the hot set too), which is why
+nothing on the hot path calls them unconditionally.
 """
 
 from collections import Counter
@@ -169,6 +171,13 @@ def check_patricia(trie: PatriciaTrie) -> None:
     Every id is range- and liveness-checked before any of its fields is read,
     and a visited set stops a cycle, so a corrupted arena is always an
     `InvariantViolation`.
+
+    The free list is checked against the `length` array, the only record of
+    deadness (Amendment 2, A11): every id in `arena.free_ids` is in range and
+    dead, every dead slot is in it, and none is listed twice. An out-of-range
+    entry is reported, never used as an index. Those clauses run before
+    `len(R) == live_count`, so a broken free list is reported as such rather
+    than as a leak.
     """
 
     arena = trie.arena
@@ -265,10 +274,20 @@ def check_patricia(trie: PatriciaTrie) -> None:
                 f"{left} and {right} sum to {total}"
             )
 
-    size = len(reached)
-    node_count = trie.node_count
     live_count = arena.live_count
     free_count = arena.free_count
+    # An identity of decision 5's arena (live_count is derived from the free
+    # list), kept because it is not one for an arena that maintained counters.
+    # The free-list clauses below are the real accounting (A11).
+    if arena.capacity != live_count + free_count:
+        raise InvariantViolation(
+            f"section 11: arena capacity is {arena.capacity} but live_count "
+            f"{live_count} + free_count {free_count} is {live_count + free_count}"
+        )
+    _check_free_list(arena.free_ids, arena.length, capacity)
+
+    size = len(reached)
+    node_count = trie.node_count
     if size != node_count:
         raise InvariantViolation(
             f"section 27: {size} nodes are reachable from the root but node_count is {node_count}"
@@ -277,11 +296,6 @@ def check_patricia(trie: PatriciaTrie) -> None:
         raise InvariantViolation(
             f"section 11: {size} nodes are reachable from the root but the arena holds "
             f"{live_count} live slots"
-        )
-    if arena.capacity != live_count + free_count:
-        raise InvariantViolation(
-            f"section 11: arena capacity is {arena.capacity} but live_count "
-            f"{live_count} + free_count {free_count} is {live_count + free_count}"
         )
     if size:
         if size != 2 * leaves - 1:
@@ -292,4 +306,37 @@ def check_patricia(trie: PatriciaTrie) -> None:
         if leaves != trie.hot_ip_count:
             raise InvariantViolation(
                 f"section 12: {leaves} leaves reachable but hot_ip_count is {trie.hot_ip_count}"
+            )
+
+
+def _check_free_list(free_ids: list[NodeId], length: list[int], capacity: int) -> None:
+    """`set(free_ids) == {i : length[i] < 0}`, no id twice (decision 5 promise 3, A11).
+
+    `capacity` is `len(length)`. Every entry is range-checked before it is used
+    as an index, so a corrupted free list is an `InvariantViolation`.
+    """
+
+    listed: dict[NodeId, int] = {}  # id -> its first position in free_ids
+    for position, nid in enumerate(free_ids):
+        if not 0 <= nid < capacity:
+            raise InvariantViolation(
+                f"section 11: arena.free_ids[{position}] is node id {nid}, outside the "
+                f"arena's [0, {capacity})"
+            )
+        if nid in listed:
+            raise InvariantViolation(
+                f"section 11: node id {nid} is listed in arena.free_ids at positions "
+                f"{listed[nid]} and {position}; expected once"
+            )
+        listed[nid] = position
+        if length[nid] >= 0:
+            raise InvariantViolation(
+                f"section 11: node id {nid} is in arena.free_ids but has length "
+                f"{length[nid]}; expected < 0 (a free slot is dead)"
+            )
+    for nid in range(capacity):
+        if length[nid] < 0 and nid not in listed:
+            raise InvariantViolation(
+                f"section 11: node id {nid} has length {length[nid]} (dead) but is not "
+                f"in arena.free_ids; expected every dead slot on the free list"
             )

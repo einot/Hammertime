@@ -1,6 +1,7 @@
 """Slab/arena allocation with integer node ids.
 
-Spec: section 11, section 27; ADR-0014 decision 5 (and Amendment 1, A1 and A4).
+Spec: section 11, section 27; ADR-0014 decision 5 (and Amendment 1, A1 and A4;
+Amendment 2, A11).
 
 HOT/COLD oscillation causes allocation churn if nodes are freed eagerly
 (section 11). An arena with integer ids also keeps nodes contiguous and
@@ -11,13 +12,22 @@ Promises (decision 5):
 
 * A `NodeId` is an index into parallel lists; both children of node `nid`
   live at `child[2 * nid]` and `child[2 * nid + 1]`.
-* `allocate` reuses a released id (LIFO) before growing, and grows by exactly
-  one node's worth of slots. A fresh arena pre-allocates nothing, so
+* `allocate` reuses a released id before growing, and grows by exactly one
+  node's worth of slots. Released ids wait on the public free list
+  `free_ids`, part of the arena's interface like the four storage lists
+  (Amendment 2, A11): LIFO, its last entry the next id handed out, and
+  `free_count == len(free_ids)`. Only `allocate`, `release` and `clear`
+  touch it. A fresh arena pre-allocates nothing, so
   `capacity` is exactly the peak number of simultaneously live nodes since
   construction or the last `clear()`.
 * `release` writes `-1` into `length`, so a released slot is detectably dead
   and a double release is a `ValueError`. A released slot's other fields are
-  stale and must not be read.
+  stale and must not be read. `length` is the only record of deadness, so
+  `allocate` rejects a negative `length` with a `ValueError`. The free list
+  holds exactly the dead slots -- `set(free_ids) == {i : length[i] < 0}`,
+  and no id is listed twice (A11); `check_patricia` checks both.
+* `live_count` is derived, `len(length) - len(free_ids)`, and stays O(1)
+  (A11): it is what `PatriciaTrie.node_count` returns.
 * `clear()` truncates every list in place.
 """
 
@@ -27,7 +37,7 @@ from hammertime.trie.structure.node import NO_NODE, NodeId
 class NodeArena:
     """Slab of Patricia node records addressed by integer `NodeId` (section 27)."""
 
-    __slots__ = ("_free", "child", "hot_count", "length", "network")
+    __slots__ = ("child", "free_ids", "hot_count", "length", "network")
 
     def __init__(self) -> None:
         # Parallel storage, indexed by NodeId. Public: this *is* the arena's
@@ -36,15 +46,18 @@ class NodeArena:
         self.length: list[int] = []
         self.hot_count: list[int] = []
         self.child: list[NodeId] = []
-        self._free: list[NodeId] = []
+        # Released ids, LIFO: the last entry is the next one allocated (A11).
+        self.free_ids: list[NodeId] = []
 
     def allocate(self, *, network: int, length: int, hot_count: int = 0) -> NodeId:
         """Return a live node id with the given fields and no children."""
 
+        # `length < 0` is the only record of deadness, so a live slot may
+        # never carry one (Amendment 2, A11).
         if length < 0:
             raise ValueError(f"node length must be >= 0, got {length}")
-        if self._free:
-            node_id = self._free.pop()
+        if self.free_ids:
+            node_id = self.free_ids.pop()
             self.network[node_id] = network
             self.length[node_id] = length
             self.hot_count[node_id] = hot_count
@@ -65,7 +78,7 @@ class NodeArena:
         if not self.is_live(node_id):
             raise ValueError(f"node id {node_id} is not live and cannot be released")
         self.length[node_id] = -1
-        self._free.append(node_id)
+        self.free_ids.append(node_id)
 
     def is_live(self, node_id: NodeId) -> bool:
         """Whether `node_id` is in range and currently allocated."""
@@ -79,13 +92,13 @@ class NodeArena:
         self.length.clear()
         self.hot_count.clear()
         self.child.clear()
-        self._free.clear()
+        self.free_ids.clear()
 
     @property
     def live_count(self) -> int:
         """Ids allocated and not released."""
 
-        return len(self.length) - len(self._free)
+        return len(self.length) - len(self.free_ids)
 
     @property
     def capacity(self) -> int:
@@ -95,6 +108,6 @@ class NodeArena:
 
     @property
     def free_count(self) -> int:
-        """Released slots awaiting reuse."""
+        """Released slots awaiting reuse: `len(free_ids)`."""
 
-        return len(self._free)
+        return len(self.free_ids)

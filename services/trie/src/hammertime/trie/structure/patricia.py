@@ -1,7 +1,7 @@
 """Path-compressed trie: the production representation.
 
 Spec: section 27, section 39; ADR-0014 decisions 2, 3, 4, 5 and 6 (and
-Amendment 1).
+Amendment 1; Amendment 2, A12 and A13).
 
 A run of single-child nodes becomes one compressed edge, so a sparse /32 does
 not cost 32 nodes. The logical model MUST stay equivalent to the binary trie
@@ -22,6 +22,17 @@ releases, and neither takes a scratch node (A4): a split allocates the new
 internal node and the new leaf and keeps both; a collapse releases the leaf
 and its now single-child parent and links the surviving sibling into the
 grandparent.
+
+`add_hot_ip` raises `InvariantViolation` if its walk reaches a
+`bit_length`-long node for the address whose count is not 1 -- a leaf
+`contains()` did not accept, which no sequence of public calls produces. It
+raises before anything has been mutated, so the trie is left exactly as it
+was; this is the package's only such mutator guard (ADR-0014 Amendment 2,
+A12).
+
+`iter_prefix_counts` validates `min_length` exactly as `ancestor_counts`
+does, when it is called rather than when its iterator is first advanced
+(Amendment 2, A13).
 """
 
 from collections.abc import Iterator
@@ -105,7 +116,10 @@ class PatriciaTrie:
                 break
             if length == bits:
                 # A leaf for this address exists but contains() said its count
-                # is not 1: the trie is corrupt. Nothing has been mutated yet.
+                # is not 1: the trie is corrupt and the walk cannot proceed.
+                # Nothing has been mutated at this point, so the trie is left
+                # exactly as it was (ADR-0014 Amendment 2, A12; the only such
+                # guard in this package).
                 raise InvariantViolation(
                     f"section 12: leaf node {nid} for {address} has hot_count "
                     f"{arena.hot_count[nid]}; expected 1"
@@ -174,11 +188,7 @@ class PatriciaTrie:
 
     def ancestor_counts(self, address: Address, *, min_length: int = 0) -> tuple[PrefixCount, ...]:
         self._check_family(address.family)
-        if not 0 <= min_length <= self._bit_length:
-            raise ValueError(
-                f"min_length must be in [0, {self._bit_length}] for {self._family}, "
-                f"got {min_length}"
-            )
+        self._check_min_length(min_length)
         counts = self._counts_along(address.value)
         return tuple(
             PrefixCount(self._prefix_of(address.value, length), counts[length])
@@ -194,17 +204,10 @@ class PatriciaTrie:
         return None
 
     def iter_prefix_counts(self, *, min_length: int = 0) -> Iterator[PrefixCount]:
-        # Every compressed edge expanded into the prefixes it stands for. The
-        # stored count decides only whether a prefix is yielded; descent is by
-        # link (Amendment 1, A3).
-        arena = self.arena
-        for nid, parent_length in self._dfs():
-            count = arena.hot_count[nid]
-            if count <= 0:
-                continue
-            network = arena.network[nid]
-            for length in range(max(parent_length + 1, min_length), arena.length[nid] + 1):
-                yield PrefixCount(self._prefix_of(network, length), count)
+        # Not a generator function: min_length is validated at call time,
+        # not on first advance (Amendment 2, A13).
+        self._check_min_length(min_length)
+        return self._iter_prefix_counts(min_length)
 
     def iter_hot_addresses(self) -> Iterator[Address]:
         # Structural: every reachable node at bit_length, counts never read (A3).
@@ -269,6 +272,21 @@ class PatriciaTrie:
             nid = arena.child[2 * nid + bit_at(value, length, bits)]
         return counts
 
+    def _iter_prefix_counts(self, min_length: int) -> Iterator[PrefixCount]:
+        """`iter_prefix_counts`'s generator; `min_length` is already validated."""
+
+        # Every compressed edge expanded into the prefixes it stands for. The
+        # stored count decides only whether a prefix is yielded; descent is by
+        # link (Amendment 1, A3).
+        arena = self.arena
+        for nid, parent_length in self._dfs():
+            count = arena.hot_count[nid]
+            if count <= 0:
+                continue
+            network = arena.network[nid]
+            for length in range(max(parent_length + 1, min_length), arena.length[nid] + 1):
+                yield PrefixCount(self._prefix_of(network, length), count)
+
     def _dfs(self) -> Iterator[tuple[NodeId, int]]:
         """Pre-order DFS by link, branch 0 first; yields `(nid, parent's length)`."""
 
@@ -305,3 +323,10 @@ class PatriciaTrie:
     def _check_family(self, family: AddressFamily) -> None:
         if family is not self._family:
             raise ValueError(f"this trie holds {self._family} addresses; got an {family} argument")
+
+    def _check_min_length(self, min_length: int) -> None:
+        if not 0 <= min_length <= self._bit_length:
+            raise ValueError(
+                f"min_length must be in [0, {self._bit_length}] for {self._family}, "
+                f"got {min_length}"
+            )

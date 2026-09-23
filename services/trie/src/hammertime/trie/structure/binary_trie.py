@@ -1,6 +1,7 @@
 """Reference bit-by-bit trie: add_hot_ip, remove_hot_ip, lookup, longest match.
 
-Spec: section 10, section 11, section 39; ADR-0014 decisions 2, 3, 4 and 7.
+Spec: section 10, section 11, section 39; ADR-0014 decisions 2, 3, 4 and 7
+(and Amendment 2, A13).
 
 add_hot_ip:    walk the address bits, node.hot_count += 1 at every visited node
 remove_hot_ip: same path, node.hot_count -= 1, then prune every emptied node
@@ -16,6 +17,10 @@ remove changes nothing and returns `False` (decision 3), and section 11's
 the node set is exactly the set of prefixes with a positive count, so
 `node_count == len(list(iter_prefix_counts()))`. Its storage is private; no
 attribute name is part of the contract (Amendment 1, A5).
+
+`iter_prefix_counts` validates `min_length` exactly as `ancestor_counts` does,
+when it is called rather than when its iterator is first advanced (Amendment
+2, A13).
 """
 
 from collections.abc import Iterator
@@ -162,10 +167,10 @@ class BinaryTrie:
         return None if best is None else self._prefix(address.value, best)
 
     def iter_prefix_counts(self, *, min_length: int = 0) -> Iterator[PrefixCount]:
-        # Descent is by link; the count decides only what is yielded (A3).
-        for node, network, length in self._walk():
-            if node.hot_count > 0 and length >= min_length:
-                yield PrefixCount(self._make_prefix(network, length), node.hot_count)
+        # Not a generator function: min_length is validated at call time,
+        # not on first advance (Amendment 2, A13).
+        self._check_min_length(min_length)
+        return self._iter_prefix_counts(min_length)
 
     def iter_hot_addresses(self) -> Iterator[Address]:
         # Structural: every materialized leaf, counts never consulted (A3).
@@ -186,6 +191,14 @@ class BinaryTrie:
     # ------------------------------------------------------------------
     # Helpers private to the reference implementation.
     # ------------------------------------------------------------------
+
+    def _iter_prefix_counts(self, min_length: int) -> Iterator[PrefixCount]:
+        """`iter_prefix_counts`'s generator; `min_length` is already validated."""
+
+        # Descent is by link; the count decides only what is yielded (A3).
+        for node, network, length in self._walk():
+            if node.hot_count > 0 and length >= min_length:
+                yield PrefixCount(self._make_prefix(network, length), node.hot_count)
 
     def _walk(self) -> Iterator[tuple[TrieNode, int, int]]:
         """Pre-order DFS by child link, branch 0 before branch 1."""
