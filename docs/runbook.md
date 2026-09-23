@@ -29,6 +29,18 @@ Loads the newest snapshot, then replays `hammertime.hot-ip.v1` from the
 snapshot's `event_sequence` (§33). Time-to-ready is reported as
 `trie_recovery_seconds`.
 
+* **Where the replay starts.** The snapshot's `event_sequence` is the offset
+  of the next record to read, `replay_position + 1` (ADR-0017). A trie with
+  no snapshot — every trie until snapshots ship — replays from the oldest
+  record the log still retains.
+* **Its deadline.** The replay has to finish inside
+  `HAMMERTIME_STARTUP_TIMEOUT_S`. A trie that keeps failing its start with
+  `start_failed reason=startup_timeout` needs a longer deadline, or a newer
+  snapshot.
+* **A corrupt trie.** A trie that finds its own structure corrupt logs
+  `trie_invariant_violation` and exits 1. The restart is the rebuild: do
+  not patch the state by hand.
+
 ### Aggregator will not start: a shard is leased elsewhere
 Every shard an aggregator is configured for is taken under a lease in the
 state store (ADR-0013 decision 7, as amended by Amendment 6); the lease

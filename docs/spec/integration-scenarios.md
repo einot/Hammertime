@@ -290,8 +290,12 @@ stop leaves a newer snapshot.
 6. `new = start_trie()` — before `await new.start()`, `new.ready is False`;
    after, `True`. Assert `trie.app`'s `GET /readyz` is 200.
 7. Exactness after replay: `prefix("10.20.30.0/24") == before` field for
-   field (`hot_ips == 56`, `state == "HOT_PREFIX"`, `event_sequence ==
-   256` = 100 + 100 + 56 applied events, `config_version == 1`);
+   field (`hot_ips == 56`, `state == "HOT_PREFIX"`, `config_version == 1`,
+   and `event_sequence == 256`). The 256 is a log position. The memory
+   log's `hammertime.hot-ip.v1` holds exactly the 256 records of these
+   transitions (100 adds, 100 removals, 56 adds) at offsets 0-255, and the
+   restarted trie's `event_sequence` is one past the last of them
+   (ADR-0017 decision 8);
    `ip("10.20.30.156") == ip_before` (HOT, `weight == 1200`);
    `ip("10.20.30.1")["state"] == "COLD"` with no `attributes`;
    `hot_prefixes(minimal=True)["prefixes"]` is exactly `[10.20.30.0/24]`.

@@ -7,9 +7,22 @@ reachable only inside the deployment (they are not TLS-terminated by the
 services and expose no write operations).
 
 All timestamps are RFC 3339 UTC with a `Z` suffix, as in every event schema.
-`event_sequence` is the responding service's own counter (§22, ADR-0003
-amendment): for the trie, the number of hot-IP events applied so far; for the
-detector, the `sequence` of the newest `PrefixStatsChanged` applied.
+`event_sequence` is the responding service's own position or counter (§22,
+ADR-0003 amendment):
+
+* for the trie, its position in `hammertime.hot-ip.v1`: the stream offset
+  of the next hot-ip record it will read. Normally that is one past the
+  last record it has handled. Offsets whose records the log no longer
+  holds when the trie starts (aged out or purged) are skipped over, so a
+  trie that starts on a log holding no record reports the log's end. On
+  the reference deployment's log, whose offsets start at 1, it is at least
+  1 once the trie is ready. It only grows, across restarts too, while the
+  stream exists, and it is not a count of events (ADR-0017 decisions 4
+  and 8);
+* for the detector, the `sequence` of the newest `PrefixStatsChanged` applied.
+
+The trie's `as_of` is the greatest `timestamp` among the hot-ip events it has
+applied. It is `null` until the trie has applied one (ADR-0017 decision 8).
 
 ## Admin endpoints — every service (§47)
 
@@ -40,6 +53,11 @@ The aggregator's pure-ASGI admin app additionally answers
 `404 {"status":"not_found"}` for any other path and
 `405 {"status":"method_not_allowed"}` for a non-GET on the three above; the
 FastAPI services answer their frameworks' own 404/405 for the same cases.
+
+The trie serves no generated API documentation. `GET /openapi.json`,
+`/docs`, `/docs/oauth2-redirect` and `/redoc` answer 404, like any other
+path it does not serve (ADR-0017 decision 13). This document, not a
+generated schema, is the trie's contract.
 
 ## Trie — port 8081 (§29, §31, §46.7)
 

@@ -4,7 +4,13 @@ Status: accepted; amended 2026-09-21 (see "Amendment 1" at the end — the
 replay-position item the Consequences deferred is settled by ADR-0013
 decision 9 now that the event log has one stream sequence, and decision
 3's "flushed before the consumer position ... is committed" is restated
-for a trie that keeps no consumer position; both noted in place)
+for a trie that keeps no consumer position; both noted in place); amended
+2026-09-23 (see "Amendment 2" at the end — by ADR-0017: the trie's
+`event_sequence` is its position in the hot-ip log, and Amendment 1's
+two numbers are one; an event that leaves the hot set unchanged publishes
+no stats; every `PrefixStatsChanged` carries its prefix as `subject`;
+Amendment 1's readiness test also reads the log's first retained offset;
+each noted in place)
 
 Scope note: this ADR pins down the interfaces the cross-service tests of
 issue #26 (`docs/spec/integration-scenarios.md`) observe the pipeline through,
@@ -109,6 +115,22 @@ committed, so a crash cannot commit an update whose stats were never emitted.
 > event whose stats never reached the log. The invariant is the same; the
 > thing that records it is the snapshot alone.
 
+> Amended 2026-09-23 (ADR-0017 decisions 8 and 14; Amendment 2): three
+> qualifications of the paragraph above.
+>
+> 1. "On each applied `HotIpAdded`/`HotIpRemoved`" means each one that
+>    changed the hot set. An event the trie absorbs as a no-op (ADR-0014
+>    decision 3) publishes nothing, because no prefix's count moved.
+> 2. "The trie's own monotonically increasing `sequence` (one counter for
+>    the whole service, incremented per applied hot-IP event ...)" is not
+>    a counter. It is the trie's `event_sequence`: one past the stream
+>    offset of the hot-ip record that caused the stats. It is still
+>    strictly increasing, shared by the stats of one event, and not dense.
+> 3. Each of an event's messages sets the envelope's `subject` to the
+>    prefix text. Without it, the stats of one event would share one
+>    `event_id`, and the log's `Nats-Msg-Id` deduplication (ADR-0013
+>    decision 4) would keep one of them.
+
 Twenty-five messages per transition is acceptable for the same reason
 ADR-0005 gave for not scoring continuously: hysteresis makes transitions rare
 relative to observations, and `PrefixStatsChanged` is keyed by prefix so the
@@ -131,6 +153,12 @@ All responses carry `as_of`, `event_sequence` (the sequence of the last
 hot-ip event applied) and `config_version` (§22). A prefix or IP with no node
 is a valid, zero-valued, `NORMAL`/`COLD` answer, not a 404: absence of a node
 *is* the trie's statement that nothing beneath it is hot.
+
+> Amended 2026-09-23 (ADR-0017 decision 8; Amendment 2): "`event_sequence`
+> (the sequence of the last hot-ip event applied)" is the trie's position
+> in the hot-ip log: the stream offset of the next record it will read.
+> `as_of` is the greatest `timestamp` among the hot-ip events it has
+> applied, and `null` until it has applied one.
 
 ### 5. The detector's read API reflects classification immediately; debounce applies to alerts only
 
@@ -268,6 +296,19 @@ Ruling (ADR-0013 decision 9, restated so it can be read from this ADR):
    dense) is left to the trie epic and is named as an open question in
    ADR-0013's hand-off report; it would touch `docs/protocol/read-api-v1.md`
    and ADR-0001 clause 4, which this amendment does not.
+
+   > Amended 2026-09-23 (ADR-0017 decision 8; Amendment 2): decided by
+   > the repository owner on 2026-09-23, on ADR-0017's recommendation —
+   > the two are one integer, the trie's log position. In ADR-0017's
+   > form, `event_sequence` is `replay_position + 1`, the offset of the
+   > next hot-ip record the trie will read, and not a count.
+   > Ruling 2's "the `offset` of the last hot-ip message
+   > applied" now reads "handled or passed". A record the trie skips
+   > (malformed, or of a family it does not serve) is handled too. An
+   > offset the log no longer holds when the trie starts is passed
+   > (ADR-0017 decision 4). Neither is read again after a restore.
+   > `docs/protocol/read-api-v1.md` and ADR-0001 clause 4
+   > are edited in the same change set.
 4. Readiness (ADR-0009 decision 4: replayed "to the log end as it stood
    when `start()` began") uses the bus's `await bus.end_offset(topic)`,
    read at `start()` — the offset the next appended message will receive,
@@ -281,6 +322,15 @@ Ruling (ADR-0013 decision 9, restated so it can be read from this ADR):
    > C5.2) renamed it `end_offset`, made it `async` on the `MessageBus`
    > protocol, and redefined it as the next offset so that one readiness
    > inequality holds on both buses.
+
+   > Amended 2026-09-23 (ADR-0013 Amendment 10; Amendment 2): the test
+   > above never completes on a JetStream stream that holds no record at
+   > or after `start_offset` and below `end_offset`. A freshly provisioned
+   > stream is one: its `end_offset` is `1`. A positional reader now also
+   > reads `first_offset(topic)`, after `end_offset` and before it
+   > subscribes, and counts every offset below it as passed. The trie
+   > moves its position there before subscribing, so it is caught up once
+   > `event_sequence >= end_offset` (ADR-0017 decision 4).
 5. The detector is bound by ADR-0013 decision 9's redelivery constraint:
    it holds a durable subscription, so after a crash it may be handed an
    older `PrefixStatsChanged` after a newer one for the same prefix, and
@@ -298,3 +348,62 @@ Assumptions made by this amendment (push back individually):
   `tools/replay` agree on it; the snapshot format is otherwise the trie
   epic's.
 * **No CHANGES entry**: no snapshot format has shipped.
+
+## Amendment 2 (2026-09-23) — the trie's `event_sequence` is its log position; only a change is published; stats carry their prefix as `subject`; readiness reads the first retained offset (ADR-0017)
+
+Why: ADR-0017 designs the trie service (epic #10). It answers three
+questions this ADR left open or stated too loosely, and corrects one test
+this ADR restated:
+
+* Amendment 1 ruling 3 left open whether the trie's `event_sequence` and
+  `replay_position` are one number. The repository owner decided on
+  2026-09-23, on ADR-0017's recommendation, that they are one, and
+  ADR-0017 decision 8 records it. Amendment 1's assumption "Two numbers
+  rather than one" had raised the question for the owner, while ADR-0013
+  decision 9 left it to the trie epic; the owner's decision makes that
+  disagreement moot.
+* Decision 3 said stats are published "on each applied" event, and
+  ADR-0011's Consequences left it to the trie epic whether that includes
+  an event the trie absorbs as a no-op. ADR-0017 decision 14 rules that it
+  does not.
+* Decision 3's twenty-five messages share one `sequence`, and nothing here
+  said they must differ in `subject`. Without it they share one
+  `event_id`, and the log's deduplication keeps one of them.
+* Amendment 1 ruling 4 restated ADR-0013 decision 9's readiness test.
+  The security audit of ADR-0017's first slice found that the test never
+  completes on a JetStream stream that holds no record to replay.
+  ADR-0013 Amendment 10 corrects it, and ADR-0017 decision 4 applies it
+  to the trie. (Added 2026-09-23, before this amendment was merged.)
+
+Decisions 1, 2, 5 and 6 are unchanged. Decisions 3 and 4 and Amendment 1
+rulings 3 and 4 carry dated notes; their text is unchanged.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended 2026-09-23" clause.
+* **Decision 3.** A dated blockquote after its 2026-09-21 blockquote, with
+  three numbered qualifications: only an event that changed the hot set
+  publishes; the shared `sequence` is the trie's log position, not a
+  counter; each message's `subject` is its prefix.
+* **Decision 4.** A dated blockquote after the paragraph. It re-reads
+  "`event_sequence` (the sequence of the last hot-ip event applied)" as the
+  log position, and defines `as_of`, which nothing here had defined.
+* **Amendment 1 ruling 3.** A nested dated blockquote records the owner's
+  decision on the open question and re-reads ruling 2's "applied" as
+  "handled or passed".
+* **Amendment 1 ruling 4.** A dated blockquote, after its 2026-09-21 one,
+  points to ADR-0013 Amendment 10's corrected readiness test.
+
+Assumptions made by this amendment (push back individually):
+
+* **Pointer notes, not rewritten decisions.** Every ruling and its
+  reasons are recorded in ADR-0017. The unification of the two numbers is
+  the owner's decision, taken on ADR-0017's recommendation; the other
+  rulings are ADR-0017's own. The notes stop this ADR's text from stating
+  what is no longer true.
+* **The `subject` rule is recorded here as well as in ADR-0017.** It binds
+  whoever implements decision 3's publisher. This ADR is where that
+  publisher's shape was fixed, so it is the first place such a reader
+  looks.
+* **No CHANGES entry.** No trie build that publishes stats has shipped.
+  The implementing change of ADR-0017's slice 2 records the publisher.

@@ -79,7 +79,18 @@ records wins a race A1 rules unspecified; the same over-determined claim is
 qualified where it also stands, in Amendment 6 ruling 2(c) and in decision
 7's `on_assigned` bullet; `AggregatorService.start()`'s docstring is brief
 C11's to fix; `docs/spec/README.md`'s §22 row gains ADR-0001 Amendment 3. No
-decision changes in substance and no code behaviour changes).
+decision changes in substance and no code behaviour changes); amended a
+ninth time 2026-09-23 (see "Amendment 9" — by ADR-0017: the open question
+decision 9 left to the trie epic is answered, and the trie's
+`event_sequence` is `replay_position + 1`, its position in the hot-ip log;
+two pointer notes in place, no decision here changes); amended a tenth
+time 2026-09-23 (see "Amendment 10" — by ADR-0017, on the security audit
+of the trie's first slice: decision 9's readiness test never completes on
+a JetStream stream that holds no record to replay, such as a freshly
+provisioned one, so `MessageBus` gains `first_offset`, the first offset
+the log still retains, and a positional reader counts every offset below
+it as passed; decisions 3 and 9, assumption 20 and Consequences carry
+dated notes).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
@@ -530,6 +541,7 @@ class MessageBus(Protocol):         # moved here from hammertime.aggregator.work
     def producer(self) -> Producer: ...
     def consumer(self, group_id: str) -> Consumer: ...
     async def end_offset(self, topic: str) -> int: ...   # amended 2026-09-21: the log end, see decision 9
+    async def first_offset(self, topic: str) -> int: ... # added 2026-09-23 (Amendment 10): the first retained offset, see below
 
 def static_partitions(topic: str, partitions: Iterable[int]) -> frozenset[int]: ...   # unchanged (ADR-0011 A3)
 ```
@@ -539,6 +551,26 @@ Added: `message_id` on `publish`, `start_offset` on `subscribe`,
 `Consumer.ack`, `Consumer.close`, `ConsumedMessage.delivery_count`,
 `MessageBus` (with `end_offset`, amended 2026-09-21 — it was `last_offset`
 and off the protocol; Amendment 1 ruling C3), `partition_for` (decision 1).
+
+**`MessageBus.first_offset(topic)`** *(added 2026-09-23, Amendment 10)*
+is the offset of the first message the log still retains for `topic`: the
+message a positional subscription with `start_offset=0` starts from.
+When the log retains no message, it is `end_offset(topic)`, the offset the
+next appended message will receive. So "the log holds no message below
+`end`" is the single comparison `first_offset(topic) >= end`. It is
+`async` on both implementations, and it raises what `end_offset` raises:
+`KeyError` for an unregistered topic on `NatsBus`, and `RuntimeError`
+before `NatsBus.start()`. Read at one instant, `first_offset <=
+end_offset`. Read after `end_offset`, it may exceed it (decision 9, as
+amended). `NatsBus.first_offset` reads `stream_info(...).state`, as
+`end_offset` does, and returns `first_offset_of(state)`: `state.first_seq`
+when `state.messages > 0`, and `state.last_seq + 1` when the stream holds
+no message. The message count decides, not `first_seq`: a stream nothing
+has been written to reports `first_seq` `0`, one that a purge or expiry
+has emptied reports `last_seq + 1`, and neither holds a message there
+(Amendment 10, Sources). `InMemoryBus.first_offset` is `0` for every
+topic. The memory log never discards, so `0` is the first index of a
+non-empty log, and it is also an empty log's `end_offset`.
 
 **`Producer.publish(topic, key, value, *, message_id=None)`** appends
 `value` to partition `partition_for(key, TOPICS[topic].partitions)` of
@@ -690,6 +722,10 @@ class NatsBus:                                   # satisfies MessageBus
     def producer(self) -> Producer               # one NatsProducer over the shared connection
     def consumer(self, group_id: str) -> Consumer   # a new NatsConsumer over the shared connection
     async def end_offset(self, topic: str) -> int   # stream_info(...).state.last_seq + 1 (amended 2026-09-21)
+    async def first_offset(self, topic: str) -> int # first_offset_of(stream_info(...).state) (added 2026-09-23, Amendment 10)
+
+def first_offset_of(state: api.StreamState) -> int:   # added 2026-09-23, Amendment 10; not re-exported from hammertime.bus
+    """`state.first_seq` when the stream holds a message; `state.last_seq + 1` when it holds none."""
 
 def bus_endpoints(servers: str | Iterable[str]) -> list[str]:   # added 2026-09-21, Amendment 2
     """`<scheme>://<host>[:<port>]` per server URL; userinfo, path, query and fragment dropped."""
@@ -895,6 +931,9 @@ group per topic). `InMemoryBus.end_offset(topic)` is the length of the
 topic's log (`0` for a topic never published to), `async` like
 `NatsBus.end_offset` so that the trie and the detector call it the same
 way on both (amended 2026-09-21, ruling C3; decision 9 defines it).
+*`InMemoryBus.first_offset(topic)` is `0` for every topic (added
+2026-09-23, Amendment 10). The memory log never discards, so its first
+index is `0`, and an empty log's `end_offset` is `0` as well.*
 
 ### 4. Publishing: every event carries `Nats-Msg-Id = event_id`; ordering is by awaited acknowledgement
 
@@ -1562,6 +1601,12 @@ JetStream stream has one sequence across all its subjects, and
   responses; ADR-0001 Amendment 1 clause 4, ADR-0010 decision 4) is
   **unchanged** and is a different number; whether the trie epic unifies
   the two is left to it (see the open question in the hand-off report).
+  *Decided 2026-09-23 by the repository owner, on ADR-0017's
+  recommendation, and recorded in ADR-0017 decision 8 (Amendment 9): the
+  two are unified. In ADR-0017's form, the trie's `event_sequence` is
+  `replay_position + 1`, the offset of the next hot-ip record it will
+  read, so its read responses and `PrefixStatsChanged.sequence` carry its
+  log position and not a count.*
 * ADR-0010 decision 3's "the producer is flushed before the consumer
   position for the hot-ip topic is committed" becomes "the producer is
   flushed before a snapshot records a `replay_position` that covers the
@@ -1589,6 +1634,24 @@ JetStream stream has one sequence across all its subjects, and
   filtered to a subset of partitions cannot use this test — the last
   message in the stream may be on a subject it does not receive — which
   is why the trie and the detector subscribe with `partitions=None`.
+
+  *Amended 2026-09-23 (Amendment 10): on JetStream the test above can
+  wait for a record that never comes. A positional reader waits for a
+  record at or after `start_offset` and below `end_offset`, and a stream
+  that holds none never delivers one. A stream nothing has been written
+  to has `end_offset` `1`, the "`1` for an empty stream" above, while a
+  reader with no snapshot starts at `0`. A stream whose every record has
+  aged out or been purged keeps its last sequence. "One readiness test
+  works on both" therefore held only on the memory bus, which never
+  discards. The test now reads `first_offset(topic)` after `end_offset`,
+  both before subscribing. Every offset below `max(start_offset,
+  first_offset)` is passed: it holds no record the reader can be
+  delivered. The reader is caught up once every offset below `end_offset`
+  is handled or passed: at once when `max(start_offset, first_offset) >=
+  end_offset`, and otherwise once the last offset it handled is `>=
+  end_offset - 1`. ADR-0017 decision 4 is the trie's form of the test.
+  The detector's durable subscription is not covered; see Amendment 10.
+  The bullet's text above is unchanged.*
 * **The detector** uses a durable subscription (`hammertime-detector`,
   `partitions=None`) and acknowledges what it applied, so after a crash
   the log may redeliver a `PrefixStatsChanged` **after** newer stats for
@@ -1933,7 +1996,10 @@ not make. Push back on them individually.
     decision 4 needs "the log end as it stood when `start()` began" for
     the trie and the detector; the bus is the only party that can read it.
     Named here so the trie epic does not invent it; `InMemoryBus`
-    implements it as the log length."
+    implements it as the log length." *Qualified 2026-09-23 (Amendment
+    10): one number is not enough for a positional reader's readiness on
+    JetStream, whose log can retain nothing below its end.
+    `first_offset(topic)` is the second number.*
 21. **`REDELIVERED` is logged at `WARNING` and not counted.** Same
     reasoning as ADR-0011 A19 for `UNCLAIMED`: it is a delivery event, not
     a content event; the record names the offset and delivery count.
@@ -1991,7 +2057,8 @@ not make. Push back on them individually.
   with one flag line instead of fourteen variables.
 * **Bus package**: `interface.py` per decision 3; `memory.py` reworked
   (dedup by id, acknowledged sets, positional subscriptions, `close`,
-  `end_offset` — Amendment 1);
+  `end_offset` — Amendment 1; *`first_offset` on both buses, with
+  `first_offset_of` in `nats.py` — Amendment 10, 2026-09-23*);
   `topics.py` gains `partition_for`, `stream_name`, `subject`,
   `subject_filter`; `nats.py` new; `kafka.py` deleted; `__init__.py`
   re-exports `NatsBus`, `NatsProducer`, `NatsConsumer`, `TRANSIENT_ERRORS`,
@@ -2028,7 +2095,8 @@ not make. Push back on them individually.
   validation of `HAMMERTIME_BUS_BROKERS` (*done 2026-09-22, Amendment 4
   ruling S2: `validate_bus_url`*); consumer-config reconciliation
   in the provisioner; a byte cap on streams; a counter for redeliveries;
-  unifying `replay_position` and `event_sequence`; the `integration` job's
+  unifying `replay_position` and `event_sequence` (*done 2026-09-23 by
+  ADR-0017 decision 8, Amendment 9*); the `integration` job's
   re-enable (#52). *Added 2026-09-22 (Amendment 4): authentication on the
   bus and the store (NATS `authorization`, Valkey `requirepass`) plumbed
   through the services — assumption 13 states the boundary and decision 11
@@ -4920,3 +4988,223 @@ Configuration and "Failure shape, summarised" italics, Amendment 6 ruling
 and §22 rows; `docs/runbook.md`'s "Aggregator will not start" entry; and
 the R10 review report and this round's brief, both as relayed by the
 top-level session.
+
+## Amendment 9 (2026-09-23) — the trie epic's answer to decision 9's open question (ADR-0017)
+
+Why: decision 9 left the trie epic to decide whether the trie's
+`event_sequence` and its `replay_position` are one number, and
+Consequences listed the unification under "Not done here". The repository
+owner decided on 2026-09-23, on ADR-0017's recommendation, that the two
+are one, and ADR-0017 decision 8 records the decision and gives the value
+its form: the trie's `event_sequence` is `replay_position + 1`, the
+stream offset of the next hot-ip record it will read. ADR-0010
+Amendment 1 had raised the same question for the owner, where this
+decision left it to the trie epic; the owner's decision makes that
+disagreement moot. The recommendation's reason is the one this ADR's
+Context item 3 gave for choosing JetStream: one monotonic stream
+sequence. A count would go backwards after a full replay of a log whose
+head has aged out, and a log position does not. Nothing in decision 9
+changes. The positional subscription, the
+readiness test and the detector's sequence rule all stand as written.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended a ninth time 2026-09-23" clause.
+* **Decision 9, second bullet.** An italic dated sentence after "whether
+  the trie epic unifies the two is left to it (see the open question in
+  the hand-off report)". The sentence it follows, including "is
+  **unchanged** and is a different number", is kept as the record of what
+  this ADR decided on 2026-09-21.
+* **Consequences, "Not done here, named".** An italic dated note after
+  "unifying `replay_position` and `event_sequence`".
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+130. **Two pointers, no ruling.** The unification is the repository
+     owner's decision, taken on ADR-0017's recommendation; its reasons
+     and what it costs are recorded in ADR-0017. This ADR only records
+     that its open question is closed, the precedent of ADR-0009
+     Amendment 6.
+131. **Decision 9's readiness test is unchanged in substance.** "Once the
+     last applied offset is `>= end_offset - 1`" reads, in ADR-0017's
+     terms, "once `event_sequence >= end_offset`". ADR-0017 counts a
+     record the trie skips as handled, so a malformed record at the tail
+     of the log does not hold readiness back. That refines "applied" to
+     "handled". It is not a change to the bus contract this ADR owns, and
+     it is left unedited here. *Superseded in part the same day by
+     Amendment 10: the test as written never completes on a JetStream
+     stream that holds no record to replay, so it does change in
+     substance. A positional reader also reads `first_offset` and counts
+     every offset below it as passed, and decision 9 carries a dated
+     note.*
+132. **No CHANGES entry from this amendment.** The trie epic's slice 1
+     records the trie's arrival (ADR-0017 Consequences).
+
+## Amendment 10 (2026-09-23) — a positional reader's readiness on a log that holds nothing to replay: `MessageBus.first_offset` (ADR-0017)
+
+Why: the security audit of the trie's first slice (epic #10) found that
+decision 9's readiness test never completes on a JetStream stream that
+holds no record at or after `start_offset` and below `end_offset`. A
+positional reader waits for such a record to move its position to
+`end_offset - 1`, and none comes. `make up` on a fresh deployment reaches
+this at once. The provisioning tool creates `hammertime-hot-ip-v1` empty,
+so `end_offset` is `last_seq + 1 = 1`, decision 9's own "`1` for an empty
+stream". A trie with no snapshot subscribes from `0`, and waits until
+`HAMMERTIME_STARTUP_TIMEOUT_S`, then exits 1. A stream whose every record
+has aged out (`max_age`) or been purged reaches the same state, because it
+keeps its last sequence (Sources below; ADR-0017 Sources). The memory bus
+cannot show it: it never discards, and an empty memory log ends at `0`.
+Decision 9's "one readiness test works on both" therefore held only
+there. ADR-0017 is revised before merge to apply the correction (its
+decision 4 step 3), and this amendment settles the bus side.
+
+Rulings:
+
+1. **`MessageBus.first_offset(topic)`.** Decision 3 now defines it: the
+   offset of the first message the log retains, or `end_offset(topic)`
+   when it retains none. `NatsBus` derives it from `stream_info` with the
+   new pure function `first_offset_of(state)`, and `InMemoryBus` returns
+   `0`. Unlike `end_offset` in Amendment 1 (assumption 33), not every
+   `MessageBus` in the repository subclasses `InMemoryBus`: the trie's
+   tests have four doubles that implement the protocol directly, and each
+   gains the method.
+2. **A positional reader's readiness.** The reader reads `end =
+   end_offset(topic)` and then `first = first_offset(topic)`, both before
+   it subscribes. Every offset below `max(start_offset, first)` is passed:
+   it holds no record the reader can be delivered. The reader is caught
+   up once every offset below `end` is handled or passed. That is at once
+   when `max(start_offset, first) >= end`, and otherwise once the last
+   offset it handled is `>= end - 1`. ADR-0017 decision 4 is the trie's
+   form: the trie moves its position to `first - 1` before it subscribes,
+   so its test is `event_sequence >= end`.
+3. **The order of the two reads.** `end_offset` comes first. JetStream
+   assigns sequences in increasing order, and never one at or below the
+   stream's last; a purge keeps the last (ADR-0017 Sources). So once a
+   `first_offset` read after `end_offset` is `>= end`, no record below
+   `end` can be delivered. In the other order, a record that aged out
+   between the two reads would still be counted, and the reader would
+   wait for it.
+4. **What it does not close.** The reader can still wait for a record
+   below `end` that it will never be handed. `first_offset` does not
+   help when an earlier record is still retained, because it cannot see
+   a hole behind a retained record. That happens in three cases. The
+   record at `end - 1` is one the transport skips (a malformed subject;
+   decision 5 as amended by Amendment 4). The records at the end of the
+   log are deleted, singly or by a subject-filtered purge, while earlier
+   records remain. Or every record left below `end` is removed between
+   the reads and its delivery. ADR-0017 assumption 19 records the trie's
+   exposure. JetStream reports a pending count with each delivery, and
+   nats-py exposes it as `Msg.Metadata.num_pending` (Sources). That is
+   the signal a follow-up could carry on `ConsumedMessage`. It is not
+   designed here.
+5. **The detector's durable subscription is outside the test.** Decision
+   9's last bullet gives the detector a durable subscription. ADR-0009
+   decision 4 makes it ready once it has consumed
+   `hammertime.prefix-stats.v1` up to the log end as it stood when
+   `start()` began. A durable's delivery starts from what its group has
+   not acknowledged, not from a `start_offset`. Neither `end_offset` nor
+   `first_offset` says whether anything below `end` is left to deliver.
+   A stream whose every record the group has already acknowledged has
+   `end_offset >= 1` and nothing to deliver, which is the same wait. The
+   detector epic designs its own test; this amendment does not.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended a tenth time 2026-09-23" clause.
+* **Decision 3, interface block.** `MessageBus` gained `async def
+  first_offset(self, topic: str) -> int`, with a dated comment.
+* **Decision 3, after the "Added:" line.** A new dated paragraph defines
+  `first_offset` on both buses and `first_offset_of`.
+* **Decision 3, `NatsBus` block.** Gained `first_offset` and
+  `first_offset_of`, each with a dated comment.
+* **Decision 3, `hammertime.bus.memory` paragraph.** A dated italic
+  sentence on `InMemoryBus.first_offset`.
+* **Decision 9, readiness bullet.** A dated italic paragraph. The
+  bullet's text is unchanged.
+* **Assumption 20.** A dated italic sentence.
+* **Consequences, bus bullet.** A dated italic clause.
+* **Text ADR-0017's change set added on the same branch, not yet on
+  master.** Decision 9's second bullet ends in an italic sentence dated
+  2026-09-23. It said "one past the offset of the last hot-ip record it
+  has handled", and now says "the offset of the next hot-ip record it
+  will read". Amendment 9's "Why" said "one past the stream offset of the
+  last hot-ip record it has handled", and now says "the stream offset of
+  the next hot-ip record it will read". Amendment 9's assumption 131
+  gained an italic sentence.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+133. **A second method beside `end_offset`, not one call that returns
+     both.** One call would read both numbers from one `stream_info`,
+     which is atomic on JetStream. The reading order in ruling 3 already
+     gives the property readiness needs. A second method also leaves
+     `end_offset`, and the tests Amendment 1 pinned for it, as they are.
+     The cost is a second broker round trip per positional start.
+134. **An empty log's first offset is its end.** A log with no message has
+     no first message. Returning `end_offset`'s value makes "nothing below
+     `end`" one comparison for every caller. The alternatives were `None`,
+     or JetStream's raw `first_seq`. `None` makes every caller handle
+     emptiness separately. The raw value is `0` on a stream nothing has
+     been written to (Sources), which reads as a message at offset 0.
+135. **The message count, not `first_seq`, decides emptiness on
+     JetStream.** For an empty stream `first_seq` depends on how it became
+     empty: `0` if nothing was ever written, `last_seq + 1` after a purge
+     or expiry. Only the memory store's code was read for this, and the
+     file store's only in part (Sources). `messages` means the same in
+     both, so `first_offset_of` reads `first_seq` only when a message is
+     there.
+136. **The memory bus still never discards.** `InMemoryBus.first_offset`
+     is `0`, and no purge or retention is added to the memory bus. The
+     trie's tests model a JetStream log with a bus double instead
+     (ADR-0017 Test seams). Retention in the memory bus would model more
+     of JetStream, at the cost of reworking offsets in every consumer
+     path, and nothing needs it yet.
+137. **The durable case is named, not ruled.** ADR-0009 decision 4 gives
+     the detector's readiness one sentence, and the detector epic owns
+     its design. This amendment only records that the positional test
+     does not carry over to it.
+138. **No CHANGES entry from this amendment.** `first_offset` is an
+     interface inside the repository. Its one caller is the trie, whose
+     slice-1 lines are not yet on master (ADR-0017 assumption 32).
+
+Read on 2026-09-23 for Amendment 10 (the same readings are cited in
+ADR-0017's Sources):
+
+* `https://raw.githubusercontent.com/nats-io/nats-server/main/server/memstore.go`,
+  through a fetch tool that quoted the lines asked for. `storeRawMsg`:
+  `if ms.state.Msgs == 0 { ms.state.FirstSeq = seq ... }` and
+  `ms.state.LastSeq = seq`. `updateFirstSeq`, when no message remains:
+  `// Like purge.` and `ms.state.FirstSeq = ms.state.LastSeq + 1`. `purge`:
+  `ms.state.FirstSeq = fseq` and `ms.state.LastSeq = fseq - 1`, with
+  `fseq = ms.state.LastSeq + 1` for a full purge. The tool found no
+  assignment when a store is created, unless the stream's configured first
+  sequence is above 0. Taken from it: rulings 1 and 3 and assumptions 134
+  and 135.
+* `https://raw.githubusercontent.com/nats-io/nats-server/main/server/filestore.go`,
+  through the same tool. Its excerpt did not reach `purge` or
+  `selectNextFirst`. It quoted `expireMsgsOnRecover`, which resets
+  `fs.state.FirstSeq, fs.state.LastSeq = 0, 0`, keeps the last block's
+  `last.seq`, and, when no block remains, calls `fs.writeTombstone(last.seq,
+  last.ts)`. The tool concluded that the last sequence survives a server
+  restart through the tombstone. Taken from it: assumption 135's caution.
+* nats-py 2.16.0 as installed: `nats/js/api.py` `StreamState(messages: int,
+  bytes: int, first_seq: int, last_seq: int, consumer_count: int, ...)`;
+  `nats/aio/msg.py` `Msg.Metadata.num_pending`, "the number of available
+  messages in the Stream that have not been consumed yet". Taken from it:
+  `first_offset_of`'s fields, and ruling 4's signal.
+* Blocked by this environment's egress proxy: `docs.nats.io` and
+  `www.synadia.com`.
+* Repository facts: `packages/hammertime-bus/src/hammertime/bus/nats.py`
+  (`NatsBus.end_offset` returns `info.state.last_seq + 1`;
+  `_open_positional` passes `opt_start_seq=max(start_offset, 1)`), `memory.py`
+  (`InMemoryBus.end_offset` is `len(self._logs[topic])`), `interface.py`
+  (`MessageBus`); `services/trie/src/hammertime/trie/worker.py`
+  (`caught_up` is `end <= start or event_sequence >= end`; a fresh state
+  subscribes with `start_offset=0`); the trie's tests' bus doubles
+  `_SpyBus` and `_ScriptedBus` in `test_worker.py`, and `_ScriptedBus` and
+  `_ClosableBus` in `test_service.py`, none of which subclasses
+  `InMemoryBus`; `packages/hammertime-bus/src/hammertime/bus/tests/test_memory_bus.py`
+  (`TestEndOffset`); the audit's finding as relayed by the top-level
+  session.

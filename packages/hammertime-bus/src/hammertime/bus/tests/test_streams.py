@@ -1,4 +1,7 @@
-"""`stream_config_for` and `ensure_streams`: the stream a topic declares, reconciled idempotently.
+"""`stream_config_for`, `ensure_streams` and `first_offset_of`: the stream a topic declares.
+
+`stream_config_for` and `ensure_streams` reconcile it idempotently;
+`first_offset_of` reads the first retained offset off its state.
 
 Spec: section 19, section 20, section 32, section 33 (`hammertime.bus.nats`'s own
 citations, ADR-0013 decision 3).
@@ -72,10 +75,55 @@ of the assertions:
    `max_bytes`, `max_msgs` and `num_replicas`; `max_msgs_per_subject` is in
    the block but in neither list, so a difference in it alone is not pinned
    either way.
+
+`first_offset_of` (`TestFirstOffsetOf`) is written from ADR-0013 decision 3
+as amended by Amendment 10 -- the `NatsBus` block's "`def
+first_offset_of(state: api.StreamState) -> int:` ... not re-exported from
+hammertime.bus", whose docstring is "`state.first_seq` when the stream holds
+a message; `state.last_seq + 1` when it holds none", and the paragraph after
+the "Added:" line: "The message count decides, not `first_seq`: a stream
+nothing has been written to reports `first_seq` `0`, one that a purge or
+expiry has emptied reports `last_seq + 1`, and neither holds a message there"
+-- and Amendment 10 assumptions 134 ("An empty log's first offset is its
+end") and 135 ("The message count, not `first_seq`, decides emptiness on
+JetStream"). It is imported from `hammertime.bus.nats`, since it is not
+re-exported. `nats.js.api.StreamState` is built with its five required
+fields (`messages`, `bytes`, `first_seq`, `last_seq`, `consumer_count`), and
+`num_deleted` where a test models interior deletions. No server is involved:
+`NatsBus.first_offset` against a live stream is the `integration` job's
+(#52).
+
+`NatsBus.end_offset` and `NatsBus.first_offset` without a server
+(`TestNatsBusOffsetReads`) are written from the same Amendment 10 paragraph
+-- "it raises what `end_offset` raises: `KeyError` for an unregistered topic
+on `NatsBus`, and `RuntimeError` before `NatsBus.start()`" and
+"`NatsBus.first_offset` reads `stream_info(...).state`, as `end_offset` does,
+and returns `first_offset_of(state)`" -- the `NatsBus` block's comments
+"`stream_info(...).state.last_seq + 1`" and "`first_offset_of(stream_info(
+...).state)`", decision 1's stream name per topic, assumption 133 ("a second
+broker round trip"), and ADR-0017 decision 7's row for `bus.end_offset`,
+`bus.first_offset` ("any exception ... Propagates", so the bus raises rather
+than masks). Pinned for both methods: an unregistered topic is a `KeyError`
+on a started-looking bus and on an unstarted one; a registered topic before
+`start()` is a `RuntimeError`; against a stub JetStream context, `end_offset`
+is `last_seq + 1`, `first_offset` is `first_offset_of(state)` for a non-empty
+and an empty state, and `stream_info` is asked once, for the topic's stream
+name. ASSUMPTIONS for this class:
+
+5. The stub is installed by assigning the private attribute `_js` on an
+   unstarted `NatsBus`. No ADR names a seam for the bus's JetStream context;
+   this one is a test seam the ADR does not pin (the name comes from the
+   review finding that asked for these tests), and if the implementation
+   renames it, the fixture changes, not the assertions.
+6. That an unregistered topic on an *unstarted* bus is a `KeyError` rather
+   than a `RuntimeError` -- the topic lookup comes first -- is the
+   dispatcher's reading. Decision 3 rules the same order for
+   `NatsConsumer.subscribe()` ("raised with the other argument checks before
+   the broker is contacted", Amendment 1 C5.6) but its text on the two offset
+   reads names both errors without ruling which wins when both apply.
 """
 
-from __future__ import annotations
-
+import copy
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from enum import Enum
@@ -83,7 +131,13 @@ from typing import Any, cast
 
 import nats.js.errors
 import pytest
-from hammertime.bus.nats import StreamConfigConflictError, ensure_streams, stream_config_for
+from hammertime.bus.nats import (
+    NatsBus,
+    StreamConfigConflictError,
+    ensure_streams,
+    first_offset_of,
+    stream_config_for,
+)
 from hammertime.bus.topics import TOPICS, TopicSpec, all_topics
 from nats.js import api
 
@@ -688,3 +742,235 @@ class TestOneEntryPerSpec:
         result = await _ensure(js, [OBSERVATIONS, HOT_IP, PREFIX_STATS])
 
         assert set(result.values()) == {"created", "unchanged", "updated"}
+
+
+# --------------------------------------------------------------------------
+# first_offset_of: the first retained offset, or the end when none is retained
+# --------------------------------------------------------------------------
+
+
+def _state(
+    *, messages: int, first_seq: int, last_seq: int, num_deleted: int | None = None
+) -> api.StreamState:
+    return api.StreamState(
+        messages=messages,
+        bytes=0,
+        first_seq=first_seq,
+        last_seq=last_seq,
+        consumer_count=0,
+        num_deleted=num_deleted,
+    )
+
+
+class TestFirstOffsetOf:
+    """ADR-0013 decision 3 as amended by Amendment 10: "`state.first_seq` when
+    the stream holds a message; `state.last_seq + 1` when it holds none." "The
+    message count decides, not `first_seq`" (assumption 135), and "An empty
+    log's first offset is its end" (assumption 134): `end_offset` is
+    `state.last_seq + 1`."""
+
+    def test_a_stream_nothing_has_been_written_to(self) -> None:
+        # "a stream nothing has been written to reports `first_seq` `0`":
+        # no message, so the end, `last_seq + 1`.
+        assert first_offset_of(_state(messages=0, first_seq=0, last_seq=0)) == 1
+
+    def test_a_stream_emptied_by_a_purge_or_expiry(self) -> None:
+        # "one that a purge or expiry has emptied reports `last_seq + 1`".
+        assert first_offset_of(_state(messages=0, first_seq=21, last_seq=20)) == 21
+
+    def test_the_message_count_decides_not_first_seq(self) -> None:
+        # Assumption 135: an empty stream's `first_seq` "depends on how it
+        # became empty", so `first_offset_of` "reads `first_seq` only when a
+        # message is there". `first_seq` 0 with no message is not offset 0.
+        assert first_offset_of(_state(messages=0, first_seq=0, last_seq=20)) == 21
+
+    def test_a_stream_that_holds_its_whole_history(self) -> None:
+        assert first_offset_of(_state(messages=3, first_seq=1, last_seq=3)) == 1
+
+    def test_a_stream_whose_head_has_aged_out(self) -> None:
+        assert first_offset_of(_state(messages=5, first_seq=16, last_seq=20)) == 16
+
+    def test_interior_deletions_do_not_move_it(self) -> None:
+        # Two messages left between 5 and 20, fourteen deleted in between:
+        # the first retained is still `first_seq`. Assumption 19 (ADR-0017)
+        # / Amendment 10 ruling 4: "`first_offset` cannot see a hole behind a
+        # retained record".
+        state = _state(messages=2, first_seq=5, last_seq=20, num_deleted=14)
+
+        assert first_offset_of(state) == 5
+
+    @pytest.mark.parametrize(
+        ("messages", "first_seq", "last_seq"),
+        [
+            pytest.param(0, 0, 0, id="never-written"),
+            pytest.param(0, 21, 20, id="emptied"),
+            pytest.param(5, 16, 20, id="head-aged-out"),
+        ],
+    )
+    def test_the_state_is_not_mutated(self, messages: int, first_seq: int, last_seq: int) -> None:
+        state = _state(messages=messages, first_seq=first_seq, last_seq=last_seq)
+        before = copy.deepcopy(state)
+
+        first_offset_of(state)
+
+        assert state == before
+        assert (state.messages, state.first_seq, state.last_seq) == (messages, first_seq, last_seq)
+
+
+# --------------------------------------------------------------------------
+# NatsBus.end_offset / NatsBus.first_offset: errors and stream_info(...).state
+# --------------------------------------------------------------------------
+
+# Any syntactically valid server list: nothing here connects.
+_SERVERS = "nats://127.0.0.1:4222"
+
+# Not in decision 1's table.
+_UNREGISTERED_TOPIC = "hammertime.no-such-topic.v1"
+
+_OFFSET_READS = ["end_offset", "first_offset"]
+
+
+class _StateInfo:
+    """What `stream_info` answers for the offset reads: an object whose `.state` is an
+    `api.StreamState` ("reads `stream_info(...).state`")."""
+
+    def __init__(self, state: api.StreamState) -> None:
+        self.state = state
+
+
+class _StateJetStream:
+    """A stub JetStream context whose `stream_info(name)` answers one `StreamState`,
+    recording the name it was asked for (positional or `name=`, ASSUMPTION 1)."""
+
+    def __init__(self, state: api.StreamState) -> None:
+        self.state = state
+        self.names: list[str] = []
+
+    async def stream_info(self, name: str | None = None, **params: Any) -> _StateInfo:
+        resolved = name if name is not None else params["name"]
+        self.names.append(resolved)
+        return _StateInfo(self.state)
+
+
+def _bus_with(js: _StateJetStream) -> NatsBus:
+    """An unstarted `NatsBus` with the stub installed.
+
+    TEST SEAM NOT PINNED BY THE ADR (ASSUMPTION 5): no ADR names how a caller
+    reaches the bus's JetStream context, so the stub is assigned to the private
+    `_js` attribute directly.
+    """
+
+    bus = NatsBus(_SERVERS)
+    # Through `Any`, so the type checker does not depend on how (or whether)
+    # the class declares the attribute.
+    cast(Any, bus)._js = js
+    return bus
+
+
+async def _read(bus: NatsBus, method: str, topic: str) -> int:
+    reader = getattr(bus, method)
+    return cast(int, await reader(topic))
+
+
+class TestNatsBusOffsetReads:
+    """ADR-0013 decision 3 as amended by Amendment 10: `first_offset` "raises what
+    `end_offset` raises: `KeyError` for an unregistered topic on `NatsBus`, and
+    `RuntimeError` before `NatsBus.start()`"; "`NatsBus.first_offset` reads
+    `stream_info(...).state`, as `end_offset` does, and returns
+    `first_offset_of(state)`"; the `NatsBus` block: `end_offset` is
+    "`stream_info(...).state.last_seq + 1`". ADR-0017 decision 7: an exception
+    from either read propagates."""
+
+    @pytest.mark.parametrize("method", _OFFSET_READS)
+    async def test_an_unregistered_topic_is_a_key_error_before_start(self, method: str) -> None:
+        # ASSUMPTION 6: the topic lookup comes first, so an unstarted bus
+        # still answers an unregistered topic with `KeyError`, not
+        # `RuntimeError`.
+        bus = NatsBus(_SERVERS)
+
+        with pytest.raises(KeyError):
+            await _read(bus, method, _UNREGISTERED_TOPIC)
+
+    @pytest.mark.parametrize("method", _OFFSET_READS)
+    async def test_an_unregistered_topic_is_a_key_error_with_a_jetstream_context(
+        self, method: str
+    ) -> None:
+        # "`KeyError` for an unregistered topic on `NatsBus`": there is no
+        # stream to ask about, whatever state the connection is in.
+        js = _StateJetStream(_state(messages=3, first_seq=1, last_seq=3))
+
+        with pytest.raises(KeyError):
+            await _read(_bus_with(js), method, _UNREGISTERED_TOPIC)
+
+    @pytest.mark.parametrize("method", _OFFSET_READS)
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    async def test_a_registered_topic_before_start_is_a_runtime_error(
+        self, method: str, spec: TopicSpec
+    ) -> None:
+        # "`RuntimeError` before `NatsBus.start()`".
+        bus = NatsBus(_SERVERS)
+
+        with pytest.raises(RuntimeError):
+            await _read(bus, method, spec.name)
+
+    @pytest.mark.parametrize(
+        ("messages", "first_seq", "last_seq"),
+        [
+            pytest.param(5, 16, 20, id="non-empty"),
+            pytest.param(0, 0, 0, id="never-written"),
+            pytest.param(0, 21, 20, id="emptied"),
+        ],
+    )
+    async def test_end_offset_is_last_seq_plus_one(
+        self, messages: int, first_seq: int, last_seq: int
+    ) -> None:
+        # "`stream_info(...).state.last_seq + 1`" -- "`1` for an empty
+        # stream" (decision 9).
+        js = _StateJetStream(_state(messages=messages, first_seq=first_seq, last_seq=last_seq))
+
+        assert await _read(_bus_with(js), "end_offset", HOT_IP.name) == last_seq + 1
+
+    @pytest.mark.parametrize(
+        ("messages", "first_seq", "last_seq", "expected"),
+        [
+            pytest.param(5, 16, 20, 16, id="non-empty"),
+            pytest.param(0, 0, 0, 1, id="never-written"),
+            pytest.param(0, 21, 20, 21, id="emptied"),
+            pytest.param(0, 0, 20, 21, id="empty-first-seq-zero"),
+        ],
+    )
+    async def test_first_offset_is_first_offset_of_the_state(
+        self, messages: int, first_seq: int, last_seq: int, expected: int
+    ) -> None:
+        # "returns `first_offset_of(state)`": the pure function's answer on
+        # the very state `stream_info` reported, for a stream that holds a
+        # message and for an empty one (assumptions 134 and 135).
+        state = _state(messages=messages, first_seq=first_seq, last_seq=last_seq)
+        js = _StateJetStream(state)
+
+        result = await _read(_bus_with(js), "first_offset", HOT_IP.name)
+
+        assert result == first_offset_of(state) == expected
+
+    async def test_an_empty_streams_first_offset_is_its_end_offset(self) -> None:
+        # "When the log retains no message, it is `end_offset(topic)`".
+        js = _StateJetStream(_state(messages=0, first_seq=21, last_seq=20))
+        bus = _bus_with(js)
+
+        end = await _read(bus, "end_offset", HOT_IP.name)
+        first = await _read(bus, "first_offset", HOT_IP.name)
+
+        assert first == end == 21
+
+    @pytest.mark.parametrize("method", _OFFSET_READS)
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    async def test_stream_info_is_asked_for_the_topics_stream(
+        self, method: str, spec: TopicSpec
+    ) -> None:
+        # Decision 1's stream name for the topic, one `stream_info` call per
+        # read (assumption 133: "a second broker round trip").
+        js = _StateJetStream(_state(messages=3, first_seq=1, last_seq=3))
+
+        await _read(_bus_with(js), method, spec.name)
+
+        assert js.names == [spec.stream_name]

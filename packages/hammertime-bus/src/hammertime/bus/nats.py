@@ -45,6 +45,12 @@ The mapping, from ADR-0013 decisions 1, 2, 4 and 5:
 * `NatsBus.end_offset(topic)` is `stream_info(...).state.last_seq + 1`: the
   offset the next appended message will receive, the readiness number of
   decision 9, `1` for an empty stream.
+* `NatsBus.first_offset(topic)` is `first_offset_of(stream_info(...).state)`:
+  `first_seq` when the stream holds a message, `last_seq + 1` when it holds
+  none -- the message count decides, not `first_seq`, which is `0` on a
+  stream nothing has been written to (decision 3 as amended by Amendment
+  10). `first_offset_of` is pure and is not re-exported from
+  `hammertime.bus`.
 * `bus_endpoints(servers)` is the spec section 47.7 reduction for bus URLs:
   the only form in which a log record may name the servers (ADR-0013
   Amendment 2), since a NATS URL may carry a password or token in its
@@ -418,6 +424,20 @@ def validate_bus_url(url: str) -> None:
         raise ValueError(_INVALID_BUS_URL)
 
 
+def first_offset_of(state: api.StreamState) -> int:
+    """`state.first_seq` when the stream holds a message; `state.last_seq + 1` when it holds none.
+
+    The message count decides, not `first_seq`: a stream nothing has been
+    written to reports `first_seq` `0`, one a purge or expiry has emptied
+    reports `last_seq + 1`, and neither holds a message there (ADR-0013
+    decision 3, Amendment 10 assumptions 134 and 135). An empty stream's
+    first offset is therefore its `end_offset`.
+    """
+    if state.messages > 0:
+        return state.first_seq
+    return state.last_seq + 1
+
+
 class NatsBus:
     """`MessageBus` over one shared NATS connection (ADR-0013 decision 3).
 
@@ -503,6 +523,17 @@ class NatsBus:
         spec = TOPICS[topic]
         info = await self._require_js().stream_info(spec.stream_name)
         return info.state.last_seq + 1
+
+    async def first_offset(self, topic: str) -> int:
+        """The first offset the stream retains, or `end_offset` when it retains none.
+
+        `first_offset_of(stream_info(...).state)` (ADR-0013 decision 3,
+        Amendment 10). An unregistered topic is a `KeyError`; before
+        `start()` it is `RuntimeError("NatsBus is not started")`.
+        """
+        spec = TOPICS[topic]
+        info = await self._require_js().stream_info(spec.stream_name)
+        return first_offset_of(info.state)
 
     def _require_js(self) -> JetStreamContext:
         if self._js is None:

@@ -1126,9 +1126,12 @@ The system SHOULD expose timestamps/version numbers for derived classifications 
 > true history, in order with possible gaps (a transition persisted but
 > never published), never a reordering; across IPs there is no ordering,
 > and a prefix aggregate catches up as transitions are applied. Every trie
-> and detector response carries `as_of`, `event_sequence` (the trie's count
-> of applied hot-ip events; the detector reports that counter as carried on
-> the newest `PrefixStatsChanged` it applied) and `config_version`
+> and detector response carries `as_of`, `event_sequence` (for the trie,
+> its position in the hot-ip log — the stream offset of the next record it
+> will read, so the number only grows, across restarts too; the
+> detector reports that number as carried on the newest
+> `PrefixStatsChanged` it applied; reworded 2026-09-23, ADR-0017) and
+> `config_version`
 > (`docs/protocol/read-api-v1.md`; ADR-0010 decision 4). A shard handover
 > may delay a demotion by up to `window_seconds` plus the handover time
 > plus one maintenance interval, and may replay a `HotIpAdded` for an IP the
@@ -1384,6 +1387,15 @@ Possible implementations include:
 The preferred mechanism depends on the runtime and persistence requirements.
 
 A single-writer model is strongly recommended where practical because trie updates are small and deterministic.
+
+> ADR-0017: the trie service's mechanism is single-writer ownership on one
+> event loop. The worker changes the trie, the attribute records and the
+> version numbers in one step with no `await` inside it. Every reader — the
+> read API, `/metrics`, a snapshot — takes what it reports without an
+> `await` between its first read and its last, on that same loop, with no
+> other thread. (FastAPI runs a `def` handler in a threadpool, so every
+> trie handler is `async def`.) A reader therefore sees the state between
+> two whole events, with no copy-on-write.
 
 ---
 
@@ -1653,6 +1665,16 @@ After loading a snapshot, events after its sequence number are replayed.
 > event, one integer for the whole log (ADR-0013 decision 9; ADR-0010
 > Amendment 1).
 
+> ADR-0017: that integer is the offset of the last hot-ip record the trie
+> handled, whether it applied the record or skipped it, or the last offset
+> it passed at startup because the log no longer held a record there. The
+> trie's `event_sequence` (Section 22) is that offset plus one, the offset
+> of the next record it will read, so this section's "event sequence
+> number" and the read API's `event_sequence` are one number. A trie with
+> no snapshot replays from the first record the log still retains, and
+> does so inside the startup deadline (Section 47.2). A log that retains
+> no record is replayed at once.
+
 ---
 
 # 34. Configuration
@@ -1745,6 +1767,11 @@ IPv6 trie
 ```
 
 The implementation SHOULD preferably maintain separate roots because IPv4 and IPv6 have different address spaces.
+
+> ADR-0017: the trie service holds one trie and one attribute record map
+> per family in `HAMMERTIME_TRIE_FAMILIES` (default `ipv4`, Section 43). A
+> hot-ip event for a family it does not hold is skipped and counted, not
+> treated as an error.
 
 ---
 
