@@ -1,7 +1,8 @@
 """Encode/decode events; schema-version negotiation and forward compatibility.
 
-Spec: section 19, section 32, section 46.2; ADR-0015 decision 5 and
-Amendment 2 (ruling A)
+Spec: section 19, section 32, section 46.2; ADR-0015 decision 5,
+Amendment 2 (ruling A) and Amendment 3 (ruling 3, assumptions 64-67); ADR-0011
+decision 3 step 1
 
 The wire format is JSON. Every message is an `EventEnvelope` (see
 `envelope.py`) with a `payload` object whose field names match the relevant
@@ -19,6 +20,19 @@ literal), or `hammertime.core.errors.InvalidAddressError` (from a malformed
 unknown/unsupported `schema_version`, or malformed bytes -- surfaces as
 `CodecError`.
 
+The codec's integer fields -- the envelope's `schema_version`, `sequence` and
+`config_version`, and every payload field it converts to `int` -- accept on
+decode exactly a JSON integer: an `int` that is not a `bool`, or a finite
+`float` with no fractional part, converted to `int`. A string, a boolean, a
+fractional or non-finite number, `null`, an array or an object is a
+`CodecError`, so no `OverflowError` from `int(float("inf"))` can escape and
+stop a consumer (ADR-0011 decision 3 step 1: "A poison message never stops
+the consumer"). `capacity`, a decimal string on the wire, accepts exactly a
+string of ASCII digits `[0-9]+`. On encode each integer field must hold an
+`int` that is not a `bool` (a subclass such as an `IntEnum` member is
+accepted), `capacity` such an `int` `>= 0`, and the envelope is serialized
+with `allow_nan=False`, so no non-finite number reaches the wire.
+
 A `HotIpAdded`/`HotIpRemoved` payload's `attributes` document goes through
 `hammertime.core.events.attributes.canonicalize_ip_attributes`, the one
 implementation of the section 46.2 rules, on encode and on decode (ADR-0015
@@ -31,6 +45,8 @@ attributes rejection (ADR-0015 assumption 32).
 """
 
 import json
+import math
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -57,6 +73,64 @@ _KNOWN_EVENT_TYPES = frozenset({"RequestObservation", "PrefixStatsChanged"}) | _
 #: (services/ingest/src/hammertime/ingest/validation/limits.py) is not yet
 #: implemented, so this is currently the only place that bounds it.
 _MAX_OBSERVATIONS = 10_000
+
+#: schemas/prefix_stats_event.v1.json: `capacity` is a decimal string -- ASCII
+#: digits only, not everything `int()` accepts (ADR-0015 assumption 65).
+_DECIMAL_STRING = re.compile(r"[0-9]+")
+
+
+def _json_integer(value: Any, field: str) -> int:
+    """Decode an integer field: exactly a JSON integer, as an `int`.
+
+    An `int` that is not a `bool`, or a finite `float` with no fractional part
+    (JSON Schema's "integer"; ADR-0015 assumption 64). Anything else raises
+    `ValueError`, which every caller turns into a `CodecError`; the message
+    names the field and the value's JSON kind, never the value.
+    """
+    if type(value) is int:
+        return value
+    if type(value) is float and math.isfinite(value) and value.is_integer():
+        return int(value)
+    raise ValueError(f"{field} must be a JSON integer, got {_json_kind(value)}")
+
+
+def _decimal_string(value: Any, field: str) -> int:
+    """Decode a decimal-string field (`capacity`): `[0-9]+`, as an `int`.
+
+    `int()` itself may still refuse an over-long string under the
+    interpreter's integer-string limit, with a `ValueError` (assumption 65).
+    """
+    if not isinstance(value, str) or _DECIMAL_STRING.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a string of ASCII decimal digits")
+    return int(value)
+
+
+def _json_kind(value: object) -> str:
+    """What a decoded JSON value is, from its type alone."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, float):
+        return "a fractional or non-finite number"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, list):
+        return "an array"
+    if isinstance(value, dict):
+        return "an object"
+    return type(value).__name__
+
+
+def _integer_field(value: object, field: str) -> int:
+    """Encode an integer field: an `int` that is not a `bool`, else `CodecError`.
+
+    An `int` subclass such as an `IntEnum` member is accepted, and `json`
+    writes it as its number (ADR-0015 assumption 66).
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise CodecError(f"{field} must be an int, got {type(value).__name__}")
+    return value
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -85,11 +159,15 @@ def _require(data: dict[str, Any], key: str) -> Any:
 def _encode_request_observation(payload: RequestObservation) -> dict[str, Any]:
     return {
         "agent_id": payload.agent_id,
-        "sequence": payload.sequence,
+        "sequence": _integer_field(payload.sequence, "sequence"),
         "window_start": _format_timestamp(payload.window_start),
-        "window_seconds": payload.window_seconds,
+        "window_seconds": _integer_field(payload.window_seconds, "window_seconds"),
         "observations": [
-            {"ip": str(obs.ip), "request_count": obs.request_count} for obs in payload.observations
+            {
+                "ip": str(obs.ip),
+                "request_count": _integer_field(obs.request_count, "request_count"),
+            }
+            for obs in payload.observations
         ],
     }
 
@@ -109,21 +187,20 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
             raise CodecError("each observation must be an object")
         try:
             ip = Address.parse(str(_require(item, "ip")))
-            observations.append(
-                Observation(ip=ip, request_count=int(_require(item, "request_count")))
-            )
-        except (TypeError, ValueError, InvalidAddressError) as exc:
+            request_count = _json_integer(_require(item, "request_count"), "request_count")
+            observations.append(Observation(ip=ip, request_count=request_count))
+        except (TypeError, ValueError, OverflowError, InvalidAddressError) as exc:
             raise CodecError(f"malformed observation entry: {item!r}") from exc
 
     try:
         return RequestObservation(
             agent_id=str(_require(data, "agent_id")),
-            sequence=int(_require(data, "sequence")),
+            sequence=_json_integer(_require(data, "sequence"), "sequence"),
             window_start=_parse_timestamp(_require(data, "window_start"), field="window_start"),
-            window_seconds=int(_require(data, "window_seconds")),
+            window_seconds=_json_integer(_require(data, "window_seconds"), "window_seconds"),
             observations=tuple(observations),
         )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise CodecError(f"malformed RequestObservation payload: {data!r}") from exc
 
 
@@ -146,9 +223,9 @@ def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) ->
         "ip": str(payload.ip),
         "family": payload.ip.family.value,
         "timestamp": _format_timestamp(payload.timestamp),
-        "sequence": payload.sequence,
-        "window_count": payload.window_count,
-        "config_version": payload.config_version,
+        "sequence": _integer_field(payload.sequence, "sequence"),
+        "window_count": _integer_field(payload.window_count, "window_count"),
+        "config_version": _integer_field(payload.config_version, "config_version"),
     }
     if payload.attributes is not None:
         document["attributes"] = _canonical_attributes(payload.attributes)
@@ -159,10 +236,10 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
     try:
         ip = Address.parse(str(_require(data, "ip")))
         timestamp = _parse_timestamp(_require(data, "timestamp"), field="timestamp")
-        sequence = int(_require(data, "sequence"))
-        window_count = int(_require(data, "window_count"))
-        config_version = int(_require(data, "config_version"))
-    except (TypeError, ValueError, InvalidAddressError) as exc:
+        sequence = _json_integer(_require(data, "sequence"), "sequence")
+        window_count = _json_integer(_require(data, "window_count"), "window_count")
+        config_version = _json_integer(_require(data, "config_version"), "config_version")
+    except (TypeError, ValueError, OverflowError, InvalidAddressError) as exc:
         # attributes is deliberately excluded from this error message: it is
         # not yet validated at this point (that happens below) and has no
         # size bound applied yet, so echoing it verbatim here would let an
@@ -199,15 +276,33 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
     )
 
 
+def _encode_capacity(capacity: object) -> str:
+    """`capacity`'s decimal string: an `int` that is not a `bool`, `>= 0`.
+
+    The string is produced here, where a failure is a `CodecError`: a capacity
+    too long for the interpreter's integer-string limit makes the conversion
+    raise `ValueError` (ADR-0015 assumption 66). `int.__repr__` rather than
+    `str()`, so that an `int` subclass's own `__str__` cannot put anything but
+    digits on the wire; for an exact `int` the two give the same text.
+    """
+    value = _integer_field(capacity, "capacity")
+    if value < 0:
+        raise CodecError("capacity must be >= 0")
+    try:
+        return int.__repr__(value)
+    except ValueError as exc:
+        raise CodecError(f"capacity cannot be written as a decimal string: {exc}") from exc
+
+
 def _encode_prefix_stats_changed(payload: PrefixStatsChanged) -> dict[str, Any]:
     return {
         "prefix": payload.prefix,
-        "hot_count": payload.hot_count,
+        "hot_count": _integer_field(payload.hot_count, "hot_count"),
         # schemas/prefix_stats_event.v1.json: a decimal string, because IPv6
         # capacities exceed 64 bits. The in-process payload keeps capacity as
         # a Python int (arbitrary precision); only the wire form is a string.
-        "capacity": str(payload.capacity),
-        "sequence": payload.sequence,
+        "capacity": _encode_capacity(payload.capacity),
+        "sequence": _integer_field(payload.sequence, "sequence"),
         "timestamp": _format_timestamp(payload.timestamp),
     }
 
@@ -216,12 +311,12 @@ def _decode_prefix_stats_changed(data: dict[str, Any]) -> PrefixStatsChanged:
     try:
         return PrefixStatsChanged(
             prefix=str(_require(data, "prefix")),
-            hot_count=int(_require(data, "hot_count")),
-            capacity=int(_require(data, "capacity")),
-            sequence=int(_require(data, "sequence")),
+            hot_count=_json_integer(_require(data, "hot_count"), "hot_count"),
+            capacity=_decimal_string(_require(data, "capacity"), "capacity"),
+            sequence=_json_integer(_require(data, "sequence"), "sequence"),
             timestamp=_parse_timestamp(_require(data, "timestamp"), field="timestamp"),
         )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise CodecError(f"malformed PrefixStatsChanged payload: {data!r}") from exc
 
 
@@ -251,23 +346,26 @@ def encode(envelope: EventEnvelope[EventPayload]) -> bytes:
     """Serialize an envelope to its JSON wire form."""
     if envelope.event_type not in _KNOWN_EVENT_TYPES:
         raise CodecError(f"unknown event_type: {envelope.event_type!r}")
-    if envelope.schema_version != SCHEMA_VERSION:
-        raise CodecError(f"unsupported schema_version: {envelope.schema_version!r}")
+    schema_version = _integer_field(envelope.schema_version, "schema_version")
+    if schema_version != SCHEMA_VERSION:
+        raise CodecError(f"unsupported schema_version: {schema_version!r}")
 
     document = {
-        "schema_version": envelope.schema_version,
+        "schema_version": schema_version,
         "event_id": envelope.event_id,
         "agent_id": envelope.agent_id,
-        "sequence": envelope.sequence,
+        "sequence": _integer_field(envelope.sequence, "sequence"),
         "event_type": envelope.event_type,
-        "config_version": envelope.config_version,
+        "config_version": _integer_field(envelope.config_version, "config_version"),
         "timestamp": _format_timestamp(envelope.timestamp),
         "payload": _encode_payload(envelope.event_type, envelope.payload),
     }
     if envelope.subject is not None:
         document["subject"] = envelope.subject
     try:
-        return json.dumps(document, separators=(",", ":")).encode("utf-8")
+        # allow_nan=False: a non-finite float anywhere is a CodecError, not
+        # NaN or Infinity on the wire (ADR-0015 Amendment 3 ruling 3).
+        return json.dumps(document, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise CodecError(f"could not serialize envelope: {exc}") from exc
 
@@ -301,7 +399,11 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
     if not isinstance(document, dict):
         raise CodecError(f"envelope must be a JSON object, got {type(document).__name__}")
 
-    schema_version = _require(document, "schema_version")
+    try:
+        # A JSON integer first, so that `true` is refused although True == 1.
+        schema_version = _json_integer(_require(document, "schema_version"), "schema_version")
+    except (ValueError, OverflowError) as exc:
+        raise CodecError(f"unsupported schema_version: {exc}") from exc
     if schema_version != SCHEMA_VERSION:
         raise CodecError(f"unsupported schema_version: {schema_version!r}")
 
@@ -325,16 +427,16 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
 
     try:
         envelope = EventEnvelope(
-            schema_version=int(schema_version),
+            schema_version=schema_version,
             agent_id=str(_require(document, "agent_id")),
-            sequence=int(_require(document, "sequence")),
+            sequence=_json_integer(_require(document, "sequence"), "sequence"),
             event_type=str(event_type),
-            config_version=int(_require(document, "config_version")),
+            config_version=_json_integer(_require(document, "config_version"), "config_version"),
             timestamp=_parse_timestamp(_require(document, "timestamp"), field="timestamp"),
             payload=_decode_payload(event_type, payload_data),
             subject=raw_subject,
         )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise CodecError(f"malformed envelope: {exc}") from exc
 
     # event_id is never trusted from the wire -- EventEnvelope always

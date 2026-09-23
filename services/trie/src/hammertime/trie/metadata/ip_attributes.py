@@ -1,9 +1,9 @@
 """Per-IP attribute records beside the trie, and the single-writer step that couples them.
 
 Spec: section 46.2, sections 46.5-46.9; ADR-0015 decisions 5, 6 and 8
-(assumptions 17-23, 37-40, 53, 57-59) and Amendment 2 (rulings A, C and D);
-ADR-0005 decisions 4 and 5; ADR-0014 decisions 1, 3 and 9, and Amendment 2
-A12.
+(assumptions 17-23, 37-40, 53, 57-59, 68), Amendment 2 (rulings A, C and D)
+and Amendment 3 (rulings 1 and 4); ADR-0005 decisions 4 and 5; ADR-0014
+decisions 1, 3 and 9, and Amendment 2 A12.
 
 `IpAttributeRecords` is a read-only, family-scoped `Mapping[Address,
 IpAttributes]` -- and so already the `Collection[Address]` that
@@ -18,7 +18,11 @@ Every write goes through `canonicalize_ip_attributes`
 the canonical compact JSON text that call returned (Amendment 2 ruling D):
 `serialized_bytes` -- section 46.8's `ip_attribute_bytes` -- is the sum of the
 stored texts' lengths, and every read decodes a fresh, exact-typed document
-behind a read-only view, so nothing a reader does reaches the map. `json` is
+behind a read-only view, so nothing a reader does reaches the map. Membership,
+`a in records`, is answered from the stored keys and decodes nothing
+(Amendment 3 ruling 4); since rule S8 admits only integers every legal
+integer-string limit parses, a read's `ValueError` still means only "the other
+family" (Amendment 3 ruling 1). `json` is
 imported to decode stored text only; this module never serializes a
 document. Nothing here interprets a stored value (sections 46.1, 46.9), and
 nothing here counts `attributes_rejected` -- the caller that handles a
@@ -101,6 +105,16 @@ class IpAttributeRecords(Mapping[Address, IpAttributes]):
         # A fresh document on every read (Amendment 2 ruling D): the reader
         # owns it, and the view keeps its top level read-only.
         return MappingProxyType(json.loads(self._records[address]))
+
+    def __contains__(self, key: object) -> bool:
+        # Answered from the stored keys, decoding nothing (Amendment 3 ruling
+        # 4, assumption 68). The type test comes first, so anything that is
+        # not an Address -- an unhashable list or dict included -- is simply
+        # absent; then the family check, as for every other read.
+        if not isinstance(key, Address):
+            return False
+        self._check_family(key.family)
+        return key in self._records
 
     def __iter__(self) -> Iterator[Address]:
         return iter(self._records)

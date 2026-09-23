@@ -1,7 +1,8 @@
 """The per-IP attribute document's rules, implemented once.
 
 Spec: section 46.2, section 46.3, section 46.9; ADR-0015 decision 5
-(assumptions 31-36, 49-56, 59) and Amendment 2 (rulings A-C). Schema:
+(assumptions 31-36, 49-56, 59, 61-63), Amendment 2 (rulings A-C) and
+Amendment 3 (rulings 1 and 2). Schema:
 `schemas/ip_attributes.v1.json`.
 
 `canonicalize_ip_attributes` is the only place in the repo that states the
@@ -31,6 +32,16 @@ value is read, and an `int` is judged by its bit length before it is
 converted. The read is iterative, so at most about 1024 values are ever read,
 whatever the input's size, sharing or nesting.
 
+Each container read once (Amendment 3 ruling 2, "Bounded work" rule 5). A
+source `dict` or `list` met again after it has been read in full is not read
+again: a fresh copy of its canonical copy -- that copy read through the same
+reader, so built iteratively -- takes its place, and the running bound grows
+exactly as a re-read would have made it. The canonical document is therefore
+a tree. A container met again while it is still being read is a cycle (S7).
+What the cap does not bound is one pass over the entry table of each distinct
+`dict`, deleted slots included; rule 5 makes that one pass however often the
+dict is shared.
+
 The rules (ADR-0015 decision 5), on the copy. Structural, on every document
 whatever its `attributes_version`:
 
@@ -49,7 +60,11 @@ whatever its `attributes_version`:
   bytes -- the size returned;
 * S7 nesting too deep, a self-referencing structure and a shared subtree
   repeated past the cap are rejections, never a `RecursionError` or
-  `ValueError`.
+  `ValueError`;
+* S8 every integer, at any depth, has at most 640 decimal digits, the sign
+  not counted: `-10**640 < n < 10**640`, compared exactly on the copied
+  integer after its bit-length charge, never by converting it to text
+  (Amendment 3 ruling 1, assumptions 61 and 62).
 
 Registry, only when `attributes_version <= 1` (the highest version this build
 interprets; a higher one is stored and echoed verbatim, section 46.2):
@@ -61,7 +76,8 @@ interprets; a higher one is stored and echoed verbatim, section 46.2):
 
 What can come out (ruling C): a result, or `InvalidAttributesError`. There is
 no blanket `except Exception`; the one conversion kept is of a
-`RecursionError` or `ValueError` from the final serialization of the copy. A
+`RecursionError` or `ValueError` from the final serialization of the copy,
+and since S8 its `ValueError` half is a backstop only (assumption 55). A
 message is composed from the copy only: it names the rule broken and, where
 it helps, a key -- at most its first 64 characters -- and never a value from
 the document (section 46.9, assumption 36). The order the rules are checked in
@@ -95,6 +111,10 @@ _EXPERIMENTAL_KEY: Final = re.compile(r"^x_[a-z0-9_]{1,48}$")
 _QUOTED_KEY_CHARS: Final = 64
 #: S5: a UTF-16 surrogate code point, valid in a Python str, not in UTF-8.
 _SURROGATE: Final = re.compile("[\ud800-\udfff]")
+#: S8: every integer's magnitude is below this -- at most 640 decimal digits,
+#: the most every legal CPython integer-string limit converts both ways
+#: (assumption 61).
+_S8_BOUND: Final = 10**640
 #: A lower bound on log10(2), scaled by 100000, for counting an integer's
 #: decimal digits from its bit length without ever over-counting.
 _LOG10_2_FLOOR: Final = 30102
@@ -133,8 +153,9 @@ def canonicalize_ip_attributes(document: object) -> CanonicalAttributes:
         # about 512 levels deep (every level costs two bytes of S6).
         raise InvalidAttributesError("attributes is nested too deeply to serialize") from None
     except ValueError:
-        # Only an interpreter whose integer-to-string limit is below the
-        # digits S6 admits (assumption 54).
+        # A backstop only (assumption 55, as amended by Amendment 3 ruling 1):
+        # S8 admits no integer of more than 640 digits, which every legal
+        # integer-to-string limit prints, and S4 no non-finite float.
         raise InvalidAttributesError(
             f"attributes cannot be serialized within {_MAX_BYTES} bytes"
         ) from None
@@ -170,7 +191,8 @@ class _Frame(NamedTuple):
     keyed: bool
     #: The copied top-level key this container sits under; None for the root.
     top: str | None
-    #: id() of the source container, for naming a self-reference (S7).
+    #: id() of the container being read, for naming a self-reference (S7)
+    #: and for rule 5's memo once it has been read in full.
     source_id: int
 
 
@@ -182,10 +204,15 @@ class _Reader:
     smallest possible encoding (1 byte, and 2 for a key, `""`), and replaced
     by a larger figure once it is. Nothing here calls a method of a value
     from the document; every read goes through a base type's slot function.
+
+    `read_in_full` is rule 5's memo: the canonical copy of every container
+    read in full, keyed by the container's id(). The document keeps every
+    source object alive for the whole call, so no id is reused within it.
     """
 
     def __init__(self) -> None:
         self.total = 0
+        self.read_in_full: dict[int, Any] = {}
 
     def read(self, document: object) -> dict[str, object]:
         if not issubclass(type(document), dict):
@@ -209,6 +236,7 @@ class _Reader:
             if entry is _END:
                 stack.pop()
                 on_path.discard(frame.source_id)
+                self.read_in_full[frame.source_id] = frame.target
                 continue
             if frame.keyed:
                 # dict.items yields exact (key, value) tuples.
@@ -274,6 +302,11 @@ class _Reader:
             number = int.__int__(raw)
             if number < 0:
                 self._charge(1, top)
+            # S8, exactly, on the copy: never by converting it to text.
+            if not -_S8_BOUND < number < _S8_BOUND:
+                raise InvalidAttributesError(
+                    f"attributes contains an integer of more than 640 digits{_under(top)}"
+                )
             return number, None
         if issubclass(kind, float):
             real = float.__float__(raw)
@@ -284,24 +317,33 @@ class _Reader:
             self._charge(len(float.__repr__(real)) - 1, top)
             return real, None
         if issubclass(kind, list):
-            self._container(id(raw), top, on_path)
-            self._charge(_list_minimum(list.__len__(raw)) - 1, top)
+            source = self._container(raw, top, on_path)
+            self._charge(_list_minimum(list.__len__(source)) - 1, top)
             items: list[object] = []
-            return items, _Frame(list.__iter__(raw), items, False, top, id(raw))
+            return items, _Frame(list.__iter__(source), items, False, top, id(source))
         if issubclass(kind, dict):
-            self._container(id(raw), top, on_path)
-            self._charge(_dict_minimum(dict.__len__(raw)) - 1, top)
+            source = self._container(raw, top, on_path)
+            self._charge(_dict_minimum(dict.__len__(source)) - 1, top)
             entries: dict[str, object] = {}
-            return entries, _Frame(iter(dict.items(raw)), entries, True, top, id(raw))
+            return entries, _Frame(iter(dict.items(source)), entries, True, top, id(source))
         raise InvalidAttributesError(
             f"attributes contains a value{_under(top)} that is not in the JSON data model"
         )
 
-    @staticmethod
-    def _container(identity: int, top: str, on_path: set[int]) -> None:
-        # S7. The bound would reject a cycle anyway; this only names it.
+    def _container(self, raw: Any, top: str, on_path: set[int]) -> Any:
+        """What to read for the container `raw`: itself, or rule 5's copy.
+
+        A container still on the current path is a cycle (S7; the bound would
+        reject it anyway, this only names it). One already read in full is
+        not read again (rule 5): its canonical copy is read in its place,
+        through this same reader, which builds a fresh tree and charges
+        exactly what a re-read of `raw` would -- every charge depends only on
+        lengths, bit lengths, signs and float values, which the copy shares.
+        """
+        identity = id(raw)
         if identity in on_path:
             raise InvalidAttributesError(f"attributes refers to itself{_under(top)}")
+        return self.read_in_full.get(identity, raw)
 
     def _charge(self, amount: int, top: str | None) -> None:
         """Raise the running lower bound; reject under S6 the moment it passes the cap."""
