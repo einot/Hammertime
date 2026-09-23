@@ -33,10 +33,13 @@ the module does not exist yet and these tests are what it is written against:
             self, window: ShardWindow, ip: Address, *, config: DetectionConfig, reason: str
         ) -> EmittedTransition | None: ...
 
-and decision 4's five ordered steps: take `window.next_sequence` (and
-increment it), `await state_store.record_transition(...)` *before* the event
-exists, build the payload, publish the envelope to
-`TOPICS["hammertime.hot-ip.v1"]` under `key_selector(payload)`, then
+and decision 4's five ordered steps, in the order ADR-0016 decision 3 gives
+them (ADR-0011 Amendment 8): take `window.next_sequence` (and increment it);
+build the payload and the envelope and `encode` it -- a `CodecError` there
+propagates with nothing persisted, published or counted and the state in
+memory unchanged; `await state_store.record_transition(...)`, still *before*
+anything is published; publish the bytes encoded earlier to
+`TOPICS["hammertime.hot-ip.v1"]` under `key_selector(payload)`; then
 `window.set_state(ip, new)` and count the transition under `reason`.
 
 ASSUMPTIONS -- things decision 4 does not pin. Each is a judgment call;
@@ -88,6 +91,7 @@ from hammertime.aggregator.window.store import ShardWindow
 from hammertime.bus.memory import InMemoryBus
 from hammertime.core.addressing.address import Address
 from hammertime.core.config.models import DetectionConfig
+from hammertime.core.errors import CodecError
 from hammertime.core.events.codec import EventPayload, decode
 from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import HotIpAdded, HotIpRemoved
@@ -466,8 +470,10 @@ class TestTheEmittedRemoveEvent:
 
 
 class TestPersistBeforePublish:
-    """Decision 4 step 2: "the durable HOT set is updated **before** the event
-    exists"; a failure there aborts the transition.
+    """Decision 4 step 2, with its 2026-09-23 note (ADR-0016 decision 3): "the
+    durable HOT set is updated **before** the event is published"; a failure
+    there aborts the transition. The event is built and encoded before that
+    write, so step 2's original "before the event exists" no longer holds.
 
     Why it matters (decision 4's own reasoning): the opposite order can leave
     the trie holding an IP no owner knows about -- the permanent section 12
@@ -535,6 +541,43 @@ class TestPersistBeforePublish:
         # a *published* event describing a transition the store refused.
         assert "hammertime-store.internal" in str(caught.value)
         assert _records(bus) == []
+
+    async def test_an_encode_failure_persists_nothing(self) -> None:
+        # ADR-0016 decision 3: the event is encoded before the durable HOT set
+        # is written, so a `CodecError` from `encode` propagates with nothing
+        # persisted, nothing published, the state in memory unchanged and no
+        # transition counted; the sequence number is consumed (assumption 7).
+        # A window total of 10**5000 has 5,001 digits, over CPython's default
+        # integer-string limit, so `encode` cannot write it (ADR-0016 decision
+        # 2) -- this test relies on that default. Before ADR-0016 the store
+        # recorded HOT first and the encode failed afterwards.
+        clock = ManualClock(initial=BASE)
+        bus = InMemoryBus()
+        state_store = MemoryShardStateStore()
+        metrics = AggregatorMetrics()
+        emitter = _emitter(bus=bus, clock=clock, state_store=state_store, metrics=metrics)
+        window = _window(clock=clock)
+        _seed(window, IP_A, count=10**5000, state=IpState.COLD)
+
+        with pytest.raises(CodecError):
+            await emitter.evaluate(window, IP_A, config=DEFAULTS, reason="observation")
+
+        assert _records(bus) == []
+        persisted = await state_store.load(SHARD)
+        assert persisted.hot_ips == frozenset()
+        assert persisted.next_sequence == 0
+        assert window.state(IP_A) is IpState.COLD
+        assert window.next_sequence == 1
+        assert (
+            _counter(
+                metrics,
+                "cold_to_hot_transitions",
+                shard=SHARD,
+                config_version=DEFAULTS.config_version,
+                reason="observation",
+            )
+            == 0
+        )
 
 
 class TestSequenceNumbering:

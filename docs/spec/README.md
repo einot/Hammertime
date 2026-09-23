@@ -50,7 +50,7 @@ Section index used throughout the code:
 | 13, 38 | `HOT_PREFIX` predicate (single implementation) | `core/state/prefix.py`, `services/detector/rules/baseline.py`, `services/trie/query`, `docs/adr/0010` |
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` (`combine.py`, `local.py`), `docs/adr/0015` |
-| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013`, `docs/adr/0015` (Amendment 3 ruling 3: the codec's integer fields) |
+| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013`, `docs/adr/0015` (Amendment 3 ruling 3: the codec's integer fields), `docs/adr/0016` (decisions 1 and 2: the schemas' numeric bounds) |
 | 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py` incl. `partition_for`), `packages/hammertime-store` (`ShardStateStore`, incl. the shard lease), `services/ingest/publisher.py`, `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0004`, `docs/adr/0011`, `docs/adr/0013` (decisions 1, 6, 7) |
 | 22 | Consistency model | `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0003` (Amendments 2, 3), `docs/adr/0011` (decisions 4, 5), `docs/adr/0013` (decisions 4, 5, 7, 8), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
@@ -59,7 +59,7 @@ Section index used throughout the code:
 | 27 | Trie representation | `services/trie/structure/patricia.py`, `services/trie/structure/arena.py`, `docs/adr/0014` |
 | 28 | Atomicity | `services/trie/worker.py` |
 | 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010` |
-| 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `core/state/transitions.py`, `docs/adr/0011` |
+| 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `core/state/transitions.py`, `docs/adr/0011`, `docs/adr/0016` (decision 3: a transition is encoded before it is persisted) |
 | 39 | Processing algorithm (trie update: `add_hot_ip` / `remove_hot_ip` / pruning) | `services/trie/structure/binary_trie.py`, `services/trie/structure/patricia.py`, `docs/adr/0014` |
 | 32, 33 | Persistence & snapshots | `services/trie/snapshot`, `packages/hammertime-bus` (`ConsumedMessage.offset`, positional `subscribe`), `tools/provision`, `docs/adr/0010` (Amendment 1), `docs/adr/0013` (decisions 2, 9) |
 | 34 | Versioned configuration | `core/config`, `services/aggregator/reevaluate.py`, `docs/adr/0011` |

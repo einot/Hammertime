@@ -2,7 +2,7 @@
 
 Spec: section 19, section 32, section 46.2; ADR-0015 decision 5,
 Amendment 2 (ruling A) and Amendment 3 (ruling 3, assumptions 64-67); ADR-0011
-decision 3 step 1
+decision 3 step 1; ADR-0016 decisions 1 and 2
 
 The wire format is JSON. Every message is an `EventEnvelope` (see
 `envelope.py`) with a `payload` object whose field names match the relevant
@@ -33,6 +33,20 @@ string of ASCII digits `[0-9]+`. On encode each integer field must hold an
 accepted), `capacity` such an `int` `>= 0`, and the envelope is serialized
 with `allow_nan=False`, so no non-finite number reaches the wire.
 
+The eight payload integer fields are also held to the inclusive `minimum` and
+`maximum` their schema states, on decode and on encode alike (ADR-0016
+decisions 1 and 2): `RequestObservation`'s `sequence` (0 to 2**63 - 1),
+`window_seconds` (1 to 3600) and each `request_count` (0 to 1,000,000,000);
+`HotIpAdded`/`HotIpRemoved`'s `sequence` and `window_count` (>= 0) and
+`config_version` (>= 1); `PrefixStatsChanged`'s `hot_count` and `sequence`
+(>= 0). Where the schema states no maximum, none is added. A value outside
+its bounds is a `CodecError`; on decode the type check comes first, so an
+integral float such as `-1.0` is converted and then refused by the bound. The
+envelope's `sequence` and `config_version` gain no bounds (ADR-0016 assumption
+3), its `schema_version` stays pinned to 1 (ADR-0016 decision 1), and
+`capacity` keeps its `[0-9]+` rule. Each bound is a module constant mirroring
+its schema (ADR-0016 assumption 10).
+
 A `HotIpAdded`/`HotIpRemoved` payload's `attributes` document goes through
 `hammertime.core.events.attributes.canonicalize_ip_attributes`, the one
 implementation of the section 46.2 rules, on encode and on decode (ADR-0015
@@ -48,7 +62,7 @@ import json
 import math
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from hammertime.core.addressing.address import Address
 from hammertime.core.errors import CodecError, InvalidAddressError, InvalidAttributesError
@@ -77,6 +91,69 @@ _MAX_OBSERVATIONS = 10_000
 #: schemas/prefix_stats_event.v1.json: `capacity` is a decimal string -- ASCII
 #: digits only, not everything `int()` accepts (ADR-0015 assumption 65).
 _DECIMAL_STRING = re.compile(r"[0-9]+")
+
+
+class _Range(NamedTuple):
+    """A field's inclusive `minimum` and `maximum`; `None` where the schema
+    states no maximum (ADR-0016 decision 1)."""
+
+    minimum: int
+    maximum: int | None
+
+
+#: schemas/observation.v1.json: properties.sequence minimum and maximum.
+_OBSERVATION_SEQUENCE = _Range(0, 9_223_372_036_854_775_807)
+#: schemas/observation.v1.json: properties.window_seconds minimum and maximum.
+_OBSERVATION_WINDOW_SECONDS = _Range(1, 3600)
+#: schemas/observation.v1.json: observations.items.request_count minimum and
+#: maximum.
+_OBSERVATION_REQUEST_COUNT = _Range(0, 1_000_000_000)
+#: schemas/hot_ip_event.v1.json: properties.sequence minimum.
+_HOT_IP_SEQUENCE = _Range(0, None)
+#: schemas/hot_ip_event.v1.json: properties.window_count minimum.
+_HOT_IP_WINDOW_COUNT = _Range(0, None)
+#: schemas/hot_ip_event.v1.json: properties.config_version minimum.
+_HOT_IP_CONFIG_VERSION = _Range(1, None)
+#: schemas/prefix_stats_event.v1.json: properties.hot_count minimum.
+_PREFIX_STATS_HOT_COUNT = _Range(0, None)
+#: schemas/prefix_stats_event.v1.json: properties.sequence minimum.
+_PREFIX_STATS_SEQUENCE = _Range(0, None)
+
+
+def _range_violation(value: int, field: str, bounds: _Range) -> str | None:
+    """Why `value` is outside `bounds`, or None if it is inside.
+
+    The text names the field and the bound it broke, never the value
+    (ADR-0016 decision 1).
+    """
+    if value < bounds.minimum:
+        return f"{field} must be >= {bounds.minimum}"
+    if bounds.maximum is not None and value > bounds.maximum:
+        return f"{field} must be <= {bounds.maximum}"
+    return None
+
+
+def _bounded_json_integer(value: Any, field: str, bounds: _Range) -> int:
+    """Decode a bounded payload integer: a JSON integer, then its range.
+
+    Raises `ValueError`, which every caller turns into a `CodecError`
+    (ADR-0016 decision 1).
+    """
+    number = _json_integer(value, field)
+    violation = _range_violation(number, field, bounds)
+    if violation is not None:
+        raise ValueError(violation)
+    return number
+
+
+def _bounded_integer_field(value: object, field: str, bounds: _Range) -> int:
+    """Encode a bounded payload integer: `_integer_field`, then its range,
+    else `CodecError` (ADR-0016 decision 2)."""
+    number = _integer_field(value, field)
+    violation = _range_violation(number, field, bounds)
+    if violation is not None:
+        raise CodecError(violation)
+    return number
 
 
 def _json_integer(value: Any, field: str) -> int:
@@ -159,13 +236,17 @@ def _require(data: dict[str, Any], key: str) -> Any:
 def _encode_request_observation(payload: RequestObservation) -> dict[str, Any]:
     return {
         "agent_id": payload.agent_id,
-        "sequence": _integer_field(payload.sequence, "sequence"),
+        "sequence": _bounded_integer_field(payload.sequence, "sequence", _OBSERVATION_SEQUENCE),
         "window_start": _format_timestamp(payload.window_start),
-        "window_seconds": _integer_field(payload.window_seconds, "window_seconds"),
+        "window_seconds": _bounded_integer_field(
+            payload.window_seconds, "window_seconds", _OBSERVATION_WINDOW_SECONDS
+        ),
         "observations": [
             {
                 "ip": str(obs.ip),
-                "request_count": _integer_field(obs.request_count, "request_count"),
+                "request_count": _bounded_integer_field(
+                    obs.request_count, "request_count", _OBSERVATION_REQUEST_COUNT
+                ),
             }
             for obs in payload.observations
         ],
@@ -187,7 +268,9 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
             raise CodecError("each observation must be an object")
         try:
             ip = Address.parse(str(_require(item, "ip")))
-            request_count = _json_integer(_require(item, "request_count"), "request_count")
+            request_count = _bounded_json_integer(
+                _require(item, "request_count"), "request_count", _OBSERVATION_REQUEST_COUNT
+            )
             observations.append(Observation(ip=ip, request_count=request_count))
         except (TypeError, ValueError, OverflowError, InvalidAddressError) as exc:
             raise CodecError(f"malformed observation entry: {item!r}") from exc
@@ -195,9 +278,13 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
     try:
         return RequestObservation(
             agent_id=str(_require(data, "agent_id")),
-            sequence=_json_integer(_require(data, "sequence"), "sequence"),
+            sequence=_bounded_json_integer(
+                _require(data, "sequence"), "sequence", _OBSERVATION_SEQUENCE
+            ),
             window_start=_parse_timestamp(_require(data, "window_start"), field="window_start"),
-            window_seconds=_json_integer(_require(data, "window_seconds"), "window_seconds"),
+            window_seconds=_bounded_json_integer(
+                _require(data, "window_seconds"), "window_seconds", _OBSERVATION_WINDOW_SECONDS
+            ),
             observations=tuple(observations),
         )
     except (TypeError, ValueError, OverflowError) as exc:
@@ -223,9 +310,13 @@ def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) ->
         "ip": str(payload.ip),
         "family": payload.ip.family.value,
         "timestamp": _format_timestamp(payload.timestamp),
-        "sequence": _integer_field(payload.sequence, "sequence"),
-        "window_count": _integer_field(payload.window_count, "window_count"),
-        "config_version": _integer_field(payload.config_version, "config_version"),
+        "sequence": _bounded_integer_field(payload.sequence, "sequence", _HOT_IP_SEQUENCE),
+        "window_count": _bounded_integer_field(
+            payload.window_count, "window_count", _HOT_IP_WINDOW_COUNT
+        ),
+        "config_version": _bounded_integer_field(
+            payload.config_version, "config_version", _HOT_IP_CONFIG_VERSION
+        ),
     }
     if payload.attributes is not None:
         document["attributes"] = _canonical_attributes(payload.attributes)
@@ -236,9 +327,13 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
     try:
         ip = Address.parse(str(_require(data, "ip")))
         timestamp = _parse_timestamp(_require(data, "timestamp"), field="timestamp")
-        sequence = _json_integer(_require(data, "sequence"), "sequence")
-        window_count = _json_integer(_require(data, "window_count"), "window_count")
-        config_version = _json_integer(_require(data, "config_version"), "config_version")
+        sequence = _bounded_json_integer(_require(data, "sequence"), "sequence", _HOT_IP_SEQUENCE)
+        window_count = _bounded_json_integer(
+            _require(data, "window_count"), "window_count", _HOT_IP_WINDOW_COUNT
+        )
+        config_version = _bounded_json_integer(
+            _require(data, "config_version"), "config_version", _HOT_IP_CONFIG_VERSION
+        )
     except (TypeError, ValueError, OverflowError, InvalidAddressError) as exc:
         # attributes is deliberately excluded from this error message: it is
         # not yet validated at this point (that happens below) and has no
@@ -297,12 +392,14 @@ def _encode_capacity(capacity: object) -> str:
 def _encode_prefix_stats_changed(payload: PrefixStatsChanged) -> dict[str, Any]:
     return {
         "prefix": payload.prefix,
-        "hot_count": _integer_field(payload.hot_count, "hot_count"),
+        "hot_count": _bounded_integer_field(
+            payload.hot_count, "hot_count", _PREFIX_STATS_HOT_COUNT
+        ),
         # schemas/prefix_stats_event.v1.json: a decimal string, because IPv6
         # capacities exceed 64 bits. The in-process payload keeps capacity as
         # a Python int (arbitrary precision); only the wire form is a string.
         "capacity": _encode_capacity(payload.capacity),
-        "sequence": _integer_field(payload.sequence, "sequence"),
+        "sequence": _bounded_integer_field(payload.sequence, "sequence", _PREFIX_STATS_SEQUENCE),
         "timestamp": _format_timestamp(payload.timestamp),
     }
 
@@ -311,9 +408,13 @@ def _decode_prefix_stats_changed(data: dict[str, Any]) -> PrefixStatsChanged:
     try:
         return PrefixStatsChanged(
             prefix=str(_require(data, "prefix")),
-            hot_count=_json_integer(_require(data, "hot_count"), "hot_count"),
+            hot_count=_bounded_json_integer(
+                _require(data, "hot_count"), "hot_count", _PREFIX_STATS_HOT_COUNT
+            ),
             capacity=_decimal_string(_require(data, "capacity"), "capacity"),
-            sequence=_json_integer(_require(data, "sequence"), "sequence"),
+            sequence=_bounded_json_integer(
+                _require(data, "sequence"), "sequence", _PREFIX_STATS_SEQUENCE
+            ),
             timestamp=_parse_timestamp(_require(data, "timestamp"), field="timestamp"),
         )
     except (TypeError, ValueError, OverflowError) as exc:
@@ -387,6 +488,11 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
         # gets to raise JSONDecodeError. A few KB of adversarial input is
         # enough to trigger this, so it must surface as CodecError too.
         raise CodecError("envelope JSON is nested too deeply to parse") from exc
+    except UnicodeDecodeError as exc:
+        # Also a ValueError subclass, so it must precede the clause below or
+        # it would be misreported as an oversized numeric literal. The
+        # exception text quotes offending bytes, so it is left out here.
+        raise CodecError("envelope is not valid UTF-8") from exc
     except ValueError as exc:
         # CPython's int-string conversion limit (default 4300 digits)
         # raises a bare ValueError from inside json.loads for an oversized

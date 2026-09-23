@@ -35,7 +35,11 @@ fields accept JSON integers only, and the encoder writes no non-finite number;
 the aggregator therefore skips, as malformed, an observation message with a
 non-integer in such a field instead of applying a coerced value or, for an
 infinity, stopping, which is this ADR's one `CHANGES` entry. `a in records`
-answers without decoding the record)
+answers without decoding the record); amended 2026-09-23 by ADR-0016 (see
+"Amendment 4" at the end — the schemas' `minimum` and `maximum`, which
+Amendment 3 ruling 3 did not add, are now enforced by the codec on decode
+and on encode; two places in Amendment 3 gain dated notes, and nothing is
+reworded)
 
 Scope note: this ADR settles the interfaces epic #9 ("Metadata inheritance &
 hot-count aggregation") implements against —
@@ -2498,7 +2502,15 @@ why.)*
 
 *What is not changed.* Decode does not reject `NaN` or `Infinity` tokens at
 parse time (assumption 67). Schema minimums and maximums are not added
-(below).
+(below). *(Superseded 2026-09-23 by ADR-0016 decisions 1 and 2; Amendment
+4. Each payload integer field the codec reads is now refused, on decode and
+on encode, outside the `minimum` and `maximum` its schema states. The
+envelope's three integer fields still get no bounds.)* *(Corrected 2026-09-23
+after review, Amendment 4: "The envelope's three integer fields still get no
+bounds" was imprecise. Two of them, `sequence` and `config_version`, get none
+(ADR-0016 assumption 3). The third, `schema_version`, is pinned to exactly 1
+(ADR-0016 decision 1: "still pinned to 1"): `decode` and `encode` both refuse
+any other value as a `CodecError`.)*
 
 **4. `a in records` answers without decoding the record** (reviewer). The
 override — `False` for a non-`Address`, the family `ValueError`, then key
@@ -2522,7 +2534,9 @@ supplies.
   part of these findings.
 * **The schemas' `minimum` and `maximum` are not enforced by the codec.**
   Examples: `sequence >= 0`, `window_seconds` 1-3600, `request_count <= 10**9`.
-  Out of scope here.
+  Out of scope here. *(Ruled 2026-09-23 by ADR-0016, after issue #112 showed
+  that a negative `request_count` stopped the aggregator and crash-looped it
+  on the redelivery. Amendment 4.)*
 * **The description of `x_` values in `schemas/ip_attributes.v1.json`** could
   mention S8 beside the 1024-byte cap it already names ("not expressible
   here"). It is a description-only edit to `schemas/`, which this dispatch was
@@ -2665,3 +2679,70 @@ kept every ruling, and changed the following:
   `__contains__`; dated notes on assumptions 27, 39, 55 and 60; the second note on
   the Consequences bullet "`hammertime-core` changes shape but not wire
   behaviour"; and the README's §19 row. All are listed above.
+
+## Amendment 4 (2026-09-23) — by ADR-0016: the codec enforces the schemas' `minimum` and `maximum`
+
+Why: Amendment 3 ruling 3 made the codec's integer fields accept JSON
+integers only. It said "Schema minimums and maximums are not added" and
+listed them as found and not ruled. Issue #112 then showed what that left
+open. A negative `request_count` decodes. The aggregator's window raises on
+it, which stops the service, and the redelivered message stops it again.
+
+ADR-0016 rules the bounds in its decisions 1 and 2. Each payload integer
+field the codec reads is now refused, on decode and on encode, outside the
+`minimum` and `maximum` its schema states. ADR-0016 follows ruling 3's
+reasoning: the contract belongs in the codec, not in a wider `except` in one
+consumer (assumption 64), and the encoder refuses what the decoder would
+refuse (assumption 66). The notes below point there; nothing in this ADR is
+reworded.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended 2026-09-23 by ADR-0016" clause.
+* **Amendment 3, ruling 3, "*What is not changed.*"** A dated note follows
+  "Schema minimums and maximums are not added (below)." It says that
+  ADR-0016 decisions 1 and 2 add them, and that the envelope's three integer
+  fields still get none. The sentence itself is kept. *(Corrected 2026-09-23
+  after review: "the envelope's three integer fields still get none" was
+  imprecise, here and in the note. `sequence` and `config_version` get none;
+  `schema_version` is pinned to exactly 1. A second dated note, after the
+  first, says so. See "Corrected after review" below.)*
+* **Amendment 3, "Found while ruling, not ruled here", third bullet.** A
+  dated note says ADR-0016 rules it.
+
+What is **not** changed: ruling 3's type rule and its list of fields;
+`capacity`'s rule (assumption 65); assumptions 64 to 69; decision 5's
+"`CodecError` only" rows. ADR-0016 builds on all of them. **No `CHANGES`
+entry** for this amendment by itself: ADR-0016's implementing change carries
+one line (its assumption 12).
+
+### Corrected after review (2026-09-23)
+
+Review of issue #112's change found that this amendment, in the note it
+added to ruling 3's "*What is not changed.*" and in its bullet above, said
+the envelope's three integer fields get no bounds. Two of them, `sequence`
+and `config_version`, get none (ADR-0016 assumption 3). The third,
+`schema_version`, is pinned to exactly 1: `decode` and `encode` both refuse
+any other value as a `CodecError` (`hammertime.core.events.codec`, read in
+this repository). ADR-0016 already says so precisely: its decision 1 lists
+"the envelope's `schema_version` (still pinned to 1), `sequence` and
+`config_version` (assumption 3)" as not changed.
+
+Every edit these corrections make is an insertion. Where one corrects
+existing wording, that wording is kept, and quoted here:
+
+* **Amendment 3, ruling 3, "*What is not changed.*"** A second dated note
+  after the first, whose last sentence is "The envelope's three integer
+  fields still get no bounds."
+* **This amendment, the "Amendment 3, ruling 3" bullet.** A dated
+  correction after "and that the envelope's three integer fields still get
+  none. The sentence itself is kept."
+* **This amendment.** This subsection.
+
+Assumptions made by these corrections (push back individually):
+
+* **Annotated, not reworded.** Both sentences are kept, each with a dated
+  correction after it, because the status line and this amendment say
+  nothing in this ADR is reworded. Push back if a reworded note, with the
+  old sentence quoted, is preferred.
+* **No `CHANGES` entry.** Wording only; the codec's behaviour is unchanged.

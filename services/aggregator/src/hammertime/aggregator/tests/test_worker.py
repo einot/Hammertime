@@ -13,7 +13,10 @@ shutdown, the `hammertime-aggregator` group), ADR-0010 decision 6 (one bucket
 per observation, over-long windows), ADR-0011 decision 3 (the outcomes and
 the worker's three steps), decision 6 (maintenance order, acknowledgement
 cadence, shutdown), decision 8 (metrics), Amendment 2 items A9 (flooring) and
-A11 (a demotion on the observation path), and ADR-0013 decision 8 (the
+A11 (a demotion on the observation path), ADR-0016 decision 4 (an observation
+whose `request_count`, payload `sequence` or `window_seconds` is outside
+`schemas/observation.v1.json`'s bounds is `MALFORMED` at decode,
+`TestOutOfRangeObservationFields`), and ADR-0013 decision 8 (the
 aggregator acknowledges what it handled; `REDELIVERED` is the eighth outcome;
 there is no revocation path -- a shard changes hands by `stop()` and
 `start()`), decision 5 (`ack_wait` redelivery is a supported input) and
@@ -186,11 +189,14 @@ the event loop with `asyncio.sleep(0)`.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import pytest
 from hammertime.aggregator.lateness import ObservationOutcome
 from hammertime.aggregator.metrics import AggregatorMetrics
 from hammertime.aggregator.window.store import ShardWindow
@@ -302,6 +308,41 @@ def _observation(
             payload=payload,
         )
     )
+
+
+def _out_of_range_observation(
+    ip: Address,
+    *,
+    request_count: int | None = None,
+    window_seconds: int | None = None,
+    payload_sequence: int | None = None,
+    sequence: int = 1,
+) -> bytes:
+    """`_observation(ip, 1, ...)` with payload integers edited in the encoded JSON.
+
+    ADR-0016 decision 2 (and its assumption 4): `encode` refuses an
+    out-of-range payload integer, so such a message can only be built by
+    editing encoded bytes, the way `test_codec.py`'s `_tamper_nested` does.
+    Only keys inside `payload` are edited, so `event_id` stays valid; the
+    envelope's own `sequence` is left alone. Each edited key is first checked
+    to be on the wire as an integer, so a key that is not there fails rather
+    than being added and ignored.
+    """
+
+    doc = json.loads(_observation(ip, 1, sequence=sequence))
+    payload = doc["payload"]
+    entry = payload["observations"][0]
+    edits: list[tuple[dict[str, Any], str, int | None]] = [
+        (entry, "request_count", request_count),
+        (payload, "window_seconds", window_seconds),
+        (payload, "sequence", payload_sequence),
+    ]
+    for target, key, value in edits:
+        if value is None:
+            continue
+        assert type(target.get(key)) is int, f"{key!r} is not an integer on the wire"
+        target[key] = value
+    return json.dumps(doc).encode("utf-8")
 
 
 def _hot_ip_event(ip: Address) -> bytes:
@@ -1995,3 +2036,271 @@ class TestTheInstanceToken:
         assert second.instance_id
         assert first.instance_id != second.instance_id
         assert first.claims.lease_owner != second.claims.lease_owner
+
+
+def _observation_schema_bounds(*pointer: str) -> tuple[int, int]:
+    """`(minimum, maximum)` of one integer property of `schemas/observation.v1.json`.
+
+    ADR-0016 assumption 10: the tests read each bound from the schema file,
+    found by walking up from this file the way `test_codec.py` does, so a
+    schema edit moves these tests with it. `pointer` is the key path to the
+    property; both bounds must be stated there as JSON integers.
+    """
+
+    for parent in Path(__file__).resolve().parents:
+        schema = parent / "schemas" / "observation.v1.json"
+        if schema.is_file():
+            break
+    else:
+        raise AssertionError("no schemas/observation.v1.json above this test file")
+    target: Any = json.loads(schema.read_text(encoding="utf-8"))
+    for key in pointer:
+        assert key in target, f"observation.v1.json: {key!r} missing on the way to {pointer!r}"
+        target = target[key]
+    minimum = target.get("minimum")
+    maximum = target.get("maximum")
+    assert type(minimum) is int, (pointer, minimum)
+    assert type(maximum) is int, (pointer, maximum)
+    return minimum, maximum
+
+
+_REQUEST_COUNT_MIN, _REQUEST_COUNT_MAX = _observation_schema_bounds(
+    "properties", "observations", "items", "properties", "request_count"
+)
+_WINDOW_SECONDS_MIN, _WINDOW_SECONDS_MAX = _observation_schema_bounds(
+    "properties", "window_seconds"
+)
+_SEQUENCE_MIN, _SEQUENCE_MAX = _observation_schema_bounds("properties", "sequence")
+
+
+class TestOutOfRangeObservationFields:
+    """ADR-0016 decision 4 (issue #112): with decision 1's bounds in the codec,
+    an observation whose `request_count`, payload `sequence` or
+    `window_seconds` is outside the inclusive `minimum`/`maximum` that
+    `schemas/observation.v1.json` states -- read from the file by
+    `_observation_schema_bounds`, not restated here -- is `MALFORMED` through
+    the worker's existing `_decode`: logged, counted in
+    `observations_rejected{reason="malformed"}`, not diverted (ADR-0011
+    assumption 10), not applied, and marked handled so it is acknowledged at
+    the next commit. The consumer carries on (ADR-0011 decision 3 step 1, as
+    amended 2026-09-23). Every such message is built by editing encoded JSON
+    (`_out_of_range_observation`), because `encode` refuses to write one.
+    """
+
+    async def _handle(
+        self, *, value: bytes
+    ) -> tuple[InMemoryBus, AggregatorMetrics, ObservationOutcome, ShardWindow]:
+        """Deliver one message about `IP_A`, keyed by it, to a fresh worker."""
+
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        metrics = AggregatorMetrics()
+        feed = _Feed(bus)
+        async with _running(_worker(bus=bus, clock=clock, metrics=metrics)) as worker:
+            outcome = await feed.deliver(worker, key=str(IP_A), value=value)
+            window = _window_of(worker)
+        return bus, metrics, outcome, window
+
+    async def test_a_negative_request_count_is_malformed_and_the_consumer_carries_on(
+        self,
+    ) -> None:
+        # ADR-0016 context, defect 1 -- the issue's repro. Before the fix the
+        # decoded -1 reached `IpCounter.observe`, whose `ValueError` escaped
+        # `handle()` and stopped the consumer. -1 is the issue's own input; it
+        # is out of range only because the schema's minimum is above it.
+        assert _REQUEST_COUNT_MIN > -1
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        metrics = AggregatorMetrics()
+        feed = _Feed(bus)
+        async with _running(_worker(bus=bus, clock=clock, metrics=metrics)) as worker:
+            outcome = await feed.deliver(
+                worker, key=str(IP_A), value=_out_of_range_observation(IP_A, request_count=-1)
+            )
+
+            assert outcome is ObservationOutcome.MALFORMED
+            assert _records(bus, RECONCILIATION_TOPIC) == []
+            assert _records(bus, HOT_IP_TOPIC) == []
+            window = _window_of(worker)
+            assert window.tracked_count == 0
+            assert _counter(metrics, "observations_rejected", reason="malformed") == 1
+            # Marked handled, so the next commit acknowledges it.
+            assert feed.last is not None
+            assert worker.claims.handled_position(0) == feed.last.offset + 1
+
+            following = await feed.deliver(
+                worker, key=str(IP_B), value=_observation(IP_B, 5, window_start=BASE)
+            )
+
+            assert following is ObservationOutcome.APPLIED
+            assert window.total(IP_B) == 5
+            assert window.is_tracked(IP_A) is False
+
+    async def test_a_negative_request_count_is_acknowledged(self) -> None:
+        # ADR-0016 decision 4 and assumption 8: every message is again
+        # acknowledged on one of ADR-0013 decision 8's paths, so decision 5's
+        # `max_deliver = -1` premise holds -- the message is not handed to the
+        # next member of the group, which is what made the crash loop.
+        assert _REQUEST_COUNT_MIN > -1
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        metrics = AggregatorMetrics()
+        feed = _Feed(bus)
+        async with _running(_worker(bus=bus, clock=clock, metrics=metrics)) as worker:
+            assert (
+                await feed.deliver(
+                    worker, key=str(IP_A), value=_out_of_range_observation(IP_A, request_count=-1)
+                )
+                is ObservationOutcome.MALFORMED
+            )
+            assert feed.last is not None
+            assert worker.claims.handled_position(0) == feed.last.offset + 1
+
+        await feed.publish(key=str(IP_B), value=_observation(IP_B, 1, window_start=BASE))
+        resumed = bus.consumer(GROUP)
+        message = await _take_one(await resumed.subscribe(OBSERVATIONS_TOPIC))
+
+        assert message.key == str(IP_B).encode()
+
+    async def test_one_above_the_request_count_maximum_is_malformed(self) -> None:
+        # ADR-0016 decision 1: the schema's maximum (1000000000) is inclusive,
+        # so one above it is out of range.
+        bus, metrics, outcome, window = await self._handle(
+            value=_out_of_range_observation(IP_A, request_count=_REQUEST_COUNT_MAX + 1)
+        )
+
+        assert outcome is ObservationOutcome.MALFORMED
+        assert window.tracked_count == 0
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert _counter(metrics, "observations_rejected", reason="malformed") == 1
+
+    async def test_the_request_count_maximum_is_applied_and_promotes_the_ip(self) -> None:
+        # ADR-0016 decision 1: the schema's maximum (1000000000) is in range.
+        # Under the defaults (`hot_threshold` 1000) it makes the IP HOT.
+        assert DEFAULTS.hot_threshold <= _REQUEST_COUNT_MAX
+        bus, metrics, outcome, window = await self._handle(
+            value=_observation(IP_A, _REQUEST_COUNT_MAX, window_start=BASE)
+        )
+
+        assert outcome is ObservationOutcome.APPLIED
+        assert window.total(IP_A) == _REQUEST_COUNT_MAX
+        assert window.state(IP_A) is IpState.HOT
+        assert [envelope.event_type for _key, envelope in _decoded(bus)] == ["HotIpAdded"]
+        assert _counter(metrics, "observations_rejected", reason="malformed") == 0
+
+    async def test_the_second_trigger_no_longer_fires(self) -> None:
+        # ADR-0016 context, defect 2, and decision 4 ("The second trigger
+        # cannot happen"). A COLD IP receives 1, then `10**4300 - 1`: 4,300
+        # digits, which `json.loads` still parses under CPython's default
+        # integer-string limit (ADR-0015 assumption 61) -- this test relies on
+        # that default. Before the fix the window total became `10**4300`,
+        # the store recorded HOT, and encoding the `HotIpAdded` raised out of
+        # `handle()`. Now the second message is `MALFORMED` and nothing moves.
+        assert _REQUEST_COUNT_MAX < 10**4300 - 1
+        clock = ManualClock(initial=BASE)
+        bus = _TappedBus()
+        metrics = AggregatorMetrics()
+        state_store = MemoryShardStateStore()
+        feed = _Feed(bus)
+        async with _running(
+            _worker(bus=bus, clock=clock, metrics=metrics, state_store=state_store)
+        ) as worker:
+            window = _window_of(worker)
+            assert window.state(IP_A) is IpState.COLD
+
+            first = await feed.deliver(
+                worker, key=str(IP_A), value=_observation(IP_A, 1, window_start=BASE)
+            )
+            assert first is ObservationOutcome.APPLIED
+
+            second = await feed.deliver(
+                worker,
+                key=str(IP_A),
+                value=_out_of_range_observation(IP_A, request_count=10**4300 - 1, sequence=2),
+            )
+
+            assert second is ObservationOutcome.MALFORMED
+            assert window.total(IP_A) == 1
+            assert window.state(IP_A) is IpState.COLD
+            assert _records(bus, HOT_IP_TOPIC) == []
+            assert (await state_store.load(0)).hot_ips == frozenset()
+
+            following = await feed.deliver(
+                worker, key=str(IP_B), value=_observation(IP_B, 5, window_start=BASE, sequence=3)
+            )
+
+            assert following is ObservationOutcome.APPLIED
+            assert window.total(IP_B) == 5
+
+    @pytest.mark.parametrize(
+        "window_seconds",
+        [_WINDOW_SECONDS_MIN - 1, _WINDOW_SECONDS_MAX + 1],
+        ids=["minimum-minus-1", "maximum-plus-1"],
+    )
+    async def test_a_window_seconds_outside_the_schema_is_malformed_not_diverted(
+        self, window_seconds: int
+    ) -> None:
+        # ADR-0016 decision 4 and assumption 5: below the schema's minimum (1)
+        # or above its maximum (3600) is `MALFORMED` -- dropped and counted as
+        # malformed. Before the fix, 0 was applied and 3601 (> the 300 s
+        # configured window) was diverted as `WINDOW_TOO_LONG`.
+        bus, metrics, outcome, window = await self._handle(
+            value=_out_of_range_observation(IP_A, window_seconds=window_seconds)
+        )
+
+        assert outcome is ObservationOutcome.MALFORMED
+        assert window.tracked_count == 0
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        assert _records(bus, HOT_IP_TOPIC) == []
+        assert _counter(metrics, "observations_rejected", reason="malformed") == 1
+        assert _counter(metrics, "observations_rejected", reason="window_too_long") == 0
+
+    async def test_the_window_seconds_maximum_is_still_window_too_long(self) -> None:
+        # ADR-0016 decision 4: `WINDOW_TOO_LONG` "still covers every
+        # `window_seconds` above `config.window_seconds` up to 3600". This case
+        # exists only while the schema's maximum exceeds the configured window
+        # `_handle`'s worker runs with (300 s); at or below it, the maximum
+        # would be applied, not diverted.
+        assert DEFAULTS.window_seconds < _WINDOW_SECONDS_MAX
+        value = _observation(IP_A, 1200, window_start=BASE, window_seconds=_WINDOW_SECONDS_MAX)
+
+        bus, metrics, outcome, window = await self._handle(value=value)
+
+        assert outcome is ObservationOutcome.WINDOW_TOO_LONG
+        assert _records(bus, RECONCILIATION_TOPIC) == [(str(IP_A).encode(), value)]
+        assert window.tracked_count == 0
+        assert _counter(metrics, "observations_rejected", reason="window_too_long") == 1
+        assert _counter(metrics, "observations_rejected", reason="malformed") == 0
+
+    @pytest.mark.parametrize(
+        "payload_sequence",
+        [_SEQUENCE_MIN - 1, _SEQUENCE_MAX + 1],
+        ids=["minimum-minus-1", "maximum-plus-1"],
+    )
+    async def test_a_payload_sequence_outside_the_schema_is_malformed(
+        self, payload_sequence: int
+    ) -> None:
+        # ADR-0016 decision 4: "A payload `sequence` below 0 or above 2**63 - 1
+        # is `MALFORMED`. It used to be applied". Both bounds are the schema's.
+        bus, metrics, outcome, window = await self._handle(
+            value=_out_of_range_observation(IP_A, payload_sequence=payload_sequence)
+        )
+
+        assert outcome is ObservationOutcome.MALFORMED
+        assert window.tracked_count == 0
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        assert _counter(metrics, "observations_rejected", reason="malformed") == 1
+
+    async def test_the_payload_sequence_maximum_is_applied(self) -> None:
+        # ADR-0016 decision 1: the schema's maximum (2**63 - 1) is inclusive.
+        # Edited in the payload only, like the out-of-range cases, so the
+        # envelope is the same shape in all three.
+        bus, metrics, outcome, window = await self._handle(
+            value=_out_of_range_observation(IP_A, payload_sequence=_SEQUENCE_MAX)
+        )
+
+        assert outcome is ObservationOutcome.APPLIED
+        assert window.total(IP_A) == 1
+        assert _records(bus, RECONCILIATION_TOPIC) == []
+        assert _counter(metrics, "observations_rejected", reason="malformed") == 0
