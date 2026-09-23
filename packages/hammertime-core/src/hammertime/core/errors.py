@@ -1,7 +1,5 @@
 """Domain errors shared across services."""
 
-from __future__ import annotations
-
 
 class HammertimeError(Exception):
     """Base class for all Hammertime domain errors."""
@@ -13,6 +11,19 @@ class InvalidAddressError(HammertimeError):
 
 class InvalidPrefixError(HammertimeError):
     """Prefix length is outside [0, bit_length] or host bits are set."""
+
+
+class InvalidAttributesError(HammertimeError):
+    """A per-IP attribute document breaks a spec section 46.2 rule.
+
+    Raised by `hammertime.core.events.attributes.canonicalize_ip_attributes`
+    (and so by `validate_ip_attributes`, its measuring form), the one
+    implementation of those rules (ADR-0015 decision 5). Deliberately
+    neither a `ValueError` nor a `CodecError` (ADR-0015 assumption 31): it is
+    bad *input*, which a caller must be able to tell from a bad call (a
+    family-mismatch `ValueError`), and a record-map rejection involves no
+    envelope. Its message never contains a value from the document.
+    """
 
 
 class ConfigurationError(HammertimeError):
