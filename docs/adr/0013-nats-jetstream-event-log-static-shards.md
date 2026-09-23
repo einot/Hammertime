@@ -90,7 +90,12 @@ a JetStream stream that holds no record to replay, such as a freshly
 provisioned one, so `MessageBus` gains `first_offset`, the first offset
 the log still retains, and a positional reader counts every offset below
 it as passed; decisions 3 and 9, assumption 20 and Consequences carry
-dated notes).
+dated notes); amended an eleventh time 2026-09-23 (see "Amendment 11" —
+flagged during the trie epic's slice 1 and listed in ADR-0017 Amendment
+1: when both of their errors apply, an unregistered topic on a `NatsBus`
+that has not started, `end_offset` and `first_offset` raise `KeyError`,
+the order the shipped code and the bus tests already follow; decision 3
+carries a dated note).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
@@ -571,6 +576,13 @@ has emptied reports `last_seq + 1`, and neither holds a message there
 (Amendment 10, Sources). `InMemoryBus.first_offset` is `0` for every
 topic. The memory log never discards, so `0` is the first index of a
 non-empty log, and it is also an empty log's `end_offset`.
+
+*Which error, when both apply (added 2026-09-23, Amendment 11). On
+`NatsBus`, `end_offset(topic)` and `first_offset(topic)` check the topic
+before they use the connection. An unregistered topic is therefore a
+`KeyError` whether or not the bus has started, and `RuntimeError("NatsBus
+is not started")` is raised only for a registered topic before `start()`.
+`InMemoryBus` raises neither.*
 
 **`Producer.publish(topic, key, value, *, message_id=None)`** appends
 `value` to partition `partition_for(key, TOPICS[topic].partitions)` of
@@ -5208,3 +5220,74 @@ ADR-0017's Sources):
   `InMemoryBus`; `packages/hammertime-bus/src/hammertime/bus/tests/test_memory_bus.py`
   (`TestEndOffset`); the audit's finding as relayed by the top-level
   session.
+
+## Amendment 11 (2026-09-23) — which error the offset reads raise when both apply (ADR-0017 Amendment 1)
+
+Why: decision 3's `first_offset` paragraph (Amendment 10) says that the
+method "raises what `end_offset` raises: `KeyError` for an unregistered
+topic on `NatsBus`, and `RuntimeError` before `NatsBus.start()`". It does
+not say which of the two an unregistered topic raises on a bus that has
+not started. The bus tests written for Amendment 10
+(`TestNatsBusOffsetReads` in
+`packages/hammertime-bus/src/hammertime/bus/tests/test_streams.py`) pin
+`KeyError` for both methods, and record that as their own assumption
+(their ASSUMPTION 6). They take it from the order decision 3 gives
+`NatsConsumer.subscribe()` (Amendment 1 ruling C5.6). The point was
+flagged during the trie epic's slice 1, and ADR-0017 Amendment 1 lists
+this amendment with the other follow-ups.
+
+Ruling: **`KeyError`, confirmed.** `NatsBus.end_offset(topic)` and
+`NatsBus.first_offset(topic)` check the topic first. An unregistered topic
+is a `KeyError` whether or not the bus has started. `RuntimeError` is
+raised only for a registered topic before `start()`. The reasons:
+
+1. **It is `subscribe()`'s order.** Decision 3 raises the unregistered
+   topic on `NatsConsumer.subscribe()` "with the other argument checks
+   before the broker is contacted" (Amendment 1 ruling C5.6). The two
+   reads take the same argument, and answer it the same way.
+2. **The argument error is permanent, and the lifecycle error is not.** No
+   later `start()` makes an unregistered topic valid, while `start()`
+   cures the `RuntimeError`. With the topic checked first, a call with a
+   given topic fails the same way at every point in the bus's life. Only
+   a call that could succeed later is told that the bus has not started.
+3. **Nothing changes.** The shipped reads look the topic up in `TOPICS`
+   before they ask for the JetStream context, and the tests pin that.
+
+No production caller meets the case. The trie reads both offsets for
+`hammertime.hot-ip.v1`, a registered topic, and only after
+`NatsBus.start()` has returned (ADR-0017 decisions 4 and 13). The ruling
+binds tests, and later callers such as `tools/replay`.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended an eleventh time 2026-09-23"
+  clause.
+* **Decision 3.** A dated italic paragraph after the `first_offset`
+  paragraph. The paragraph's own text is unchanged.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+139. **The argument is checked before the lifecycle.** The alternative was
+     `RuntimeError` first, on the rule that nothing on the bus works
+     before `start()`. It was not chosen because it reverses
+     `subscribe()`'s order, and it would cost a code change and a test
+     change for no caller's benefit.
+140. **Only the two reads are ruled.** `NatsProducer.publish` has the same
+     two errors, and the shipped code checks its topic first too. But
+     decision 3 does not rule its order, no test pins it, and this
+     amendment was asked only about the reads.
+141. **The tests need no change.** `TestNatsBusOffsetReads` already
+     asserts the ruled order. Its ASSUMPTION 6 comment still describes
+     the point as open. Updating that comment is optional, and is
+     `test-author`'s.
+142. **No `CHANGES` entry.** The order is internal to the repository, and
+     nothing observable changes.
+
+Read on 2026-09-23 for this amendment. No web source was consulted.
+Repository facts: `packages/hammertime-bus/src/hammertime/bus/nats.py`
+(`NatsBus.end_offset` and `first_offset` evaluate `TOPICS[topic]` before
+`self._require_js()`, and so do `NatsConsumer.subscribe` and
+`NatsProducer.publish`); `memory.py` (`InMemoryBus.end_offset` reads a
+`defaultdict`, and `first_offset` returns `0`, so neither raises);
+`tests/test_streams.py` (`TestNatsBusOffsetReads` and its ASSUMPTION 6).

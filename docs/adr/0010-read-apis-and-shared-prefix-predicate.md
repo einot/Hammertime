@@ -282,6 +282,10 @@ Ruling (ADR-0013 decision 9, restated so it can be read from this ADR):
    iterator yields them, and never acknowledges. There is no
    `hammertime-trie` durable consumer; ADR-0009 decision 9's name is
    unused by the trie.
+
+   > Amended 2026-09-23: "`start_offset=1` with no snapshot" is stale.
+   > ADR-0013 Amendment 1 ruling C5.7 changed it to `start_offset=0` on
+   > 2026-09-21; ADR-0017 decision 3 gives the trie's start as built.
 2. The snapshot records `replay_position: int`, the `offset` of the last
    hot-ip message applied before the snapshot was written. That integer is
    §33's "event sequence number"; after loading a snapshot the trie replays

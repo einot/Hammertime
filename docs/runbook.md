@@ -37,6 +37,17 @@ snapshot's `event_sequence` (§33). Time-to-ready is reported as
   `HAMMERTIME_STARTUP_TIMEOUT_S`. A trie that keeps failing its start with
   `start_failed reason=startup_timeout` needs a longer deadline, or a newer
   snapshot.
+
+  Two causes give the same repeated failure without the replay being slow
+  (ADR-0017 assumption 19, its first and third cases): the last record in
+  the hot-ip log is one the bus skips, for which the trie logs a
+  `malformed_subject` warning; or records at the end of the hot-ip stream
+  were deleted while earlier ones remain. Either needs someone to have
+  written to the stream, or deleted from it, outside Hammertime's own
+  services. The replay then waits for a record that is not coming, and
+  only the next hot-ip transition ends the wait: until one is published,
+  every start waits again. A longer `HAMMERTIME_STARTUP_TIMEOUT_S` does
+  not help in these cases.
 * **A corrupt trie.** A trie that finds its own structure corrupt logs
   `trie_invariant_violation` and exits 1. The restart is the rebuild: do
   not patch the state by hand.
