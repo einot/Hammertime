@@ -6,19 +6,35 @@ applied event), section 33 (replay), section 35 (one root per family), section
 37 and section 46.8 (the counters), section 46.5 (the trie and the attribute
 record move in one step).
 
-Written from ADR-0017 decisions 3-10 and 12 and its "Test seams", with the
-documents it cites (ADR-0013 decision 9: the whole-topic positional
-subscription and `end_offset`; ADR-0014 A12: `InvariantViolation`; ADR-0015
+Written from ADR-0017 decisions 3-10 and 12, its "Test seams" and its
+"Revision 2026-09-23", with the documents it cites (ADR-0013 decision 9: the
+whole-topic positional subscription and `end_offset`; ADR-0013 decision 3 and
+Amendment 10: `first_offset`; ADR-0014 A12: `InvariantViolation`; ADR-0015
 decision 6: `apply_hot_ip_added` / `apply_hot_ip_removed`). What is pinned:
 
-* `start()` reads `end_offset` before subscribing, keeps it as
-  `replay_target`, and handles messages until caught up (`end <= S`, or
-  `event_sequence >= end`); a second `start()` returns at once (decision 4);
+* `start()` reads `end_offset`, then `first_offset`, both before subscribing,
+  keeps `end` as `replay_target`, and handles messages until caught up
+  (`event_sequence >= end`); a second `start()` returns at once (decision 4
+  steps 1, 2 and 5);
+* decision 4 step 3: when `first > event_sequence`, `start()` passes the
+  offsets below `first` (`note_passed(first - 1)`) before subscribing, so a
+  log that holds nothing to replay -- never written, every record aged out or
+  purged, or a `first` read after `end` that exceeds it -- is caught up at
+  once with `event_sequence == first`; a log whose head has aged out is
+  replayed from `first`; the step does not run when `first <=
+  event_sequence`, and is skipped once `stop()` has begun (assumption 29);
+  a restarted trie does not report a smaller `event_sequence` than its
+  predecessor (decision 8, assumption 26);
+* an exception from `first_offset` propagates out of `start()` before
+  anything is subscribed (decision 7's table);
 * `start()` subscribes with `subscribe(HOT_IP.name, start_offset=S)`,
-  `partitions=None` and no listener, where `S` is `0` for a fresh state and
-  `position + 1` for one that already has a position (decision 3); a stream
-  that ends before the worker is caught up is a `RuntimeError`, and once
-  `stop()` has begun `start()` returns without being caught up (decision 4);
+  `partitions=None` and no listener, where `S` is `state.event_sequence`
+  after step 3: `0` for a fresh state on the memory bus and `position + 1`
+  for one that already has a position (decision 3); a stream that ends
+  before the worker is caught up is a `RuntimeError`, and once `stop()` has
+  begun `start()` returns without being caught up (decision 4 step 5);
+* `replay_complete` is logged at INFO with `start_offset`, `first_offset`,
+  `replay_target` and `event_sequence` (decision 12's table);
 * `handle()` returns one of six outcomes, in decision 6's order:
   REDELIVERED (offset not past `position`), MALFORMED (codec error; payload not
   a hot-ip event; key or subject not the payload's IP), FAMILY_NOT_SERVED,
@@ -54,14 +70,17 @@ Choices of this file's own:
   paragraph says nothing requires the message to come from the worker's own
   consumer.
 * Waiting is `asyncio.sleep(0)` in a bounded loop; `asyncio.wait_for(...,
-  10.0)` appears only as a failure bound on `run()` returning.
+  10.0)` appears only as a failure bound on `run()` or `start()` returning.
 * The hot-ip envelope is shaped as ADR-0011 decision 4 has the aggregator
   shape it: `agent_id="aggregator-shard-0"`, `subject` and key the IP's
   canonical text, `window_count` present (the codec requires it).
 * The order of `start()`'s bus calls and its `subscribe` arguments are read
   off `_SpyBus`, which wraps an `InMemoryBus` and satisfies ADR-0013
   decision 3's `MessageBus` and `Consumer` protocols. The two early exits of
-  `start()` use `_ScriptedBus`, whose stream yields exactly the messages a
+  `start()`, and every JetStream log shape the memory bus cannot show
+  ("Test seams", "The log's bounds"), use `_ScriptedBus`, whose `end_offset`
+  and `first_offset` return what the test chooses (`first` defaults to `0`,
+  the memory bus's value) and whose stream yields exactly the messages a
   test queues and then either ends or waits for the next `feed()`. After
   `stop()` the test feeds one more message rather than ending the stream:
   which of the two rules wins when the stream ends *after* `stop()` has
@@ -359,8 +378,8 @@ class _SpyConsumer:
 
 
 class _SpyBus:
-    """An `InMemoryBus` whose `consumer`, `end_offset` and `subscribe` calls are
-    recorded, in the order they are made."""
+    """An `InMemoryBus` whose `consumer`, `end_offset`, `first_offset` and
+    `subscribe` calls are recorded, in the order they are made."""
 
     def __init__(self) -> None:
         self.inner = InMemoryBus()
@@ -376,6 +395,10 @@ class _SpyBus:
     async def end_offset(self, topic: str) -> int:
         self.calls.append(("end_offset", topic))
         return await self.inner.end_offset(topic)
+
+    async def first_offset(self, topic: str) -> int:
+        self.calls.append(("first_offset", topic))
+        return await self.inner.first_offset(topic)
 
 
 def _subscriptions(calls: list[tuple[str, object]]) -> list[object]:
@@ -451,12 +474,20 @@ class _ScriptedConsumer:
 
 
 class _ScriptedBus:
-    """A bus whose log end is `end` and whose one consumer reads `stream`."""
+    """A bus whose log end is `end`, whose first retained offset is `first`, and
+    whose one consumer reads `stream`.
 
-    def __init__(self, stream: _ScriptedStream, *, end: int) -> None:
+    `first` defaults to `0`, the memory bus's value (ADR-0013 decision 3 as
+    amended by Amendment 10), so a test that does not name it models a log
+    that never discards. A JetStream log that holds nothing to replay, or
+    whose head has aged out, names it (ADR-0017 Test seams, "The log's
+    bounds")."""
+
+    def __init__(self, stream: _ScriptedStream, *, end: int, first: int = 0) -> None:
         self.stream = stream
         self.calls: list[tuple[str, object]] = []
         self._end = end
+        self._first = first
         self._consumer = _ScriptedConsumer(stream, self.calls)
 
     def producer(self) -> Producer:
@@ -469,6 +500,22 @@ class _ScriptedBus:
     async def end_offset(self, topic: str) -> int:
         self.calls.append(("end_offset", topic))
         return self._end
+
+    async def first_offset(self, topic: str) -> int:
+        self.calls.append(("first_offset", topic))
+        return self._first
+
+
+class _FirstOffsetFailed(Exception):
+    """Raised by `_FailingFirstOffsetBus.first_offset`; no other code raises it."""
+
+
+class _FailingFirstOffsetBus(_ScriptedBus):
+    """A `_ScriptedBus` whose `first_offset` records the call, then raises."""
+
+    async def first_offset(self, topic: str) -> int:
+        self.calls.append(("first_offset", topic))
+        raise _FirstOffsetFailed
 
 
 def _worker_on(bus: MessageBus, state: TrieState | None = None) -> TrieWorker:
@@ -508,6 +555,9 @@ class TestConstants:
 
 class TestReplayAndReadiness:
     async def test_an_empty_log_is_caught_up_at_once(self) -> None:
+        # Decision 4: "On the memory bus `first_offset` is always `0` ... Step
+        # 3 therefore never runs there": an empty memory log ends at `0`, and
+        # nothing is passed.
         worker = _worker()
         assert worker.replay_target is None
 
@@ -601,9 +651,14 @@ class TestStartRules:
 
         await worker.start()
         try:
-            # Decision 4 step 2: "It reads `end = await bus.end_offset(HOT_IP.name)`
-            # *before* subscribing"; step 3 subscribes (decision 3).
-            assert bus.calls[1:] == [("end_offset", TOPIC), ("subscribe", _positional(0))]
+            # Decision 4 step 2: "It reads `end = await bus.end_offset(HOT_IP.name)`,
+            # then `first = await bus.first_offset(HOT_IP.name)`: both *before*
+            # subscribing, and in that order"; step 4 subscribes (decision 3).
+            assert bus.calls[1:] == [
+                ("end_offset", TOPIC),
+                ("first_offset", TOPIC),
+                ("subscribe", _positional(0)),
+            ]
             assert worker.replay_target == 3
             assert worker.caught_up is True
             assert worker.state.event_sequence == 3
@@ -633,8 +688,9 @@ class TestStartRules:
             await worker.stop()
 
     async def test_a_state_already_at_the_log_end_takes_no_message(self) -> None:
-        # Decision 4: caught up means `end <= S`. The stream ends at once, so
-        # taking a message would end the replay in a `RuntimeError`.
+        # Decision 4: caught up means `state.event_sequence >= end`, and here
+        # `event_sequence` is already `end`. The stream ends at once, so taking
+        # a message would end the replay in a `RuntimeError`.
         stream = _ScriptedStream([], hold=False)
         bus = _ScriptedBus(stream, end=3)
         state = TrieState(families=ONLY_V4, config=_config())
@@ -652,7 +708,7 @@ class TestStartRules:
             await worker.stop()
 
     async def test_a_stream_that_ends_before_the_log_end_is_a_runtime_error(self) -> None:
-        # Decision 4 step 4: "If the iterator ends before that, `start()` raises
+        # Decision 4 step 5: "If the iterator ends before that, `start()` raises
         # `RuntimeError`."
         stream = _ScriptedStream([_added(0)], hold=False)
         worker = _worker_on(_ScriptedBus(stream, end=3))
@@ -667,7 +723,7 @@ class TestStartRules:
             await worker.stop()
 
     async def test_stop_during_the_replay_returns_without_catching_up(self) -> None:
-        # Decision 4 step 4: "If `stop()` has begun, `start()` returns without
+        # Decision 4 step 5: "If `stop()` has begun, `start()` returns without
         # being caught up."
         stream = _ScriptedStream([_added(0)], hold=True)
         worker = _worker_on(_ScriptedBus(stream, end=3))
@@ -698,6 +754,254 @@ class TestStartRules:
         assert worker.caught_up is False
         assert worker.state.position is None
         assert worker.state.of(IPV4).trie.hot_ip_count == 0
+
+
+def _held(offsets: Iterable[int]) -> _ScriptedStream:
+    """A held stream yielding `_added(i)` for each offset, then waiting."""
+
+    return _ScriptedStream([_added(i) for i in offsets], hold=True)
+
+
+class TestPassingWhatTheLogNoLongerHolds:
+    """Decision 4 step 3: "If `first > state.event_sequence`, the log retains
+    no record between the trie's position and `first` ... The worker takes its
+    lock and, unless `stop()` has begun, calls `state.note_passed(first - 1)`,
+    so that `event_sequence` becomes `first`." Step 4 then subscribes from
+    `S = state.event_sequence`, and caught up is `state.event_sequence >= end`.
+
+    The memory bus cannot show this ("Test seams", "The log's bounds"), so
+    each JetStream log shape is a `_ScriptedBus` with the test's `end` and
+    `first`. Every stream here is held: a worker that tried to take a message
+    from an empty one would wait, and `asyncio.wait_for(..., 10.0)` is the
+    failure bound on that."""
+
+    @pytest.mark.parametrize(
+        "end",
+        [
+            # "*A stream nothing has been written to.* `end` and `first` are
+            # both `1`."
+            pytest.param(1, id="never-written"),
+            # "*A stream whose every record has aged out or been purged.*
+            # `first` is `end`, because the stream keeps its last sequence."
+            pytest.param(501, id="every-record-aged-out-or-purged"),
+        ],
+    )
+    async def test_a_log_holding_nothing_to_replay_is_caught_up_at_once(self, end: int) -> None:
+        stream = _ScriptedStream([], hold=True)
+        bus = _ScriptedBus(stream, end=end, first=end)
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            state = worker.state
+            fs = state.of(IPV4)
+            assert worker.caught_up is True
+            assert worker.replay_target == end
+            # `note_passed(first - 1)`: "`event_sequence` becomes `first`".
+            assert state.event_sequence == end
+            assert state.position == end - 1
+            # Decision 2: `note_passed` "sets `position = offset`, and nothing
+            # else ... `as_of` does not move."
+            assert state.as_of is None
+            assert stream.taken == 0
+            # Step 4: "It subscribes (decision 3), from `S =
+            # state.event_sequence`."
+            assert _subscriptions(bus.calls) == [_positional(end)]
+            assert fs.trie.hot_ip_count == 0
+            assert len(fs.records) == 0
+        finally:
+            await worker.stop()
+
+    async def test_a_log_whose_head_has_aged_out_is_replayed_from_first(self) -> None:
+        # "*A stream whose head has aged out.* `0 < first < end`. The replay
+        # reads `[first, end)`, as it did before, but subscribes from `first`."
+        stream = _held(range(5, 10))
+        bus = _ScriptedBus(stream, end=10, first=5)
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            state = worker.state
+            fs = state.of(IPV4)
+            assert _subscriptions(bus.calls) == [_positional(5)]
+            assert worker.caught_up is True
+            assert worker.replay_target == 10
+            assert state.event_sequence == 10
+            assert state.position == 9
+            assert stream.taken == 5
+            assert fs.trie.hot_ip_count == 5
+            assert set(fs.records) == {_ip(i + 1) for i in range(5, 10)}
+            # Decision 8: `as_of` is "the greatest `timestamp` among the
+            # payloads of events whose outcome was `APPLIED` or `UNCHANGED`".
+            assert state.as_of == T0 + timedelta(seconds=9)
+        finally:
+            await worker.stop()
+
+    async def test_a_first_read_after_end_that_exceeds_it_is_passed_too(self) -> None:
+        # "Why `end` is read first": "`first` can exceed `end` when records
+        # are appended and the head ages out between the two reads. Step 3
+        # then passes those offsets as well, and the trie is caught up at
+        # once."
+        stream = _ScriptedStream([], hold=True)
+        bus = _ScriptedBus(stream, end=10, first=12)
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.caught_up is True
+            assert worker.replay_target == 10
+            assert worker.state.event_sequence == 12
+            assert worker.state.position == 11
+            assert stream.taken == 0
+            assert _subscriptions(bus.calls) == [_positional(12)]
+        finally:
+            await worker.stop()
+
+    async def test_a_restarted_trie_does_not_report_a_smaller_event_sequence(self) -> None:
+        # Decision 4, "Why step 3 moves the position": without it a restarted
+        # trie "would report `0` until the next record arrived: backwards,
+        # against decision 8 and `read-api-v1.md`" (assumption 26). Worker A
+        # reads offsets 1..10 of a JetStream log; every record then ages out,
+        # and worker B starts on a fresh state.
+        bus_a = _ScriptedBus(_held(range(1, 11)), end=11, first=1)
+        worker_a = _worker_on(bus_a)
+        try:
+            await asyncio.wait_for(worker_a.start(), timeout=10.0)
+            assert worker_a.caught_up is True
+            reported_by_a = worker_a.state.event_sequence
+            assert reported_by_a == 11
+        finally:
+            await worker_a.stop()
+
+        bus_b = _ScriptedBus(_ScriptedStream([], hold=True), end=11, first=11)
+        worker_b = _worker_on(bus_b)
+        try:
+            await asyncio.wait_for(worker_b.start(), timeout=10.0)
+
+            assert worker_b.caught_up is True
+            assert worker_b.state.event_sequence == 11
+            assert worker_b.state.event_sequence >= reported_by_a
+            # "After step 3, `event_sequence` is the offset of the next record
+            # the trie will read in every case. The subscription starts
+            # there".
+            assert _subscriptions(bus_b.calls) == [_positional(11)]
+        finally:
+            await worker_b.stop()
+
+    async def test_nothing_is_passed_when_first_is_not_past_event_sequence(self) -> None:
+        # Step 3 runs only "If `first > state.event_sequence`". A state at
+        # position 6 (`event_sequence` 7) on a log whose first retained offset
+        # is 3 subscribes from 7, decision 3's `state.position + 1`.
+        state = TrieState(families=ONLY_V4, config=_config())
+        state.note_handled(6)
+        stream = _held([7, 8, 9])
+        bus = _ScriptedBus(stream, end=10, first=3)
+        worker = _worker_on(bus, state)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert _subscriptions(bus.calls) == [_positional(7)]
+            assert worker.caught_up is True
+            assert state.event_sequence == 10
+            assert state.position == 9
+            assert stream.taken == 3
+        finally:
+            await worker.stop()
+
+    async def test_nothing_is_passed_once_stop_has_begun(self) -> None:
+        # Step 3: "unless `stop()` has begun"; decision 13: after `stop()` has
+        # begun, "`start()`'s step 3 passes nothing"; assumption 29: "A worker
+        # stopped before `start()` therefore stays not caught up on a log that
+        # holds nothing to replay."
+        stream = _ScriptedStream([], hold=True)
+        worker = _worker_on(_ScriptedBus(stream, end=1, first=1))
+
+        await worker.stop()
+        await asyncio.wait_for(worker.start(), timeout=10.0)
+
+        assert worker.caught_up is False
+        assert worker.state.position is None
+        assert worker.state.event_sequence == 0
+        assert stream.taken == 0
+
+    async def test_an_exception_from_first_offset_propagates_out_of_start(self) -> None:
+        # Decision 7's table: "`bus.end_offset`, `bus.first_offset`,
+        # `subscribe` | any exception | Propagates out of `start()`". Step 2
+        # reads `first` before subscribing, so nothing is subscribed.
+        bus = _FailingFirstOffsetBus(_ScriptedStream([], hold=True), end=3, first=0)
+        worker = _worker_on(bus)
+
+        try:
+            with pytest.raises(_FirstOffsetFailed):
+                await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert ("first_offset", TOPIC) in bus.calls
+            assert _subscriptions(bus.calls) == []
+            assert worker.caught_up is False
+            assert worker.state.position is None
+        finally:
+            await worker.stop()
+
+
+class TestReplayCompleteIsLogged:
+    """Decision 4 step 6: "It logs `replay_complete` (decision 12)"; decision
+    12's table: `replay_complete` | info | `start_offset`, `first_offset`,
+    `replay_target`, `event_sequence`. Assumption 30: "`replay_complete`
+    carries `first_offset`"."""
+
+    @staticmethod
+    def _fields(record: logging.LogRecord) -> dict[str, str | None]:
+        return {
+            name: _field(record, name)
+            for name in ("start_offset", "first_offset", "replay_target", "event_sequence")
+        }
+
+    async def test_after_a_memory_replay(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        bus = InMemoryBus()
+        for i in range(3):
+            await _publish(bus, _envelope(_ip(i + 1), i))
+        worker = _worker(bus=bus)
+
+        await worker.start()
+        try:
+            records = _logged(caplog, "replay_complete")
+            assert len(records) == 1
+            assert records[0].levelno == logging.INFO
+            assert self._fields(records[0]) == {
+                "start_offset": "0",
+                "first_offset": "0",
+                "replay_target": "3",
+                "event_sequence": "3",
+            }
+        finally:
+            await worker.stop()
+
+    async def test_after_passing_a_log_that_holds_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # `start_offset` is step 4's `S`, which step 3 has moved to `first`.
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        worker = _worker_on(_ScriptedBus(_ScriptedStream([], hold=True), end=11, first=11))
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            records = _logged(caplog, "replay_complete")
+            assert len(records) == 1
+            assert records[0].levelno == logging.INFO
+            assert self._fields(records[0]) == {
+                "start_offset": "11",
+                "first_offset": "11",
+                "replay_target": "11",
+                "event_sequence": "11",
+            }
+        finally:
+            await worker.stop()
 
 
 class TestAddsAndRemoves:

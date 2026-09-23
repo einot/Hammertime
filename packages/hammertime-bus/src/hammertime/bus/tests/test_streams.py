@@ -1,4 +1,7 @@
-"""`stream_config_for` and `ensure_streams`: the stream a topic declares, reconciled idempotently.
+"""`stream_config_for`, `ensure_streams` and `first_offset_of`: the stream a topic declares.
+
+`stream_config_for` and `ensure_streams` reconcile it idempotently;
+`first_offset_of` reads the first retained offset off its state.
 
 Spec: section 19, section 20, section 32, section 33 (`hammertime.bus.nats`'s own
 citations, ADR-0013 decision 3).
@@ -72,10 +75,26 @@ of the assertions:
    `max_bytes`, `max_msgs` and `num_replicas`; `max_msgs_per_subject` is in
    the block but in neither list, so a difference in it alone is not pinned
    either way.
+
+`first_offset_of` (`TestFirstOffsetOf`) is written from ADR-0013 decision 3
+as amended by Amendment 10 -- the `NatsBus` block's "`def
+first_offset_of(state: api.StreamState) -> int:` ... not re-exported from
+hammertime.bus", whose docstring is "`state.first_seq` when the stream holds
+a message; `state.last_seq + 1` when it holds none", and the paragraph after
+the "Added:" line: "The message count decides, not `first_seq`: a stream
+nothing has been written to reports `first_seq` `0`, one that a purge or
+expiry has emptied reports `last_seq + 1`, and neither holds a message there"
+-- and Amendment 10 assumptions 134 ("An empty log's first offset is its
+end") and 135 ("The message count, not `first_seq`, decides emptiness on
+JetStream"). It is imported from `hammertime.bus.nats`, since it is not
+re-exported. `nats.js.api.StreamState` is built with its five required
+fields (`messages`, `bytes`, `first_seq`, `last_seq`, `consumer_count`), and
+`num_deleted` where a test models interior deletions. No server is involved:
+`NatsBus.first_offset` against a live stream is the `integration` job's
+(#52).
 """
 
-from __future__ import annotations
-
+import copy
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from enum import Enum
@@ -83,7 +102,12 @@ from typing import Any, cast
 
 import nats.js.errors
 import pytest
-from hammertime.bus.nats import StreamConfigConflictError, ensure_streams, stream_config_for
+from hammertime.bus.nats import (
+    StreamConfigConflictError,
+    ensure_streams,
+    first_offset_of,
+    stream_config_for,
+)
 from hammertime.bus.topics import TOPICS, TopicSpec, all_topics
 from nats.js import api
 
@@ -688,3 +712,76 @@ class TestOneEntryPerSpec:
         result = await _ensure(js, [OBSERVATIONS, HOT_IP, PREFIX_STATS])
 
         assert set(result.values()) == {"created", "unchanged", "updated"}
+
+
+# --------------------------------------------------------------------------
+# first_offset_of: the first retained offset, or the end when none is retained
+# --------------------------------------------------------------------------
+
+
+def _state(
+    *, messages: int, first_seq: int, last_seq: int, num_deleted: int | None = None
+) -> api.StreamState:
+    return api.StreamState(
+        messages=messages,
+        bytes=0,
+        first_seq=first_seq,
+        last_seq=last_seq,
+        consumer_count=0,
+        num_deleted=num_deleted,
+    )
+
+
+class TestFirstOffsetOf:
+    """ADR-0013 decision 3 as amended by Amendment 10: "`state.first_seq` when
+    the stream holds a message; `state.last_seq + 1` when it holds none." "The
+    message count decides, not `first_seq`" (assumption 135), and "An empty
+    log's first offset is its end" (assumption 134): `end_offset` is
+    `state.last_seq + 1`."""
+
+    def test_a_stream_nothing_has_been_written_to(self) -> None:
+        # "a stream nothing has been written to reports `first_seq` `0`":
+        # no message, so the end, `last_seq + 1`.
+        assert first_offset_of(_state(messages=0, first_seq=0, last_seq=0)) == 1
+
+    def test_a_stream_emptied_by_a_purge_or_expiry(self) -> None:
+        # "one that a purge or expiry has emptied reports `last_seq + 1`".
+        assert first_offset_of(_state(messages=0, first_seq=21, last_seq=20)) == 21
+
+    def test_the_message_count_decides_not_first_seq(self) -> None:
+        # Assumption 135: an empty stream's `first_seq` "depends on how it
+        # became empty", so `first_offset_of` "reads `first_seq` only when a
+        # message is there". `first_seq` 0 with no message is not offset 0.
+        assert first_offset_of(_state(messages=0, first_seq=0, last_seq=20)) == 21
+
+    def test_a_stream_that_holds_its_whole_history(self) -> None:
+        assert first_offset_of(_state(messages=3, first_seq=1, last_seq=3)) == 1
+
+    def test_a_stream_whose_head_has_aged_out(self) -> None:
+        assert first_offset_of(_state(messages=5, first_seq=16, last_seq=20)) == 16
+
+    def test_interior_deletions_do_not_move_it(self) -> None:
+        # Two messages left between 5 and 20, fourteen deleted in between:
+        # the first retained is still `first_seq`. Assumption 19 (ADR-0017)
+        # / Amendment 10 ruling 4: "`first_offset` cannot see a hole behind a
+        # retained record".
+        state = _state(messages=2, first_seq=5, last_seq=20, num_deleted=14)
+
+        assert first_offset_of(state) == 5
+
+    @pytest.mark.parametrize(
+        ("messages", "first_seq", "last_seq"),
+        [
+            pytest.param(0, 0, 0, id="never-written"),
+            pytest.param(0, 21, 20, id="emptied"),
+            pytest.param(5, 16, 20, id="head-aged-out"),
+        ],
+    )
+    def test_the_state_is_not_mutated(self, messages: int, first_seq: int, last_seq: int) -> None:
+        state = _state(messages=messages, first_seq=first_seq, last_seq=last_seq)
+        before = copy.deepcopy(state)
+
+        first_offset_of(state)
+
+        assert state == before
+        assert (state.messages, state.first_seq, state.last_seq) == (messages, first_seq, last_seq)

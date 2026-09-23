@@ -5,17 +5,20 @@ Spec: section 22 (every read carries `event_sequence`, `as_of` and
 snapshot's event sequence number), section 35 (one root per address family),
 section 46.5 (the trie and the record map move together).
 
-Written from ADR-0017 decision 2 (the `state.py` block and its bullets) and
-decision 8 (`position`, `event_sequence`, `as_of`):
+Written from ADR-0017 decision 2 (the `state.py` block and its bullets, as
+revised on 2026-09-23) and decision 8 (`position`, `event_sequence`, `as_of`):
 
 * the constructor builds one empty `PatriciaTrie(f)` and one empty
   `IpAttributeRecords(f)` per family; an empty `families` is a `ValueError`;
   it starts with `position = None`, `as_of = None` and the given `config`;
 * `event_sequence` is `0` when `position` is `None`, else `position + 1`;
 * `note_handled(offset)` sets `position`; `note_applied(offset, timestamp)`
-  also sets `as_of` to the maximum seen;
-* both refuse an offset below 0 or not greater than `position`, and
+  also sets `as_of` to the maximum seen; `note_passed(offset)` "sets
+  `position = offset`, and nothing else ... `as_of` does not move"
+  (`TestNotePassed`; decision 4 step 3 is its caller);
+* all three refuse an offset below 0 or not greater than `position`, and
   `note_applied` a naive timestamp, with a `ValueError` "and nothing changes";
+  an offset passed by `note_passed` is refused by the other two as well;
 * `adopt_config` "compares no versions" (decision 10).
 """
 
@@ -163,12 +166,77 @@ class TestNoteApplied:
         assert state.event_sequence == 2
 
 
-class TestRefusals:
-    """Decision 2: "An `offset` below 0, or not greater than `position`, is a
-    `ValueError`, and nothing changes. `note_applied` also refuses a naive
-    `timestamp` in the same way." """
+class TestNotePassed:
+    """Decision 2: "**`note_passed(offset)`** sets `position = offset`, and
+    nothing else: the log holds no record at or below `offset` that the trie
+    has not read (decision 4 step 3). `as_of` does not move." Decision 8:
+    `position` is "the last offset the worker has *handled* or *passed*"."""
 
-    def test_a_negative_offset_is_refused_by_both(self) -> None:
+    def test_passing_offset_zero_gives_event_sequence_one(self) -> None:
+        # JetStream's offset 0 holds no record, "so a trie started there
+        # passes it" (decision 8, "What it costs").
+        state = TrieState(families=[IPV4], config=_config())
+
+        state.note_passed(0)
+
+        assert state.position == 0
+        assert state.event_sequence == 1
+        assert state.as_of is None
+
+    def test_passing_many_offsets_on_a_fresh_state(self) -> None:
+        state = TrieState(families=[IPV4], config=_config())
+
+        state.note_passed(500)
+
+        assert state.position == 500
+        assert state.event_sequence == 501
+        assert state.as_of is None
+
+    def test_as_of_does_not_move(self) -> None:
+        state = TrieState(families=[IPV4], config=_config())
+        state.note_applied(3, T0)
+
+        state.note_passed(500)
+
+        assert state.position == 500
+        assert state.event_sequence == 501
+        assert state.as_of == T0
+
+    def test_it_leaves_the_config_alone(self) -> None:
+        config = _config()
+        state = TrieState(families=[IPV4], config=config)
+
+        state.note_passed(7)
+
+        assert state.config is config
+
+    def test_a_passed_offset_is_not_handled_or_applied_afterwards(self) -> None:
+        # "What all three refuse": an offset "not greater than `position`" --
+        # and `note_passed(10)` has made `position` 10.
+        state = TrieState(families=[IPV4], config=_config())
+        state.note_passed(10)
+        before = _snapshot(state)
+
+        with pytest.raises(ValueError):
+            state.note_handled(10)
+        with pytest.raises(ValueError):
+            state.note_applied(10, T0)
+
+        assert _snapshot(state) == before
+
+        state.note_handled(11)
+
+        assert state.position == 11
+        assert state.event_sequence == 12
+
+
+class TestRefusals:
+    """Decision 2: "**What all three refuse.** An `offset` below 0, or not
+    greater than `position`, is a `ValueError` from `note_handled`,
+    `note_applied` and `note_passed`, and nothing changes. `note_applied` also
+    refuses a naive `timestamp` in the same way." """
+
+    def test_a_negative_offset_is_refused_by_all_three(self) -> None:
         state = TrieState(families=[IPV4], config=_config())
         before = _snapshot(state)
 
@@ -176,13 +244,15 @@ class TestRefusals:
             state.note_handled(-1)
         with pytest.raises(ValueError):
             state.note_applied(-1, T0)
+        with pytest.raises(ValueError):
+            state.note_passed(-1)
 
         assert _snapshot(state) == before
 
     @pytest.mark.parametrize(
         "offset", [pytest.param(3, id="repeated"), pytest.param(2, id="lower")]
     )
-    def test_an_offset_not_past_the_position_is_refused_by_both(self, offset: int) -> None:
+    def test_an_offset_not_past_the_position_is_refused_by_all_three(self, offset: int) -> None:
         state = TrieState(families=[IPV4], config=_config())
         state.note_applied(3, T0)
         before = _snapshot(state)
@@ -191,6 +261,21 @@ class TestRefusals:
             state.note_handled(offset)
         with pytest.raises(ValueError):
             state.note_applied(offset, T0 + timedelta(seconds=60))
+        with pytest.raises(ValueError):
+            state.note_passed(offset)
+
+        assert _snapshot(state) == before
+
+    @pytest.mark.parametrize(
+        "offset", [pytest.param(5, id="repeated"), pytest.param(4, id="lower")]
+    )
+    def test_note_passed_refuses_an_offset_not_past_a_passed_position(self, offset: int) -> None:
+        state = TrieState(families=[IPV4], config=_config())
+        state.note_passed(5)
+        before = _snapshot(state)
+
+        with pytest.raises(ValueError):
+            state.note_passed(offset)
 
         assert _snapshot(state) == before
 

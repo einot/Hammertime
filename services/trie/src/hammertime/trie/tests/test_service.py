@@ -14,6 +14,19 @@ a document is applied only when its version is greater, and a rejected one
 leaves the previous version in force). The admin answers are
 `docs/protocol/read-api-v1.md`'s table.
 
+From ADR-0017's "Revision 2026-09-23", for the security audit's two findings:
+
+* finding 1: on a log that holds nothing to replay (`end_offset ==
+  first_offset`, a JetStream stream never written to or emptied by age or a
+  purge), `start()` returns at once and the service is ready, with
+  `event_sequence == first` (decision 4 step 3;
+  `TestReadyOnALogThatHoldsNothingToReplay`);
+* finding 2: the admin app serves no generated API documentation --
+  `/openapi.json`, `/docs`, `/docs/oauth2-redirect` and `/redoc` answer 404
+  before and after `start()`, while `/healthz`, `/readyz` and `/metrics`
+  answer as before (decision 13; read-api-v1.md;
+  `TestNoGeneratedApiDocumentation`).
+
 Choices of this file's own:
 
 * The detection document is integration-scenarios section 2.1's, written to
@@ -30,7 +43,10 @@ Choices of this file's own:
   itself ready -- unless `stop()` has begun or the worker is not caught up")
   uses `_ScriptedBus`, whose stream yields one message and then waits for
   the test to `feed()` another. The worker is built by the test and handed
-  to `TrieService`, so the test can stop the worker alone.
+  to `TrieService`, so the test can stop the worker alone. `_ScriptedBus`'s
+  `first_offset` is `first`, `0` unless a test names it (the memory bus's
+  value, ADR-0013 Amendment 10); `_ClosableBus` delegates it to its
+  `InMemoryBus`.
 * Who closes what (decision 13): `build_service` "passes the `NatsBus` it
   built, if any, as `transport`", and `run()` "closes the transport it
   built". So a `transport=` handed to `TrieService` is started by `start()`
@@ -245,10 +261,13 @@ class _HeldConsumer:
 
 
 class _ScriptedBus:
-    """A bus whose log end is `end` and whose one consumer reads `stream`."""
+    """A bus whose log end is `end`, whose first retained offset is `first`
+    (default `0`, the memory bus's value), and whose one consumer reads
+    `stream`."""
 
-    def __init__(self, stream: _HeldStream, *, end: int) -> None:
+    def __init__(self, stream: _HeldStream, *, end: int, first: int = 0) -> None:
         self._end = end
+        self._first = first
         self._consumer = _HeldConsumer(stream)
 
     def producer(self) -> Producer:
@@ -259,6 +278,9 @@ class _ScriptedBus:
 
     async def end_offset(self, topic: str) -> int:
         return self._end
+
+    async def first_offset(self, topic: str) -> int:
+        return self._first
 
 
 class _ClosableBus:
@@ -276,6 +298,9 @@ class _ClosableBus:
 
     async def end_offset(self, topic: str) -> int:
         return await self.inner.end_offset(topic)
+
+    async def first_offset(self, topic: str) -> int:
+        return await self.inner.first_offset(topic)
 
     async def close(self) -> None:
         self.closed += 1
@@ -350,6 +375,64 @@ class TestAdminEndpointsAcrossTheLifecycle:
             assert readyz.status_code == 503
             assert readyz.content == b'{"status":"stopping"}'
             assert service.ready is False
+
+
+# FastAPI's default documentation paths (ADR-0017 decision 13).
+GENERATED_DOCUMENTATION_PATHS = ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc")
+
+
+class TestNoGeneratedApiDocumentation:
+    """Decision 13: `create_app` builds `FastAPI(..., openapi_url=None,
+    docs_url=None, redoc_url=None)`, "so the app serves the routes it declares
+    and nothing else ... Those four paths answer FastAPI's 404, like any other
+    path the app does not declare." `docs/protocol/read-api-v1.md`: "The trie
+    serves no generated API documentation. `GET /openapi.json`, `/docs`,
+    `/docs/oauth2-redirect` and `/redoc` answer 404". Only the status is
+    pinned, not FastAPI's 404 body; the body is checked only for not being a
+    documentation page."""
+
+    @staticmethod
+    async def _assert_no_documentation(client: httpx.AsyncClient) -> None:
+        for path in GENERATED_DOCUMENTATION_PATHS:
+            response = await client.get(path)
+            assert response.status_code == 404, path
+            body = response.text.lower()
+            assert "swagger" not in body, path
+            assert "redoc" not in body, path
+
+    async def test_the_four_paths_answer_404_before_and_after_start(
+        self, config_path: Path, bus: InMemoryBus
+    ) -> None:
+        service = build_service(_settings(config_path), bus=bus)
+
+        async with _client(service) as client:
+            await self._assert_no_documentation(client)
+            # The three admin routes still answer as read-api-v1.md's table
+            # says (and `TestAdminEndpointsAcrossTheLifecycle` pins).
+            healthz = await client.get("/healthz")
+            assert healthz.status_code == 200
+            assert healthz.content == b'{"status":"ok"}'
+            readyz = await client.get("/readyz")
+            assert readyz.status_code == 503
+            assert readyz.content == b'{"status":"starting"}'
+            metrics = await client.get("/metrics")
+            assert metrics.status_code == 200
+            assert metrics.headers["content-type"].startswith("text/plain; version=0.0.4")
+
+            await service.start()
+            try:
+                await self._assert_no_documentation(client)
+                healthz = await client.get("/healthz")
+                assert healthz.status_code == 200
+                assert healthz.content == b'{"status":"ok"}'
+                readyz = await client.get("/readyz")
+                assert readyz.status_code == 200
+                assert readyz.content == b'{"status":"ready"}'
+                metrics = await client.get("/metrics")
+                assert metrics.status_code == 200
+                assert metrics.headers["content-type"].startswith("text/plain; version=0.0.4")
+            finally:
+                await service.stop()
 
 
 class TestStartReplays:
@@ -541,6 +624,49 @@ class TestReadinessAfterAnInterruptedReplay:
 
             assert worker.caught_up is False
             await self._assert_not_ready(service)
+        finally:
+            await service.stop()
+
+
+class TestReadyOnALogThatHoldsNothingToReplay:
+    """The security audit's finding 1 (ADR-0017 "Revision 2026-09-23"): on a
+    JetStream hot-ip stream that holds no record at or after the fresh start
+    offset, `start()` waited until the startup deadline. Decision 4 step 3 now
+    passes the offsets below `first`, so the worker is caught up at once, and
+    `TrieService.start()` "marks itself ready". Consequences: "On a fresh
+    deployment that is at once, because the provisioned hot-ip stream is
+    empty". The log is modelled by `_ScriptedBus` with `end == first` ("Test
+    seams", "The log's bounds"), over a stream that yields nothing;
+    `asyncio.wait_for(..., 10.0)` is the failure bound on a `start()` that
+    waits for a record."""
+
+    @pytest.mark.parametrize(
+        "end",
+        [
+            # "*A stream nothing has been written to.* `end` and `first` are
+            # both `1`."
+            pytest.param(1, id="never-written"),
+            # "*A stream whose every record has aged out or been purged.*
+            # `first` is `end`".
+            pytest.param(10_000, id="every-record-aged-out-or-purged"),
+        ],
+    )
+    async def test_start_returns_and_the_service_is_ready(
+        self, config_path: Path, end: int
+    ) -> None:
+        worker = _worker_on(_ScriptedBus(_HeldStream([]), end=end, first=end))
+        service = TrieService(_settings(config_path), worker, DETECTION_CONFIG)
+
+        try:
+            await asyncio.wait_for(service.start(), timeout=10.0)
+
+            assert service.ready is True
+            async with _client(service) as client:
+                readyz = await client.get("/readyz")
+            assert readyz.status_code == 200
+            assert readyz.content == b'{"status":"ready"}'
+            # Decision 4 step 3: "`event_sequence` becomes `first`".
+            assert service.state.event_sequence == end
         finally:
             await service.stop()
 

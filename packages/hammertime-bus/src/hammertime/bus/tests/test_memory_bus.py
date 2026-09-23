@@ -48,7 +48,8 @@ and the semantics below alone". What that block pins, and is asserted here:
 * "Removed: `Consumer.seek`, `Consumer.commit`". `MessageBus` is a
   `runtime_checkable` Protocol in `hammertime.bus.interface` ("moved here
   from `hammertime.aggregator.worker`"), with `producer()`,
-  `consumer(group_id)` and -- since Amendment 1 -- `end_offset(topic)`.
+  `consumer(group_id)`, -- since Amendment 1 -- `end_offset(topic)` and --
+  since Amendment 10 -- `first_offset(topic)`.
 
 Amendment 1 (2026-09-21) added these sentences to decision 3 and decision 9;
 each is pinned by the class named after it:
@@ -78,6 +79,18 @@ each is pinned by the class named after it:
   end_offset` has been applied, i.e. once the last applied offset is `>=
   end_offset - 1`, or immediately when `end_offset <= start_offset`"
   (`TestEndOffset`).
+
+Amendment 10 (2026-09-23) added `first_offset` to the `MessageBus` protocol
+and defined it in decision 3, pinned in `TestFirstOffset`:
+"**`MessageBus.first_offset(topic)`** ... is the offset of the first message
+the log still retains for `topic`: the message a positional subscription with
+`start_offset=0` starts from. When the log retains no message, it is
+`end_offset(topic)` ... It is `async` on both implementations ... Read at one
+instant, `first_offset <= end_offset`"; "`InMemoryBus.first_offset` is `0` for
+every topic. The memory log never discards, so `0` is the first index of a
+non-empty log, and it is also an empty log's `end_offset`" (and the dated
+sentence in the `hammertime.bus.memory` paragraph; Amendment 10 assumption
+136: "no purge or retention is added to the memory bus").
 
 Amendment 3 (2026-09-21) ruling (a) appended one more sentence to the `ack`
 paragraph, pinned in `TestAckPrecedence` as well: "Closed is checked first
@@ -122,8 +135,6 @@ many messages as were published, then stop -- they never iterate past the
 end of a bounded publish burst, except after `close()`, where the iterator
 must end on its own.
 """
-
-from __future__ import annotations
 
 import asyncio
 import inspect
@@ -1189,6 +1200,98 @@ class TestEndOffset:
         bus: MessageBus = InMemoryBus()
 
         assert await bus.end_offset(TOPIC) == 0
+
+
+class TestFirstOffset:
+    """Decision 3 as amended by Amendment 10: "`MessageBus.first_offset(topic)`
+    ... is the offset of the first message the log still retains for `topic`:
+    the message a positional subscription with `start_offset=0` starts from.
+    When the log retains no message, it is `end_offset(topic)` ... It is
+    `async` on both implementations ... Read at one instant, `first_offset <=
+    end_offset`." "`InMemoryBus.first_offset` is `0` for every topic. The
+    memory log never discards, so `0` is the first index of a non-empty log,
+    and it is also an empty log's `end_offset`." """
+
+    async def test_it_is_zero_before_any_publish_and_equals_end_offset(self) -> None:
+        # "When the log retains no message, it is `end_offset(topic)`", and
+        # an empty memory log's `end_offset` is `0`.
+        bus = InMemoryBus()
+
+        assert await bus.first_offset(TOPIC) == 0
+        assert await bus.first_offset(TOPIC) == await bus.end_offset(TOPIC) == 0
+
+    async def test_it_is_awaitable(self) -> None:
+        # "It is `async` on both implementations".
+        bus = InMemoryBus()
+
+        pending = bus.first_offset(TOPIC)
+
+        assert inspect.isawaitable(pending)
+        assert await pending == 0
+
+    async def test_it_stays_zero_after_publishes(self) -> None:
+        # "The memory log never discards" (assumption 136): the first index
+        # stays `0` while the end moves.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        assert await bus.first_offset(TOPIC) == 0
+        assert await bus.end_offset(TOPIC) == 3
+
+    async def test_it_is_zero_for_every_topic(self) -> None:
+        # "`0` for every topic", one never published to included.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        assert await bus.first_offset(TOPIC) == 0
+        assert await bus.first_offset(OTHER_TOPIC) == 0
+        assert await bus.first_offset("test.never-published.v1") == 0
+
+    async def test_it_is_never_past_end_offset(self) -> None:
+        # "Read at one instant, `first_offset <= end_offset`".
+        bus = InMemoryBus()
+        assert await bus.first_offset(TOPIC) <= await bus.end_offset(TOPIC)
+
+        await _publish_three(bus)
+        assert await bus.first_offset(TOPIC) <= await bus.end_offset(TOPIC)
+
+        await bus.producer().publish(TOPIC, key="k4", value=b"fourth", message_id="id-4")
+        assert await bus.first_offset(TOPIC) <= await bus.end_offset(TOPIC)
+
+    async def test_a_subscription_from_it_starts_at_the_first_message(self) -> None:
+        # "the message a positional subscription with `start_offset=0` starts
+        # from": subscribing from `first_offset` itself yields that message.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+        first = await bus.first_offset(TOPIC)
+        consumer = bus.consumer("replayer")
+
+        replayed = await _take(await consumer.subscribe(TOPIC, start_offset=first), 1)
+
+        assert replayed[0].offset == first
+        assert replayed[0].value == b"first"
+
+    async def test_a_deduplicated_publish_leaves_it_zero(self) -> None:
+        bus = InMemoryBus()
+        producer = bus.producer()
+        await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
+
+        await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
+
+        assert await bus.first_offset(TOPIC) == 0
+        assert await bus.end_offset(TOPIC) == 1
+
+    def test_first_offset_is_on_the_message_bus_protocol(self) -> None:
+        # Decision 3's interface block: `MessageBus` gains `async def
+        # first_offset(self, topic: str) -> int`; `InMemoryBus` still
+        # satisfies the widened protocol.
+        assert hasattr(MessageBus, "first_offset")
+        assert isinstance(InMemoryBus(), MessageBus)
+
+    async def test_a_message_bus_typed_reference_can_read_it(self) -> None:
+        bus: MessageBus = InMemoryBus()
+
+        assert await bus.first_offset(TOPIC) == 0
 
 
 class TestTheInterfaceAfterAdr0013:
