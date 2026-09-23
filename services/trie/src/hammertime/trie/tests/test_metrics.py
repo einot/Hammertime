@@ -18,7 +18,9 @@ The derived series read the bound `TrieState`: `trie_nodes` is
 `trie.node_count`, `hot_ip_count` is `trie.hot_ip_count`,
 `ip_attribute_records` is `len(records)`, `ip_attribute_bytes` is
 `records.serialized_bytes`, and `event_sequence` is the state's.
-`DEFAULT_ATTRIBUTES` encodes to 24 bytes (ADR-0015; `test_metadata.py`).
+`DEFAULT_ATTRIBUTES` encodes to 24 bytes (ADR-0015; `test_metadata.py`). A
+record's `request_count` adds nothing to `ip_attribute_bytes`, and no series
+exists for it (ADR-0015 Amendment 5 rulings 5 and 10).
 
 Choice of this file's own: every counter and gauge test binds a state before
 it writes. Decision 12's "any series read before `bind_state`" reads `0` is
@@ -268,7 +270,7 @@ class TestSeriesDerivedFromTheState:
         metrics, state = _bound()
         fs = state.of(IPV4)
 
-        assert apply_hot_ip_added(fs.trie, fs.records, IP, None) is True
+        assert apply_hot_ip_added(fs.trie, fs.records, IP, None, request_count=1200) is True
 
         assert metrics.get("hot_ip_count", family="ipv4") == 1
         assert metrics.get("trie_nodes", family="ipv4") == 1
@@ -280,7 +282,7 @@ class TestSeriesDerivedFromTheState:
     def test_an_unserved_family_reads_zero(self) -> None:
         metrics, state = _bound()
         fs = state.of(IPV4)
-        apply_hot_ip_added(fs.trie, fs.records, IP, None)
+        apply_hot_ip_added(fs.trie, fs.records, IP, None, request_count=1200)
 
         for name in ("hot_ip_count", "trie_nodes", "ip_attribute_records", "ip_attribute_bytes"):
             assert metrics.get(name, family="ipv6") == 0, name
@@ -288,13 +290,34 @@ class TestSeriesDerivedFromTheState:
     def test_the_series_follow_the_state_as_it_changes(self) -> None:
         metrics, state = _bound()
         fs = state.of(IPV4)
-        apply_hot_ip_added(fs.trie, fs.records, IP, None)
-        apply_hot_ip_added(fs.trie, fs.records, IP_B, {"attributes_version": 1, "weight": 7})
+        apply_hot_ip_added(fs.trie, fs.records, IP, None, request_count=1200)
+        document = {"attributes_version": 1, "weight": 7}
+        apply_hot_ip_added(fs.trie, fs.records, IP_B, document, request_count=1300)
 
         assert metrics.get("hot_ip_count", family="ipv4") == fs.trie.hot_ip_count == 2
         assert metrics.get("trie_nodes", family="ipv4") == fs.trie.node_count
         assert metrics.get("ip_attribute_records", family="ipv4") == len(fs.records) == 2
         assert metrics.get("ip_attribute_bytes", family="ipv4") == fs.records.serialized_bytes
+
+    def test_the_attribute_series_ignore_request_count(self) -> None:
+        """ADR-0015 Amendment 5 rulings 5 and 10: `ip_attribute_bytes` counts
+        the attribute texts only and `ip_attribute_records` is `len(records)`,
+        so two default records with different counts are 48 bytes and 2
+        records."""
+
+        metrics, state = _bound()
+        fs = state.of(IPV4)
+
+        assert apply_hot_ip_added(fs.trie, fs.records, IP, None, request_count=0) is True
+        assert apply_hot_ip_added(fs.trie, fs.records, IP_B, None, request_count=10**30) is True
+
+        assert metrics.get("ip_attribute_bytes", family="ipv4") == 48
+        assert metrics.get("ip_attribute_records", family="ipv4") == 2
+
+        # A write that changes only a count moves neither series.
+        assert apply_hot_ip_added(fs.trie, fs.records, IP, None, request_count=1200) is False
+        assert metrics.get("ip_attribute_bytes", family="ipv4") == 48
+        assert metrics.get("ip_attribute_records", family="ipv4") == 2
 
     def test_event_sequence_mirrors_the_state(self) -> None:
         metrics, state = _bound()
@@ -310,7 +333,8 @@ class TestSeriesDerivedFromTheState:
         metrics, state = _bound(frozenset({IPV4, IPV6}))
         v6 = state.of(IPV6)
 
-        apply_hot_ip_added(v6.trie, v6.records, Address.parse("2001:db8::1"), None)
+        ip_v6 = Address.parse("2001:db8::1")
+        apply_hot_ip_added(v6.trie, v6.records, ip_v6, None, request_count=1200)
 
         assert metrics.get("hot_ip_count", family="ipv6") == 1
         assert metrics.get("ip_attribute_records", family="ipv6") == 1

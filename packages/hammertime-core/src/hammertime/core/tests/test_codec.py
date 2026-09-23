@@ -61,6 +61,12 @@ outside the inclusive `minimum` and `maximum` its schema file states -- read
 from `schemas/` here, not restated (assumption 10) -- while the envelope's
 integer fields stay unbounded (assumption 3). An out-of-range message is built
 by editing encoded JSON, because `encode` no longer produces one (assumption 4).
+
+ADR-0015 Amendment 5 ruling 8 (issue #116, assumptions 80 and 81) is tested
+at the very end: a `HotIpAdded` or `HotIpRemoved` payload without
+`window_count` is a `CodecError` that is not an attributes rejection, and
+`schemas/hot_ip_event.v1.json` lists `window_count` in `required`. The
+message is not pinned.
 """
 
 import json
@@ -72,7 +78,7 @@ from typing import Any, NamedTuple
 
 import pytest
 from hammertime.core.addressing.address import Address
-from hammertime.core.errors import CodecError
+from hammertime.core.errors import CodecError, InvalidAttributesError
 from hammertime.core.events.codec import decode, encode
 from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import (
@@ -1163,3 +1169,68 @@ def test_decode_range_error_does_not_name_the_refused_value(bound: _Bound, value
 
     assert excinfo.value.__cause__ is not None
     _assert_value_not_named(str(excinfo.value.__cause__), value)
+
+
+# ==========================================================================
+# ADR-0015 Amendment 5 ruling 8: `window_count` is required on both hot-ip
+# event types, by the codec and by `schemas/hot_ip_event.v1.json`.
+# ==========================================================================
+
+HOT_IP_EVENT_TYPES = ["HotIpAdded", "HotIpRemoved"]
+
+
+def _hot_ip_wire(event_type: str, attributes: dict[str, Any] | None) -> bytes:
+    """A valid hot-ip envelope of `event_type`, encoded, carrying `attributes`."""
+
+    payload: HotIpAdded | HotIpRemoved
+    if event_type == "HotIpAdded":
+        payload = HotIpAdded(**_HOT_IP_FIELDS, attributes=attributes)
+    else:
+        payload = HotIpRemoved(**_HOT_IP_FIELDS, attributes=attributes)
+    envelope = EventEnvelope(event_type=event_type, payload=payload, **_ENVELOPE_FIELDS)
+    return encode(envelope)
+
+
+def _without_payload_key(data: bytes, key: str) -> bytes:
+    """`data` with `key` deleted from its payload, as `_tamper` edits it."""
+
+    doc = json.loads(data)
+    assert key in doc["payload"], f"{key!r} is not on the wire"
+    del doc["payload"][key]
+    return json.dumps(doc).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        pytest.param(None, id="no-attributes"),
+        pytest.param({"attributes_version": 1, "weight": 5}, id="valid-attributes"),
+    ],
+)
+@pytest.mark.parametrize("event_type", HOT_IP_EVENT_TYPES)
+def test_decode_refuses_a_hot_ip_payload_without_window_count(
+    event_type: str, attributes: dict[str, Any] | None
+) -> None:
+    """Ruling 8: the codec refuses a hot-ip payload without `window_count`,
+    as a `CodecError` -- not an attributes rejection, so its `__cause__` is
+    not an `InvalidAttributesError`. The untampered bytes decode (control)."""
+
+    data = _hot_ip_wire(event_type, attributes)
+    control: Any = decode(data)
+    assert control.payload.window_count == 1000
+
+    with pytest.raises(CodecError) as excinfo:
+        decode(_without_payload_key(data, "window_count"))
+
+    assert not isinstance(excinfo.value.__cause__, InvalidAttributesError)
+
+
+def test_the_hot_ip_schema_requires_window_count() -> None:
+    """Ruling 8: `required` lists `window_count`, which the schema applies to
+    both event types (one schema, `type` enumerating both)."""
+
+    path = _schemas_dir() / "hot_ip_event.v1.json"
+    schema: Any = json.loads(path.read_text(encoding="utf-8"))
+
+    assert "window_count" in schema["required"]
+    assert set(schema["properties"]["type"]["enum"]) == set(HOT_IP_EVENT_TYPES)

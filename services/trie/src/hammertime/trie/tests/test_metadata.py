@@ -23,10 +23,11 @@ The interface under test is ADR-0015 decisions 1-8, as re-exported from
   acceptance criterion); `prefix_stats` / `ancestor_stats` bind the trie's
   counts element for element.
 * D (decisions 5, 6, section 46): `IpAttributeRecords` is a read-only,
-  family-scoped `Mapping[Address, IpAttributes]` that validates every write
-  and is all-or-nothing; `apply_hot_ip_added` validates, then mutates the
-  trie, then the record, so the section 46.5 invariant holds after every
-  step and after every exception.
+  family-scoped `Mapping[Address, IpRecord]` (Amendment 5) that validates
+  every write and is all-or-nothing; `apply_hot_ip_added` validates, then
+  mutates the trie, then the record, so the section 46.5 invariant holds
+  after every step and after every exception. Documents are read through
+  `records[a].attributes`, and every write passes `request_count=`.
 * E (Amendment 1 rulings 3-7, assumptions 44-48): what the metadata surface
   refuses -- `declare`'s malformed document (`TypeError`), a non-`Prefix`
   given to `in` (`False`), a value built with a wrong field type
@@ -53,6 +54,16 @@ The interface under test is ADR-0015 decisions 1-8, as re-exported from
   family, `False` for anything that is not an `Address` (unhashable
   included), the family `ValueError` otherwise -- the same through
   `records.keys()`.
+* H (ADR-0015 Amendment 5 rulings 1-7 and 10, assumptions 70-78; decisions
+  5 and 6 with their Amendment 5 notes; ADR-0014 decisions 3 and 9 with
+  their 2026-09-23 notes; sections 46.5 and 46.8): `request_count` joins the
+  per-IP record. `records[a]` is a fresh, frozen `IpRecord` holding the
+  document and the count; both writers take the count as a required
+  keyword-only argument, refuse anything but an exact `int >= 0` after the
+  family check and before the document, and change nothing when they
+  refuse; replace-on-add and the rejected-document recovery carry the
+  count; removal takes it with the record; `serialized_bytes` still counts
+  the attribute texts only; both checkers take the widened map unchanged.
 
 ADR-0014 (decisions 1-4, 8, 9; A1, A3, A5, A12) supplies the trie surface, and
 its A12 clause 4 forbids comparing implementations, or running the checks, on
@@ -114,10 +125,19 @@ Choices of this file's own, not dictated by the spec or ADR-0015:
   which decision 5 says is the only use the record map makes of `json`, with
   a function that raises. A `records[a]` that then raises is the control
   showing that the replacement reached the map's decode.
+* Every "changes nothing" snapshot (`_records_state`) captures each record's
+  `request_count` beside its document, so it covers counts too. Tests that
+  predate Amendment 5 pass counts chosen only to keep their meaning; where a
+  test checks a replacement, the two counts differ.
+* Section H: "the message contains `request_count`" is checked verbatim; the
+  message's other wording is not pinned. An `IntEnum` member is refused as a
+  count because it is an `int` subclass (assumption 74), and is expected to be
+  a `TypeError`.
 """
 
 import contextlib
 import copy
+import dataclasses
 import itertools
 import json
 import math
@@ -145,6 +165,7 @@ from hammertime.trie.metadata import (
     EMPTY_METADATA,
     Bitmask,
     IpAttributeRecords,
+    IpRecord,
     Metadata,
     Override,
     PrefixMetadataStore,
@@ -1064,8 +1085,13 @@ def _compact_size(document: Mapping[str, object]) -> int:
 
 def _records_state(
     records: IpAttributeRecords,
-) -> tuple[int, int, dict[Address, dict[str, object]]]:
-    stored = {address: copy.deepcopy(dict(records[address])) for address in records}
+) -> tuple[int, int, dict[Address, tuple[dict[str, object], int]]]:
+    """Length, byte total, and each address's (document, request_count)."""
+
+    stored: dict[Address, tuple[dict[str, object], int]] = {}
+    for address in records:
+        record = records[address]
+        stored[address] = (copy.deepcopy(dict(record.attributes)), record.request_count)
     return len(records), records.serialized_bytes, stored
 
 
@@ -1089,7 +1115,7 @@ def _check_coupled(trie: HotTrie, records: IpAttributeRecords) -> None:
     assert_attribute_records_match(trie, records)
     assert set(records) == set(trie.iter_hot_addresses())
     assert len(records) == trie.hot_ip_count
-    assert records.serialized_bytes == sum(_compact_size(records[a]) for a in records)
+    assert records.serialized_bytes == sum(_compact_size(records[a].attributes) for a in records)
 
 
 def _padded(size: int) -> dict[str, object]:
@@ -1147,6 +1173,13 @@ VALID_ATTRIBUTES = st.one_of(
     st.none(),
     st.fixed_dictionaries(_REQUIRED_ATTRIBUTES, optional=_OPTIONAL_ATTRIBUTES),
 )
+# Amendment 5 ruling 3: any exact int >= 0, with no maximum.
+REQUEST_COUNTS = st.one_of(
+    st.just(0),
+    st.integers(min_value=0, max_value=10**9),
+    st.just(10**30),
+    st.integers(min_value=10**18, max_value=10**40),
+)
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -1158,15 +1191,16 @@ def test_a_record_exists_exactly_while_its_address_is_hot(
 ) -> None:
     """Section 46.5: `set(record.keys())` is the HOT set and `len(record) ==
     hot_count(root)` after every coupled step, redundant ones included; the
-    record is the most recent add's document; section 46.8's byte total is the
-    sum of the stored records' compact sizes."""
+    record is the most recent add's document and count (Amendment 5 rulings
+    1 and 4); section 46.8's byte total is the sum of the stored documents'
+    compact sizes."""
 
     pool = data.draw(address_pools(family))
     operations = data.draw(trie_operations(pool))
     trie = make_trie(family)
     records = IpAttributeRecords(family)
     assert records.family is family
-    model: dict[Address, dict[str, object]] = {}
+    model: dict[Address, tuple[dict[str, object], int]] = {}
     _check_coupled(trie, records)
 
     for operation in operations:
@@ -1174,15 +1208,18 @@ def test_a_record_exists_exactly_while_its_address_is_hot(
         was_hot = address in model
         if operation.kind == "add":
             document = data.draw(VALID_ATTRIBUTES)
-            assert apply_hot_ip_added(trie, records, address, document) is (not was_hot)
-            model[address] = (
+            count = data.draw(REQUEST_COUNTS)
+            added = apply_hot_ip_added(trie, records, address, document, request_count=count)
+            assert added is (not was_hot)
+            stored: dict[str, object] = (
                 {"attributes_version": 1} if document is None else copy.deepcopy(document)
             )
+            model[address] = (stored, count)
         else:
             assert apply_hot_ip_removed(trie, records, address) is was_hot
             model.pop(address, None)
         _check_coupled(trie, records)
-        assert {a: dict(records[a]) for a in records} == model
+        assert {a: (dict(r.attributes), r.request_count) for a, r in records.items()} == model
 
 
 @pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
@@ -1196,12 +1233,14 @@ def test_a_redelivered_add_returns_false_and_still_replaces_the_record(
     records = IpAttributeRecords(IPV4)
     first = {"attributes_version": 1, "weight": 10}
     second = {"attributes_version": 1, "weight": 12345, "x_note": "redelivered"}
-    assert apply_hot_ip_added(trie, records, V4, first) is True
-    assert dict(records[V4]) == first
+    assert apply_hot_ip_added(trie, records, V4, first, request_count=1200) is True
+    assert dict(records[V4].attributes) == first
+    assert records[V4].request_count == 1200
     counts = _trie_state(trie)
 
-    assert apply_hot_ip_added(trie, records, V4, second) is False
-    assert dict(records[V4]) == second
+    assert apply_hot_ip_added(trie, records, V4, second, request_count=1375) is False
+    assert dict(records[V4].attributes) == second
+    assert records[V4].request_count == 1375
     assert _trie_state(trie) == counts
     assert records.serialized_bytes == _compact_size(second)
     _check_coupled(trie, records)
@@ -1213,7 +1252,8 @@ def test_removing_an_unknown_address_deletes_nothing_but_a_stray_record(
 ) -> None:
     trie = make_trie(IPV4)
     records = IpAttributeRecords(IPV4)
-    assert apply_hot_ip_added(trie, records, V4, {"attributes_version": 1, "weight": 1}) is True
+    document = {"attributes_version": 1, "weight": 1}
+    assert apply_hot_ip_added(trie, records, V4, document, request_count=1200) is True
 
     before = _records_state(records)
     assert apply_hot_ip_removed(trie, records, V4_B) is False
@@ -1222,7 +1262,7 @@ def test_removing_an_unknown_address_deletes_nothing_but_a_stray_record(
 
     # A stray record for a COLD address, written behind the trie's back, is
     # deleted by the next removal for it (decision 6: self-healing).
-    records.record(V4_C)
+    records.record(V4_C, request_count=900)
     assert V4_C in records
     counts = _trie_state(trie)
     assert apply_hot_ip_removed(trie, records, V4_C) is False
@@ -1243,15 +1283,15 @@ def test_no_document_stores_the_default_and_costs_24_bytes() -> None:
 
     assert dict(DEFAULT_ATTRIBUTES) == {"attributes_version": 1}
     records = IpAttributeRecords(IPV4)
-    records.record(V4_C, {"attributes_version": 1, "weight": 5})
+    records.record(V4_C, {"attributes_version": 1, "weight": 5}, request_count=1200)
     before = records.serialized_bytes
 
-    records.record(V4)
-    assert dict(records[V4]) == {"attributes_version": 1}
+    records.record(V4, request_count=1200)
+    assert dict(records[V4].attributes) == {"attributes_version": 1}
     assert records.serialized_bytes == before + 24
 
-    records.record(V4_B, None)
-    assert dict(records[V4_B]) == {"attributes_version": 1}
+    records.record(V4_B, None, request_count=1200)
+    assert dict(records[V4_B].attributes) == {"attributes_version": 1}
     assert records.serialized_bytes == before + 48
 
 
@@ -1282,8 +1322,8 @@ def test_valid_documents_are_stored_and_read_back_verbatim(document: dict[str, o
     """Sections 46.2 and 46.9: stored and echoed, never interpreted."""
 
     records = IpAttributeRecords(IPV4)
-    records.record(V4, document)
-    assert dict(records[V4]) == document
+    records.record(V4, document, request_count=1200)
+    assert dict(records[V4].attributes) == document
     assert records.serialized_bytes == _compact_size(document)
 
 
@@ -1295,25 +1335,28 @@ def test_record_rejects_an_invalid_document_and_changes_nothing(
     """Decision 5: `record()` validates every write and is all-or-nothing."""
 
     records = IpAttributeRecords(IPV4)
-    records.record(V4_C, {"attributes_version": 1, "weight": 7})
+    records.record(V4_C, {"attributes_version": 1, "weight": 7}, request_count=1100)
     if earlier:
-        records.record(V4, {"attributes_version": 1, "weight": 1450, "x_note": "kept"})
+        kept = {"attributes_version": 1, "weight": 1450, "x_note": "kept"}
+        records.record(V4, kept, request_count=1200)
     before = _records_state(records)
     with pytest.raises(InvalidAttributesError):
-        records.record(V4, document)  # type: ignore[arg-type]
+        records.record(V4, document, request_count=1300)  # type: ignore[arg-type]
     assert _records_state(records) == before
 
 
 def test_a_stored_record_is_a_private_deep_copy() -> None:
     document: dict[str, Any] = {"attributes_version": 1, "x_list": [1, 2], "x_obj": {"k": "v"}}
     records = IpAttributeRecords(IPV4)
-    records.record(V4, document)
+    records.record(V4, document, request_count=1200)
     size = records.serialized_bytes
 
     document["x_list"].append("a" * 2000)
     document["x_obj"]["k"] = "changed"
     document["x_added"] = 1
-    assert dict(records[V4]) == {"attributes_version": 1, "x_list": [1, 2], "x_obj": {"k": "v"}}
+    expected = {"attributes_version": 1, "x_list": [1, 2], "x_obj": {"k": "v"}}
+    assert dict(records[V4].attributes) == expected
+    assert records[V4].request_count == 1200
     assert records.serialized_bytes == size
 
 
@@ -1321,8 +1364,8 @@ def test_the_record_map_is_a_read_only_mapping() -> None:
     """Decision 5: not a `MutableMapping`; reads are read-only views."""
 
     records = IpAttributeRecords(IPV4)
-    records.record(V4, {"attributes_version": 1, "weight": 3})
-    records.record(V4_C)
+    records.record(V4, {"attributes_version": 1, "weight": 3}, request_count=1200)
+    records.record(V4_C, request_count=900)
     before = _records_state(records)
 
     writable: Any = records
@@ -1330,7 +1373,7 @@ def test_the_record_map_is_a_read_only_mapping() -> None:
         writable[V4_B] = {"attributes_version": 1}
     with pytest.raises(TypeError):
         del writable[V4]
-    view: Any = records[V4]
+    view: Any = records[V4].attributes
     with pytest.raises(TypeError):
         view["weight"] = 4
     assert _records_state(records) == before
@@ -1341,7 +1384,8 @@ def test_the_record_map_is_a_read_only_mapping() -> None:
     assert records.get(V4_B) is None
     found = records.get(V4)
     assert found is not None
-    assert dict(found) == {"attributes_version": 1, "weight": 3}
+    assert dict(found.attributes) == {"attributes_version": 1, "weight": 3}
+    assert found.request_count == 1200
     keys = list(records)
     assert all(isinstance(key, Address) for key in keys)
     assert sorted(keys, key=lambda a: a.value) == sorted([V4, V4_C], key=lambda a: a.value)
@@ -1351,8 +1395,8 @@ def test_the_record_map_is_a_read_only_mapping() -> None:
 def test_discard_and_clear_keep_the_byte_total() -> None:
     records = IpAttributeRecords(IPV4)
     kept = {"attributes_version": 1, "weight": 1450}
-    records.record(V4, kept)
-    records.record(V4_C, {"attributes_version": 1, "x_note": "gone"})
+    records.record(V4, kept, request_count=1200)
+    records.record(V4_C, {"attributes_version": 1, "x_note": "gone"}, request_count=10**30)
 
     assert records.discard(V4_C) is True
     assert records.discard(V4_C) is False
@@ -1371,9 +1415,9 @@ RECORD_METHODS = ["record", "record-with-a-bad-document", "discard", "getitem", 
 
 def _call_records(records: IpAttributeRecords, method: str, address: Address) -> None:
     if method == "record":
-        records.record(address, {"attributes_version": 1})
+        records.record(address, {"attributes_version": 1}, request_count=1200)
     elif method == "record-with-a-bad-document":
-        records.record(address, {})
+        records.record(address, {}, request_count=1200)
     elif method == "discard":
         records.discard(address)
     elif method == "getitem":
@@ -1394,7 +1438,7 @@ def test_every_record_map_method_rejects_the_other_family(populated: bool, metho
 
     records = IpAttributeRecords(IPV4)
     if populated:
-        records.record(V4, {"attributes_version": 1, "weight": 3})
+        records.record(V4, {"attributes_version": 1, "weight": 3}, request_count=1200)
     before = _records_state(records)
     with pytest.raises(ValueError) as excinfo:
         _call_records(records, method, V6)
@@ -1404,7 +1448,7 @@ def test_every_record_map_method_rejects_the_other_family(populated: bool, metho
 
 def test_a_key_that_is_not_an_address_is_simply_absent() -> None:
     records = IpAttributeRecords(IPV4)
-    records.record(V4)
+    records.record(V4, request_count=1200)
     # Through `Any`: mypy's strict equality would (rightly) flag the lookup.
     untyped: Any = records
     assert "192.168.1.42" not in untyped
@@ -1443,13 +1487,14 @@ def test_the_coupled_step_rejects_mismatched_families_and_changes_nothing(
     trie = make_trie(trie_family)
     assert trie.add_hot_ip(OTHER_SAMPLE[trie_family]) is True
     records = IpAttributeRecords(records_family)
-    records.record(OTHER_SAMPLE[records_family], {"attributes_version": 1, "weight": 2})
+    neighbour = {"attributes_version": 1, "weight": 2}
+    records.record(OTHER_SAMPLE[records_family], neighbour, request_count=1100)
     trie_before = _trie_state(trie)
     records_before = _records_state(records)
     address = SAMPLE[address_family]
 
     with pytest.raises(ValueError) as excinfo:
-        apply_hot_ip_added(trie, records, address, document)
+        apply_hot_ip_added(trie, records, address, document, request_count=1200)
     _assert_names_both_families(excinfo.value)
     assert _trie_state(trie) == trie_before
     assert _records_state(records) == records_before
@@ -1471,21 +1516,24 @@ def test_a_rejected_document_for_a_new_address_changes_neither_and_recovers_with
 
     trie = make_trie(IPV4)
     records = IpAttributeRecords(IPV4)
-    assert apply_hot_ip_added(trie, records, V4_C, {"attributes_version": 1, "weight": 3}) is True
+    neighbour = {"attributes_version": 1, "weight": 3}
+    assert apply_hot_ip_added(trie, records, V4_C, neighbour, request_count=1100) is True
     trie_before = _trie_state(trie)
     records_before = _records_state(records)
 
+    untyped: Any = document
     with pytest.raises(InvalidAttributesError):
-        apply_hot_ip_added(trie, records, V4, document)  # type: ignore[arg-type]
+        apply_hot_ip_added(trie, records, V4, untyped, request_count=1200)
     assert trie.contains(V4) is False
     assert V4 not in records
     assert _trie_state(trie) == trie_before
     assert _records_state(records) == records_before
     _check_coupled(trie, records)
 
-    assert apply_hot_ip_added(trie, records, V4, None) is True
+    assert apply_hot_ip_added(trie, records, V4, None, request_count=1200) is True
     assert trie.contains(V4) is True
-    assert dict(records[V4]) == {"attributes_version": 1}
+    assert dict(records[V4].attributes) == {"attributes_version": 1}
+    assert records[V4].request_count == 1200
     _check_coupled(trie, records)
 
 
@@ -1497,14 +1545,16 @@ def test_a_rejected_document_for_a_hot_address_keeps_its_valid_record(
     trie = make_trie(IPV4)
     records = IpAttributeRecords(IPV4)
     valid = {"attributes_version": 1, "weight": 1450, "x_note": "valid"}
-    assert apply_hot_ip_added(trie, records, V4, valid) is True
+    assert apply_hot_ip_added(trie, records, V4, valid, request_count=1200) is True
     trie_before = _trie_state(trie)
     records_before = _records_state(records)
 
+    untyped: Any = document
     with pytest.raises(InvalidAttributesError):
-        apply_hot_ip_added(trie, records, V4, document)  # type: ignore[arg-type]
+        apply_hot_ip_added(trie, records, V4, untyped, request_count=1300)
     assert trie.contains(V4) is True
-    assert dict(records[V4]) == valid
+    assert dict(records[V4].attributes) == valid
+    assert records[V4].request_count == 1200
     assert _trie_state(trie) == trie_before
     assert _records_state(records) == records_before
     _check_coupled(trie, records)
@@ -1520,15 +1570,17 @@ def test_a_corrupt_trie_raises_before_the_record_is_written(with_record: bool) -
     trie = PatriciaTrie(IPV4)
     records = IpAttributeRecords(IPV4)
     if with_record:
-        assert apply_hot_ip_added(trie, records, V4, {"attributes_version": 1, "weight": 1}) is True
+        document = {"attributes_version": 1, "weight": 1}
+        assert apply_hot_ip_added(trie, records, V4, document, request_count=1200) is True
     else:
         assert trie.add_hot_ip(V4) is True
     assert trie.node_count == 1
     trie.arena.hot_count[trie.root] = 0
     before = _records_state(records)
+    replacement = {"attributes_version": 1, "weight": 2000}
 
     with pytest.raises(InvariantViolation):
-        apply_hot_ip_added(trie, records, V4, {"attributes_version": 1, "weight": 2000})
+        apply_hot_ip_added(trie, records, V4, replacement, request_count=1300)
     assert _records_state(records) == before
 
 
@@ -1540,11 +1592,12 @@ def test_prefix_metadata_and_ip_attributes_share_no_namespace() -> None:
     trie = PatriciaTrie(IPV4)
     records = IpAttributeRecords(IPV4)
     attributes = {"attributes_version": 1, "weight": 1450}
-    assert apply_hot_ip_added(trie, records, HOST, attributes) is True
+    assert apply_hot_ip_added(trie, records, HOST, attributes, request_count=1200) is True
     elsewhere = Address.parse("10.20.31.1")
-    assert apply_hot_ip_added(trie, records, elsewhere, {"attributes_version": 1}) is True
+    default = {"attributes_version": 1}
+    assert apply_hot_ip_added(trie, records, elsewhere, default, request_count=1200) is True
 
-    assert dict(records[HOST]) == attributes
+    assert dict(records[HOST].attributes) == attributes
     assert dict(store.effective(HOST)) == {"weight": Override(5)}
     assert dict(store.effective(elsewhere)) == {}
     assert dict(store.local(HOST_ROUTE)) == {}
@@ -2524,9 +2577,9 @@ _EARLIER = {"attributes_version": 1, "x_note": "earlier"}
 def _write(entry: str, trie: HotTrie, records: IpAttributeRecords, document: object) -> None:
     untyped: Any = document
     if entry == "record":
-        records.record(V4, untyped)
+        records.record(V4, untyped, request_count=1300)
     else:
-        assert apply_hot_ip_added(trie, records, V4, untyped) is True
+        assert apply_hot_ip_added(trie, records, V4, untyped, request_count=1300) is True
 
 
 def _assert_stored_outcome(
@@ -2548,9 +2601,9 @@ def _assert_stored_outcome(
 
     trie = PatriciaTrie(IPV4)
     records = IpAttributeRecords(IPV4)
-    assert apply_hot_ip_added(trie, records, V4_C, dict(_NEIGHBOUR)) is True
+    assert apply_hot_ip_added(trie, records, V4_C, dict(_NEIGHBOUR), request_count=1100) is True
     if entry == "record":
-        records.record(V4, dict(_EARLIER))
+        records.record(V4, dict(_EARLIER), request_count=1200)
     trie_before = _trie_state(trie)
     records_before = _records_state(records)
 
@@ -2568,7 +2621,8 @@ def _assert_stored_outcome(
 
     with _armed(error, endless=endless):
         _write(entry, trie, records, document)
-    stored = dict(records[V4])
+    stored = dict(records[V4].attributes)
+    assert records[V4].request_count == 1300
     _assert_exact(stored)
     assert stored == expected.document
     assert records.serialized_bytes == _compact_size(_NEIGHBOUR) + expected.size
@@ -2648,8 +2702,8 @@ def test_subclasses_are_stored_and_read_back_as_their_base_types(
 def test_a_bool_x_value_reads_back_as_a_bool() -> None:
     records = IpAttributeRecords(IPV4)
     document = {"attributes_version": 1, "x_t": True, "x_f": False, "x_l": [True, [False]]}
-    records.record(V4, document)
-    stored: Any = records[V4]
+    records.record(V4, document, request_count=1200)
+    stored: Any = records[V4].attributes
     assert dict(stored) == document
     assert stored["x_t"] is True
     assert stored["x_f"] is False
@@ -2870,16 +2924,16 @@ def test_none_still_stores_the_default_after_the_default_itself_is_refused() -> 
     records = IpAttributeRecords(IPV4)
     default: Any = DEFAULT_ATTRIBUTES
     with pytest.raises(InvalidAttributesError):
-        records.record(V4, default)
+        records.record(V4, default, request_count=1200)
     with pytest.raises(InvalidAttributesError):
-        apply_hot_ip_added(trie, records, V4, default)
+        apply_hot_ip_added(trie, records, V4, default, request_count=1200)
     assert len(records) == 0
     assert trie.hot_ip_count == 0
 
-    records.record(V4_C, None)
-    assert dict(records[V4_C]) == {"attributes_version": 1}
-    assert apply_hot_ip_added(trie, records, V4, None) is True
-    assert dict(records[V4]) == {"attributes_version": 1}
+    records.record(V4_C, None, request_count=1200)
+    assert dict(records[V4_C].attributes) == {"attributes_version": 1}
+    assert apply_hot_ip_added(trie, records, V4, None, request_count=1200) is True
+    assert dict(records[V4].attributes) == {"attributes_version": 1}
     assert records.serialized_bytes == 48
 
 
@@ -2986,13 +3040,16 @@ READ_BACK: dict[str, Any] = {
 READS = ["getitem", "get", "values", "items"]
 
 
-def _read(records: IpAttributeRecords, address: Address, how: str) -> Any:
-    """One of decision 5's read paths, on a map holding only `address`."""
+def _read_record(records: IpAttributeRecords, address: Address, how: str) -> IpRecord:
+    """One of decision 5's read paths, on a map holding only `address`: the
+    whole `IpRecord` (Amendment 5 ruling 2)."""
 
     if how == "getitem":
         return records[address]
     if how == "get":
-        return records.get(address)
+        found = records.get(address)
+        assert found is not None
+        return found
     if how == "values":
         (value,) = records.values()
         return value
@@ -3001,18 +3058,25 @@ def _read(records: IpAttributeRecords, address: Address, how: str) -> Any:
     return value
 
 
+def _read(records: IpAttributeRecords, address: Address, how: str) -> Any:
+    """The document of `_read_record`'s record, as `records[a].attributes`."""
+
+    return _read_record(records, address, how).attributes
+
+
 @pytest.mark.parametrize("how", READS)
 def test_every_read_decodes_a_fresh_exact_typed_document(how: str) -> None:
     """Ruling D / assumptions 57-58: two reads are distinct objects at every
     depth, each a read-only view over exact built-in types."""
 
     records = IpAttributeRecords(IPV4)
-    records.record(V4, copy.deepcopy(READ_BACK))
+    records.record(V4, copy.deepcopy(READ_BACK), request_count=1200)
     first = _read(records, V4, how)
     second = _read(records, V4, how)
 
     assert first is not second
     assert records[V4] is not records[V4]
+    assert records[V4].attributes is not records[V4].attributes
     assert first["x_list"] is not second["x_list"]
     assert first["x_list"][1] is not second["x_list"][1]
     assert first["x_list"][1][1] is not second["x_list"][1][1]
@@ -3026,11 +3090,12 @@ def test_every_read_decodes_a_fresh_exact_typed_document(how: str) -> None:
 
 def test_every_read_of_the_default_record_is_fresh_too() -> None:
     records = IpAttributeRecords(IPV4)
-    records.record(V4)
+    records.record(V4, request_count=1200)
     first, second = records[V4], records[V4]
     assert first is not second
-    assert dict(first) == dict(second) == {"attributes_version": 1}
-    _assert_exact(dict(first))
+    assert first.attributes is not second.attributes
+    assert dict(first.attributes) == dict(second.attributes) == {"attributes_version": 1}
+    _assert_exact(dict(first.attributes))
 
 
 @pytest.mark.parametrize("how", READS)
@@ -3041,7 +3106,8 @@ def test_mutating_a_read_at_any_depth_changes_nothing_stored(how: str) -> None:
 
     trie = PatriciaTrie(IPV4)
     records = IpAttributeRecords(IPV4)
-    assert apply_hot_ip_added(trie, records, V4, copy.deepcopy(READ_BACK)) is True
+    document = copy.deepcopy(READ_BACK)
+    assert apply_hot_ip_added(trie, records, V4, document, request_count=1200) is True
     size = records.serialized_bytes
     assert size == _compact_size(READ_BACK)
 
@@ -3054,7 +3120,8 @@ def test_mutating_a_read_at_any_depth_changes_nothing_stored(how: str) -> None:
     with pytest.raises(TypeError):
         view["weight"] = 4
 
-    assert dict(records[V4]) == READ_BACK
+    assert dict(records[V4].attributes) == READ_BACK
+    assert records[V4].request_count == 1200
     assert records.serialized_bytes == size
     _check_coupled(trie, records)
 
@@ -3093,15 +3160,16 @@ def test_record_refuses_an_integer_of_641_digits_and_changes_nothing(earlier: bo
     address are exactly as they were."""
 
     records = IpAttributeRecords(IPV4)
-    records.record(V4_C, {"attributes_version": 1, "weight": 7})
+    records.record(V4_C, {"attributes_version": 1, "weight": 7}, request_count=1100)
     if earlier:
-        records.record(V4, {"attributes_version": 1, "weight": 1450, "x_note": "kept"})
+        kept = {"attributes_version": 1, "weight": 1450, "x_note": "kept"}
+        records.record(V4, kept, request_count=1200)
     before = _records_state(records)
 
     with pytest.raises(InvalidAttributesError):
-        records.record(V4, {"attributes_version": 1, "x_big": S8_REFUSED})
+        records.record(V4, {"attributes_version": 1, "x_big": S8_REFUSED}, request_count=1300)
     with pytest.raises(InvalidAttributesError):
-        records.record(V4, _s8_refused_document())
+        records.record(V4, _s8_refused_document(), request_count=1300)
     assert _records_state(records) == before
     assert len(records) == (2 if earlier else 1)
     assert (V4 in records) is earlier
@@ -3116,15 +3184,16 @@ def test_apply_hot_ip_added_refuses_an_integer_of_641_digits_and_changes_neither
 
     trie = make_trie(IPV4)
     records = IpAttributeRecords(IPV4)
-    assert apply_hot_ip_added(trie, records, V4_C, {"attributes_version": 1, "weight": 3}) is True
+    neighbour = {"attributes_version": 1, "weight": 3}
+    assert apply_hot_ip_added(trie, records, V4_C, neighbour, request_count=1100) is True
     if hot:
         kept = {"attributes_version": 1, "x_note": "kept"}
-        assert apply_hot_ip_added(trie, records, V4, kept) is True
+        assert apply_hot_ip_added(trie, records, V4, kept, request_count=1200) is True
     trie_before = _trie_state(trie)
     records_before = _records_state(records)
 
     with pytest.raises(InvalidAttributesError):
-        apply_hot_ip_added(trie, records, V4, _s8_refused_document())
+        apply_hot_ip_added(trie, records, V4, _s8_refused_document(), request_count=1300)
     assert trie.contains(V4) is hot
     assert _trie_state(trie) == trie_before
     assert _records_state(records) == records_before
@@ -3148,21 +3217,21 @@ def test_a_stored_640_digit_integer_reads_back_equal_under_every_limit(
     top_level = {"attributes_version": 1, "x_big": value}
     nested = {"attributes_version": 1, "x_l": [0, {"k": value}]}
     records = IpAttributeRecords(IPV4)
-    records.record(V4, top_level)
+    records.record(V4, top_level, request_count=1200)
 
     with _int_str_limit(limit):
-        records.record(V4_B, nested)
-        by_item = dict(records[V4])
+        records.record(V4_B, nested, request_count=1300)
+        by_item = dict(records[V4].attributes)
         by_get = records.get(V4)
-        nested_by_item = dict(records[V4_B])
+        nested_by_item = dict(records[V4_B].attributes)
         nested_by_get = records.get(V4_B)
         assert V4 in records
     assert by_get is not None
     assert nested_by_get is not None
-    for read in (by_item, dict(by_get)):
+    for read in (by_item, dict(by_get.attributes)):
         _assert_exact(read)
         assert read == top_level
-    for read in (nested_by_item, dict(nested_by_get)):
+    for read in (nested_by_item, dict(nested_by_get.attributes)):
         _assert_exact(read)
         assert read == nested
     assert records.serialized_bytes == _compact_size(top_level) + _compact_size(nested)
@@ -3182,7 +3251,7 @@ def test_in_answers_whether_a_record_is_stored() -> None:
     """Ruling 4 / assumption 68: for an `Address` of the map's family."""
 
     records = IpAttributeRecords(IPV4)
-    records.record(V4, {"attributes_version": 1, "weight": 3})
+    records.record(V4, {"attributes_version": 1, "weight": 3}, request_count=1200)
     assert (V4 in records) is True
     assert (V4_B in records) is False
     keys = records.keys()
@@ -3203,7 +3272,7 @@ def test_in_is_false_for_anything_that_is_not_an_address(populated: bool, key: o
 
     records = IpAttributeRecords(IPV4)
     if populated:
-        records.record(V4)
+        records.record(V4, request_count=1200)
     untyped: Any = records
     assert (key in untyped) is False
     keys = untyped.keys()
@@ -3226,7 +3295,7 @@ def test_in_raises_for_an_address_of_the_other_family(
 
     records = IpAttributeRecords(family)
     if populated:
-        records.record(SAMPLE[family])
+        records.record(SAMPLE[family], request_count=1200)
     with pytest.raises(ValueError) as excinfo:
         _ = other in records
     _assert_names_both_families(excinfo.value)
@@ -3250,8 +3319,8 @@ def test_in_decodes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     check is the control: a read, which must decode, does raise."""
 
     records = IpAttributeRecords(IPV4)
-    records.record(V4, {"attributes_version": 1, "weight": 3})
-    records.record(V4_C)
+    records.record(V4, {"attributes_version": 1, "weight": 3}, request_count=1200)
+    records.record(V4_C, request_count=900)
     other_family = IpAttributeRecords(IPV6)
     untyped: Any = records
     monkeypatch.setattr(json, "loads", _refuse_to_decode)
@@ -3282,3 +3351,640 @@ def test_in_decodes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(_DecodeAttemptedError):
         _ = records[V4]
+
+
+# ==========================================================================
+# H. Amendment 5: `request_count` joins the per-IP record (rulings 1-7 and
+#    10; assumptions 70-78; decisions 5 and 6 as amended; sections 46.5 and
+#    46.8).
+# ==========================================================================
+
+# Per family: an address no test in this section records, and a third one
+# beside `SAMPLE` and `OTHER_SAMPLE`.
+ABSENT = {IPV4: V4_B, IPV6: Address.parse("2001:db8::2b")}
+THIRD = {IPV4: Address.parse("192.168.1.44"), IPV6: Address.parse("2001:db8::2c")}
+
+HUGE_COUNT = 10**30
+
+
+def _pair(make_trie: TrieFactory, family: AddressFamily) -> tuple[HotTrie, IpAttributeRecords]:
+    """A trie and its records, holding one neighbour of `SAMPLE[family]`."""
+
+    trie = make_trie(family)
+    records = IpAttributeRecords(family)
+    neighbour = OTHER_SAMPLE[family]
+    assert apply_hot_ip_added(trie, records, neighbour, dict(_NEIGHBOUR), request_count=1100)
+    return trie, records
+
+
+def _record_of(records: IpAttributeRecords, address: Address) -> tuple[dict[str, object], int]:
+    record = records[address]
+    return dict(record.attributes), record.request_count
+
+
+# --- Ruling 2: a read is an `IpRecord`, fresh and read-only. ----------------
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_read_is_an_ip_record_holding_the_document_and_the_count(
+    family: AddressFamily,
+) -> None:
+    """Ruling 2: `records[a]` returns the whole record; `get`, `values` and
+    `items` go through it; `records.get(absent)` is `None`."""
+
+    records = IpAttributeRecords(family)
+    address, other = SAMPLE[family], OTHER_SAMPLE[family]
+    document = {"attributes_version": 1, "weight": 1450, "x_note": "held"}
+    records.record(address, document, request_count=1200)
+    records.record(other, request_count=0)
+
+    record = records[address]
+    assert type(record) is IpRecord
+    assert dict(record.attributes) == document
+    assert record.request_count == 1200
+    assert type(record.request_count) is int
+    assert _record_of(records, other) == ({"attributes_version": 1}, 0)
+    assert type(records[other].request_count) is int
+
+    assert records.get(ABSENT[family]) is None
+    found = records.get(address)
+    assert found is not None
+    assert type(found) is IpRecord
+    assert (dict(found.attributes), found.request_count) == (document, 1200)
+
+    values = list(records.values())
+    assert len(values) == 2
+    assert all(type(value) is IpRecord for value in values)
+    assert sorted(value.request_count for value in values) == [0, 1200]
+
+    items = list(records.items())
+    assert {key for key, _value in items} == {address, other}
+    for key, value in items:
+        assert type(value) is IpRecord
+        assert (dict(value.attributes), value.request_count) == _record_of(records, key)
+
+
+@pytest.mark.parametrize("how", READS)
+@pytest.mark.parametrize("family", FAMILIES)
+def test_two_reads_are_two_records_with_two_documents(family: AddressFamily, how: str) -> None:
+    """Ruling 2: "It then returns a new `IpRecord` on every call", whose
+    `attributes` is a view over a document decoded afresh for that read."""
+
+    records = IpAttributeRecords(family)
+    address = SAMPLE[family]
+    records.record(address, copy.deepcopy(READ_BACK), request_count=1200)
+
+    first = _read_record(records, address, how)
+    second = _read_record(records, address, how)
+
+    assert type(first) is IpRecord
+    assert type(second) is IpRecord
+    assert first is not second
+    assert first.attributes is not second.attributes
+    for record in (first, second):
+        assert dict(record.attributes) == READ_BACK
+        assert record.request_count == 1200
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_record_is_frozen_and_its_document_read_only(family: AddressFamily) -> None:
+    """Ruling 2: a frozen dataclass, so assigning either field is a
+    `FrozenInstanceError`; the document is a read-only view; the record
+    itself takes no item assignment. Nothing reaches the map."""
+
+    records = IpAttributeRecords(family)
+    address = SAMPLE[family]
+    records.record(address, {"attributes_version": 1, "weight": 3}, request_count=1200)
+    before = _records_state(records)
+
+    record: Any = records[address]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        record.attributes = {"attributes_version": 1, "weight": 4}
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        record.request_count = 5
+    view: Any = records[address].attributes
+    with pytest.raises(TypeError):
+        view["weight"] = 4
+    whole: Any = records[address]
+    with pytest.raises(TypeError):
+        whole["weight"] = 4
+
+    assert _records_state(records) == before
+    assert _record_of(records, address) == ({"attributes_version": 1, "weight": 3}, 1200)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_mutating_a_nested_value_of_a_read_changes_nothing_stored(family: AddressFamily) -> None:
+    """Ruling 2 with decision 5's reads bullet: a later read and
+    `serialized_bytes` are untouched, and so is the count."""
+
+    records = IpAttributeRecords(family)
+    address = SAMPLE[family]
+    records.record(address, copy.deepcopy(READ_BACK), request_count=1200)
+    size = records.serialized_bytes
+
+    view: Any = records[address].attributes
+    view["x_list"].append("a" * 2000)
+    view["x_list"][1][1]["k"] = "changed"
+    view["x_obj"]["k"]["j"].clear()
+
+    assert _record_of(records, address) == (READ_BACK, 1200)
+    assert records.serialized_bytes == size == _compact_size(READ_BACK)
+
+
+# --- Ruling 3: both writers store the count. -------------------------------
+
+STORED_COUNTS = [
+    pytest.param(0, id="zero"),
+    pytest.param(1, id="one"),
+    pytest.param(1200, id="1200"),
+    pytest.param(HUGE_COUNT, id="10-to-the-30"),
+]
+
+
+@pytest.mark.parametrize("count", STORED_COUNTS)
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_both_writers_store_the_count_exactly(
+    make_trie: TrieFactory, family: AddressFamily, entry: str, count: int
+) -> None:
+    """Ruling 3 / assumption 74: any exact `int >= 0`, `0` included whether
+    or not the address is HOT, and no maximum: `10**30` reads back exactly."""
+
+    trie, records = _pair(make_trie, family)
+    address = SAMPLE[family]
+    if entry == "record":
+        records.record(address, None, request_count=count)
+    else:
+        assert apply_hot_ip_added(trie, records, address, None, request_count=count) is True
+        _check_coupled(trie, records)
+
+    stored = records[address].request_count
+    assert type(stored) is int
+    assert stored == count
+    assert dict(records[address].attributes) == {"attributes_version": 1}
+    assert records[OTHER_SAMPLE[family]].request_count == 1100
+
+
+# --- Ruling 3: keyword-only and required. ----------------------------------
+
+MISSING_OR_POSITIONAL = [
+    pytest.param("record-no-count", id="record-without-request-count"),
+    pytest.param("record-no-count-no-document", id="record-with-only-the-address"),
+    pytest.param("record-positional", id="record-count-passed-positionally"),
+    pytest.param("apply-no-count", id="apply-without-request-count"),
+    pytest.param("apply-no-count-no-document", id="apply-with-only-the-address"),
+    pytest.param("apply-positional", id="apply-count-passed-positionally"),
+]
+
+
+def _call_without_the_keyword(
+    how: str, trie: HotTrie, records: IpAttributeRecords, address: Address
+) -> None:
+    # Through `Any`: each call is one the signature forbids.
+    loose_records: Any = records
+    loose_apply: Any = apply_hot_ip_added
+    if how == "record-no-count":
+        loose_records.record(address, None)
+    elif how == "record-no-count-no-document":
+        loose_records.record(address)
+    elif how == "record-positional":
+        loose_records.record(address, None, 5)
+    elif how == "apply-no-count":
+        loose_apply(trie, records, address, None)
+    elif how == "apply-no-count-no-document":
+        loose_apply(trie, records, address)
+    elif how == "apply-positional":
+        loose_apply(trie, records, address, None, 5)
+    else:
+        raise AssertionError(how)
+
+
+@pytest.mark.parametrize("hot", [False, True], ids=["new-address", "hot-address"])
+@pytest.mark.parametrize("how", MISSING_OR_POSITIONAL)
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_request_count_is_required_and_keyword_only(
+    make_trie: TrieFactory, family: AddressFamily, how: str, hot: bool
+) -> None:
+    """Ruling 3 / assumption 72: omitting `request_count`, or passing it
+    positionally, is a `TypeError` and changes neither the map nor the trie."""
+
+    trie, records = _pair(make_trie, family)
+    address = SAMPLE[family]
+    if hot:
+        assert apply_hot_ip_added(trie, records, address, dict(_EARLIER), request_count=1200)
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+
+    with pytest.raises(TypeError):
+        _call_without_the_keyword(how, trie, records, address)
+
+    assert _trie_state(trie) == trie_before
+    assert _records_state(records) == records_before
+    _check_coupled(trie, records)
+
+
+# --- Ruling 3: refused counts, all-or-nothing. -----------------------------
+
+
+class _CountEnum(IntEnum):
+    TWELVE_HUNDRED = 1200
+
+
+# Built arithmetically; never converted to text (assumption 76: rendering it
+# would exceed the interpreter's integer-string limit).
+_VERY_NEGATIVE = -(10**5000)
+
+# (the count, the error it must raise). Explicit ids throughout: pytest would
+# otherwise render each value as text.
+REFUSED_COUNTS = [
+    pytest.param(True, TypeError, id="true"),
+    pytest.param(False, TypeError, id="false"),
+    pytest.param(5.0, TypeError, id="integral-float"),
+    pytest.param("5", TypeError, id="str"),
+    pytest.param(None, TypeError, id="none"),
+    pytest.param(_CountEnum.TWELVE_HUNDRED, TypeError, id="int-enum-member"),
+    pytest.param(-1, ValueError, id="minus-1"),
+    pytest.param(_VERY_NEGATIVE, ValueError, id="minus-10-to-the-5000"),
+]
+
+COUNT_ENTRIES = ["record-new", "record-existing", "apply-new", "apply-hot"]
+
+
+def _prepare(
+    entry: str, make_trie: TrieFactory, family: AddressFamily
+) -> tuple[HotTrie, IpAttributeRecords]:
+    """`_pair`, plus -- for "record-existing" and "apply-hot" -- a HOT
+    `SAMPLE[family]` with its own document and count."""
+
+    trie, records = _pair(make_trie, family)
+    if entry in ("record-existing", "apply-hot"):
+        address = SAMPLE[family]
+        assert apply_hot_ip_added(trie, records, address, dict(_EARLIER), request_count=1200)
+    return trie, records
+
+
+def _write_count(
+    entry: str,
+    trie: HotTrie,
+    records: IpAttributeRecords,
+    address: Address,
+    count: object,
+    document: object = None,
+) -> None:
+    loose_count: Any = count
+    loose_document: Any = document
+    if entry.startswith("record"):
+        records.record(address, loose_document, request_count=loose_count)
+    else:
+        apply_hot_ip_added(trie, records, address, loose_document, request_count=loose_count)
+
+
+def _assert_names_request_count(error: BaseException) -> None:
+    """Assumption 76: the message names `request_count`. Only a slice of the
+    message is shown on failure."""
+
+    message = str(error)
+    assert "request_count" in message, message[:200]
+
+
+@pytest.mark.parametrize(("count", "error"), REFUSED_COUNTS)
+@pytest.mark.parametrize("entry", COUNT_ENTRIES)
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_a_refused_count_changes_nothing(
+    make_trie: TrieFactory,
+    family: AddressFamily,
+    entry: str,
+    count: object,
+    error: type[Exception],
+) -> None:
+    """Ruling 3 / assumptions 74 and 76: `TypeError` unless the count is an
+    exact `int` (a `bool`, an integral `float` and an `int` subclass
+    included), `ValueError` if it is negative; the message names
+    `request_count` and never holds the value; the map's length, byte total,
+    every document and every count, and the trie, are all as they were."""
+
+    trie, records = _prepare(entry, make_trie, family)
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+    document = {"attributes_version": 1, "weight": 2000}
+
+    with pytest.raises(error) as excinfo:
+        _write_count(entry, trie, records, SAMPLE[family], count, document)
+
+    _assert_names_request_count(excinfo.value)
+    assert "0" * 40 not in str(excinfo.value)
+    assert _trie_state(trie) == trie_before
+    assert _records_state(records) == records_before
+    _check_coupled(trie, records)
+
+
+# --- Ruling 3 / assumption 75: the order of the checks. ---------------------
+
+ORDER_BAD_COUNTS = [
+    pytest.param(True, id="true"),
+    pytest.param("5", id="str"),
+    pytest.param(None, id="none"),
+    pytest.param(-1, id="minus-1"),
+]
+
+
+@pytest.mark.parametrize("count", ORDER_BAD_COUNTS)
+@pytest.mark.parametrize("family", FAMILIES)
+def test_record_checks_the_family_before_the_count(family: AddressFamily, count: object) -> None:
+    """Ruling 3: "The family (`ValueError`); the count ...": an address of the
+    other family with a bad count is the family `ValueError`, naming both."""
+
+    records = IpAttributeRecords(family)
+    records.record(SAMPLE[family], dict(_EARLIER), request_count=1200)
+    before = _records_state(records)
+    loose_count: Any = count
+
+    with pytest.raises(ValueError) as excinfo:
+        records.record(SAMPLE[_other(family)], None, request_count=loose_count)
+
+    _assert_names_both_families(excinfo.value)
+    assert _records_state(records) == before
+
+
+@pytest.mark.parametrize("count", ORDER_BAD_COUNTS)
+@pytest.mark.parametrize(("trie_family", "records_family", "address_family"), MISMATCHES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_the_coupled_step_checks_the_families_before_the_count(
+    make_trie: TrieFactory,
+    trie_family: AddressFamily,
+    records_family: AddressFamily,
+    address_family: AddressFamily,
+    count: object,
+) -> None:
+    """Ruling 3: "the families; the count; the document ..."."""
+
+    trie = make_trie(trie_family)
+    assert trie.add_hot_ip(OTHER_SAMPLE[trie_family]) is True
+    records = IpAttributeRecords(records_family)
+    records.record(OTHER_SAMPLE[records_family], dict(_NEIGHBOUR), request_count=1100)
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+    loose_count: Any = count
+
+    with pytest.raises(ValueError) as excinfo:
+        apply_hot_ip_added(trie, records, SAMPLE[address_family], None, request_count=loose_count)
+
+    _assert_names_both_families(excinfo.value)
+    assert _trie_state(trie) == trie_before
+    assert _records_state(records) == records_before
+
+
+ORDER_COUNT_ERRORS = [
+    pytest.param(True, TypeError, id="true"),
+    pytest.param("5", TypeError, id="str"),
+    pytest.param(5.0, TypeError, id="integral-float"),
+    pytest.param(-1, ValueError, id="minus-1"),
+]
+
+
+@pytest.mark.parametrize(("count", "error"), ORDER_COUNT_ERRORS)
+@pytest.mark.parametrize("entry", COUNT_ENTRIES)
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_a_bad_count_is_reported_before_an_invalid_document(
+    make_trie: TrieFactory,
+    family: AddressFamily,
+    entry: str,
+    count: object,
+    error: type[Exception],
+) -> None:
+    """Assumption 75: the count is checked before the document, so a bug is
+    never reported as a rejected document -- the count's error, not
+    `InvalidAttributesError`, and nothing changes."""
+
+    trie, records = _prepare(entry, make_trie, family)
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+
+    with pytest.raises(error) as excinfo:
+        _write_count(entry, trie, records, SAMPLE[family], count, {})
+
+    assert not isinstance(excinfo.value, InvalidAttributesError), repr(excinfo.value)
+    _assert_names_request_count(excinfo.value)
+    assert _trie_state(trie) == trie_before
+    assert _records_state(records) == records_before
+
+
+@pytest.mark.parametrize(("count", "error"), ORDER_COUNT_ERRORS)
+@pytest.mark.parametrize("with_record", [True, False], ids=["recorded", "unrecorded"])
+def test_a_bad_count_is_reported_before_a_corrupt_trie_is_touched(
+    with_record: bool, count: object, error: type[Exception]
+) -> None:
+    """Ruling 3: the count (clause 1) comes before the trie (clause 3), so on
+    `test_a_corrupt_trie_raises_before_the_record_is_written`'s setup a bad
+    count is the count's error, not `InvariantViolation`. Per ADR-0014 A12
+    clause 4 no check is run on this state."""
+
+    trie = PatriciaTrie(IPV4)
+    records = IpAttributeRecords(IPV4)
+    if with_record:
+        document = {"attributes_version": 1, "weight": 1}
+        assert apply_hot_ip_added(trie, records, V4, document, request_count=1200) is True
+    else:
+        assert trie.add_hot_ip(V4) is True
+    assert trie.node_count == 1
+    trie.arena.hot_count[trie.root] = 0
+    before = _records_state(records)
+    loose_count: Any = count
+
+    with pytest.raises(error) as excinfo:
+        apply_hot_ip_added(trie, records, V4, None, request_count=loose_count)
+
+    assert not isinstance(excinfo.value, InvariantViolation), repr(excinfo.value)
+    _assert_names_request_count(excinfo.value)
+    assert _records_state(records) == before
+
+
+# --- Ruling 4: replace-on-add, removal and the recovery carry the count. ----
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_a_redundant_add_replaces_the_document_and_the_count(
+    make_trie: TrieFactory, family: AddressFamily
+) -> None:
+    """Ruling 4 / ADR-0014 decision 3 as noted: an add for an address that is
+    already HOT returns `False`, leaves the trie's counts alone, and replaces
+    the whole record -- a lower count and `0` included; the identical call
+    again leaves the record as it was."""
+
+    trie, records = _pair(make_trie, family)
+    address = SAMPLE[family]
+    first = {"attributes_version": 1, "weight": 10}
+    second = {"attributes_version": 1, "weight": 12345, "x_note": "new owner"}
+    assert apply_hot_ip_added(trie, records, address, first, request_count=1200) is True
+    counts = _trie_state(trie)
+
+    assert apply_hot_ip_added(trie, records, address, second, request_count=1375) is False
+    assert _trie_state(trie) == counts
+    assert _record_of(records, address) == (second, 1375)
+    _check_coupled(trie, records)
+
+    before = _records_state(records)
+    assert apply_hot_ip_added(trie, records, address, second, request_count=1375) is False
+    assert _records_state(records) == before
+    assert _trie_state(trie) == counts
+
+    for count in (1001, 0, HUGE_COUNT):
+        assert apply_hot_ip_added(trie, records, address, None, request_count=count) is False
+        assert _record_of(records, address) == ({"attributes_version": 1}, count)
+        assert _trie_state(trie) == counts
+        _check_coupled(trie, records)
+    assert records[OTHER_SAMPLE[family]].request_count == 1100
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_a_removal_takes_the_count_with_the_record(
+    make_trie: TrieFactory, family: AddressFamily
+) -> None:
+    """Ruling 4: `HotIpRemoved` deletes both; one for an address with no
+    record deletes nothing; a later add sets its own count, not the old one.
+    `discard` and `clear` remove whole records too (ruling 2)."""
+
+    trie, records = _pair(make_trie, family)
+    address = SAMPLE[family]
+    assert apply_hot_ip_added(trie, records, address, dict(_EARLIER), request_count=1200)
+
+    assert apply_hot_ip_removed(trie, records, address) is True
+    assert address not in records
+    assert records.get(address) is None
+    assert _record_of(records, OTHER_SAMPLE[family]) == (_NEIGHBOUR, 1100)
+    _check_coupled(trie, records)
+
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+    assert apply_hot_ip_removed(trie, records, address) is False
+    assert apply_hot_ip_removed(trie, records, ABSENT[family]) is False
+    assert _trie_state(trie) == trie_before
+    assert _records_state(records) == records_before
+
+    assert apply_hot_ip_added(trie, records, address, None, request_count=7) is True
+    assert _record_of(records, address) == ({"attributes_version": 1}, 7)
+    _check_coupled(trie, records)
+
+    assert records.discard(address) is True
+    records.record(address, None, request_count=9)
+    assert records[address].request_count == 9
+    records.clear()
+    records.record(address, None, request_count=11)
+    assert _record_of(records, address) == ({"attributes_version": 1}, 11)
+    assert len(records) == 1
+
+
+@pytest.mark.parametrize("had_record", [True, False], ids=["hot-address", "new-address"])
+@pytest.mark.parametrize("document", REJECTED_DOCUMENTS)
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_a_rejected_document_keeps_the_old_count_and_the_recovery_stores_the_new(
+    make_trie: TrieFactory, family: AddressFamily, document: object, had_record: bool
+) -> None:
+    """Ruling 4: when `apply_hot_ip_added` raises `InvalidAttributesError`
+    nothing has changed, count included; the recovery call, with no document
+    and the same `request_count`, stores the default document with that
+    count. The document was rejected, not the count."""
+
+    trie, records = _pair(make_trie, family)
+    address = SAMPLE[family]
+    earlier = {"attributes_version": 1, "weight": 1450, "x_note": "earlier"}
+    if had_record:
+        assert apply_hot_ip_added(trie, records, address, earlier, request_count=1200) is True
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+    loose_document: Any = document
+
+    with pytest.raises(InvalidAttributesError):
+        apply_hot_ip_added(trie, records, address, loose_document, request_count=1375)
+
+    assert _trie_state(trie) == trie_before
+    assert _records_state(records) == records_before
+    if had_record:
+        assert _record_of(records, address) == (earlier, 1200)
+    else:
+        assert address not in records
+
+    changed = apply_hot_ip_added(trie, records, address, None, request_count=1375)
+    assert changed is (not had_record)
+    assert _record_of(records, address) == ({"attributes_version": 1}, 1375)
+    _check_coupled(trie, records)
+
+
+# --- Ruling 5: the byte total counts the attribute texts only. ---------------
+
+
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_the_byte_total_counts_attribute_texts_only(
+    make_trie: TrieFactory, family: AddressFamily, entry: str
+) -> None:
+    """Ruling 5 / section 46.8: two default records with counts `0` and
+    `10**30` are 48 bytes; a write that changes only the count leaves the
+    total where it was; the total is the sum of the documents' compact
+    sizes."""
+
+    trie = make_trie(family)
+    records = IpAttributeRecords(family)
+    address, other = SAMPLE[family], OTHER_SAMPLE[family]
+
+    def write(target: Address, document: dict[str, object] | None, count: int) -> None:
+        if entry == "record":
+            records.record(target, document, request_count=count)
+        else:
+            apply_hot_ip_added(trie, records, target, document, request_count=count)
+
+    write(address, None, 0)
+    write(other, None, HUGE_COUNT)
+    assert records.serialized_bytes == 48
+
+    write(address, None, 7)
+    assert records.serialized_bytes == 48
+    write(other, {"attributes_version": 1}, 1)
+    assert records.serialized_bytes == 48
+    assert _record_of(records, address) == ({"attributes_version": 1}, 7)
+    assert _record_of(records, other) == ({"attributes_version": 1}, 1)
+
+    document = {"attributes_version": 1, "weight": 1450, "x_note": "sized"}
+    write(address, document, 1200)
+    size = records.serialized_bytes
+    assert size == 24 + _compact_size(document)
+    write(address, document, HUGE_COUNT)
+    assert records.serialized_bytes == size
+    assert records.serialized_bytes == sum(_compact_size(records[a].attributes) for a in records)
+
+
+# --- Ruling 6: the checkers take the widened map unchanged. -----------------
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_both_checkers_accept_a_map_filled_with_counts(
+    make_trie: TrieFactory, family: AddressFamily
+) -> None:
+    """Ruling 6 / ADR-0014 decision 9 as noted: `check_attribute_records` and
+    testkit's `assert_attribute_records_match` take any
+    `Collection[Address]`, and a `Mapping[Address, IpRecord]` is one."""
+
+    trie = make_trie(family)
+    records = IpAttributeRecords(family)
+    hot = [SAMPLE[family], OTHER_SAMPLE[family], THIRD[family]]
+    for count, address in enumerate(hot):
+        added = apply_hot_ip_added(trie, records, address, None, request_count=count * HUGE_COUNT)
+        assert added is True
+        check_attribute_records(trie, records)
+        assert_attribute_records_match(trie, records)
+
+    assert apply_hot_ip_added(trie, records, SAMPLE[family], None, request_count=3) is False
+    assert apply_hot_ip_removed(trie, records, OTHER_SAMPLE[family]) is True
+    check_attribute_records(trie, records)
+    assert_attribute_records_match(trie, records)
+    _check_coupled(trie, records)
