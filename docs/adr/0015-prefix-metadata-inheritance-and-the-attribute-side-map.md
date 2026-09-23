@@ -15,7 +15,16 @@ operand that is not one of the three kinds with a `TypeError`. Each edit is
 in place with a dated note and is listed there. Only the path ruling changes
 a behaviour the text implied — such a declaration used to be accepted, and
 every read through it failed; the other rulings correct an example, confirm
-a reading or state what was unstated)
+a reading or state what was unstated); amended again the same day (see
+"Amendment 2" at the end — four findings of the post-implementation review
+against decision 5 are ruled: the attribute validator reads a document once,
+through the built-in types' own slots, into a canonical copy, and that copy —
+never the caller's object — is what is checked, measured, stored and sent; its
+work is bounded by the size cap before it reads anything; nothing but
+`InvalidAttributesError` can come out of a document; and the record map keeps
+each record as its canonical JSON text and decodes a fresh document on every
+read, which reverses assumption 18's "Reads are not copied". Rulings A, B and
+D change shipped code; ruling C is the contract they make true)
 
 Scope note: this ADR settles the interfaces epic #9 ("Metadata inheritance &
 hot-count aggregation") implements against —
@@ -451,9 +460,21 @@ class PrefixMetadataStore:
 
 ```python
 # hammertime.core.events.attributes         Spec: §46.2, §46.3, §46.9      (new)
+class CanonicalAttributes(NamedTuple):                               # Amendment 2
+    document: dict[str, object]   # exact built-in types only; a tree no caller has held
+    text: str                     # its compact JSON encoding; ASCII only
+    @property
+    def size(self) -> int: ...    # len(text): the S6 size, in bytes
+
+def canonicalize_ip_attributes(document: object) -> CanonicalAttributes: ...
+    # Reads `document` once, through the built-in types' own slots, into a new
+    # tree; applies the §46.2 rules below to that copy; returns the copy and its
+    # text. Raises InvalidAttributesError for every violation, and no other
+    # exception can be caused by the document.                    (Amendment 2)
+
 def validate_ip_attributes(document: object) -> int: ...
-    # The §46.2 rules below; returns the document's serialized size in bytes.
-    # Raises InvalidAttributesError for every violation, and nothing else.
+    # canonicalize_ip_attributes(document).size — for checking and measuring.
+    # Anything that stores or sends a document keeps the canonical copy.
 
 # hammertime.core.errors                                                     (added)
 class InvalidAttributesError(HammertimeError): ...
@@ -495,8 +516,11 @@ harness. Everything below is about *how*.
 
 **The rules exist once, in `hammertime-core`.** The codec's private checks
 (`_validate_attributes` and its helpers in `hammertime.core.events.codec`) move
-into one new public function, `validate_ip_attributes`, in a new module
-`hammertime.core.events.attributes`. Both enforcement points call it:
+into a new module, `hammertime.core.events.attributes`, whose entry point is
+`canonicalize_ip_attributes`; `validate_ip_attributes` is its measuring form.
+Both enforcement points call `canonicalize_ip_attributes` and keep what it
+returns — never their own argument: *(Amended 2026-09-23, Amendment 2 ruling A;
+the superseded sentences are quoted there.)*
 
 * **the codec**, on encode and on decode as today, translating the new
   `InvalidAttributesError` into its own `CodecError` with `raise … from exc`, so
@@ -507,9 +531,14 @@ into one new public function, `validate_ip_attributes`, in a new module
   `"attributes": null` on decode, which the codec today rejects inline and
   which is simply a document that is not a JSON object (S1) — so that
   `__cause__` identifies all of them and none is invisible to
-  `attributes_rejected` (assumption 37);
-* **the record map**, on every write, letting `InvalidAttributesError`
-  propagate.
+  `attributes_rejected` (assumption 37). It puts the canonical document —
+  not the payload's own object — into the envelope it encodes and into the
+  event it decodes, so the bytes on the wire are the bytes that were checked
+  *(added 2026-09-23, Amendment 2 ruling A)*;
+* **the record map**, on every write, keeping only the canonical text and
+  letting `InvalidAttributesError` propagate. *(Amended 2026-09-23, Amendment 2
+  rulings A and D; was: "on every write, letting `InvalidAttributesError`
+  propagate.")*
 
 Nothing else in the repo may restate the 1024-byte cap, the 16-key cap, the
 registered-name set or the `x_` grammar.
@@ -519,21 +548,26 @@ column says so; everything else is the codec's existing behaviour, moved:
 
 ```text
 structural — every document, whatever its attributes_version
-  S1  a JSON object: a dict                                              schema "type": "object"
+  S1  a JSON object: a dict, a subclass read through dict's own slots;
+      any other Mapping is refused                                       schema "type": "object"
   S2  at most 16 top-level keys                                          schema maxProperties
   S3  attributes_version present, a JSON integer (an int that is not a
       bool, or an integral finite float), and >= 1                       schema required, minimum
   S4  every value at every depth is in the JSON data model — dict with
-      str keys, list, str, int, finite float, bool, None; no tuple,
-      set, bytes, non-str key or other object                            NEW (see below)
+      str keys, list, str, int, finite float, bool, None; a subclass of
+      dict, list, str, int or float is read and copied as its base
+      type; the keys of one object are distinct as text; no tuple, set,
+      bytes or other object                                              NEW (see below)
   S5  no str, key or value, at any depth, holds an unpaired UTF-16
       surrogate (U+D800-U+DFFF)                                          keys are NEW; values were checked
-  S6  serialized size <= 1024 bytes, measured as
-        len(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+  S6  serialized size <= 1024 bytes, measured on the canonical copy as
+        len(json.dumps(copy, separators=(",", ":")).encode("utf-8"))
       with json's default ensure_ascii — the compact form the codec
-      writes; this is the size the function returns                      §46.2; the return value is NEW
-  S7  nesting too deep to walk or serialize, and a self-referencing
-      structure, are rejections — never a RecursionError or ValueError   cycles are NEW
+      writes; this is the size returned. A document is rejected as
+      soon as a lower bound on it exceeds 1024 ("Bounded work" below)    §46.2; the return value is NEW
+  S7  nesting too deep to walk or serialize, a self-referencing
+      structure, and a shared subtree repeated past the cap are
+      rejections — never a RecursionError or ValueError                  cycles are NEW
 
 registry — only when attributes_version <= 1, the highest version this
 build knows (§46.2: a higher version is stored and echoed verbatim and
@@ -543,6 +577,10 @@ is not interpreted)
       and a misspelt `wieght` are rejected                               schema properties, patternProperties
   R2  weight, if present, is a JSON integer (not a bool) in [0, 1000000]  schema weight
 ```
+
+*(Rows S1, S4, S6 and S7 amended 2026-09-23, Amendment 2 rulings A and B; the
+superseded rows are quoted there. Every rule applies to the canonical copy, not
+to the caller's object.)*
 
 S4 and S7-on-cycles change nothing for wire input: `json.loads` produces only
 JSON-model types, string keys and acyclic structures. They exist because the
@@ -565,6 +603,92 @@ defect the codec already rejects in values, for the reason its own docstring
 gives: such strings "corrupt or crash any strict downstream consumer (a schema
 validator, a non-Python parser, a UTF-8 store)". A key is no safer than a value.
 
+**One read, into the copy that is used** *(added 2026-09-23, Amendment 2
+ruling A; assumptions 49-53)*. `canonicalize_ip_attributes` reads the document
+exactly once and builds a new tree of exact built-in types from it. It decides
+what each value is from `type(value)`, tested with `issubclass` against `dict`,
+`list`, `str`, `int` and `float` (`bool` and `None` are exact: neither can be
+subclassed). It reads a subclass instance only through the base type's own slot
+functions — `dict.__len__` and `dict.items`, `list.__len__` and
+`list.__iter__`, `str.__len__` and `str.__str__`, `int.__int__` and
+`int.bit_length`, `float.__float__` — and never through `isinstance` (which
+consults an overridden `__class__`), `len()`, iteration, comparison, hashing,
+`repr`, or any method, property or attribute the value's own class defines. A
+key is read the same way, so a key cannot pass the registry as one name and be
+serialized as another; two keys of one object whose copies are equal text are a
+rejection (S4). The rules are then applied to the copy, the compact text is
+produced from the copy, and `CanonicalAttributes(document=copy, text=text)` is
+returned. The codec sends that copy and the record map stores that text;
+nothing downstream reads the caller's object again, so no value can show one
+content to the checks and another to the serializer or the store. For
+exact-type input — everything `json.loads` produces, and everything this
+project's producer builds — the copy equals the input, and acceptance, size
+and wire bytes are unchanged.
+
+**Bounded work** *(added 2026-09-23, Amendment 2 ruling B; assumption 54)*.
+While it reads, the function keeps a running total that never exceeds the
+compact size of what it has read so far, and rejects the document under S6 the
+moment the total passes 1024:
+
+1. Every value read adds at least its minimal compact size: 1 for `null`,
+   `true`, `false` or a number; `n + 2` for a string of `n` characters, key or
+   value; 2 for a list's brackets or a dict's braces, plus a comma between
+   neighbouring items or entries and a colon per entry.
+2. Before any string, list or dict is read, its length — measured by the base
+   type's own `__len__` — is checked. If the running total plus that value's
+   minimum already exceeds 1024, the document is rejected without the value
+   being read. The minimum is `n + 2` for a string, `2n + 1` for a list of
+   `n >= 1` items, `5n + 1` for a dict of `n >= 1` entries, and 2 for an empty
+   list or dict.
+3. An `int` is rejected without being converted to text when its bit length
+   alone shows that its decimal form would push the total past 1024.
+4. The read is iterative: it holds an explicit stack of pending containers and
+   never recurses per nesting level.
+
+Each figure under-counts the real compact size, so no document whose compact
+encoding is at most 1024 bytes can be rejected by the bound; the exact size is
+still measured afterwards, on the copy's text. The consequences are that at
+most 1024 values are ever read, whatever the input's size or shape. A cycle,
+a subtree shared by many branches, `[0] * 10**8` or a 50 MB string is rejected
+after O(1024) work. Nesting cannot pass 512 levels, since each level costs two
+bytes, so neither the iterative read nor the final (recursive) serialization of
+the copy can meet an unbounded depth. And no rejection depends on CPython's
+integer-to-string conversion limit.
+
+**What can come out** *(added 2026-09-23, Amendment 2 ruling C; assumptions 55
+and 56)*. Because nothing a document's own types define is ever called, the
+document itself can cause no exception but `InvalidAttributesError`. Per
+function:
+
+```text
+canonicalize_ip_attributes, validate_ip_attributes
+    return, or raise InvalidAttributesError
+codec.encode, codec.decode
+    CodecError only, as before; an attributes rejection is a CodecError whose
+    __cause__ is the InvalidAttributesError
+IpAttributeRecords.record
+    ValueError (the other family, checked first) or InvalidAttributesError
+records[a], records.get(a), a in records
+    ValueError (the other family); KeyError from records[a] when absent
+IpAttributeRecords.discard
+    ValueError (the other family)
+apply_hot_ip_added
+    ValueError (families) or InvalidAttributesError, both before the trie is
+    touched; InvariantViolation from a corrupt trie (ADR-0014 A12)
+apply_hot_ip_removed
+    ValueError (families)
+```
+
+There is **no blanket `except Exception`**: nothing converts an arbitrary
+exception into `InvalidAttributesError`. `MemoryError` and the
+`BaseException`s that are not `Exception`s (`KeyboardInterrupt`, `SystemExit`)
+pass through unchanged. The one narrow conversion kept covers the final
+serialization of the canonical copy: a `RecursionError` or `ValueError` from
+`json.dumps` there becomes an `InvalidAttributesError`. On an exact-typed,
+finite, bounded copy, that can only mean an interpreter configured with an
+integer-to-string limit below what S6 admits, or a caller already at the edge
+of the stack.
+
 **An `InvalidAttributesError` message never contains a value from the
 document.** It names the rule broken and, where that helps, the offending key —
 at most its first 64 characters. §46.9 makes values opaque, the codec already
@@ -572,7 +696,11 @@ redacts `attributes` from its malformed-scalar message for the same reason, and
 an echoed value is exactly how an oversized `x_` payload or a 5,000-digit
 integer (whose `repr` itself raises) would turn a rejection into a flood or a
 crash. The order in which the rules are checked is not part of the contract; a
-document that breaks several may be reported for any of them.
+document that breaks several may be reported for any of them. A message is
+composed only from the canonical copy, never from the caller's objects, so
+nothing a subclass defines — a `__len__` that raises, a `__str__` that lies —
+can run while a rejection is described. *(Added 2026-09-23, Amendment 2 ruling
+C.)*
 
 The record map itself:
 
@@ -592,27 +720,40 @@ The record map itself:
   `record` and `discard` are the only ways to change it, so the coupling in
   decision 6 is the only documented path by which the map moves.
 * **`record(address, attributes)` is all-or-nothing.** In order: the family
-  check (`ValueError`); `None` becomes `DEFAULT_ATTRIBUTES` (§46.5, and
+  check (`ValueError`); `None` selects the default document (§46.5, and
   `read-api-v1.md`'s "an absent `attributes` on the event is stored, and
   returned, as `{"attributes_version": 1}`"), so a record exists for every HOT
-  address unconditionally and §46.5's count invariant needs no special case; a
-  document that is not a `Mapping` is an `InvalidAttributesError` (S1);
-  `validate_ip_attributes` runs on a plain-`dict` copy of it; the validated
-  document is deep-copied; and only then does the map change — the new record
-  replaces any earlier one for that address (§46.5's replace-on-add) and
-  `serialized_bytes` moves by the difference. Every step that can raise comes
-  before the map changes, so a rejected call leaves the map, its length, its
-  byte total and any earlier record for that address exactly as they were.
-* **Stored records are private deep copies**, so nothing a caller does to the
-  document afterwards — at any depth — can make a stored record invalid or
-  different from what was validated; replay determinism depends on it. Reads
-  return a read-only view of the stored top level (`MappingProxyType`); nested
-  containers inside a returned record are read-only by contract.
-* **`serialized_bytes` is §46.8's `ip_attribute_bytes`**: the sum of the sizes
-  `validate_ip_attributes` returned for the records currently stored — so a
-  default record counts 24 bytes, the length of `{"attributes_version":1}` —
-  kept up to date by every replace, `discard` and `clear`, and O(1) to read.
-  §46.8's `ip_attribute_records` is `len(records)`.
+  address unconditionally and §46.5's count invariant needs no special case;
+  anything else goes to `canonicalize_ip_attributes`, which refuses a
+  document that is not a `dict` (S1 — `DEFAULT_ATTRIBUTES` itself included:
+  pass `None` for the default) or that breaks any other rule, with
+  `InvalidAttributesError`; and only then does the map change — the canonical
+  text replaces any earlier record for that address (§46.5's replace-on-add)
+  and `serialized_bytes` moves by the difference. Every step that can raise
+  comes before the map changes, so a rejected call leaves the map, its length,
+  its byte total and any earlier record for that address exactly as they were.
+  *(Amended 2026-09-23, Amendment 2 rulings A and D; the superseded bullet is
+  quoted there.)*
+* **The map keeps each record as its canonical text, and decodes a fresh
+  document on every read.** Per address it holds the compact JSON text that
+  `canonicalize_ip_attributes` returned, and nothing else of the document.
+  `records[a]` — and `get`, `values` and `items`, which go through it —
+  decodes that text anew on each call and returns a read-only view
+  (`MappingProxyType`) over the freshly decoded document. Two reads return
+  distinct objects, every value in them is an exact built-in type, and nothing
+  a reader does to a returned record, at any depth, reaches the map, its byte
+  total or any later read. Replay determinism and §46.8's snapshot fidelity
+  rest on it: what is stored is exactly what was checked, and nobody holds a
+  reference into it. *(Amended 2026-09-23, Amendment 2 ruling D, which
+  replaces the bullet "Stored records are private deep copies", quoted there;
+  assumptions 57-59.)*
+* **`serialized_bytes` is §46.8's `ip_attribute_bytes`**: the total length of
+  the stored canonical texts — each the size S6 measured — so a default record
+  counts 24 bytes, the length of `{"attributes_version":1}`; kept up to date by
+  every replace, `discard` and `clear`, and O(1) to read. §46.8's
+  `ip_attribute_records` is `len(records)`. *(Amended 2026-09-23, Amendment 2
+  ruling D; was: "the sum of the sizes `validate_ip_attributes` returned for
+  the records currently stored".)*
 * **`discard` never raises** for an address with no record (the family check
   aside); it returns whether one was removed. A `HotIpRemoved` for an IP the
   trie does not hold (ADR-0011, ADR-0014 decision 3) therefore deletes nothing
@@ -630,7 +771,11 @@ The record map itself:
   §46.9's "stored and echoed as opaque data"), and no stored value reaches
   `hot_count`, the §13 predicate, or any
   authorization, routing or rate-limiting decision (§46.1, §46.9). The module
-  imports neither `json` nor the schema: sizes come back from the validator.
+  imports `json` only to decode its own stored text on read; it never
+  serializes a document and states no rule — texts and sizes come from the
+  validator. *(Amended 2026-09-23, Amendment 2 ruling D; was: "The module
+  imports neither `json` nor the schema: sizes come back from the
+  validator.")*
 
 ### 6. The §46.5 single-writer step lives in this epic, as two pure functions: validate, then the trie, then the record
 
@@ -653,16 +798,22 @@ nothing else. `apply_hot_ip_added` runs in exactly this order:
 1. **Arguments.** `trie.family`, `records.family` and `address.family` must
    agree; a mismatch is a `ValueError` naming them.
 2. **The document.** `attributes` is prepared exactly as `record()` prepares
-   it — `None` becomes `DEFAULT_ATTRIBUTES`, a non-`Mapping` or any §46.2
+   it — `None` selects the default, anything else goes through
+   `canonicalize_ip_attributes`, which raises `InvalidAttributesError` for a
+   non-`dict` or any §46.2 violation, and the canonical text is kept —
+   **before the trie is touched**. Validation runs once, here; clause 4 does
+   not repeat it. *(Amended 2026-09-23, Amendment 2 rulings A and D; was:
+   "`None` becomes `DEFAULT_ATTRIBUTES`, a non-`Mapping` or any §46.2
    violation is an `InvalidAttributesError`, the validated document is
-   deep-copied and its size kept — **before the trie is touched**. Validation
-   runs once, here; clause 4 does not repeat it.
+   deep-copied and its size kept".)*
 3. **The trie.** `trie.add_hot_ip(address)`. ADR-0014 Amendment 2 A12 allows it
    to raise `InvariantViolation` on an already-corrupt trie, and requires it to
    raise before mutating anything.
-4. **The record.** The prepared document replaces any record for the address,
-   and `serialized_bytes` moves by the difference. Nothing in this step can
-   raise: everything fallible ran in clauses 1-3.
+4. **The record.** The prepared text replaces any record for the address, and
+   `serialized_bytes` moves by the difference. Nothing in this step can raise:
+   everything fallible ran in clauses 1-3. *(Amended 2026-09-23, Amendment 2
+   ruling D; was: "The prepared document replaces any record for the
+   address".)*
 5. **The return value is the trie's**, unchanged: whether the HOT set changed.
    That is the signal ADR-0014 decision 3 preserved so the worker can decide
    what a no-op event emits — a question ADR-0011's Consequences and ADR-0010
@@ -714,6 +865,12 @@ InvariantViolation      This process's trie is untrustworthy: rebuild from
                         snapshot plus replay (ADR-0014 A12 clause 5). Unchanged.
 ```
 
+No exception outside these three can be caused by the document (decision 5,
+"What can come out"), so a worker built to this table meets every
+document-caused failure in it — including one produced by a document whose
+types override every method they have. *(Added 2026-09-23, Amendment 2 ruling
+C.)*
+
 They take `(address, attributes)` rather than a `HotIpAdded`/`HotIpRemoved`
 object: the pair is everything §46.5 uses, it keeps this module independent of
 the event models (`hammertime.core.events.models`), and it is also the shape
@@ -730,9 +887,10 @@ block above, readiness and snapshots.
 ```text
 packages/hammertime-core/src/hammertime/core/
   errors.py          + InvalidAttributesError                              (§46.2)
-  events/attributes.py   validate_ip_attributes — the §46.2 rules, once    (§46.2, §46.3, §46.9)   new
-  events/codec.py    calls validate_ip_attributes; its private copies of the
-                     rules are removed                                     (§19, §32, §46.2)
+  events/attributes.py   canonicalize_ip_attributes, CanonicalAttributes,
+                     validate_ip_attributes — the §46.2 rules, once        (§46.2, §46.3, §46.9)   new
+  events/codec.py    calls canonicalize_ip_attributes and sends the copy;
+                     its private copies of the rules are removed           (§19, §32, §46.2)
 
 services/trie/src/hammertime/trie/metadata/
   __init__.py        re-exports the names of the other three modules   (§16, §17, §46)
@@ -755,7 +913,10 @@ imported by none of them. **Nothing in `hammertime.trie.structure` imports
 `hammertime.trie.metadata`**, which is what keeps ADR-0014 decision 9's "the
 trie structure holds no reference to the map" true. Every module keeps its
 existing `Spec:` docstring line, extended where this ADR adds a section, and
-cites ADR-0015.
+cites ADR-0015. *(Layout rows for `events/attributes.py` and `events/codec.py`
+amended 2026-09-23, Amendment 2 ruling A; they read "validate_ip_attributes —
+the §46.2 rules, once" and "calls validate_ip_attributes; its private copies of
+the rules are removed".)*
 
 ### 8. Neither store is thread-safe, and neither is snapshot-shaped by this epic
 
@@ -893,7 +1054,18 @@ not dictate. Push back on them individually.
     level stops the obvious mistake, and the readers are the trie service's own
     query and snapshot code, not an untrusted party. Deep-freezing (tuples for
     lists) was rejected because a read-back would then no longer equal the
-    document that was stored.
+    document that was stored. *(Superseded 2026-09-23 by Amendment 2 ruling D
+    in three places. The heading, "Stored documents are deep copies; reads are
+    shallow read-only views.", is superseded: records are no longer stored as
+    deep copies, and reads are no longer views over what is stored. The
+    write-side claim, "a deep copy per write costs nothing that matters", is
+    superseded: no deep copy is made on write, and the map keeps each record
+    as its canonical text. "Reads are not copied" is superseded: it let a
+    reader grow a stored record through a nested container while
+    `serialized_bytes` stayed stale, and let a snapshot save a record no replay
+    can reproduce. Records are now stored as canonical text and every read
+    decodes a fresh document; the trade-off is assumption 57, and the
+    deep-freeze argument above still stands.)*
 19. **`attributes=None` normalizes to `DEFAULT_ATTRIBUTES`; `{}` is
     rejected.** (Revised: an earlier draft stored `{}` verbatim.) `None` is the
     event's "absent" (§46.5). An empty dict is a document missing the schema's
@@ -927,7 +1099,9 @@ not dictate. Push back on them individually.
     `ip_attribute_bytes` is the obvious alternative (ADR-0014 assumption 3 chose
     metric names for `hot_ip_count`) and I did not take it only because
     `records.ip_attribute_bytes` repeats its own receiver. Renaming is
-    mechanical.
+    mechanical. *(Amended 2026-09-23, Amendment 2 ruling D: the per-record size
+    is now the length of the stored canonical text, and the store does import
+    `json` — to decode that text on read, never to serialize.)*
 22. **No iteration order is promised for the record map** (it is a dict, so
     insertion order in practice). §46.5's checks are set-based. A snapshot that
     needs determinism sorts, or writes in `trie.iter_hot_addresses()` order,
@@ -1026,13 +1200,22 @@ not dictate. Push back on them individually.
     such as an `IntEnum` value. On the codec's encode path this newly rejects a
     `tuple` (previously written as an array) and a non-`str` nested key
     (previously coerced to a string); a `set` was already rejected.
+    *(Amended 2026-09-23, Amendment 2 ruling A. The test is no longer
+    `isinstance`, which consults an overridden `__class__`, but `type()` with
+    `issubclass`. A subclass is read only through its base type's own slots and
+    is stored and sent as the base type — which "passes as its base type" had
+    promised and the shipped code did not deliver: it validated through, and
+    stored, the subclass objects themselves. Assumptions 50 and 51.)*
 34. **S5 covers keys and S7 covers cycles.** The codec's walk checked string
     *values* for lone surrogates; a key can carry one just as well, including
     on the wire (decision 5), and is just as unencodable as UTF-8. A
     self-referencing document can only be built in-process; it would otherwise
     surface as a `RecursionError` from the walk or a `ValueError` ("Circular
     reference detected") from `json.dumps`, and S7 makes both an
-    `InvalidAttributesError`.
+    `InvalidAttributesError`. *(Amended 2026-09-23, Amendment 2 ruling B: a
+    cycle — and a subtree shared by many branches, which is acyclic but
+    exponential to walk — is now stopped by S6's running bound before it can
+    repeat or recurse.)*
 35. **S6 measures the compact, ASCII-escaped encoding, and the validator
     returns that number.** §46.2 says "serialized size <= 1024 bytes" without
     naming a serialization. The codec has always measured
@@ -1050,7 +1233,9 @@ not dictate. Push back on them individually.
     `ValueError` (CPython's integer-string conversion limit), which would turn
     a rejection into a crash of the error path. 64 is my number: it shows every
     name the `x_` grammar can produce (at most 50 characters) in full and bounds
-    everything else.
+    everything else. *(Amended 2026-09-23, Amendment 2 ruling C: a message is
+    composed from the canonical copy only, so a key's own `__len__` or
+    `__str__` cannot run while the key is quoted.)*
 37. **`attributes_rejected` (§46.8) is counted by whoever handles a rejection
     inside the trie service — never by the validator, the codec or the record
     map.** §37 lists it among the *trie* metrics, and the codec is shared by
@@ -1094,7 +1279,9 @@ not dictate. Push back on them individually.
     and `apply_hot_ip_added` both use — prepare (normalize, validate,
     deep-copy, size) may raise and changes nothing, commit (assign, adjust the
     byte total) cannot raise. The names and shape are `coder`'s; only those two
-    properties are contract.
+    properties are contract. *(Amended 2026-09-23, Amendment 2 rulings A and D:
+    prepare is now `canonicalize_ip_attributes`, and commit stores the
+    canonical text.)*
 41. **The producer's generation and the validator's highest known version stay
     two constants.** `hammertime.core.state.weight.ATTRIBUTES_VERSION` is the
     generation the aggregator writes; the validator's highest known version is
@@ -1244,6 +1431,136 @@ not dictate. Push back on them individually.
     malformed and mixed-kind. `combine_path` is not required to check every
     document before it folds, because it takes any iterable, a generator
     included, and would have to materialize it to do so.
+49. **The canonical copy is made inside `hammertime-core`, once, for both
+    callers; `validate_ip_attributes` stays as its measuring form** (Amendment
+    2 ruling A). The findings offered this or a copy in each caller. Two
+    callers would mean two copies of the one routine whose correctness is
+    subtle — which reads are safe — and `codec.encode` had the same hole as the
+    record map, so a caller-side fix would have to be made twice to be made at
+    all. Keeping `validate_ip_attributes`, with the same contract and the same
+    size for every exact-type input, spares every existing validator test; what
+    it no longer offers is a licence to check a document and then keep the
+    argument. No production caller may do that, and a reviewer can check it.
+50. **Subclasses stay accepted; they are not refused** (ruling A). The
+    alternative the findings name — exact types only — is just as safe once
+    nothing reads a value through its own methods, and simpler to state. I kept
+    assumption 33's "a subclass passes as its base type" because it was an
+    accepted ruling that tests were about to pin (an `IntEnum` weight, a
+    `str`-subclass key), and because the canonical copy finally delivers what it
+    promised: the subclass never reaches the store or the wire. If the
+    base-slot reads prove too subtle to keep correct, exact types only is a
+    small change and should be made by amendment, not quietly.
+51. **`type()` with `issubclass`, never `isinstance`; the slot functions named
+    in decision 5 are the mechanism.** `isinstance(obj, cls)` falls back to an
+    instance's `__class__` attribute when the direct type test fails, which is
+    how `unittest.mock` makes mocks "pass `isinstance` tests"
+    (`/usr/lib/python3.12/unittest/mock.py`, lines 1229-1230, and line 69: "can't
+    use isinstance on Mock objects because they override `__class__`") — so a
+    value can claim a type it does not have. `issubclass(type(v), dict)` asks
+    the type object and runs nothing the value defines. The reference JSON
+    encoder likewise reads a `dict` through its own `items()` and a `list`
+    through its own iteration (`/usr/lib/python3.12/json/encoder.py`, lines
+    297 and 354-356), which is why the shipped code's validation, sizing and
+    copying could each see different content. That the slot functions
+    (`dict.items(v)`, `list.__iter__(v)`, `str.__str__(v)`, `int.__int__(v)`,
+    `float.__float__(v)` and the base `__len__`s) read the built-in storage and
+    call nothing a subclass overrides is CPython's behaviour, whose C source is
+    not installed here, so I did not read it. The contract is therefore stated
+    as an observable — no method of the value's own class is called, and the
+    copy holds exact built-in types — and the tests pin it with subclasses
+    whose every override raises or lies.
+52. **Two keys that copy to the same text are refused, not merged.** Only a
+    `str` subclass with its own `__hash__`/`__eq__` can put two such keys into
+    one `dict`. Keeping the last would silently drop an entry the caller
+    supplied, and a JSON object as this project writes it cannot hold both. A
+    rejection is the only answer that neither loses data silently nor invents a
+    precedence rule.
+53. **At the top level only a `dict` is accepted, and `record()` keeps its
+    `Mapping[str, object] | None` annotation.** Reading any other mapping — a
+    `MappingProxyType`, a user `Mapping` — means calling its own methods, which
+    ruling A exists to avoid. The shipped `record()` copied any `Mapping` with
+    `dict(...)`, so this is the one place the amendment refuses a document the
+    old code accepted from an in-process caller. `DEFAULT_ATTRIBUTES` is a
+    `MappingProxyType`, so passing it is refused too: it is the value a default
+    record reads back as, and `None` is how a caller asks for one. The
+    annotation stays `Mapping` because `dict` is invariant in its value type: a
+    caller holding a `dict[str, int]` would otherwise fail type-checking on a
+    call that is valid at run time. The run-time refusal is loud, and decision 5
+    states it.
+54. **The early bound under-counts by construction, and its figures are mine.**
+    Each figure in "Bounded work" is the smallest compact encoding a value of
+    that kind and length can have, so the bound can only reject documents whose
+    real size is over 1024; tighter figures are allowed as long as they never
+    over-count. Judging an `int` by `int.bit_length` before converting it avoids
+    both the cost of converting a huge integer and CPython's integer-to-string
+    limit (4,300 digits by default, adjustable with `PYTHONINTMAXSTRDIGITS`),
+    whose `ValueError` the shipped code had to catch. One edge remains: an
+    interpreter configured with a limit below the roughly 1,020 digits S6 can
+    admit will reject such an integer through ruling C's narrow conversion —
+    as `InvalidAttributesError`, never as a `ValueError`.
+55. **No blanket `except Exception`.** Once nothing a document defines is
+    called, the only exceptions a document can cause are the rules' own. A
+    catch-all would add nothing for documents. What it would do is turn a bug in
+    the validator — a `TypeError` from a coding slip — into "document rejected",
+    send the worker down decision 6's recovery path and replace the attributes
+    with the default: the bug hidden, the data lost. Letting such a bug surface
+    is the better failure. `MemoryError` and the `BaseException`s that are not
+    `Exception`s mean the process is failing, not that a document is bad, and
+    must not be answered by storing a default. The one narrow conversion — a
+    `RecursionError` or `ValueError` from serializing the canonical copy — stays
+    because both are conditions of the interpreter, which a document of legal
+    shape can still meet.
+56. **The threat model is data, not code.** The guarantees hold for any value
+    an in-process producer can build — any nesting, sharing, cycle, size,
+    subclass or override — and they hold because none of that value's code
+    runs. They do not extend to a producer that is itself hostile code. Such a
+    producer could mutate a document from another thread while it is read
+    (§28 gives the trie one writer, and a document is read on that writer's
+    thread), have a finalizer mutate it mid-read, or simply never return. No
+    pure-Python validator can bound those, and §46.9's trust boundary —
+    trusted internal producers — already excludes them.
+57. **Canonical text with a decode per read, rather than copy-on-read or
+    anything else** (ruling D). There were three candidates: (a) keep the
+    canonical copy and return a deep copy on every read; (b) keep the
+    canonical JSON text and decode it on every read; (c) keep objects and
+    document nested read-only-ness, the shipped state that the finding showed
+    to be unsafe. (b) wins on every axis that matters here:
+    * *The hot path.* The single writer's `apply_hot_ip_added` never decodes.
+      With (b) a write stores a string the validator has already produced, so
+      writes get cheaper than the shipped deep copy, which (a) would keep.
+    * *Read cost.* One `json.loads` of at most 1,024 bytes — microseconds — on
+      `GET /ip/{addr}` and in the snapshot writer's pass, neither of which is on
+      the writer's path. A `deepcopy` of the same document under (a) is not
+      cheaper.
+    * *Memory.* A record becomes its compact text, typically far smaller than
+      the equivalent dict and list objects, so ADR-0005's "one bounded record
+      per HOT IP (≤ 1 KiB serialized)" comes close to the literal resident size.
+    * *Exactness.* `serialized_bytes` is the sum of the stored lengths and
+      cannot drift from what is stored, because nothing is shared.
+    * *Snapshot fidelity.* The stored form is the wire form, which is what
+      §46.8 needs a snapshot to reproduce.
+
+    The cost is that every read allocates a new document — which is the point.
+58. **Reads still return a `MappingProxyType`, now over a fresh document.**
+    Isolation comes from the freshness, not from the view: the reader owns its
+    copy. The view is kept so that decision 5's read-only top level stays true
+    for existing callers and tests, and so that `records[a]["weight"] = …` stays
+    the loud mistake it was, rather than a silent write to a throwaway copy.
+59. **The canonical text is a fixed point, so the snapshot epic needs no
+    accessor.** For every text `t` the function returns,
+    `json.dumps(json.loads(t), separators=(",", ":")) == t`, and canonicalizing
+    a decoded canonical text returns the same text. Key order is kept, a finite
+    float's `repr` round-trips, integers are exact, and `ensure_ascii`
+    escaping is deterministic. A snapshot may therefore write `records[a]` back
+    through the codec's serialization, or keep texts, and either way a load
+    reproduces the stored bytes. I added no public accessor for the raw text:
+    nothing needs one yet, and it would widen the map's surface.
+60. **Still no `CHANGES` entry** (assumption 27). For exact-type input — all
+    wire input, and everything this project's producer builds — acceptance,
+    sizes and encoded bytes are unchanged. What changes is observable only to
+    in-process callers passing subclasses, non-`dict` mappings, or documents
+    built to exhaust the old walk, and none of that is a deployment's
+    behaviour.
 
 ## Consequences
 
@@ -1251,7 +1568,9 @@ not dictate. Push back on them individually.
   value kinds, three combine entry points, one metadata store, one record map,
   two coupled apply functions, one `PrefixStats` view — and, in
   `hammertime-core`, one public validator and one error type that the codec and
-  the record map share.
+  the record map share. *(Amended 2026-09-23, Amendment 2 ruling A: the
+  validator's entry point is `canonicalize_ip_attributes`, returning
+  `CanonicalAttributes`; `validate_ip_attributes` is its measuring form.)*
 * **ADR-0005 decision 5 and ADR-0014 decision 9 are discharged**, not
   departed from: the trie validates shape and size before storing, with the
   same rules the codec applies, and no copy of those rules exists outside
@@ -1260,7 +1579,9 @@ not dictate. Push back on them individually.
   surrogate-in-a-key tightening (assumption 27): `events/attributes.py` is new,
   `errors.py` gains `InvalidAttributesError`, and `events/codec.py` loses its
   private copies of the §46.2 rules and calls the shared function instead.
-  `test_ip_attributes.py` must pass unmodified.
+  `test_ip_attributes.py` must pass unmodified. *(Amended 2026-09-23,
+  Amendment 2: the codec now sends and decodes the canonical copy, and for
+  exact-type input — all wire input — the bytes it produces are unchanged.)*
 * Both acceptance criteria map to statements a test can assert without reading
   the implementation: (1) `aggregate` is order-independent, associative under
   regrouping and has an identity, and `combine` is associative/idempotent with
@@ -1394,3 +1715,268 @@ reads "`declare` stores whatever document it is given, including
 left as written with a dated note appended: "whatever document" means any
 well-formed document that gives no key a second kind on its path, and
 `EMPTY_METADATA` is still stored as a declaration.
+
+## Amendment 2 (2026-09-23) — the attribute validator reads a document once, into the copy that is checked, stored and sent; its work is bounded before it reads; nothing but `InvalidAttributesError` comes out of a document; the record map keeps canonical text
+
+Why: epic #9 is implemented (branch `claude/eager-gates-lyihfk`, head
+`d67e2c5`; `hammertime.core.events.attributes`, `codec.py`, `errors.py`,
+`hammertime.trie.metadata`), with all four gates green. `reviewer` and
+`security-auditor`, each under `supervisor`, then raised five findings against
+decision 5's validator and record map. All are low severity, and all are
+reachable only from in-process code, since `json.loads` produces nothing but
+exact built-in types. Four (A-D) are interface questions and are ruled here,
+in place, with dated notes; the fifth (E) is test coverage and is listed under
+*Follow-ups*. Unlike Amendment 1, which ruled points ahead of the code, these
+bind code that exists: rulings A, B and D require changes to it, and ruling C
+is the contract that A and B make true. Nothing changes for exact-type input,
+which is all wire input and everything this project's producer builds, so
+there is still no `CHANGES` entry (assumption 60).
+
+**A. One read, into a canonical copy — and that copy, never the caller's
+object, is what is checked, measured, stored and sent.** The shipped validator
+read the caller's objects three times, each time through methods a subclass
+can override. It checked them with `isinstance`, `len`, `.items()`, iteration
+and comparisons; `json.dumps` read them again to size them; and the record
+map's copier read them a third time to build what it stored. `codec.encode`
+had the same shape. A value could therefore show different content to each
+read, for instance:
+
+* a `list` subclass whose `__iter__` shows `[1]` to the check while its
+  storage holds a 50 MB string;
+* a `str` subclass whose `__iter__` hides a lone surrogate;
+* an `int` subclass whose comparisons pass `10**9` as a `weight`;
+* a key that equals `"weight"` by `__eq__`/`__hash__` but serializes as
+  `"sources"`.
+
+Ruled:
+
+1. A new public `canonicalize_ip_attributes(document: object) ->
+   CanonicalAttributes` in `hammertime.core.events.attributes` reads the
+   document once and builds a new tree of exact built-in types. It dispatches
+   on `type()` with `issubclass`, and reads a subclass instance only through
+   the base type's own slot functions. It then applies the rules to that
+   copy, serializes that copy, and returns both. The mechanism and its
+   observable contract are in decision 5, "One read, into the copy that is
+   used".
+2. `CanonicalAttributes` is a `NamedTuple` with two fields and one property.
+   `document: dict[str, object]` holds exact built-in types only, and no
+   caller has held it. `text: str` is its compact encoding: ASCII only, and a
+   fixed point of `json.loads` followed by compact `json.dumps` (assumption
+   59). `size` is `len(text)`.
+3. Two keys of one object that copy to the same text are a rejection (S4).
+4. S1 means a `dict`. Any other mapping, `DEFAULT_ATTRIBUTES` included, is
+   refused (assumption 53).
+5. `validate_ip_attributes` stays, as `canonicalize_ip_attributes(d).size`:
+   same contract, and the same number for every exact-type input. It is for
+   checking and measuring only. No production code may call it and then keep
+   its argument.
+6. **The copy happens inside `hammertime-core`, for both callers**
+   (assumption 49). The codec puts `result.document` into the envelope it
+   encodes and into the event it decodes; the record map keeps `result.text`
+   (ruling D). So `codec.encode`'s version of the hole is closed by the same
+   change as the store's.
+7. Subclasses stay accepted and are stored and sent as their base types
+   (assumptions 50 and 51). That is what assumption 33 had promised; the
+   shipped code did not deliver it, because it stored the subclass objects
+   themselves.
+
+Behaviour: for exact-type input, acceptance, sizes and encoded bytes are
+unchanged. For in-process input:
+
+* a subclass is now read from its built-in storage and copied as its base type;
+* documents that used to slip through are now rejected — the hidden surrogate,
+  the impersonating key, the lying comparison;
+* two keys equal as text are rejected;
+* a non-`dict` mapping, which `record()` used to copy, is now refused.
+
+**B. The work is bounded by the size cap before anything is read.** The shipped
+walk tracked only the current path. A subtree shared by many branches
+(`x = [x, x]`, 40-65 levels deep) was therefore re-walked every time it was
+met, about 2**40-2**65 visits, and would hang the single writer. A flat
+`[0] * 10**8` was walked in full before S6 was reached. Ruled: decision 5,
+"Bounded work".
+
+* A running lower bound on the compact size rejects the document under S6 the
+  moment it passes 1024.
+* A string's, list's or dict's length, measured by its base type, is checked
+  before its contents are read.
+* An integer is judged by its bit length before it is converted to text.
+* The read is iterative.
+
+At most 1024 values are ever read, and no document of at most 1024 bytes can
+be rejected by the bound (assumption 54). This is S6 applied early, not a new
+limit.
+
+**C. Nothing but `InvalidAttributesError` comes out of a document.** The
+shipped code converted only `RecursionError`, `TypeError` and `ValueError`.
+Everything else escaped: a subclass `__len__` raising `RuntimeError` or
+`OverflowError` while `_quote` built a message, or `items()` or `__iter__`
+raising anything, or never ending. Those escaped `record()`,
+`apply_hot_ip_added()` (before the trie was touched, so without desync) and
+`codec.encode` (not as a `CodecError`). A worker built to decision 6's table
+would then not have taken the `attributes=None` recovery path, and the §46.1
+transition would have been lost. Ruled: decision 5, "What can come out",
+states per function which exceptions may escape.
+
+* Ruling A makes that table true by construction: nothing the document's own
+  types define is ever called.
+* Messages are composed from the canonical copy only.
+* There is **no blanket `except Exception`** (assumption 55). `MemoryError` and
+  non-`Exception` `BaseException`s pass through.
+* One narrow conversion is kept: a `RecursionError` or `ValueError` from
+  serializing the canonical copy becomes `InvalidAttributesError`.
+* Decision 6 gains a sentence saying its table is complete for
+  document-caused failures.
+
+**D. The record map keeps each record as canonical text and decodes a fresh
+document on every read.** The shipped map returned a `MappingProxyType` over
+the stored top level, whose nested dicts and lists *were* the stored objects.
+A reader could therefore grow a record past 1024 bytes while
+`serialized_bytes` stayed stale, and a snapshot would then save a record that
+no replay can reproduce (§46.8). Decision 5 ("nested containers inside a
+returned record are read-only by contract") and assumption 18 ("Reads are not
+copied") had accepted this. Ruled, reversing both:
+
+* The map keeps, per address, the canonical text that
+  `canonicalize_ip_attributes` returned.
+* Every read decodes that text into a fresh document and returns a read-only
+  view over it. Two reads are distinct objects; every value is an exact
+  built-in type; nothing a reader does reaches the map.
+* `serialized_bytes` is the sum of the stored lengths.
+* The store imports `json`, to decode only.
+
+Stored text was chosen over copy-on-read and over keeping objects under a
+read-only contract. The trade-offs — the writer's hot path, read cost,
+memory, exactness and snapshot fidelity — are set out in assumption 57, and
+why reads still return a view in assumption 58.
+
+### Follow-ups (not part of this amendment; for the top-level session to dispatch)
+
+* `test-author` (E): no test yet shows that subclasses are accepted as their
+  base type. That covers an `IntEnum` `weight` and `attributes_version`, a
+  `str`-subclass key and value, a `float` subclass, `dict` and `list`
+  subclasses nested and at the top level, and the canonical copy and every
+  read-back holding exact built-in types only.
+* `test-author` (E): no test yet shows that `bool` is refused where S3 or R2
+  need an integer, yet accepted and read back as a JSON boolean inside an
+  `x_` value.
+* `test-author` (E): no test yet shows that the map stores nested subclass
+  containers as plain `dict` and `list`.
+* `test-author` (E): both new test files still carry `from __future__ import
+  annotations`, against #24: `test_metadata.py` line 75 and
+  `test_attribute_validation.py` line 40.
+* `test-author` (A-D): the new contract. That means hostile subclasses whose
+  overrides lie, raise or never return, each with the same outcome as the
+  plain document; the impersonating key, the lying comparison, the hidden
+  surrogate and duplicate text keys; the shared-subtree, flat-list,
+  long-string, huge-integer and cycle cases, and the deepest nesting and
+  many-small-items documents at exactly 1024 bytes that must be *accepted*;
+  canonical idempotence; the codec sending and decoding the canonical copy;
+  non-`dict` mappings refused at the top level; and fresh, isolated,
+  exact-typed reads.
+* `coder` (A-D): `canonicalize_ip_attributes` and `CanonicalAttributes`, with
+  `validate_ip_attributes` delegating to them; the codec and the record map
+  using the canonical copy; the map storing text; and removal of the
+  now-unused copier.
+
+### Every edit outside this section, with the superseded wording quoted
+
+* **Status line.** Gained a clause naming this amendment; nothing removed.
+* **Decision 5, the interface sketch.** The `hammertime.core.events.attributes`
+  block gains `CanonicalAttributes` and `canonicalize_ip_attributes`.
+  `validate_ip_attributes`'s comment was: "The §46.2 rules below; returns the
+  document's serialized size in bytes. / Raises InvalidAttributesError for
+  every violation, and nothing else." It now describes the function as
+  `canonicalize_ip_attributes(document).size`.
+* **Decision 5, "The rules exist once".** Was: "The codec's private checks
+  (`_validate_attributes` and its helpers in `hammertime.core.events.codec`)
+  move into one new public function, `validate_ip_attributes`, in a new module
+  `hammertime.core.events.attributes`. Both enforcement points call it:". Now
+  names `canonicalize_ip_attributes` as the entry point both callers use, and
+  keeps what it returns.
+* **Decision 5, the codec bullet.** One sentence appended: the codec sends and
+  decodes the canonical document. Nothing removed.
+* **Decision 5, the record-map bullet.** Was: "**the record map**, on every
+  write, letting `InvalidAttributesError` propagate." Now also "keeping only
+  the canonical text".
+* **Decision 5, the rules table.** Four rows were rewritten; the old text of
+  each follows.
+  * S1 was: "a JSON object: a dict".
+  * S4 was: "every value at every depth is in the JSON data model — dict with
+    str keys, list, str, int, finite float, bool, None; no tuple, set, bytes,
+    non-str key or other object".
+  * S6 was: "serialized size <= 1024 bytes, measured as
+    len(json.dumps(document, separators=(",", ":")).encode("utf-8")) with
+    json's default ensure_ascii — the compact form the codec writes; this is
+    the size the function returns".
+  * S7 was: "nesting too deep to walk or serialize, and a self-referencing
+    structure, are rejections — never a RecursionError or ValueError".
+
+  A dated note follows the table.
+* **Decision 5, three new paragraphs** after the one ending "A key is no safer
+  than a value.": "One read, into the copy that is used" (ruling A), "Bounded
+  work" (ruling B) and "What can come out" (ruling C). Nothing removed.
+* **Decision 5, the messages paragraph.** One sentence appended (ruling C).
+* **Decision 5, the `record()` bullet.** Its middle was: "`None` becomes
+  `DEFAULT_ATTRIBUTES` (…), so a record exists for every HOT address
+  unconditionally and §46.5's count invariant needs no special case; a
+  document that is not a `Mapping` is an `InvalidAttributesError` (S1);
+  `validate_ip_attributes` runs on a plain-`dict` copy of it; the validated
+  document is deep-copied; and only then does the map change — the new record
+  replaces any earlier one for that address (§46.5's replace-on-add) and
+  `serialized_bytes` moves by the difference." Now `None` selects the default,
+  anything else goes through `canonicalize_ip_attributes` (a non-`dict` is
+  refused under S1), and the canonical text is what replaces the record. The
+  bullet's first and last sentences are unchanged.
+* **Decision 5, the "private deep copies" bullet, replaced.** Was: "**Stored
+  records are private deep copies**, so nothing a caller does to the document
+  afterwards — at any depth — can make a stored record invalid or different
+  from what was validated; replay determinism depends on it. Reads return a
+  read-only view of the stored top level (`MappingProxyType`); nested
+  containers inside a returned record are read-only by contract." Now "The map
+  keeps each record as its canonical text, and decodes a fresh document on
+  every read" (ruling D).
+* **Decision 5, the `serialized_bytes` bullet.** Was: "the sum of the sizes
+  `validate_ip_attributes` returned for the records currently stored"; now
+  "the total length of the stored canonical texts — each the size S6
+  measured".
+* **Decision 5, the last bullet's last sentence.** Was: "The module imports
+  neither `json` nor the schema: sizes come back from the validator." Now the
+  module imports `json` to decode its stored text on read only.
+* **Decision 6, clause 2.** Was: "`None` becomes `DEFAULT_ATTRIBUTES`, a
+  non-`Mapping` or any §46.2 violation is an `InvalidAttributesError`, the
+  validated document is deep-copied and its size kept". Now names
+  `canonicalize_ip_attributes` and the canonical text.
+* **Decision 6, clause 4.** Was: "The prepared document replaces any record for
+  the address"; now "The prepared text".
+* **Decision 6**, a paragraph after the worker's exception table, saying the
+  table is complete for document-caused failures (ruling C). Nothing removed.
+* **Decision 7, the module layout.** The `events/attributes.py` row read
+  "validate_ip_attributes — the §46.2 rules, once" and the `events/codec.py`
+  row "calls validate_ip_attributes; its private copies of the rules are
+  removed". Both now name `canonicalize_ip_attributes`, and the codec row says
+  it sends the copy. A dated note follows the import paragraph.
+* **Assumptions 18, 21, 33, 34, 36 and 40** each gain a dated note. Nothing in
+  any of them was reworded. Ruling D supersedes assumption 18 in three places:
+  its heading, "Stored documents are deep copies; reads are shallow read-only
+  views."; its write-side claim, "a deep copy per write costs nothing that
+  matters"; and "Reads are not copied". Records are now stored as canonical
+  text (assumption 57). The other five are qualified.
+* **Assumptions 49-60** are new.
+* **Consequences**, the first bullet and the "`hammertime-core` changes shape"
+  bullet, each gain a dated note. Nothing removed.
+* **Spec §46.5's ADR-0015 note.** Was: "It validates every document before
+  storing it, whatever path the document arrived by, with
+  `hammertime.core.events.attributes.validate_ip_attributes` — the same
+  function the codec calls, so the Section 46.2 rules exist once (ADR-0005
+  decision 5, ADR-0014 decision 9)." Now names `canonicalize_ip_attributes`,
+  and adds one sentence: the map stores the canonical text and decodes a fresh
+  document on every read.
+* **Spec §46.9's ADR-0015 note.** Was: "its record map runs every document
+  through `hammertime.core.events.attributes.validate_ip_attributes`, the
+  codec's own rules moved into one public function, so a snapshot file or an
+  in-process producer is no way around Section 46.2. The validator accepts only
+  the JSON data model and never puts a document value into an exception
+  message." Now names `canonicalize_ip_attributes`, says the document is read
+  once into a canonical copy and that only the copy is checked, stored and
+  sent, and adds that the work is bounded by the size cap before reading.

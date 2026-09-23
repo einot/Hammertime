@@ -2790,9 +2790,12 @@ len(record)        == hot_count(root)          per address family
 > already the `Collection[Address]` the checks above take) with `record()` and
 > `discard()` as its only mutators. It validates every document before storing
 > it, whatever path the document arrived by, with
-> `hammertime.core.events.attributes.validate_ip_attributes` — the same
+> `hammertime.core.events.attributes.canonicalize_ip_attributes` — the same
 > function the codec calls, so the Section 46.2 rules exist once (ADR-0005
-> decision 5, ADR-0014 decision 9). The two lines above are applied by
+> decision 5, ADR-0014 decision 9). That function reads the document once into
+> a canonical copy and checks the copy; the map stores the copy's canonical
+> text and decodes a fresh document on every read (ADR-0015 Amendment 2). The
+> two lines above are applied by
 > `apply_hot_ip_added` / `apply_hot_ip_removed` in a fixed order: validate the
 > document, then update the trie, then the record map. A rejected document
 > (`InvalidAttributesError`) therefore changes neither, and since `add_hot_ip`
@@ -2885,10 +2888,14 @@ are stored and echoed as opaque data.
 
 > **ADR-0015:** the trie service validates before storing as well as on decode:
 > its record map runs every document through
-> `hammertime.core.events.attributes.validate_ip_attributes`, the codec's own
-> rules moved into one public function, so a snapshot file or an in-process
-> producer is no way around Section 46.2. The validator accepts only the JSON
-> data model and never puts a document value into an exception message.
+> `hammertime.core.events.attributes.canonicalize_ip_attributes`, the codec's
+> own rules moved into one public function, so a snapshot file or an in-process
+> producer is no way around Section 46.2. That function reads a document once,
+> through the built-in types' own slots, into a canonical copy. Only that copy
+> is checked, stored and sent, and nothing the document's own types define is
+> ever run (Amendment 2). The validator accepts only the JSON data model, bounds
+> its work by the size cap before reading, and never puts a document value into
+> an exception message.
 
 ---
 
