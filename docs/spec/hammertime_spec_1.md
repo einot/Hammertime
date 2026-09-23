@@ -466,6 +466,14 @@ BOT_NETWORK
 
 The implementation SHOULD distinguish between explicitly stored state and derived state.
 
+> **ADR-0014:** the node record in `services/trie/structure` stores `child[0]`,
+> `child[1]` and `hot_count` — the stored state — and nothing else.
+> `local_metadata` (Section 16) and the cached `prefix_state` (Section 12,
+> derived) are attached outside that package: a Patricia node (Section 27) does
+> not exist for every prefix, so neither can be a node slot in the production
+> representation. Where each does live is the metadata epic's and the query
+> epic's decision, in the same way ADR-0005 put per-IP attributes in a side map.
+
 ---
 
 # 10. Hot IP Insertion
@@ -548,6 +556,18 @@ However, frequent HOT/COLD oscillation can cause allocation churn.
 
 Implementations SHOULD consider retaining structural nodes or using an arena/slab allocation strategy.
 
+> **ADR-0014:** this project takes the second option and makes pruning
+> mandatory in both representations — a node whose `hot_count` reaches zero is
+> removed on the removal that emptied it, so the structure is a pure function
+> of the current hot set and an empty trie holds no nodes. The churn this
+> section warns about is absorbed by the arena: a pruned node's slot goes on a
+> free list and is handed back to the next allocation, so a HOT → COLD → HOT
+> cycle allocates nothing after the first pass, and the slab never exceeds the
+> greatest number of nodes ever live at one time. `add_hot_ip` for an
+> already-HOT address and `remove_hot_ip` for one that is not HOT are both
+> no-ops that leave every count untouched (ADR-0011: the aggregator's recovery
+> paths depend on it) and return `False`.
+
 ---
 
 # 12. Trie Invariants
@@ -582,6 +602,15 @@ assuming both children are represented and the node has no separate `/32` semant
 > attributes (Section 46), including `weight`, are never summed along the path
 > and never enter this invariant. The attribute map adds a derived invariant
 > instead: `len(records) == hot_count(root)` per address family.
+
+> **ADR-0014:** this invariant is checked by
+> `services/trie/structure/invariants.py` (`check_hot_counts`, raising
+> `InvariantViolation`) and, independently recomputed, by
+> `packages/hammertime-testkit`'s `assert_hot_count_consistent`. Both recompute
+> it bottom-up from the currently HOT addresses the trie itself reports, which
+> is also what `tools/trie-inspect --verify` runs. The leaf rule
+> `hot_count(/32) ∈ {0, 1}` is the trie's only membership test: there is no
+> separate hot-IP set that could drift away from the counts.
 
 This invariant is more important than cached `prefix_state`.
 
@@ -1273,6 +1302,18 @@ For example:
 can be represented as a compressed edge rather than 32 individual nodes.
 
 However, the logical model MUST remain equivalent to the binary trie described above.
+
+> **ADR-0014:** both representations are built and both ship.
+> `structure/binary_trie.py` is the bit-by-bit reference and shares no
+> traversal, counting or pruning code with `structure/patricia.py`, which is
+> the production representation: path-compressed, allocated from
+> `structure/arena.py` (integer node ids indexing parallel lists, two child
+> slots per node, a free list). The equivalence this section requires is made
+> operational as one observable — both must yield the identical sequence of
+> `(prefix, hot_count)` pairs for every prefix whose count is greater than
+> zero, which for the Patricia trie means expanding each compressed edge back
+> into the prefixes it stands for. That sequence, and every point query, is
+> what the differential tests compare.
 
 ---
 
@@ -2696,6 +2737,17 @@ perturbing it:
 set(record.keys()) == the set of currently HOT /32 addresses
 len(record)        == hot_count(root)          per address family
 ```
+
+> **ADR-0014:** both lines are asserted by
+> `services/trie/structure/invariants.py`'s `check_attribute_records(trie,
+> records)` and by `packages/hammertime-testkit`'s
+> `assert_attribute_records_match`. Each takes the record map as a
+> `Collection[Address]` — which a `Mapping[Address, IpAttributes]` already is —
+> so the check needs no knowledge of the attribute document and the trie
+> structure holds no reference to the map. Because a `HotIpAdded` for an
+> already-HOT address replaces the record while leaving `hot_count` untouched,
+> and a `HotIpRemoved` for an unknown address deletes nothing and leaves
+> `hot_count` untouched, the equality survives every redelivery.
 
 Because attributes are reconstructed from the same event replay as the trie
 (Section 32), they require no separate durability or consistency mechanism.

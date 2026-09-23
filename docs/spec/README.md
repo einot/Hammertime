@@ -10,7 +10,10 @@ adds pointer notes to §13 and §29, ADR-0011 adds pointer notes to §5, §20,
 for many aggregator shards feeding one trie — adds pointer notes to §21 and
 §22, and ADR-0012 — open-source-only components with named drop-ins — adds
 a pointer note to §43; ADR-0013 — NATS JetStream as the event log, static
-shard assignment — rewords the §20, §22, §24, §33, §43 and §47.2 notes).
+shard assignment — rewords the §20, §22, §24, §33, §43 and §47.2 notes;
+ADR-0014 — the trie structure package: one trie per address family, a pruned
+binary reference, an arena-backed Patricia production trie and the invariants
+both satisfy — adds pointer notes to §9, §11, §12, §27 and §46.5).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -40,7 +43,7 @@ Section index used throughout the code:
 | 4 | Agent ingestion protocol | `services/ingest` |
 | 5 | Sliding window / buckets | `services/aggregator/window/counter.py`, `services/aggregator/window/store.py`, `core/time`, `docs/adr/0011` |
 | 6, 7, 38 | HOT/COLD hysteresis | `core/state/machine.py`, `tests/property/test_state_machine.py` |
-| 8-12 | Binary IP trie & invariants | `services/trie/structure` |
+| 8-12 | Binary IP trie & invariants | `services/trie/structure` (`node.py`, `binary_trie.py`, `invariants.py`), `packages/hammertime-testkit` (`invariants.py`), `docs/adr/0014` |
 | 13, 38 | `HOT_PREFIX` predicate (single implementation) | `core/state/prefix.py`, `services/detector/rules/baseline.py`, `services/trie/query`, `docs/adr/0010` |
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` |
@@ -50,10 +53,11 @@ Section index used throughout the code:
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
 | 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `services/aggregator/worker.py`, `core/time/buckets.py`, `docs/adr/0002` (Amendment 1), `docs/adr/0011` |
 | 26 | Memory / retention | `services/aggregator/window/store.py`, `packages/hammertime-store` (`ShardStateStore`), `docs/adr/0011` |
-| 27 | Trie representation | `services/trie/structure/patricia.py` |
+| 27 | Trie representation | `services/trie/structure/patricia.py`, `services/trie/structure/arena.py`, `docs/adr/0014` |
 | 28 | Atomicity | `services/trie/worker.py` |
 | 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010` |
 | 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `core/state/transitions.py`, `docs/adr/0011` |
+| 39 | Processing algorithm (trie update: `add_hot_ip` / `remove_hot_ip` / pruning) | `services/trie/structure/binary_trie.py`, `services/trie/structure/patricia.py`, `docs/adr/0014` |
 | 32, 33 | Persistence & snapshots | `services/trie/snapshot`, `packages/hammertime-bus` (`ConsumedMessage.offset`, positional `subscribe`), `tools/provision`, `docs/adr/0010` (Amendment 1), `docs/adr/0013` (decisions 2, 9) |
 | 34 | Versioned configuration | `core/config`, `services/aggregator/reevaluate.py`, `docs/adr/0011` |
 | 35 | IPv6 readiness | `core/addressing` |
@@ -63,4 +67,5 @@ Section index used throughout the code:
 | 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `deploy/grafana` |
 | 43 | Recommended initial implementation; reference components (event log, store, images) and their licence policy | `deploy/docker-compose.yml`, `docs/adr/0012` (Amendment 2), `docs/adr/0013` (decisions 11, 12) |
 | 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events`, `core/config`, `docs/adr/0005`, `docs/adr/0011` |
+| 46.5 | The derived count invariant `len(records) == hot_count(root)` | `services/trie/structure/invariants.py`, `packages/hammertime-testkit` (`invariants.py`), `docs/adr/0014` |
 | 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `packages/hammertime-bus` (`nats.py` `bus_endpoints`, the §47.7 reduction of bus URLs for log records), `docs/adr/0009`, `docs/adr/0013` (Amendment 2), `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |
