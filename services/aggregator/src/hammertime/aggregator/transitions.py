@@ -4,18 +4,26 @@ Spec: section 6, section 19, section 30, section 46.4
 
 ADR-0011 decision 4, with Amendment 2 item A11 (an applied observation can
 demote) and Amendment 3 item A14 (`EmittedTransition.transition` is core's
-`StateTransition`).
+`StateTransition`); ADR-0016 decision 3 (encode before persist).
 
 This module MUST call `hammertime.core.state.machine.evaluate_ip_state`
 rather than re-implementing the comparison, and it is the aggregator's only
 caller of it: spec section 30 requires a single authoritative state machine
 shared by ingestion, replay, and re-evaluation.
 
-The order of decision 4's five steps is load-bearing. The durable HOT set is
-updated *before* the event exists, so a crash between the two leaves the
-store saying HOT and the trie not told -- which the next owner's inheritance
-and warm-up repair -- rather than the trie holding an IP no owner knows
-about, which is the permanent section 12 leak ADR-0011 exists to close.
+The order of decision 4's steps, as ADR-0016 decision 3 revises it, is
+load-bearing: take the sequence number; build the payload and envelope and
+encode them; persist the transition to the durable HOT set; publish the
+already-encoded bytes; then update the in-memory state and count it. The
+durable HOT set is updated *before* the event is published, so a crash
+between the two leaves the store saying HOT and the trie not told -- which
+the next owner's inheritance and warm-up repair -- rather than the trie
+holding an IP no owner knows about, which is the permanent section 12 leak
+ADR-0011 exists to close. Encoding comes before the durable write, so the one
+step between persist and publish that could fail without any I/O -- a
+`CodecError` from `encode`, which after ADR-0016 decision 1 only a bug can
+cause -- fails with nothing persisted or published and the state unchanged,
+and cannot leave the store ahead of the log.
 """
 
 from dataclasses import dataclass
@@ -84,10 +92,14 @@ class TransitionEmitter:
         `reason` is the path that called: `observation`, `expiry`, `warmup`
         or `config`. It labels the transition counters and nothing else.
 
-        A failure from the state store propagates: the transition is not
-        emitted and the state is not changed in memory. The sequence number
-        is consumed; gaps are harmless, because `subject` qualifies the
-        `event_id` (ADR-0004).
+        The event is built and encoded before the state store is written
+        (ADR-0016 decision 3), and the encoded bytes are what is published.
+        A `CodecError` from `encode` propagates with nothing persisted or
+        published and the state not changed in memory. A failure from the
+        state store propagates likewise: the transition is not emitted and
+        the state is not changed in memory. Either way the sequence number
+        is consumed (ADR-0016 assumption 7); gaps are harmless, because
+        `subject` qualifies the `event_id` (ADR-0004).
         """
         previous = window.state(ip)
         count = window.total(ip)
@@ -99,7 +111,6 @@ class TransitionEmitter:
 
         sequence = window.next_sequence
         window.next_sequence += 1
-        await self._state_store.record_transition(window.shard, ip, new, sequence)
 
         timestamp = datetime.fromtimestamp(self._clock.now(), tz=UTC)
         payload: HotIpAdded | HotIpRemoved
@@ -137,6 +148,12 @@ class TransitionEmitter:
             subject=str(ip),
             payload=payload,
         )
+        # ADR-0016 decision 3: encode before the durable write, so a
+        # CodecError leaves nothing persisted, published or changed in memory.
+        value = encode(envelope)
+
+        await self._state_store.record_transition(window.shard, ip, new, sequence)
+
         # Both bus producers return only once the broker has acknowledged, so
         # there is no separate flush per transition. The `event_id` travels
         # as the log's own dedup key (ADR-0013 decision 4; ADR-0003 Amendment
@@ -145,7 +162,7 @@ class TransitionEmitter:
         await self._producer.publish(
             HOT_IP.name,
             key=HOT_IP.key_selector(payload),
-            value=encode(envelope),
+            value=value,
             message_id=envelope.event_id,
         )
 
