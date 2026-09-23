@@ -33,11 +33,17 @@ set: `iter_prefix_counts()` must equal the model's counts in pre-order
 depth-first order (decision 2: a prefix before its descendants, branch 0
 before branch 1), which is exactly ascending `(network, length)` order.
 
-Assumptions not pinned by the spec or ADR-0014:
+Every comparison here is between intact tries. ADR-0014 Amendment 2 A12
+clause 4 forbids asserting equivalence across a corrupted state, so the
+corruption cases live in `test_invariants.py` and never here.
 
-* A `PatriciaTrie` exposes its `NodeArena` as the attribute `arena` (decision
-  5 describes the arena but names no attribute); it is read only to check that
-  `clear()` resets it (decision 2).
+`PatriciaTrie.arena` is the arena's public name (Amendment 1, A1); it is read
+only to check that `clear()` resets it (decision 2). `iter_prefix_counts`
+rejects a `min_length` outside `[0, bit_length]` when called, exactly as
+`ancestor_counts` does (Amendment 2, A13).
+
+Choices of this file's own, not dictated by the spec or ADR-0014:
+
 * Section 27's example bit string is 32 bits long, i.e. the IPv4 address
   `0.0.0.202`. Its IPv6 counterparts here are `0:ca::` (the same 24-bit zero
   run and `11001010` at the top of a 128-bit address) and `::ca` (a 120-bit
@@ -74,6 +80,22 @@ FAMILIES = [
 ]
 
 TrieClass = type[BinaryTrie] | type[PatriciaTrie]
+
+POPULATED = [pytest.param(False, id="empty"), pytest.param(True, id="populated")]
+
+# Per family: two last-bit siblings and a third far from both.
+HOT_SAMPLES: dict[AddressFamily, tuple[Address, ...]] = {
+    AddressFamily.IPV4: (
+        Address.parse("192.168.1.42"),
+        Address.parse("192.168.1.43"),
+        Address.parse("10.0.0.1"),
+    ),
+    AddressFamily.IPV6: (
+        Address.parse("2001:db8::2a"),
+        Address.parse("2001:db8::2b"),
+        Address.parse("fe80::1"),
+    ),
+}
 
 
 def _prefix_of(address: Address, length: int) -> Prefix:
@@ -419,6 +441,58 @@ class TestQuerySemantics:
         trie = make_trie(AddressFamily.IPV4)
         with pytest.raises(ValueError):
             trie.ancestor_counts(Address.parse("192.168.1.42"), min_length=min_length)
+
+    @pytest.mark.parametrize("populated", POPULATED)
+    @pytest.mark.parametrize(
+        ("family", "too_long"),
+        [
+            pytest.param(AddressFamily.IPV4, 33, id="ipv4"),
+            pytest.param(AddressFamily.IPV6, 129, id="ipv6"),
+        ],
+    )
+    def test_iter_prefix_counts_rejects_an_out_of_range_min_length_when_called(
+        self, make_trie: TrieClass, family: AddressFamily, too_long: int, populated: bool
+    ) -> None:
+        """ADR-0014 Amendment 2, A13: `min_length` outside `[0, bit_length]` is a
+        `ValueError`, exactly as on `ancestor_counts`, raised when the method
+        is called rather than when its iterator is first advanced."""
+
+        assert too_long == family.bit_length + 1
+        trie = make_trie(family)
+        if populated:
+            for address in HOT_SAMPLES[family]:
+                assert trie.add_hot_ip(address) is True
+
+        # There is deliberately no list(...) around these calls: the absence of
+        # list() is the point. A13 requires the error at call time, so an
+        # implementation whose iter_prefix_counts is a generator function (and
+        # would only validate once advanced) must fail here.
+        with pytest.raises(ValueError):
+            trie.iter_prefix_counts(min_length=-1)
+        with pytest.raises(ValueError):
+            trie.iter_prefix_counts(min_length=too_long)
+
+    @pytest.mark.parametrize("family", FAMILIES)
+    def test_iter_prefix_counts_accepts_both_ends_of_the_range(
+        self, make_trie: TrieClass, family: AddressFamily
+    ) -> None:
+        """A13: `0` and `bit_length` are legal; `bit_length` selects exactly the
+        host routes (decision 2's pre-order DFS, i.e. ascending address)."""
+
+        bit_length = family.bit_length
+        trie = make_trie(family)
+        assert list(trie.iter_prefix_counts(min_length=0)) == []
+        assert list(trie.iter_prefix_counts(min_length=bit_length)) == []
+
+        hot = HOT_SAMPLES[family]
+        for address in hot:
+            assert trie.add_hot_ip(address) is True
+        assert list(trie.iter_prefix_counts(min_length=0)) == list(trie.iter_prefix_counts())
+        host_routes = [
+            PrefixCount(_prefix_of(address, bit_length), 1)
+            for address in sorted(hot, key=lambda a: a.value)
+        ]
+        assert list(trie.iter_prefix_counts(min_length=bit_length)) == host_routes
 
     def test_hot_count_of_an_absent_prefix_is_zero(self, make_trie: TrieClass) -> None:
         """ADR-0010 decision 4: absence of a node is a zero, not an error."""

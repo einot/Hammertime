@@ -4,8 +4,8 @@ Spec: section 11 (removal keeps `hot_count >= 0`; pruning), section 12 (the
 `hot_count` invariant), section 35 (one trie per family), section 46.5 (the
 attribute records mirror the HOT set, per address family).
 
-The interface under test is ADR-0014 decisions 1-5 and 8-10:
-`BinaryTrie`, `PatriciaTrie` and `NodeArena` from
+The interface under test is ADR-0014 decisions 1-5 and 8-10 with Amendments 1
+and 2: `BinaryTrie`, `PatriciaTrie` and `NodeArena` from
 `hammertime.trie.structure`, the checks `check_trie`, `check_hot_counts`,
 `check_no_orphaned_nodes`, `check_attribute_records` and `check_patricia`
 (which raise `hammertime.core.errors.InvariantViolation`), and testkit's
@@ -13,25 +13,46 @@ independently recomputing `assert_*` helpers (which raise `AssertionError`).
 Every expectation below comes from those decisions and the spec sections
 above, never from the modules.
 
-Assumptions not pinned by the spec or ADR-0014:
+Pinned by the amendments, and relied on here:
 
-* A `PatriciaTrie` exposes its `NodeArena` as the public attribute `arena`.
-  Decision 5 makes the arena's storage lists public and says the Patricia trie
-  owns it, and decision 6 names `PatriciaTrie.root`, but no decision spells
-  the attribute name. Corruption is injected only through that documented
-  storage (`arena.hot_count`, `arena.child`, `allocate`, `release`).
-* `iter_nodes()` yields every materialized node whatever its stored count
-  (decision 2: "yields the *materialized* nodes"), so a live node whose count
-  has been zeroed is visible to `check_no_orphaned_nodes`.
-* `BinaryTrie` documents no public storage, so the corruption cases that must
-  also run against it do so through `_DoctoredView`: a `HotTrie` that answers
-  from a real trie except for the one observable a test overrides. Decision 8
-  states which observables each check reads (`iter_hot_addresses`,
+* `PatriciaTrie.arena` is the public `NodeArena`, never rebound (A1), and its
+  storage lists -- `network`, `length`, `hot_count`, `child` and the LIFO free
+  list `free_ids` (A11) -- are writable. Corruption is injected only through
+  that documented storage and through `allocate` / `release`.
+* `check_patricia` computes reachability itself, and a bad id -- out of range,
+  released, or reached twice -- is an `InvariantViolation`, never an
+  `IndexError`, a `ValueError` or a hang (A2). The free list must hold exactly
+  the dead slots, each once, and an out-of-range entry is reported rather than
+  indexed with (A11).
+* `iter_nodes()` and `iter_hot_addresses()` are structural and report stored
+  counts verbatim; `contains`, `hot_count`, `iter_prefix_counts` and
+  `hot_ip_count` are count-derived (A3). That is what makes a zeroed or
+  inflated count visible to the checks.
+* The family is checked before any other argument on every address-taking
+  method, with a `ValueError` naming both families (decision 1, A9).
+* A mutator that finds a corruption it cannot walk past raises
+  `InvariantViolation` before mutating anything (A12). `BinaryTrie` need not
+  match on a corrupted trie (A12 clause 4), so nothing in this file compares
+  the two implementations on a corrupted state.
+
+Choices of this file's own, not dictated by the spec or ADR-0014:
+
+* `BinaryTrie` documents no public storage (A5), so the corruption cases that
+  must also run against it do so through `_DoctoredView`: a `HotTrie` that
+  answers from a real trie except for the one observable a test overrides.
+  Decision 8 states which observables each check reads (`iter_hot_addresses`,
   `iter_prefix_counts`, `hot_ip_count`, `iter_nodes`), so doctoring one of
   them is a faithful corruption as far as the check can tell.
 * A record for the other family cannot be told apart from a missing or extra
-  record by count alone, because an `Address`'s family is part of its
-  identity; the tests only require that such a collection is rejected.
+  record by count alone (A7); the tests only require that such a collection
+  is rejected.
+* `NodeArena()` takes no constructor arguments. Decision 5's sketch declares
+  none, and a fresh arena pre-allocates nothing (A4), so there is nothing to
+  configure.
+* Where a doctored trie could violate more than one `check_patricia` clause,
+  only the exception type is asserted: the ADR does not order the clauses.
+* "A family's name" in a `ValueError` message means the `AddressFamily`
+  value (`"ipv4"` / `"ipv6"`), matched case-insensitively.
 """
 
 from __future__ import annotations
@@ -52,6 +73,7 @@ from hammertime.trie.structure import (
     NO_NODE,
     BinaryTrie,
     HotTrie,
+    NodeArena,
     NodeView,
     PatriciaTrie,
     PrefixCount,
@@ -351,6 +373,73 @@ def test_other_family_is_rejected_and_changes_nothing(
     check_trie(trie)
 
 
+# Decision 1 (A9): every `HotTrie` method that takes an `Address` or a
+# `Prefix`, each handed one of the other family. `iter_prefix_counts` takes
+# neither and has no family check.
+FAMILY_CHECKED_CALLS: dict[str, Callable[[HotTrie, Address], object]] = {
+    "add_hot_ip": lambda t, a: t.add_hot_ip(a),
+    "remove_hot_ip": lambda t, a: t.remove_hot_ip(a),
+    "contains": lambda t, a: t.contains(a),
+    "hot_count-host-route": lambda t, a: t.hot_count(_prefix_of(a, a.bit_length)),
+    "hot_count-slash-8": lambda t, a: t.hot_count(_prefix_of(a, 8)),
+    "hot_count-slash-0": lambda t, a: t.hot_count(_root_prefix(a.family)),
+    "ancestor_counts": lambda t, a: t.ancestor_counts(a),
+    "ancestor_counts-min-length-8": lambda t, a: t.ancestor_counts(a, min_length=8),
+    "longest_matching_prefix": lambda t, a: t.longest_matching_prefix(a),
+}
+POPULATED = [pytest.param(False, id="empty"), pytest.param(True, id="populated")]
+
+
+def _assert_names_both_families(error: pytest.ExceptionInfo[ValueError]) -> None:
+    """Decision 1: "a `ValueError` naming both families"."""
+
+    message = str(error.value).lower()
+    for family in (AddressFamily.IPV4, AddressFamily.IPV6):
+        assert family.value in message, message
+
+
+@pytest.mark.parametrize("call", sorted(FAMILY_CHECKED_CALLS))
+@pytest.mark.parametrize("populated", POPULATED)
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_every_address_taking_method_rejects_the_other_family(
+    make_trie: TrieFactory, family: AddressFamily, populated: bool, call: str
+) -> None:
+    """ADR-0014 decision 1 and Amendment 1 A9: a query is as much a routing
+    bug as an update. Every method that takes an `Address` or `Prefix` raises
+    a `ValueError` naming both families and changes nothing observable."""
+
+    trie = _populated(make_trie, family) if populated else make_trie(family)
+    other = SAMPLES[family][3]
+    assert other.family is not family
+    before = _observe(trie)
+    with pytest.raises(ValueError) as excinfo:
+        FAMILY_CHECKED_CALLS[call](trie, other)
+    _assert_names_both_families(excinfo)
+    assert _observe(trie) == before
+    check_trie(trie)
+
+
+@pytest.mark.parametrize("min_length", [99, -1])
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_the_family_is_checked_before_min_length(
+    make_trie: TrieFactory, family: AddressFamily, min_length: int
+) -> None:
+    """A9: the family is checked before any other argument, so a call wrong
+    in both ways reports the family. Naming *both* families is what tells
+    this error apart from a `min_length` one, which has no reason to mention
+    the family the trie does not hold."""
+
+    trie = _populated(make_trie, family)
+    other = SAMPLES[family][3]
+    before = _observe(trie)
+    with pytest.raises(ValueError) as excinfo:
+        trie.ancestor_counts(other, min_length=min_length)
+    _assert_names_both_families(excinfo)
+    assert _observe(trie) == before
+
+
 @pytest.mark.parametrize("family", FAMILIES)
 @pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
 def test_clear_leaves_a_trie_that_passes_every_check(
@@ -575,6 +664,506 @@ class TestCheckPatricia:
         assert trie.arena.is_live(node) is False
         with pytest.raises(ValueError):
             trie.arena.release(node)
+
+
+# --------------------------------------------------------------------------
+# NodeArena's promises on a bare arena (decision 5, A4, A11).
+# --------------------------------------------------------------------------
+
+
+def _arena_state(arena: NodeArena) -> tuple[object, ...]:
+    """Every storage list and every count, copied."""
+
+    return (
+        list(arena.network),
+        list(arena.length),
+        list(arena.hot_count),
+        list(arena.child),
+        list(arena.free_ids),
+        arena.capacity,
+        arena.live_count,
+        arena.free_count,
+    )
+
+
+def _assert_storage_agrees(arena: NodeArena) -> None:
+    """Decision 5 promise 2: capacity == len(network) == len(length) ==
+    len(hot_count) == len(child) // 2 at all times; free_count ==
+    len(free_ids); A11: live_count == capacity - free_count."""
+
+    assert arena.capacity == len(arena.network) == len(arena.length) == len(arena.hot_count)
+    assert len(arena.child) == 2 * arena.capacity
+    assert arena.free_count == len(arena.free_ids)
+    assert arena.live_count == arena.capacity - arena.free_count
+
+
+def _assert_slot(arena: NodeArena, node: int, network: int, length: int, hot_count: int) -> None:
+    assert arena.is_live(node) is True
+    assert arena.network[node] == network
+    assert arena.length[node] == length
+    assert arena.hot_count[node] == hot_count
+    assert arena.child[2 * node] == NO_NODE
+    assert arena.child[2 * node + 1] == NO_NODE
+
+
+class TestNodeArena:
+    def test_a_fresh_arena_preallocates_nothing(self) -> None:
+        """Decision 5 promise 2 / A4: capacity == 0, every list empty."""
+
+        arena = NodeArena()
+        assert (arena.capacity, arena.live_count, arena.free_count) == (0, 0, 0)
+        assert arena.network == []
+        assert arena.length == []
+        assert arena.hot_count == []
+        assert arena.child == []
+        assert arena.free_ids == []
+
+    def test_growth_is_by_exactly_one_slot(self) -> None:
+        """Decision 5 promise 2: with an empty free list, `allocate` appends one
+        node's worth of slots, so capacity rises by exactly 1 and the new id
+        is the index just appended."""
+
+        arena = NodeArena()
+        for expected in range(6):
+            assert arena.free_ids == []
+            network, length, hot_count = expected << 8, 24, expected + 1
+            node = arena.allocate(network=network, length=length, hot_count=hot_count)
+            assert node == expected
+            assert arena.capacity == expected + 1
+            assert arena.live_count == expected + 1
+            assert arena.free_count == 0
+            _assert_storage_agrees(arena)
+            _assert_slot(arena, node, network, length, hot_count)
+
+        # hot_count defaults to 0.
+        node = arena.allocate(network=0, length=0)
+        assert arena.capacity == 7
+        _assert_storage_agrees(arena)
+        _assert_slot(arena, node, 0, 0, 0)
+
+    def test_released_slots_are_reused_last_in_first_out(self) -> None:
+        """Decision 5 promises 2 and 3, A11: `release` writes -1 into `length`
+        and pushes the id on `free_ids`; `allocate` pops the most recently
+        released id before it grows, and hands back a slot holding exactly
+        the fields just passed, with no children."""
+
+        arena = NodeArena()
+        first = arena.allocate(network=0, length=0, hot_count=3)
+        second = arena.allocate(network=0, length=1, hot_count=2)
+        third = arena.allocate(network=1 << 31, length=1, hot_count=1)
+        assert arena.capacity == 3
+        # Give the slots children, so reuse has something stale to clear.
+        arena.child[2 * third] = first
+        arena.child[2 * third + 1] = second
+        arena.child[2 * first] = third
+
+        arena.release(first)
+        arena.release(third)
+        assert arena.length[first] == -1
+        assert arena.length[third] == -1
+        assert arena.is_live(first) is False
+        assert arena.is_live(third) is False
+        assert arena.is_live(second) is True
+        assert (arena.capacity, arena.live_count, arena.free_count) == (3, 1, 2)
+        assert arena.free_ids[-1] == third
+        assert sorted(arena.free_ids) == sorted([first, third])
+        _assert_storage_agrees(arena)
+
+        reused = arena.allocate(network=0xC0A80100, length=24, hot_count=7)
+        assert reused == third
+        assert (arena.capacity, arena.live_count, arena.free_count) == (3, 2, 1)
+        _assert_slot(arena, reused, 0xC0A80100, 24, 7)
+        _assert_storage_agrees(arena)
+
+        reused = arena.allocate(network=0x0A000000, length=8)
+        assert reused == first
+        assert (arena.capacity, arena.live_count, arena.free_count) == (3, 3, 0)
+        _assert_slot(arena, reused, 0x0A000000, 8, 0)
+        _assert_storage_agrees(arena)
+
+        # The free list is empty again, so the next allocation grows by one.
+        grown = arena.allocate(network=0, length=32, hot_count=1)
+        assert grown == 3
+        assert (arena.capacity, arena.live_count, arena.free_count) == (4, 4, 0)
+        _assert_slot(arena, grown, 0, 32, 1)
+        _assert_storage_agrees(arena)
+
+    @pytest.mark.parametrize("length", [-1, -2])
+    @pytest.mark.parametrize("with_free_slot", [False, True], ids=["no-free-slot", "free-slot"])
+    def test_allocate_rejects_a_negative_length(self, length: int, with_free_slot: bool) -> None:
+        """A11 clause 3: `length < 0` is the only record of deadness, so a
+        negative length is a `ValueError` and changes nothing -- not even a
+        pop from the free list."""
+
+        arena = NodeArena()
+        arena.allocate(network=0, length=0, hot_count=1)
+        released = arena.allocate(network=0, length=1)
+        if with_free_slot:
+            arena.release(released)
+        before = _arena_state(arena)
+        with pytest.raises(ValueError):
+            arena.allocate(network=0, length=length)
+        assert _arena_state(arena) == before
+
+    def test_release_rejects_a_dead_or_out_of_range_id(self) -> None:
+        """Decision 5 promise 3 and assumption 18: a double release is a
+        `ValueError`; so is releasing an id the slab never held. Neither
+        changes anything."""
+
+        arena = NodeArena()
+        arena.allocate(network=0, length=0, hot_count=2)
+        released = arena.allocate(network=0, length=1, hot_count=1)
+        arena.allocate(network=1 << 31, length=1, hot_count=1)
+        arena.release(released)
+        before = _arena_state(arena)
+        for node in (released, arena.capacity, arena.capacity + 10):
+            with pytest.raises(ValueError):
+                arena.release(node)
+            assert _arena_state(arena) == before
+
+    def test_is_live_is_false_outside_the_slab(self) -> None:
+        """Decision 5 promise 3. The last slot is live, so a negative id that
+        were used as a Python index would wrongly read it as live."""
+
+        arena = NodeArena()
+        for length in (0, 1, 1):
+            arena.allocate(network=0, length=length)
+        assert arena.is_live(arena.capacity - 1) is True
+        for node in (NO_NODE, -2, arena.capacity, arena.capacity + 100):
+            assert arena.is_live(node) is False, node
+
+    def test_clear_truncates_every_list(self) -> None:
+        """Decision 5 promise 4: `clear()` resets the slab to empty, the free
+        list included, and the bound restarts from scratch."""
+
+        arena = NodeArena()
+        for length in (0, 1, 1):
+            arena.allocate(network=0, length=length, hot_count=1)
+        arena.child[0] = 1
+        arena.release(2)
+        arena.clear()
+        assert (arena.capacity, arena.live_count, arena.free_count) == (0, 0, 0)
+        assert arena.network == []
+        assert arena.length == []
+        assert arena.hot_count == []
+        assert arena.child == []
+        assert arena.free_ids == []
+
+        assert arena.allocate(network=0, length=0) == 0
+        assert arena.capacity == 1
+        _assert_storage_agrees(arena)
+
+
+# --------------------------------------------------------------------------
+# check_patricia's representation clauses (decisions 6 and 8, A2).
+# --------------------------------------------------------------------------
+
+
+def _root_children(trie: PatriciaTrie) -> tuple[int, int]:
+    arena = trie.arena
+    assert trie.root != NO_NODE
+    return arena.child[2 * trie.root], arena.child[2 * trie.root + 1]
+
+
+def _internal_below_root(trie: PatriciaTrie) -> int:
+    """The node above SAMPLES' A and B: /31 for IPv4, /127 for IPv6.
+
+    In both families A and C differ in their first bit, so the root of
+    `_patricia_with_three` is the /0 with C's leaf on one side and this node
+    on the other.
+    """
+
+    internal = [n for n in _root_children(trie) if trie.arena.length[n] < trie.bit_length]
+    assert len(internal) == 1, internal
+    return internal[0]
+
+
+def _leaf_below_root(trie: PatriciaTrie) -> int:
+    leaves = [n for n in _root_children(trie) if trie.arena.length[n] == trie.bit_length]
+    assert len(leaves) == 1, leaves
+    return leaves[0]
+
+
+def _corrupt_cycle(trie: PatriciaTrie) -> None:
+    # An internal node's child pointer rewritten to the root: the walk would
+    # come back round forever without a visited set. The node keeps two
+    # non-NO_NODE children, so the one-child clause cannot fire first.
+    arena = trie.arena
+    internal = _internal_below_root(trie)
+    arena.child[2 * internal + 1] = trie.root
+    assert NO_NODE not in (arena.child[2 * internal], arena.child[2 * internal + 1])
+
+
+def _corrupt_shared_subtree(trie: PatriciaTrie) -> None:
+    arena = trie.arena
+    arena.child[2 * trie.root + 1] = arena.child[2 * trie.root]
+
+
+def _corrupt_child_id_past_capacity(trie: PatriciaTrie) -> None:
+    trie.arena.child[2 * trie.root + 1] = trie.arena.capacity
+
+
+def _corrupt_child_id_far_past_capacity(trie: PatriciaTrie) -> None:
+    trie.arena.child[2 * trie.root + 1] = trie.arena.capacity + 1000
+
+
+def _corrupt_negative_child_id(trie: PatriciaTrie) -> None:
+    # Negative but not NO_NODE; as a Python index it would read a real slot.
+    trie.arena.child[2 * trie.root + 1] = -2
+
+
+def _corrupt_one_child(trie: PatriciaTrie) -> None:
+    internal = _internal_below_root(trie)
+    trie.arena.child[2 * internal + 1] = NO_NODE
+
+
+def _corrupt_swapped_children(trie: PatriciaTrie) -> None:
+    # A and B stay reachable and still extend their parent, and the sum is
+    # unchanged: only the branch bit is wrong.
+    arena = trie.arena
+    internal = _internal_below_root(trie)
+    zero, one = arena.child[2 * internal], arena.child[2 * internal + 1]
+    arena.child[2 * internal], arena.child[2 * internal + 1] = one, zero
+
+
+def _corrupt_host_bits(trie: PatriciaTrie) -> None:
+    # The /31 (/127) node's last bit is a host bit; setting it leaves both
+    # children extending the node's first `length` bits.
+    arena = trie.arena
+    internal = _internal_below_root(trie)
+    assert arena.length[internal] < trie.bit_length
+    arena.network[internal] |= 1
+
+
+def _corrupt_length_too_long(trie: PatriciaTrie) -> None:
+    trie.arena.length[_leaf_below_root(trie)] = trie.bit_length + 1
+
+
+def _corrupt_network_list_longer(trie: PatriciaTrie) -> None:
+    trie.arena.network.append(0)
+
+
+def _corrupt_hot_count_list_longer(trie: PatriciaTrie) -> None:
+    trie.arena.hot_count.append(0)
+
+
+def _corrupt_child_list_odd(trie: PatriciaTrie) -> None:
+    trie.arena.child.append(NO_NODE)
+
+
+REPRESENTATION_CORRUPTIONS = [
+    pytest.param(_corrupt_cycle, id="cycle"),
+    pytest.param(_corrupt_shared_subtree, id="shared-subtree"),
+    pytest.param(_corrupt_child_id_past_capacity, id="child-id-equal-to-capacity"),
+    pytest.param(_corrupt_child_id_far_past_capacity, id="child-id-far-past-capacity"),
+    pytest.param(_corrupt_negative_child_id, id="child-id-minus-2"),
+    pytest.param(_corrupt_one_child, id="one-child"),
+    pytest.param(_corrupt_swapped_children, id="wrong-branch-bit"),
+    pytest.param(_corrupt_host_bits, id="host-bits-set"),
+    pytest.param(_corrupt_length_too_long, id="length-above-bit-length"),
+    pytest.param(_corrupt_network_list_longer, id="network-list-longer"),
+    pytest.param(_corrupt_hot_count_list_longer, id="hot-count-list-longer"),
+    pytest.param(_corrupt_child_list_odd, id="child-list-odd"),
+]
+
+
+@pytest.mark.parametrize("corrupt", REPRESENTATION_CORRUPTIONS)
+@pytest.mark.parametrize("family", FAMILIES)
+def test_check_patricia_diagnoses_a_broken_representation(
+    family: AddressFamily, corrupt: Callable[[PatriciaTrie], None]
+) -> None:
+    """Decision 6's shape and decision 5's storage identity, checked by
+    decision 8 / A2: each corruption is an `InvariantViolation` from
+    `check_patricia` and from `check_trie` (which runs it first) -- never an
+    `IndexError`, a `ValueError` or a hang. The cycle case is also the
+    demonstration that the walk terminates. Only the type is asserted: more
+    than one clause can fire on some of these, and the ADR does not order
+    them."""
+
+    trie = _patricia_with_three(family)
+    check_patricia(trie)
+    corrupt(trie)
+    with pytest.raises(InvariantViolation):
+        check_patricia(trie)
+    with pytest.raises(InvariantViolation):
+        check_trie(trie)
+
+
+# --------------------------------------------------------------------------
+# check_patricia's free-list clauses (decision 5 promise 3, A11). Each case
+# passes every accounting clause that predates A11, so only a new one can
+# catch it.
+# --------------------------------------------------------------------------
+
+
+def _adds_only(family: AddressFamily) -> PatriciaTrie:
+    """Three adds and no removal: five live, reachable nodes, nothing free."""
+
+    trie = _patricia_with_three(family)
+    arena = trie.arena
+    assert arena.free_ids == []
+    assert arena.capacity == arena.live_count == trie.node_count == 5
+    return trie
+
+
+def _assert_old_accounting_holds(trie: PatriciaTrie) -> None:
+    """The pre-A11 clauses: len(R) == node_count == live_count == 2 * leaves - 1,
+    and capacity == live_count + free_count. R is 5 nodes (or 3 after one
+    removal) in every case below, so these must all be true."""
+
+    arena = trie.arena
+    assert arena.live_count == trie.node_count == 2 * trie.hot_ip_count - 1
+    assert arena.capacity == arena.live_count + arena.free_count
+    assert arena.free_count == len(arena.free_ids)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+class TestFreeListClauses:
+    def test_a_live_reachable_id_on_the_free_list_is_caught(self, family: AddressFamily) -> None:
+        """A11's motivating hole: a live, reachable id queued for reuse,
+        cancelled out by an unrelated live slot nobody links to. The order
+        matters -- allocating after the append would pop the id back off."""
+
+        trie = _adds_only(family)
+        arena = trie.arena
+        arena.allocate(network=0, length=0)
+        arena.free_ids.append(trie.root)
+        assert (arena.capacity, arena.free_count, arena.live_count) == (6, 1, 5)
+        assert arena.is_live(trie.root) is True
+        _assert_old_accounting_holds(trie)
+        with pytest.raises(InvariantViolation):
+            check_patricia(trie)
+        with pytest.raises(InvariantViolation):
+            check_trie(trie)
+
+    def test_a_resurrected_slot_left_on_the_free_list_is_caught(
+        self, family: AddressFamily
+    ) -> None:
+        """A dead slot's `length` set back to a live value while its id stays
+        queued: "every id in free_ids is dead" is the only clause it breaks."""
+
+        trie = _adds_only(family)
+        assert trie.remove_hot_ip(SAMPLES[family][2]) is True
+        arena = trie.arena
+        assert len(arena.free_ids) == 2
+        arena.length[arena.free_ids[-1]] = 0
+        assert (arena.capacity, arena.free_count, arena.live_count) == (5, 2, 3)
+        _assert_old_accounting_holds(trie)
+        with pytest.raises(InvariantViolation):
+            check_patricia(trie)
+        with pytest.raises(InvariantViolation):
+            check_trie(trie)
+
+    def test_a_dead_id_listed_twice_is_caught(self, family: AddressFamily) -> None:
+        """set(free_ids) == {y} == the dead slots, and the live, unreachable x
+        compensates for the double-counted entry, so only "no id twice" can
+        fire."""
+
+        trie = _adds_only(family)
+        arena = trie.arena
+        x = arena.allocate(network=0, length=0)
+        y = arena.allocate(network=0, length=0)
+        arena.release(y)
+        arena.free_ids.append(y)
+        assert arena.free_ids == [y, y]
+        assert arena.is_live(x) is True
+        assert (arena.capacity, arena.free_count, arena.live_count) == (7, 2, 5)
+        assert {i for i in range(arena.capacity) if arena.length[i] < 0} == {y}
+        _assert_old_accounting_holds(trie)
+        with pytest.raises(InvariantViolation):
+            check_patricia(trie)
+        with pytest.raises(InvariantViolation):
+            check_trie(trie)
+
+    @pytest.mark.parametrize("where", ["capacity", "no-node"])
+    def test_an_out_of_range_free_list_entry_is_caught(
+        self, family: AddressFamily, where: str
+    ) -> None:
+        """A11: an entry outside `[0, capacity)` is reported, not indexed with
+        -- an `InvariantViolation`, never an `IndexError`. A `-1` used as an
+        index would read the last slot, which here is live."""
+
+        trie = _adds_only(family)
+        arena = trie.arena
+        arena.allocate(network=0, length=0)
+        entry = arena.capacity if where == "capacity" else NO_NODE
+        arena.free_ids.append(entry)
+        assert (arena.capacity, arena.free_count, arena.live_count) == (6, 1, 5)
+        _assert_old_accounting_holds(trie)
+        with pytest.raises(InvariantViolation):
+            check_patricia(trie)
+        with pytest.raises(InvariantViolation):
+            check_trie(trie)
+
+    def test_a_valid_trie_after_a_removal_passes(self, family: AddressFamily) -> None:
+        """The free-list clauses accept what `remove_hot_ip` and `add_hot_ip`
+        actually produce: exactly the dead slots, each once."""
+
+        _a, _b, c, _other = SAMPLES[family]
+        trie = _adds_only(family)
+        assert trie.remove_hot_ip(c) is True
+        arena = trie.arena
+        check_patricia(trie)
+        check_trie(trie)
+        assert arena.free_count == len(arena.free_ids) == 2
+        assert len(set(arena.free_ids)) == 2
+        for node in arena.free_ids:
+            assert arena.is_live(node) is False
+            assert arena.length[node] < 0
+        dead = {i for i in range(arena.capacity) if arena.length[i] < 0}
+        assert set(arena.free_ids) == dead
+
+        # Re-adding reuses both slots and leaves nothing free.
+        assert trie.add_hot_ip(c) is True
+        check_patricia(trie)
+        check_trie(trie)
+        assert arena.free_ids == []
+        assert arena.capacity == 5
+
+
+# --------------------------------------------------------------------------
+# A mutator raises on corruption it cannot walk past (decision 3, A12).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("corrupted_count", [2, 0])
+@pytest.mark.parametrize("family", FAMILIES)
+def test_add_on_a_corrupted_leaf_raises_and_changes_nothing(
+    family: AddressFamily, corrupted_count: int
+) -> None:
+    """A12: a single-address Patricia trie is one node, the root, which is
+    that address's leaf (decision 6, A8). With its count corrupted away from
+    1, `contains()` says the address is not HOT, and `add_hot_ip` then finds
+    a leaf it cannot proceed past: it raises `InvariantViolation` before
+    mutating anything. The checks diagnose the same state. Patricia only --
+    `BinaryTrie` need not match on a corrupted trie (A12 clause 4)."""
+
+    address = SAMPLES[family][0]
+    trie = PatriciaTrie(family)
+    assert trie.add_hot_ip(address) is True
+    arena = trie.arena
+    assert trie.node_count == 1
+    assert arena.length[trie.root] == trie.bit_length
+
+    arena.hot_count[trie.root] = corrupted_count
+    assert trie.contains(address) is False  # count-derived (decision 2, A3)
+    with pytest.raises(InvariantViolation):
+        check_patricia(trie)
+    with pytest.raises(InvariantViolation):
+        check_hot_counts(trie)
+
+    before = _observe(trie)
+    storage_before = (trie.root, _arena_state(arena))
+    with pytest.raises(InvariantViolation):
+        trie.add_hot_ip(address)
+    assert _observe(trie) == before
+    assert (trie.root, _arena_state(arena)) == storage_before
+
+    # Still exactly as broken, and still diagnosed.
+    with pytest.raises(InvariantViolation):
+        check_patricia(trie)
+    with pytest.raises(InvariantViolation):
+        check_hot_counts(trie)
 
 
 # --------------------------------------------------------------------------

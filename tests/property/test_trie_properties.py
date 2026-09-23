@@ -10,9 +10,18 @@ Epic #8's acceptance criteria 2 ("no orphaned nodes" after every step of a
 randomized sequence) and 3 ("pruning without fragmentation blowing up
 memory") as ADR-0014 makes them testable:
 
-* every step keeps testkit's independently recomputing assertions silent
-  (decision 10), and a plain model set agrees with `hot_ip_count`,
-  `iter_hot_addresses()`, `iter_prefix_counts()` and sampled `hot_count`s;
+* every step passes the service's own `check_trie` and
+  `check_attribute_records` (Consequences clause (2): "`check_trie` after
+  every step of a randomized sequence"; for a `PatriciaTrie`, decision 8 runs
+  `check_patricia` first, so this is the only randomized coverage its
+  representation and arena-accounting clauses get);
+* every step also keeps testkit's `assert_*` helpers silent. That is not a
+  duplicate of the line above: decision 10 rule 2 makes testkit a deliberately
+  independent recomputation that never calls the service's checks, so a
+  checker wrong in the same direction as the structure is caught by the
+  other one;
+* a plain model set agrees with `hot_ip_count`, `iter_hot_addresses()`,
+  `iter_prefix_counts()` and sampled `hot_count`s;
 * the structure is a pure function of the HOT set (decision 4);
 * a redundant add or remove returns False and changes nothing (decision 3);
 * removing everything leaves no node, and for the Patricia trie no live arena
@@ -26,23 +35,18 @@ memory") as ADR-0014 makes them testable:
 Both representations and both families are covered. Streams draw from a small
 address pool so that redundant operations actually happen.
 
-Assumptions not pinned by the spec or ADR-0014:
+What earlier versions of this docstring listed as unpinned assumptions is now
+pinned by ADR-0014's amendments:
 
-* A `PatriciaTrie` exposes its `NodeArena` as the attribute `arena` (decision
-  5 describes the arena and names no attribute).
-* `node_count` equals the number of nodes `iter_nodes()` yields (decision 2:
-  `node_count` is section 37's `trie_nodes`, `iter_nodes` yields the
-  materialized nodes).
-* Two node counts follow from the ADR's text rather than being stated as
-  numbers: the binary trie's node set *is* its positive-count prefix set
-  (decision 2, `iter_prefix_counts`), and a Patricia trie whose every node is
-  a leaf or has exactly two children (decision 6) with one leaf per HOT
-  address has `2 * hot_ip_count - 1` nodes when non-empty.
-* The capacity equality compares against `node_count` sampled after each
-  operation, which presumes no operation holds more nodes mid-flight than it
-  ends with. Decision 5 states the equality over "simultaneously live nodes";
-  an implementation that transiently over-allocates would satisfy the ADR's
-  wording and fail this test, and that would be worth raising, not hiding.
+* `PatriciaTrie.arena` is the public name of the Patricia trie's `NodeArena`
+  (Amendment 1, A1).
+* `node_count` is defined by reachability, so `len(list(iter_nodes())) ==
+  node_count` (A2), and the derived counts -- the binary trie's node set is
+  its positive-count prefix set, a non-empty Patricia trie has
+  `2 * hot_ip_count - 1` nodes -- are contract (A8).
+* No operation allocates a node it does not keep, so comparing
+  `arena.capacity` with the running maximum of `node_count` sampled between
+  operations is exact (A4).
 """
 
 from __future__ import annotations
@@ -64,7 +68,14 @@ from hammertime.testkit.invariants import (
     assert_no_negative_counts,
     assert_no_orphaned_nodes,
 )
-from hammertime.trie.structure import BinaryTrie, HotTrie, PatriciaTrie, PrefixCount
+from hammertime.trie.structure import (
+    BinaryTrie,
+    HotTrie,
+    PatriciaTrie,
+    PrefixCount,
+    check_attribute_records,
+    check_trie,
+)
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -145,6 +156,11 @@ def _check_step(
 ) -> None:
     """Everything that must hold after any operation."""
 
+    # The service's checks (Consequences clause (2); check_patricia runs first
+    # for a PatriciaTrie, decision 8) ...
+    check_trie(trie)
+    check_attribute_records(trie, records)
+    # ... and testkit's independent recomputation (decision 10 rule 2).
     assert_hot_count_consistent(trie)
     assert_no_negative_counts(trie)
     assert_no_orphaned_nodes(trie)
