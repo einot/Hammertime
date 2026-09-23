@@ -1,7 +1,8 @@
 """Single-writer positional replay worker applying HotIpAdded / HotIpRemoved.
 
 Spec: section 19, section 22, section 28, section 33, section 46.5; ADR-0017
-decisions 3-10 and 12 (ADR-0013 decision 9, ADR-0014 A12, ADR-0015 decision 6).
+decisions 3-10, 12 and 17 (ADR-0013 decision 9, ADR-0014 A12, ADR-0015 decision 6,
+ADR-0015 Amendment 5 ruling 7).
 
 Consumption (decision 3). One positional, whole-topic subscription to
 `hammertime.hot-ip.v1` (`partitions=None`, no listener), starting at
@@ -362,6 +363,10 @@ class TrieWorker:
         dead-lettered or rebuilt. From the bus this cannot happen -- the
         codec runs the same validator -- so the path serves ADR-0015 decision
         5's other writers.
+
+        ADR-0015 Amendment 5 ruling 7 / ADR-0017 decision 17: both calls,
+        including the `attributes=None` retry, pass
+        `request_count=payload.window_count`.
         """
         try:
             return apply_hot_ip_added(
