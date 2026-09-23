@@ -33,6 +33,15 @@ The interface under test is ADR-0015 decisions 1-8, as re-exported from
   (`TypeError`), a key given two kinds on one path (`ValueError` at
   `declare`), and a combine operand that is not one of the three kinds
   (`TypeError`, checked before any key is combined).
+* F (Amendment 2 rulings A-D and its follow-ups, assumptions 18, 33, 49-60;
+  sections 46.2, 46.5, 46.8, 46.9): `record()` and `apply_hot_ip_added` keep
+  `canonicalize_ip_attributes`'s copy, never the caller's object -- a
+  subclass is stored as its base type, a lying subclass is judged and stored
+  by what it holds, a hostile one gives the plain document's outcome, a
+  non-`dict` mapping (`DEFAULT_ATTRIBUTES` included) is refused -- and every
+  read decodes a fresh, exact-typed document that a reader cannot use to
+  change the map. The validator's own rules, bounds and canonical form are
+  tested in `hammertime-core`'s `test_attribute_validation.py`.
 
 ADR-0014 (decisions 1-4, 8, 9; A1, A3, A5, A12) supplies the trie surface, and
 its A12 clause 4 forbids comparing implementations, or running the checks, on
@@ -70,21 +79,41 @@ Choices of this file's own, not dictated by the spec or ADR-0015:
 * Snapshots of the record map deep-copy every record, so a later nested
   mutation by the code under test could not make "before" and "after" agree
   by aliasing.
+* Section F copies `test_attribute_validation.py`'s trap machinery rather
+  than importing a test module across packages: every hostile or lying class
+  consults one switch, `_Traps`, and misbehaves only inside `_armed()`; a
+  document is built first and armed afterwards, because building a `dict`
+  hashes its keys. Only `_Impersonator` and `_Twin`, whose lie is their hash
+  and equality, lie unconditionally. A hostile document's expected outcome is
+  that of its plain twin, built by the same function from the plain types,
+  and an `accepted` flag pins which way the twin goes. `str(exc)` of every
+  rejection is taken while the traps are still armed.
+* Section F writes through two entry points: `record()` over an address that
+  already has a record (so a rejection must keep it), and
+  `apply_hot_ip_added` for a new address on a `PatriciaTrie` (so a rejection
+  must leave the trie as well as the map). Validation runs before the trie is
+  touched (decision 6), so the trie implementation does not bear on it and
+  only one is used.
+* Rule R1 applies to top-level keys only, so the nested lying `dict` hides an
+  S4 or S6 violation rather than a `sources` key.
 """
 
-from __future__ import annotations
-
+import contextlib
 import copy
+import itertools
 import json
-from collections.abc import Callable, Iterable, Mapping
-from enum import IntEnum
+import math
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from enum import IntEnum, StrEnum
 from fractions import Fraction
-from typing import Any
+from types import MappingProxyType
+from typing import Any, NamedTuple
 
 import pytest
 from hammertime.core.addressing.address import Address, AddressFamily
 from hammertime.core.addressing.prefix import Prefix
 from hammertime.core.errors import InvalidAttributesError, InvariantViolation
+from hammertime.core.events.attributes import CanonicalAttributes, canonicalize_ip_attributes
 from hammertime.testkit.generators import address_pools, addresses, prefixes, trie_operations
 from hammertime.testkit.invariants import (
     assert_attribute_records_match,
@@ -2017,3 +2046,995 @@ def test_combine_path_raises_at_its_first_failing_step() -> None:
         combine_path(malformed_first)
     with pytest.raises(TypeError):
         combine_path(iter(malformed_first))
+
+
+# ==========================================================================
+# F. ADR-0015 Amendment 2: the record map keeps the canonical copy, as text,
+#    and every read decodes a fresh document (rulings A-D, follow-ups).
+# ==========================================================================
+
+
+class _Traps:
+    """The one switch every trapped or lying class in section F consults.
+
+    Off while a document is built -- building a `dict` hashes, and may
+    compare, its keys -- and on only inside `_armed()`, around the write under
+    test. Nothing here is thread-safe, and nothing needs to be.
+    """
+
+    armed = False
+    error: type[BaseException] = RuntimeError
+    endless = False
+
+
+@contextlib.contextmanager
+def _armed(error: type[BaseException] = RuntimeError, *, endless: bool = False) -> Iterator[None]:
+    _Traps.error = error
+    _Traps.endless = endless
+    _Traps.armed = True
+    try:
+        yield
+    finally:
+        _Traps.armed = False
+        _Traps.endless = False
+
+
+# Every method a hostile class overrides, where its base type has it. Armed,
+# each raises `_Traps.error`; in "endless" mode the iterating ones instead
+# return an iterator that never ends, and the rest tell the truth.
+_TRAPPED = (
+    "__getattribute__",
+    "__hash__",
+    "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__repr__",
+    "__str__",
+    "__format__",
+    "__bool__",
+    "__len__",
+    "__iter__",
+    "__reversed__",
+    "__contains__",
+    "__getitem__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__sizeof__",
+    "__getnewargs__",
+    "__add__",
+    "__mul__",
+    "__mod__",
+    "__int__",
+    "__index__",
+    "__float__",
+    "__abs__",
+    "__neg__",
+    "__trunc__",
+    "__round__",
+    "__floor__",
+    "__ceil__",
+    "__rshift__",
+    "__floordiv__",
+    "__truediv__",
+    "__pow__",
+    "bit_length",
+    "to_bytes",
+    "is_integer",
+    "as_integer_ratio",
+    "hex",
+    "encode",
+    "isascii",
+    "join",
+    "startswith",
+    "split",
+    "items",
+    "keys",
+    "values",
+    "get",
+    "copy",
+    "count",
+    "index",
+)
+_ITERATING = frozenset({"__iter__", "__reversed__", "items", "keys", "values"})
+
+
+def _trap(base: type, name: str) -> Callable[..., Any]:
+    original = getattr(base, name)
+
+    def method(self: object, *args: Any, **kwargs: Any) -> Any:
+        if _Traps.armed:
+            if not _Traps.endless:
+                raise _Traps.error(name)
+            if name in _ITERATING:
+                return itertools.repeat(("x_a", 1)) if name == "items" else itertools.count()
+        return original(self, *args, **kwargs)
+
+    method.__name__ = name
+    return method
+
+
+def _class_trap(self: object) -> type:
+    if _Traps.armed and not _Traps.endless:
+        raise _Traps.error("__class__")
+    return type(self)
+
+
+def _hostile(base: type) -> Any:
+    """A subclass of `base` overriding every method in `_TRAPPED`, and `__class__`."""
+
+    namespace: dict[str, Any] = {
+        name: _trap(base, name) for name in _TRAPPED if getattr(base, name, None) is not None
+    }
+    namespace["__class__"] = property(_class_trap)
+    return type(f"_Hostile{base.__name__.title()}", (base,), namespace)
+
+
+class _Kinds(NamedTuple):
+    """Constructors for the five subclassable JSON-model types: str, int,
+    float, list, dict. `bool` and `None` cannot be subclassed."""
+
+    t: Callable[[Any], Any]
+    n: Callable[[Any], Any]
+    r: Callable[[Any], Any]
+    a: Callable[[Any], Any]
+    o: Callable[[Any], Any]
+
+
+_PLAIN = _Kinds(str, int, float, list, dict)
+_HOSTILE = _Kinds(_hostile(str), _hostile(int), _hostile(float), _hostile(list), _hostile(dict))
+
+
+class _LyingList(list[Any]):
+    """Holds its own content; armed, every overridable read shows `shown`."""
+
+    shown: list[Any]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.shown) if _Traps.armed else list.__iter__(self)
+
+    def __reversed__(self) -> Iterator[Any]:
+        return reversed(self.shown) if _Traps.armed else list.__reversed__(self)
+
+    def __len__(self) -> int:
+        return len(self.shown) if _Traps.armed else list.__len__(self)
+
+    def __getitem__(self, index: Any) -> Any:
+        return self.shown[index] if _Traps.armed else list.__getitem__(self, index)
+
+    def __contains__(self, item: object) -> bool:
+        return item in self.shown if _Traps.armed else list.__contains__(self, item)
+
+    def __eq__(self, other: object) -> bool:
+        return self.shown == other if _Traps.armed else list.__eq__(self, other)
+
+    def __repr__(self) -> str:
+        return repr(self.shown) if _Traps.armed else list.__repr__(self)
+
+    def copy(self) -> Any:
+        return list(self.shown) if _Traps.armed else list.copy(self)
+
+
+class _LyingDict(dict[Any, Any]):
+    """Holds its own entries; armed, every overridable read shows `shown`."""
+
+    shown: dict[Any, Any]
+
+    def items(self) -> Any:
+        return self.shown.items() if _Traps.armed else dict.items(self)
+
+    def keys(self) -> Any:
+        return self.shown.keys() if _Traps.armed else dict.keys(self)
+
+    def values(self) -> Any:
+        return self.shown.values() if _Traps.armed else dict.values(self)
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.shown) if _Traps.armed else dict.__iter__(self)
+
+    def __getitem__(self, key: Any) -> Any:
+        return self.shown[key] if _Traps.armed else dict.__getitem__(self, key)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.shown if _Traps.armed else dict.__contains__(self, key)
+
+    def __len__(self) -> int:
+        return len(self.shown) if _Traps.armed else dict.__len__(self)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return self.shown.get(key, default) if _Traps.armed else dict.get(self, key, default)
+
+    def copy(self) -> Any:
+        return dict(self.shown) if _Traps.armed else dict.copy(self)
+
+    def __eq__(self, other: object) -> bool:
+        return self.shown == other if _Traps.armed else dict.__eq__(self, other)
+
+    def __repr__(self) -> str:
+        return repr(self.shown) if _Traps.armed else dict.__repr__(self)
+
+
+class _LyingStr(str):
+    """Holds its own characters; armed, every overridable read shows `shown`."""
+
+    shown: str
+
+    def __str__(self) -> Any:
+        return self.shown if _Traps.armed else str.__str__(self)
+
+    def __repr__(self) -> Any:
+        return repr(self.shown) if _Traps.armed else str.__repr__(self)
+
+    def __iter__(self) -> Any:
+        return iter(self.shown) if _Traps.armed else str.__iter__(self)
+
+    def __getitem__(self, key: Any) -> Any:
+        return self.shown[key] if _Traps.armed else str.__getitem__(self, key)
+
+    def __len__(self) -> int:
+        return len(self.shown) if _Traps.armed else str.__len__(self)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self.shown if _Traps.armed else str.__contains__(self, key)
+
+    def __eq__(self, other: object) -> bool:
+        return self.shown == other if _Traps.armed else str.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        return self.shown != other if _Traps.armed else str.__ne__(self, other)
+
+    def __hash__(self) -> int:
+        return hash(self.shown) if _Traps.armed else str.__hash__(self)
+
+    def encode(self, *args: Any, **kwargs: Any) -> Any:
+        if _Traps.armed:
+            return self.shown.encode(*args, **kwargs)
+        return str.encode(self, *args, **kwargs)
+
+
+class _LyingInt(int):
+    """Holds its own value; armed, every comparison answers True and every
+    conversion shows `shown`."""
+
+    shown: int
+
+    def __lt__(self, other: Any) -> bool:
+        return True if _Traps.armed else int.__lt__(self, other)
+
+    def __le__(self, other: Any) -> bool:
+        return True if _Traps.armed else int.__le__(self, other)
+
+    def __gt__(self, other: Any) -> bool:
+        return True if _Traps.armed else int.__gt__(self, other)
+
+    def __ge__(self, other: Any) -> bool:
+        return True if _Traps.armed else int.__ge__(self, other)
+
+    def __eq__(self, other: object) -> bool:
+        return True if _Traps.armed else int.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        return True if _Traps.armed else int.__ne__(self, other)
+
+    def __hash__(self) -> int:
+        return int.__hash__(self)
+
+    def __int__(self) -> int:
+        return self.shown if _Traps.armed else int.__int__(self)
+
+    def __index__(self) -> int:
+        return self.shown if _Traps.armed else int.__index__(self)
+
+    def bit_length(self) -> int:
+        return self.shown.bit_length() if _Traps.armed else int.bit_length(self)
+
+    def __repr__(self) -> str:
+        return repr(self.shown) if _Traps.armed else int.__repr__(self)
+
+
+class _Impersonator(str):
+    """Its characters are whatever it was built from; it hashes and compares
+    as "weight" always, and armed it prints and measures as "weight" too."""
+
+    def __hash__(self) -> int:
+        return hash("weight")
+
+    def __eq__(self, other: object) -> bool:
+        return other is self or other == "weight"
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __str__(self) -> Any:
+        return "weight" if _Traps.armed else str.__str__(self)
+
+    def __len__(self) -> int:
+        return len("weight") if _Traps.armed else str.__len__(self)
+
+
+class _Twin(str):
+    """Equal only to itself and hashed by identity, so two with the same
+    characters are two keys of one `dict`."""
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return other is self
+
+    def __ne__(self, other: object) -> bool:
+        return other is not self
+
+
+def _lying_list(held: list[Any], shown: list[Any]) -> _LyingList:
+    value = _LyingList(held)
+    value.shown = shown
+    return value
+
+
+def _lying_dict(held: dict[Any, Any], shown: dict[Any, Any]) -> _LyingDict:
+    value = _LyingDict(held)
+    value.shown = shown
+    return value
+
+
+def _lying_str(held: str, shown: str) -> _LyingStr:
+    value = _LyingStr(held)
+    value.shown = shown
+    return value
+
+
+def _lying_int(held: int, shown: int) -> _LyingInt:
+    value = _LyingInt(held)
+    value.shown = shown
+    return value
+
+
+# Objects whose class claims, through a `__class__` property, to be `dict`
+# or `str` -- enough to pass `isinstance` -- and which quack like one.
+_FAKE_DICT_TYPE: Any = type(
+    "_FakeDict",
+    (),
+    {
+        "__class__": property(lambda self: dict),
+        "items": lambda self: {"attributes_version": 1}.items(),
+        "keys": lambda self: {"attributes_version": 1}.keys(),
+        "values": lambda self: {"attributes_version": 1}.values(),
+        "__iter__": lambda self: iter(["attributes_version"]),
+        "__len__": lambda self: 1,
+        "__getitem__": lambda self, key: 1,
+        "__contains__": lambda self, key: key == "attributes_version",
+    },
+)
+_FAKE_STR_TYPE: Any = type(
+    "_FakeStr",
+    (),
+    {
+        "__class__": property(lambda self: str),
+        "__str__": lambda self: "x_fake",
+        "__len__": lambda self: 6,
+        "__iter__": lambda self: iter("x_fake"),
+    },
+)
+
+
+class _PlainMapping(Mapping[str, object]):
+    """A correct, read-only `collections.abc.Mapping` that is not a `dict`."""
+
+    def __init__(self, data: dict[str, object]) -> None:
+        self._data = data
+
+    def __getitem__(self, key: str) -> object:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+class _Version(IntEnum):
+    ONE = 1
+
+
+class _Weight(IntEnum):
+    HEAVY = 1450
+
+
+class _Name(StrEnum):
+    X_COLOUR = "x_colour"
+    RED = "red"
+
+
+class _StrSub(str):
+    """A `str` subclass that changes nothing."""
+
+
+class _FloatSub(float):
+    """A `float` subclass that changes nothing."""
+
+
+class _DictSub(dict[str, Any]):
+    """A `dict` subclass that changes nothing."""
+
+
+class _ListSub(list[Any]):
+    """A `list` subclass that changes nothing."""
+
+
+_LEAF_TYPES: tuple[type, ...] = (str, int, float, bool, type(None))
+
+
+def _assert_exact(value: object) -> None:
+    """Every value reachable from `value` is an exact built-in JSON-model type
+    and every key an exact `str` -- read through `type()` and the base types'
+    own slots, so nothing a subclass defines runs."""
+
+    pending: list[Any] = [value]
+    visited = 0
+    while pending:
+        visited += 1
+        assert visited < 100_000, "not a finite tree"
+        item = pending.pop()
+        kind = type(item)
+        if kind is dict:
+            for key, child in dict.items(item):
+                assert type(key) is str, type(key)
+                pending.append(child)
+        elif kind is list:
+            pending.extend(list.__iter__(item))
+        else:
+            assert any(kind is leaf for leaf in _LEAF_TYPES), kind
+
+
+def _canonical_or_none(document: object) -> CanonicalAttributes | None:
+    try:
+        return canonicalize_ip_attributes(document)
+    except InvalidAttributesError:
+        return None
+
+
+STORE_ENTRIES = ["record", "apply"]
+_NEIGHBOUR = {"attributes_version": 1, "weight": 7}
+_EARLIER = {"attributes_version": 1, "x_note": "earlier"}
+
+
+def _write(entry: str, trie: HotTrie, records: IpAttributeRecords, document: object) -> None:
+    untyped: Any = document
+    if entry == "record":
+        records.record(V4, untyped)
+    else:
+        assert apply_hot_ip_added(trie, records, V4, untyped) is True
+
+
+def _assert_stored_outcome(
+    entry: str,
+    document: object,
+    expected: CanonicalAttributes | None,
+    *,
+    error: type[BaseException] = RuntimeError,
+    endless: bool = False,
+) -> None:
+    """Decision 5, "What can come out", and decision 6: `document` written
+    through `entry` is stored as `expected`'s canonical copy -- read back
+    exact-typed, counted at its canonical size -- or, when `expected` is None,
+    rejected with `InvalidAttributesError` alone, leaving the trie and the map
+    exactly as they were.
+
+    "record" writes over an address that already has a record; "apply" adds a
+    new address to a trie that already holds one."""
+
+    trie = PatriciaTrie(IPV4)
+    records = IpAttributeRecords(IPV4)
+    assert apply_hot_ip_added(trie, records, V4_C, dict(_NEIGHBOUR)) is True
+    if entry == "record":
+        records.record(V4, dict(_EARLIER))
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+
+    if expected is None:
+        with _armed(error, endless=endless):
+            with pytest.raises(InvalidAttributesError) as excinfo:
+                _write(entry, trie, records, document)
+            message = str(excinfo.value)
+        assert len(message) < 1024
+        assert _trie_state(trie) == trie_before
+        assert _records_state(records) == records_before
+        if entry == "apply":
+            _check_coupled(trie, records)
+        return
+
+    with _armed(error, endless=endless):
+        _write(entry, trie, records, document)
+    stored = dict(records[V4])
+    _assert_exact(stored)
+    assert stored == expected.document
+    assert records.serialized_bytes == _compact_size(_NEIGHBOUR) + expected.size
+    if entry == "apply":
+        assert trie.contains(V4) is True
+        _check_coupled(trie, records)
+
+
+# --- Follow-up E: subclasses are stored as their base types; bool. ---------
+
+# (build the document, its plain equivalent)
+SUBCLASS_DOCUMENTS: list[Any] = [
+    pytest.param(
+        lambda: {"attributes_version": _Version.ONE, "weight": _Weight.HEAVY},
+        {"attributes_version": 1, "weight": 1450},
+        id="int-enum-version-and-weight",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, _Name.X_COLOUR: _Name.RED},
+        {"attributes_version": 1, "x_colour": "red"},
+        id="str-enum-key-and-value",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, _StrSub("x_t"): [_StrSub("v"), {_StrSub("k"): 1}]},
+        {"attributes_version": 1, "x_t": ["v", {"k": 1}]},
+        id="str-subclass-keys-and-values",
+    ),
+    pytest.param(
+        lambda: {
+            "attributes_version": 1,
+            _lying_str("x_key", "sources"): _lying_str("café", "\ud800"),
+            "x_n": [_lying_str("ok", "\udfff")],
+        },
+        {"attributes_version": 1, "x_key": "café", "x_n": ["ok"]},
+        id="lying-str-key-and-values",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_r": _FloatSub(2.5), "x_l": [_FloatSub(-0.25)]},
+        {"attributes_version": 1, "x_r": 2.5, "x_l": [-0.25]},
+        id="float-subclass",
+    ),
+    pytest.param(
+        lambda: {
+            "attributes_version": 1,
+            "x_n": _ListSub([_DictSub({"k": _ListSub([1, _DictSub()])}), _ListSub()]),
+        },
+        {"attributes_version": 1, "x_n": [{"k": [1, {}]}, []]},
+        id="nested-dict-and-list-subclasses",
+    ),
+    pytest.param(
+        lambda: _DictSub({"attributes_version": 1, "weight": 3}),
+        {"attributes_version": 1, "weight": 3},
+        id="dict-subclass-document",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_t": True, "x_f": False, "x_l": [True, [False]]},
+        {"attributes_version": 1, "x_t": True, "x_f": False, "x_l": [True, [False]]},
+        id="bools-in-x-values",
+    ),
+]
+
+
+@pytest.mark.parametrize(("make", "plain"), SUBCLASS_DOCUMENTS)
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+def test_subclasses_are_stored_and_read_back_as_their_base_types(
+    entry: str, make: Callable[[], object], plain: dict[str, object]
+) -> None:
+    """Follow-up E / assumption 33 as amended: the map stores nested subclass
+    containers as plain `dict` and `list`, and every read-back value is an
+    exact built-in type equal to the plain equivalent."""
+
+    expected = canonicalize_ip_attributes(plain)
+    assert expected.document == plain
+    _assert_stored_outcome(entry, make(), expected)
+
+
+def test_a_bool_x_value_reads_back_as_a_bool() -> None:
+    records = IpAttributeRecords(IPV4)
+    document = {"attributes_version": 1, "x_t": True, "x_f": False, "x_l": [True, [False]]}
+    records.record(V4, document)
+    stored: Any = records[V4]
+    assert dict(stored) == document
+    assert stored["x_t"] is True
+    assert stored["x_f"] is False
+    assert stored["x_l"][0] is True
+    assert stored["x_l"][1][0] is False
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param({"attributes_version": True}, id="version-true"),
+        pytest.param({"attributes_version": False}, id="version-false"),
+        pytest.param({"attributes_version": 1, "weight": True}, id="weight-true"),
+        pytest.param({"attributes_version": 1, "weight": False}, id="weight-false"),
+    ],
+)
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+def test_a_bool_is_not_an_integer_for_the_version_or_the_weight(
+    entry: str, document: dict[str, object]
+) -> None:
+    _assert_stored_outcome(entry, document, None)
+
+
+# --- Ruling A: one read, into the copy that is stored. ----------------------
+
+NAN = math.nan
+
+# (build the document, the plain document holding the same content -- or None
+# where no plain dict can hold it -- and whether that content is accepted)
+LYING_DOCUMENTS: list[Any] = [
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_l": _lying_list([1], [NAN])},
+        {"attributes_version": 1, "x_l": [1]},
+        True,
+        id="list-holds-1-shows-nan",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_l": _lying_list(["a" * 5000], [1])},
+        {"attributes_version": 1, "x_l": ["a" * 5000]},
+        False,
+        id="list-holds-5000-characters-shows-1",
+    ),
+    pytest.param(
+        lambda: _lying_dict({"attributes_version": 1, "sources": [1]}, {"attributes_version": 1}),
+        {"attributes_version": 1, "sources": [1]},
+        False,
+        id="document-hides-sources",
+    ),
+    pytest.param(
+        lambda: _lying_dict(
+            {"attributes_version": 1, "x_ok": 1}, {"attributes_version": 1, "sources": [1]}
+        ),
+        {"attributes_version": 1, "x_ok": 1},
+        True,
+        id="document-shows-sources-holds-valid",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_d": _lying_dict({"k": NAN}, {"k": 1})},
+        {"attributes_version": 1, "x_d": {"k": NAN}},
+        False,
+        id="nested-dict-hides-nan",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_d": _lying_dict({"k": "a" * 2000}, {"k": 1})},
+        {"attributes_version": 1, "x_d": {"k": "a" * 2000}},
+        False,
+        id="nested-dict-hides-oversize",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_d": _lying_dict({"k": 1}, {"k": NAN})},
+        {"attributes_version": 1, "x_d": {"k": 1}},
+        True,
+        id="nested-dict-shows-nan-holds-1",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_s": _lying_str("ok\ud800", "ok")},
+        {"attributes_version": 1, "x_s": "ok\ud800"},
+        False,
+        id="str-value-hides-surrogate",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_d": {_lying_str("k\ud800", "k"): 1}},
+        {"attributes_version": 1, "x_d": {"k\ud800": 1}},
+        False,
+        id="nested-str-key-hides-surrogate",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 2, _lying_str("\ud800", "ok"): 1},
+        {"attributes_version": 2, "\ud800": 1},
+        False,
+        id="top-level-str-key-hides-surrogate-at-v2",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_s": _lying_str("ok", "\ud800")},
+        {"attributes_version": 1, "x_s": "ok"},
+        True,
+        id="str-value-shows-surrogate-holds-ok",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, _lying_str("sources", "x_ok"): 1},
+        {"attributes_version": 1, "sources": 1},
+        False,
+        id="key-holds-sources-shows-x-name",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, _lying_str("x_ok", "sources"): 1},
+        {"attributes_version": 1, "x_ok": 1},
+        True,
+        id="key-holds-x-name-shows-sources",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, _Impersonator("sources"): 5},
+        {"attributes_version": 1, "sources": 5},
+        False,
+        id="key-equal-to-weight-spelt-sources",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 2, _Impersonator("sources"): 5},
+        {"attributes_version": 2, "sources": 5},
+        True,
+        id="key-equal-to-weight-spelt-sources-at-v2",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "weight": _lying_int(10**9, 5)},
+        {"attributes_version": 1, "weight": 10**9},
+        False,
+        id="int-weight-holds-10-9",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "weight": _lying_int(5, 10**9)},
+        {"attributes_version": 1, "weight": 5},
+        True,
+        id="int-weight-holds-5",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": _lying_int(0, 1)},
+        {"attributes_version": 0},
+        False,
+        id="int-version-holds-0",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, _Twin("x_a"): 1, _Twin("x_a"): 2},
+        None,
+        False,
+        id="two-twin-keys",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_a": 1, _Twin("x_a"): 2},
+        None,
+        False,
+        id="plain-and-twin-key",
+    ),
+    pytest.param(
+        lambda: {"attributes_version": 1, "x_d": {_Twin("k"): 1, _Twin("k"): 2}},
+        None,
+        False,
+        id="nested-twin-keys",
+    ),
+]
+
+
+@pytest.mark.parametrize(("make", "held", "accepted"), LYING_DOCUMENTS)
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+def test_the_stored_record_is_what_the_document_holds_not_what_it_shows(
+    entry: str, make: Callable[[], object], held: dict[str, object] | None, accepted: bool
+) -> None:
+    """Ruling A: the store keeps the canonical copy, read once through the
+    base types' own slots; a rejection leaves the trie and the map as they
+    were."""
+
+    expected = None if held is None else _canonical_or_none(held)
+    assert (expected is not None) is accepted
+    _assert_stored_outcome(entry, make(), expected)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda: _FAKE_DICT_TYPE(), id="s1-whole-document-claims-dict"),
+        pytest.param(
+            lambda: {"attributes_version": 1, "x_d": _FAKE_DICT_TYPE()},
+            id="s4-nested-value-claims-dict",
+        ),
+        pytest.param(
+            lambda: {"attributes_version": 1, "x_s": _FAKE_STR_TYPE()},
+            id="s4-nested-value-claims-str",
+        ),
+    ],
+)
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+def test_an_object_claiming_a_type_through_class_is_not_stored(
+    entry: str, make: Callable[[], object]
+) -> None:
+    assert isinstance(_FAKE_DICT_TYPE(), dict)
+    _assert_stored_outcome(entry, make(), None)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda: MappingProxyType({"attributes_version": 1}), id="mapping-proxy"),
+        pytest.param(lambda: _PlainMapping({"attributes_version": 1}), id="collections-mapping"),
+        pytest.param(lambda: DEFAULT_ATTRIBUTES, id="default-attributes"),
+    ],
+)
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+def test_a_top_level_mapping_that_is_not_a_dict_is_refused(
+    entry: str, make: Callable[[], object]
+) -> None:
+    """Ruling A.4 / assumption 53: S1 means a `dict`, `DEFAULT_ATTRIBUTES`
+    included; `None` is how a caller asks for the default."""
+
+    _assert_stored_outcome(entry, make(), None)
+
+
+def test_none_still_stores_the_default_after_the_default_itself_is_refused() -> None:
+    trie = PatriciaTrie(IPV4)
+    records = IpAttributeRecords(IPV4)
+    default: Any = DEFAULT_ATTRIBUTES
+    with pytest.raises(InvalidAttributesError):
+        records.record(V4, default)
+    with pytest.raises(InvalidAttributesError):
+        apply_hot_ip_added(trie, records, V4, default)
+    assert len(records) == 0
+    assert trie.hot_ip_count == 0
+
+    records.record(V4_C, None)
+    assert dict(records[V4_C]) == {"attributes_version": 1}
+    assert apply_hot_ip_added(trie, records, V4, None) is True
+    assert dict(records[V4]) == {"attributes_version": 1}
+    assert records.serialized_bytes == 48
+
+
+# --- Ruling C: a hostile document gives the plain document's outcome. -------
+
+
+def _full(k: _Kinds) -> object:
+    """Every kind at every depth; a valid version-1 document."""
+
+    return k.o(
+        {
+            k.t("attributes_version"): k.n(1),
+            k.t("weight"): k.n(1450),
+            k.t("x_text"): k.t("café"),
+            k.t("x_real"): k.r(2.5),
+            k.t("x_list"): k.a(
+                [k.n(-3), k.t("a"), k.a([k.r(0.5), None]), k.o({k.t("k"): k.t("v")})]
+            ),
+            k.t("x_obj"): k.o(
+                {k.t("n"): k.a([]), k.t("m"): k.o({}), k.t("t"): True, k.t("f"): False}
+            ),
+            k.t("x_none"): None,
+        }
+    )
+
+
+def _seventeen(k: _Kinds) -> object:
+    entries = {k.t(f"x_key_{i}"): k.n(i) for i in range(16)}
+    return k.o({k.t("attributes_version"): k.n(1), **entries})
+
+
+def _v1(k: _Kinds, key: str, value: object) -> object:
+    return k.o({k.t("attributes_version"): k.n(1), k.t(key): value})
+
+
+# (build from a set of kinds, whether the plain twin is accepted)
+SHAPES: list[Any] = [
+    pytest.param(_full, True, id="every-kind-nested"),
+    pytest.param(lambda k: k.o({k.t("attributes_version"): k.n(1)}), True, id="minimal"),
+    pytest.param(
+        lambda k: k.o({k.t("attributes_version"): k.r(1.0), k.t("weight"): k.r(500.0)}),
+        True,
+        id="integral-reals",
+    ),
+    pytest.param(
+        lambda k: k.o({k.t("attributes_version"): k.n(2), k.t("severity"): k.a([k.n(3)])}),
+        True,
+        id="version-2-pass-through",
+    ),
+    pytest.param(lambda k: _v1(k, "unregistered", k.n(1)), False, id="r1-unregistered"),
+    pytest.param(lambda k: _v1(k, "sources", k.a([])), False, id="r1-sources"),
+    pytest.param(lambda k: _v1(k, "weight", k.n(10**9)), False, id="r2-weight-too-big"),
+    pytest.param(lambda k: k.o({k.t("attributes_version"): k.n(0)}), False, id="s3-version-0"),
+    pytest.param(lambda k: _v1(k, "x_list", k.a([k.r(NAN)])), False, id="s4-nan"),
+    pytest.param(lambda k: _v1(k, "x_list", k.a([k.t("\ud800")])), False, id="s5-value"),
+    pytest.param(lambda k: _v1(k, "x_obj", k.o({k.t("\udc00"): k.n(1)})), False, id="s5-key"),
+    pytest.param(lambda k: _v1(k, "x_text", k.t("a" * 2000)), False, id="s6-long-text"),
+    pytest.param(lambda k: _v1(k, "x_list", k.a([k.n(0)] * 600)), False, id="s6-long-list"),
+    pytest.param(_seventeen, False, id="s2-17-keys"),
+    pytest.param(
+        lambda k: k.a([k.o({k.t("attributes_version"): k.n(1)})]), False, id="s1-whole-array"
+    ),
+]
+
+MODES = [
+    pytest.param(RuntimeError, False, id="raise-RuntimeError"),
+    pytest.param(OverflowError, False, id="raise-OverflowError"),
+    pytest.param(KeyError, False, id="raise-KeyError"),
+    pytest.param(StopIteration, False, id="raise-StopIteration"),
+    pytest.param(ZeroDivisionError, False, id="raise-ZeroDivisionError"),
+    pytest.param(RuntimeError, True, id="never-finish"),
+]
+
+
+@pytest.mark.parametrize(("error", "endless"), MODES)
+@pytest.mark.parametrize(("shape", "accepted"), SHAPES)
+@pytest.mark.parametrize("entry", STORE_ENTRIES)
+def test_hostile_subclasses_are_stored_or_refused_exactly_as_the_plain_document(
+    entry: str,
+    shape: Callable[[_Kinds], object],
+    accepted: bool,
+    error: type[BaseException],
+    endless: bool,
+) -> None:
+    """Ruling C: keys, values and containers whose every overridable method
+    raises, or whose iteration never ends, are stored as the plain twin's
+    canonical copy or refused as it is, with `InvalidAttributesError` alone
+    and before the trie is touched. A regression in the never-finish mode
+    hangs; that is the signal."""
+
+    expected = _canonical_or_none(shape(_PLAIN))
+    assert (expected is not None) is accepted
+    _assert_stored_outcome(entry, shape(_HOSTILE), expected, error=error, endless=endless)
+
+
+# --- Ruling D: every read is a fresh, exact-typed document. -----------------
+
+READ_BACK: dict[str, Any] = {
+    "attributes_version": 1,
+    "weight": 3,
+    "x_list": [1, [2, {"k": "v"}]],
+    "x_obj": {"k": {"j": [True, None, 0.5]}},
+}
+READS = ["getitem", "get", "values", "items"]
+
+
+def _read(records: IpAttributeRecords, address: Address, how: str) -> Any:
+    """One of decision 5's read paths, on a map holding only `address`."""
+
+    if how == "getitem":
+        return records[address]
+    if how == "get":
+        return records.get(address)
+    if how == "values":
+        (value,) = records.values()
+        return value
+    ((key, value),) = records.items()
+    assert key == address
+    return value
+
+
+@pytest.mark.parametrize("how", READS)
+def test_every_read_decodes_a_fresh_exact_typed_document(how: str) -> None:
+    """Ruling D / assumptions 57-58: two reads are distinct objects at every
+    depth, each a read-only view over exact built-in types."""
+
+    records = IpAttributeRecords(IPV4)
+    records.record(V4, copy.deepcopy(READ_BACK))
+    first = _read(records, V4, how)
+    second = _read(records, V4, how)
+
+    assert first is not second
+    assert records[V4] is not records[V4]
+    assert first["x_list"] is not second["x_list"]
+    assert first["x_list"][1] is not second["x_list"][1]
+    assert first["x_list"][1][1] is not second["x_list"][1][1]
+    assert first["x_obj"] is not second["x_obj"]
+    assert first["x_obj"]["k"]["j"] is not second["x_obj"]["k"]["j"]
+    for view in (first, second):
+        assert type(view) is MappingProxyType
+        _assert_exact(dict(view))
+        assert dict(view) == READ_BACK
+
+
+def test_every_read_of_the_default_record_is_fresh_too() -> None:
+    records = IpAttributeRecords(IPV4)
+    records.record(V4)
+    first, second = records[V4], records[V4]
+    assert first is not second
+    assert dict(first) == dict(second) == {"attributes_version": 1}
+    _assert_exact(dict(first))
+
+
+@pytest.mark.parametrize("how", READS)
+def test_mutating_a_read_at_any_depth_changes_nothing_stored(how: str) -> None:
+    """Ruling D: nothing a reader does to a returned record, at any depth,
+    reaches the map, its byte total, a later read or the section 46.5 checks.
+    The top level still refuses assignment."""
+
+    trie = PatriciaTrie(IPV4)
+    records = IpAttributeRecords(IPV4)
+    assert apply_hot_ip_added(trie, records, V4, copy.deepcopy(READ_BACK)) is True
+    size = records.serialized_bytes
+    assert size == _compact_size(READ_BACK)
+
+    view = _read(records, V4, how)
+    view["x_list"].append("a" * 2000)
+    view["x_list"][1][1]["k"] = "changed"
+    view["x_list"][1].insert(0, {"grown": "a" * 2000})
+    view["x_obj"]["k"]["j"].clear()
+    view["x_obj"]["added"] = {"x": "a" * 2000}
+    with pytest.raises(TypeError):
+        view["weight"] = 4
+
+    assert dict(records[V4]) == READ_BACK
+    assert records.serialized_bytes == size
+    _check_coupled(trie, records)
