@@ -42,6 +42,17 @@ The interface under test is ADR-0015 decisions 1-8, as re-exported from
   read decodes a fresh, exact-typed document that a reader cannot use to
   change the map. The validator's own rules, bounds and canonical form are
   tested in `hammertime-core`'s `test_attribute_validation.py`.
+* G (ADR-0015 Amendment 3 rulings 1 and 4, assumptions 39, 59, 61, 62 and 68;
+  decision 5's "Three rows that hold because of Amendment 3"): rule S8 on the
+  record map -- `record()` and `apply_hot_ip_added` refuse an integer of more
+  than 640 digits with `InvalidAttributesError` and change nothing, and a
+  stored 640-digit integer reads back equal under the lowest legal
+  integer-string limit and under none, so a read's `ValueError` still means
+  only "the other family"; and `a in records`, answered from the stored keys
+  without decoding anything: `True` / `False` for an `Address` of the map's
+  family, `False` for anything that is not an `Address` (unhashable
+  included), the family `ValueError` otherwise -- the same through
+  `records.keys()`.
 
 ADR-0014 (decisions 1-4, 8, 9; A1, A3, A5, A12) supplies the trie surface, and
 its A12 clause 4 forbids comparing implementations, or running the checks, on
@@ -96,6 +107,13 @@ Choices of this file's own, not dictated by the spec or ADR-0015:
   only one is used.
 * Rule R1 applies to top-level keys only, so the nested lying `dict` hides an
   S4 or S6 violation rather than a `sources` key.
+* Section G: a test that changes CPython's integer-string limit sets only 0 or
+  640 -- 1 to 639 are not legal limits -- and restores the previous one in a
+  `finally`; S8's integers are built arithmetically, never parsed.
+* Section G: "`in` decodes nothing" is observed by replacing `json.loads`,
+  which decision 5 says is the only use the record map makes of `json`, with
+  a function that raises. A `records[a]` that then raises is the control
+  showing that the replacement reached the map's decode.
 """
 
 import contextlib
@@ -103,11 +121,12 @@ import copy
 import itertools
 import json
 import math
+import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from enum import IntEnum, StrEnum
 from fractions import Fraction
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 import pytest
 from hammertime.core.addressing.address import Address, AddressFamily
@@ -3038,3 +3057,228 @@ def test_mutating_a_read_at_any_depth_changes_nothing_stored(how: str) -> None:
     assert dict(records[V4]) == READ_BACK
     assert records.serialized_bytes == size
     _check_coupled(trie, records)
+
+
+# ==========================================================================
+# G. Amendment 3: rule S8 on the record map (ruling 1), and `in` answered
+# from the stored keys without a decode (ruling 4).
+# ==========================================================================
+
+S8_LARGEST = 10**640 - 1  # 640 digits: the largest magnitude S8 admits
+S8_REFUSED = 10**640  # 641 digits: the smallest magnitude S8 refuses
+
+
+@contextlib.contextmanager
+def _int_str_limit(limit: int) -> Iterator[None]:
+    """CPython's integer-string limit set to `limit`, and the previous limit
+    restored however the block ends."""
+
+    assert limit == 0 or limit >= 640
+    previous = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(limit)
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def _s8_refused_document() -> dict[str, object]:
+    return {"attributes_version": 1, "x_big": [0, {"k": -S8_REFUSED}]}
+
+
+@pytest.mark.parametrize("earlier", [False, True], ids=["new-address", "replacing-a-record"])
+def test_record_refuses_an_integer_of_641_digits_and_changes_nothing(earlier: bool) -> None:
+    """Rule S8 on the record map: `InvalidAttributesError`, never a
+    `ValueError`; `len`, `serialized_bytes` and any earlier record for the
+    address are exactly as they were."""
+
+    records = IpAttributeRecords(IPV4)
+    records.record(V4_C, {"attributes_version": 1, "weight": 7})
+    if earlier:
+        records.record(V4, {"attributes_version": 1, "weight": 1450, "x_note": "kept"})
+    before = _records_state(records)
+
+    with pytest.raises(InvalidAttributesError):
+        records.record(V4, {"attributes_version": 1, "x_big": S8_REFUSED})
+    with pytest.raises(InvalidAttributesError):
+        records.record(V4, _s8_refused_document())
+    assert _records_state(records) == before
+    assert len(records) == (2 if earlier else 1)
+    assert (V4 in records) is earlier
+
+
+@pytest.mark.parametrize("hot", [False, True], ids=["new-address", "hot-address"])
+@pytest.mark.parametrize("make_trie", IMPLEMENTATIONS)
+def test_apply_hot_ip_added_refuses_an_integer_of_641_digits_and_changes_neither(
+    make_trie: TrieFactory, hot: bool
+) -> None:
+    """Decision 6 clause 2 with rule S8: refused before the trie is touched."""
+
+    trie = make_trie(IPV4)
+    records = IpAttributeRecords(IPV4)
+    assert apply_hot_ip_added(trie, records, V4_C, {"attributes_version": 1, "weight": 3}) is True
+    if hot:
+        kept = {"attributes_version": 1, "x_note": "kept"}
+        assert apply_hot_ip_added(trie, records, V4, kept) is True
+    trie_before = _trie_state(trie)
+    records_before = _records_state(records)
+
+    with pytest.raises(InvalidAttributesError):
+        apply_hot_ip_added(trie, records, V4, _s8_refused_document())
+    assert trie.contains(V4) is hot
+    assert _trie_state(trie) == trie_before
+    assert _records_state(records) == records_before
+    _check_coupled(trie, records)
+
+
+@pytest.mark.parametrize(
+    "limit", [pytest.param(640, id="limit-640"), pytest.param(0, id="no-limit")]
+)
+@pytest.mark.parametrize("sign", [pytest.param(1, id="positive"), pytest.param(-1, id="negative")])
+def test_a_stored_640_digit_integer_reads_back_equal_under_every_limit(
+    sign: int, limit: int
+) -> None:
+    """Decision 5's "Three rows" / assumption 59 as amended: a record stored
+    under the default limit, and one stored under `limit`, both read back
+    equal under `limit` through `records[a]` and `records.get(a)` -- never
+    the integer-string limit's `ValueError`, which a read keeps for the other
+    family."""
+
+    value = sign * S8_LARGEST
+    top_level = {"attributes_version": 1, "x_big": value}
+    nested = {"attributes_version": 1, "x_l": [0, {"k": value}]}
+    records = IpAttributeRecords(IPV4)
+    records.record(V4, top_level)
+
+    with _int_str_limit(limit):
+        records.record(V4_B, nested)
+        by_item = dict(records[V4])
+        by_get = records.get(V4)
+        nested_by_item = dict(records[V4_B])
+        nested_by_get = records.get(V4_B)
+        assert V4 in records
+    assert by_get is not None
+    assert nested_by_get is not None
+    for read in (by_item, dict(by_get)):
+        _assert_exact(read)
+        assert read == top_level
+    for read in (nested_by_item, dict(nested_by_get)):
+        _assert_exact(read)
+        assert read == nested
+    assert records.serialized_bytes == _compact_size(top_level) + _compact_size(nested)
+
+
+NOT_ADDRESSES: list[Any] = [
+    pytest.param("192.168.1.42", id="str"),
+    pytest.param(None, id="none"),
+    pytest.param(V4.value, id="int"),
+    pytest.param(Prefix.parse("192.168.1.42/32"), id="prefix"),
+    pytest.param([], id="list"),
+    pytest.param({}, id="dict"),
+]
+
+
+def test_in_answers_whether_a_record_is_stored() -> None:
+    """Ruling 4 / assumption 68: for an `Address` of the map's family."""
+
+    records = IpAttributeRecords(IPV4)
+    records.record(V4, {"attributes_version": 1, "weight": 3})
+    assert (V4 in records) is True
+    assert (V4_B in records) is False
+    keys = records.keys()
+    assert (V4 in keys) is True
+    assert (V4_B in keys) is False
+
+    assert records.discard(V4) is True
+    assert (V4 in records) is False
+    assert (V4 in keys) is False
+
+
+@pytest.mark.parametrize("key", NOT_ADDRESSES)
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "populated"])
+def test_in_is_false_for_anything_that_is_not_an_address(populated: bool, key: object) -> None:
+    """Decision 5: "a key that is not an `Address` at all is simply absent" --
+    `False`, never an exception, the unhashable `[]` and `{}` included
+    (assumption 68). `records.keys()` asks the map's own `__contains__`."""
+
+    records = IpAttributeRecords(IPV4)
+    if populated:
+        records.record(V4)
+    untyped: Any = records
+    assert (key in untyped) is False
+    keys = untyped.keys()
+    assert (key in keys) is False
+
+
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "populated"])
+@pytest.mark.parametrize(
+    ("family", "other"),
+    [
+        pytest.param(IPV4, V6, id="ipv4-map-ipv6-key"),
+        pytest.param(IPV6, V4, id="ipv6-map-ipv4-key"),
+    ],
+)
+def test_in_raises_for_an_address_of_the_other_family(
+    family: AddressFamily, other: Address, populated: bool
+) -> None:
+    """Assumptions 39 and 68: the family `ValueError`, as from every other
+    method, and through `records.keys()` too."""
+
+    records = IpAttributeRecords(family)
+    if populated:
+        records.record(SAMPLE[family])
+    with pytest.raises(ValueError) as excinfo:
+        _ = other in records
+    _assert_names_both_families(excinfo.value)
+    keys = records.keys()
+    with pytest.raises(ValueError) as excinfo:
+        _ = other in keys
+    _assert_names_both_families(excinfo.value)
+
+
+class _DecodeAttemptedError(Exception):
+    """Raised by the stand-in for `json.loads`."""
+
+
+def _refuse_to_decode(*args: object, **kwargs: object) -> NoReturn:
+    raise _DecodeAttemptedError
+
+
+def test_in_decodes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ruling 4: every answer of the tests above, unchanged while `json.loads`
+    -- the record map's only use of `json` (decision 5) -- raises. The last
+    check is the control: a read, which must decode, does raise."""
+
+    records = IpAttributeRecords(IPV4)
+    records.record(V4, {"attributes_version": 1, "weight": 3})
+    records.record(V4_C)
+    other_family = IpAttributeRecords(IPV6)
+    untyped: Any = records
+    monkeypatch.setattr(json, "loads", _refuse_to_decode)
+
+    assert (V4 in records) is True
+    assert (V4_C in records) is True
+    assert (V4_B in records) is False
+    keys = records.keys()
+    untyped_keys: Any = keys
+    assert (V4 in keys) is True
+    assert (V4_B in keys) is False
+    probes: tuple[object, ...] = (
+        "192.168.1.42",
+        None,
+        V4.value,
+        Prefix.parse("192.168.1.42/32"),
+        [],
+        {},
+    )
+    for key in probes:
+        assert (key in untyped) is False
+        assert (key in untyped_keys) is False
+    with pytest.raises(ValueError):
+        _ = V6 in records
+    with pytest.raises(ValueError):
+        _ = V4 in other_family
+    assert len(records) == 2
+
+    with pytest.raises(_DecodeAttemptedError):
+        _ = records[V4]

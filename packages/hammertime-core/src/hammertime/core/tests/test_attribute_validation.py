@@ -41,10 +41,35 @@ ADR-0015 Amendment 2 (rulings A-D, assumptions 49-60) adds
 
 Ruling D (the record map) is tested in the trie service's `test_metadata.py`.
 
-`test_ip_attributes.py` and `test_codec.py` are deliberately untouched: they
-must pass unchanged against the refactored codec (ADR-0015 assumption 30).
-This file copies their envelope-building and tampering pattern rather than
-importing it.
+ADR-0015 Amendment 3 (rulings 1 and 2, assumptions 61-63) is pinned by the
+tests after the "Amendment 3" banners, and by the boundary test beside the
+exact-1024 tests of ruling B:
+
+* Ruling 1 -- rule S8: every integer, at any depth, has at most 640 decimal
+  digits, sign not counted. 640 digits are accepted and 641 refused under the
+  default integer-string limit, under 0 (no limit) and under 640 (the lowest
+  legal one), always as `InvalidAttributesError`, never `ValueError`; the
+  rule reaches `attributes_version`; the codec chains its `CodecError` from
+  the rejection. `sys.int_info.str_digits_check_threshold >= 640` is the one
+  premise of assumption 61 a test can see.
+* Ruling 2 -- "Bounded work" rule 5: a container met again is not read again,
+  but a fresh copy of its canonical copy takes its place. What is pinned is
+  the result, not the work (assumption 63; ADR-0014 assumption 17 rules out
+  timing assertions): a shared document gives exactly the document, text and
+  size of its unshared equivalent, the canonical document is a tree holding
+  no input object, sharing counts in full against the size cap, and a cycle
+  through two containers is an S7 rejection. These hold before and after the
+  fix.
+* The coordinator's boundary cases: a list of `null`, `true`, `false`, a
+  negative float, a negative int or an escaped `"é"` at exactly 1024 compact
+  bytes is accepted, and one more item is not.
+
+`test_ip_attributes.py` is deliberately untouched: it must pass unchanged
+against the refactored codec (ADR-0015 assumption 30). `test_codec.py` was
+untouched until Amendment 3 ruling 3, whose tests of the codec's own integer
+fields live there because they concern the codec, not attributes. This file
+copies their envelope-building and tampering pattern rather than importing
+it.
 
 Choices of this file's own, not dictated by the spec or ADR-0015:
 
@@ -81,6 +106,14 @@ Choices of this file's own, not dictated by the spec or ADR-0015:
   construction can spring one.
 * The canonical-form property draws exact-type documents only, where the
   ADR promises that the copy equals the input.
+* Amendment 3: a test that changes CPython's integer-string limit sets only 0
+  or 640 -- 1 to 639 are not legal limits -- and restores the previous one in
+  a `finally`. S8's integers are built arithmetically and their digits are
+  counted without converting them to text, so no helper depends on the limit
+  in force. A rejection's message must not contain a run of 20 zeros, which
+  any echo of `10**640` would.
+* Amendment 3: every boundary document is built to its exact size by
+  measuring its compact encoding; no size is hard-coded but the target.
 """
 
 import contextlib
@@ -1724,6 +1757,57 @@ def test_many_small_items_at_exactly_1024_bytes_are_accepted_and_one_more_is_not
     _assert_outcome("validate", wider, None)
 
 
+def _one_kind_at(target: int, item: object) -> tuple[dict[str, Any], str]:
+    """A list holding only `item`, under an `x_` key, whose document is exactly
+    `target` compact bytes; and that key. The list is the longest that fits,
+    and the key's name takes up the few bytes an item cannot."""
+
+    items: list[object] = []
+    while _size({"attributes_version": 1, "x_a": items}) <= target:
+        items.append(item)
+    items.pop()
+    spare = target - _size({"attributes_version": 1, "x_a": items})
+    key = "x_" + "a" * (1 + spare)
+    document: dict[str, Any] = {"attributes_version": 1, key: items}
+    assert _size(document) == target
+    assert len(key) <= 50
+    return document, key
+
+
+BOUNDARY_ITEMS: list[Any] = [
+    pytest.param(None, id="null"),
+    pytest.param(True, id="true"),
+    pytest.param(False, id="false"),
+    pytest.param(-0.5, id="negative-float"),
+    pytest.param(-7, id="negative-int"),
+    pytest.param("é", id="escaped-e-acute"),
+]
+
+
+@pytest.mark.parametrize("item", BOUNDARY_ITEMS)
+def test_a_list_of_one_kind_at_exactly_1024_bytes_is_accepted_and_one_more_item_is_not(
+    item: object,
+) -> None:
+    """Amendment 3's follow-up boundary cases, by S6's definition of size:
+    the running bound under-counts every kind of item, so none rejects a
+    document of 1024 bytes, and the exact size rejects 1025 or more."""
+
+    if item == "é":
+        assert json.dumps(item) == '"\\u00e9"'
+    document, key = _one_kind_at(1024, item)
+    assert len(document[key]) > 100
+    canonical = canonicalize_ip_attributes(document)
+    assert validate_ip_attributes(document) == canonical.size == 1024
+    assert canonical.document == document
+    assert canonical.text == json.dumps(document, separators=(",", ":"))
+
+    longer = copy.deepcopy(document)
+    longer[key].append(item)
+    assert _size(longer) > 1024
+    for entry in ("canonicalize", "validate"):
+        _assert_outcome(entry, longer, None)
+
+
 def test_the_deepest_nesting_that_fits_is_accepted_and_one_level_more_is_not() -> None:
     depth, leaf = _deepest_at(1024)
     assert depth > 400
@@ -1920,3 +2004,404 @@ def test_the_canonical_copy_is_exact_equal_detached_and_a_fixed_point(
     assert canonical.document == snapshot
     assert canonical.text == text
     assert json.dumps(canonical.document, separators=(",", ":")) == text
+
+
+# ==========================================================================
+# Amendment 3, ruling 1: S8 -- every integer, at any depth, has at most 640
+# decimal digits, sign not counted (assumptions 61 and 62).
+# ==========================================================================
+
+S8_LARGEST = 10**640 - 1  # 640 nines: the largest magnitude S8 admits
+S8_REFUSED = 10**640  # 641 digits: the smallest magnitude S8 refuses
+
+
+def _digits(value: int) -> int:
+    """Decimal digits of `value`, sign not counted, never converting it to text."""
+
+    magnitude = abs(value)
+    count = 1
+    while magnitude >= 10**count:
+        count += 1
+    return count
+
+
+@contextlib.contextmanager
+def _int_str_limit(limit: int | None) -> Iterator[None]:
+    """CPython's integer-string limit set to `limit` (None: left as it is),
+    and the previous limit restored however the block ends."""
+
+    assert limit is None or limit == 0 or limit >= 640
+    previous = sys.get_int_max_str_digits()
+    try:
+        if limit is not None:
+            sys.set_int_max_str_digits(limit)
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def _s8_top_level(value: int) -> dict[str, object]:
+    return {"attributes_version": 1, "x_n": value}
+
+
+def _s8_in_a_list(value: int) -> dict[str, object]:
+    return {"attributes_version": 1, "x_l": [0, value, "a"]}
+
+
+def _s8_in_a_nested_dict(value: int) -> dict[str, object]:
+    return {"attributes_version": 1, "x_d": {"k": {"j": value}, "m": 1}}
+
+
+S8_PLACES: list[Any] = [
+    pytest.param(_s8_top_level, id="top-level"),
+    pytest.param(_s8_in_a_list, id="in-a-list"),
+    pytest.param(_s8_in_a_nested_dict, id="in-a-nested-dict"),
+]
+S8_SIGNS: list[Any] = [pytest.param(1, id="positive"), pytest.param(-1, id="negative")]
+INT_STR_LIMITS: list[Any] = [
+    pytest.param(None, id="default-limit"),
+    pytest.param(0, id="no-limit"),
+    pytest.param(640, id="limit-640"),
+]
+
+
+def test_s8_rests_on_cpythons_threshold_of_640() -> None:
+    """Assumption 61: the one premise of S8's number a test can see; and this
+    file's own arithmetic."""
+
+    assert sys.int_info.str_digits_check_threshold >= 640
+    assert _digits(S8_LARGEST) == 640
+    assert _digits(-S8_LARGEST) == 640
+    assert _digits(S8_REFUSED) == 641
+    assert [_digits(n) for n in (0, 9, 10, -99, 100)] == [1, 1, 2, 2, 3]
+
+
+@pytest.mark.parametrize("limit", INT_STR_LIMITS)
+@pytest.mark.parametrize("sign", S8_SIGNS)
+@pytest.mark.parametrize("place", S8_PLACES)
+def test_s8_640_digits_are_accepted_at_any_depth_under_every_limit(
+    place: Callable[[int], dict[str, object]], sign: int, limit: int | None
+) -> None:
+    """S8: -10**640 < n < 10**640 is admitted anywhere. The canonical document
+    equals the input, its size is the compact size, and -- whatever the
+    limit, which is what S8 buys (assumption 59 as amended) -- its text
+    decodes and canonicalizes back to itself."""
+
+    value = sign * S8_LARGEST
+    assert _digits(value) == 640
+    document = place(value)
+    with _int_str_limit(limit):
+        canonical = canonicalize_ip_attributes(document)
+        size = validate_ip_attributes(document)
+        compact = json.dumps(document, separators=(",", ":"))
+        reparsed = json.loads(canonical.text)
+        again = canonicalize_ip_attributes(reparsed)
+    _assert_exact(canonical.document)
+    assert canonical.document == document
+    assert canonical.text == compact
+    assert size == canonical.size == len(compact.encode("utf-8"))
+    assert reparsed == document
+    assert again.text == canonical.text
+
+
+@pytest.mark.parametrize("limit", INT_STR_LIMITS)
+@pytest.mark.parametrize("sign", S8_SIGNS)
+@pytest.mark.parametrize("place", S8_PLACES)
+@pytest.mark.parametrize("entry", ["canonicalize", "validate"])
+def test_s8_641_digits_are_invalid_attributes_at_any_depth_under_every_limit(
+    entry: str, place: Callable[[int], dict[str, object]], sign: int, limit: int | None
+) -> None:
+    """S8 and "What can come out": `InvalidAttributesError`, never the
+    `ValueError` of the integer-string limit -- `pytest.raises` lets any other
+    type fail the test. The message echoes no value: `str(exc)` does not raise
+    and holds no run of 20 zeros."""
+
+    value = sign * S8_REFUSED
+    assert _digits(value) == 641
+    document = place(value)
+    with _int_str_limit(limit):
+        with pytest.raises(InvalidAttributesError) as excinfo:
+            _through(entry, document)()
+        message = str(excinfo.value)
+    assert "0" * 20 not in message
+    assert len(message) < 1024
+
+
+@pytest.mark.parametrize("entry", ["canonicalize", "validate"])
+def test_s8_reaches_attributes_version(entry: str) -> None:
+    """Assumption 62: a 641-digit `attributes_version`, which S3 alone passed,
+    is refused; a 640-digit one is still a version above 1, stored verbatim
+    and not interpreted (section 46.2's pass-through rule)."""
+
+    with pytest.raises(InvalidAttributesError) as excinfo:
+        _through(entry, {"attributes_version": S8_REFUSED})()
+    message = str(excinfo.value)
+    assert "0" * 20 not in message
+
+    version = 10**639
+    assert _digits(version) == 640
+    higher: dict[str, object] = {"attributes_version": version, "severity": 3, "Weight": "x"}
+    text = json.dumps(higher, separators=(",", ":"))
+    _assert_outcome(entry, higher, CanonicalAttributes(document=higher, text=text))
+
+
+@pytest.mark.parametrize(
+    "limit", [pytest.param(None, id="default-limit"), pytest.param(0, id="no-limit")]
+)
+def test_decode_refuses_a_641_digit_attribute_integer_as_an_attributes_rejection(
+    limit: int | None,
+) -> None:
+    """Assumption 61: where the decoding process can parse the integer at all,
+    S8 refuses it, and the `CodecError` is chained from the
+    `InvalidAttributesError` that assumption 37's `attributes_rejected` count
+    relies on. 640 digits decode to equal attributes. (Under a limit of 640,
+    `json.loads` refuses 641 digits first, with no such cause; the ADR says
+    so, and that case is not pinned here.)"""
+
+    refused = {"attributes_version": 1, "x_l": [S8_REFUSED]}
+    admitted = {"attributes_version": 1, "x_l": [-S8_LARGEST]}
+    with _int_str_limit(limit):
+        refused_wire = _wire_with_attributes(refused)
+        with pytest.raises(CodecError) as excinfo:
+            decode(refused_wire)
+        decoded: Any = decode(_wire_with_attributes(admitted))
+    assert isinstance(excinfo.value.__cause__, InvalidAttributesError)
+    _assert_exact(decoded.payload.attributes)
+    assert decoded.payload.attributes == admitted
+
+
+def test_encode_refuses_a_641_digit_attribute_integer_as_an_attributes_rejection() -> None:
+    envelope = _hot_ip_added_envelope(attributes={"attributes_version": 1, "x_n": -S8_REFUSED})
+    with pytest.raises(CodecError) as excinfo:
+        encode(envelope)
+    assert isinstance(excinfo.value.__cause__, InvalidAttributesError)
+
+    admitted = {"attributes_version": 1, "x_n": S8_LARGEST}
+    decoded: Any = decode(encode(_hot_ip_added_envelope(attributes=admitted)))
+    assert decoded.payload.attributes == admitted
+
+
+# ==========================================================================
+# Amendment 3, ruling 2: "Bounded work" rule 5 -- each distinct container is
+# read at most once, and a repeat is a fresh copy of its canonical copy. Only
+# the result is pinned, never the work (assumption 63; ADR-0014 assumption
+# 17): these hold before the fix as well as after it.
+# ==========================================================================
+
+
+def _shared_plain() -> dict[str, Any]:
+    leaf: list[Any] = [1, "a", None]
+    inner: dict[str, Any] = {"k": leaf, "j": [leaf, leaf]}
+    return {
+        "attributes_version": 1,
+        "x_a": inner,
+        "x_b": inner,
+        "x_c": [inner, leaf, inner],
+    }
+
+
+def _shared_subclasses() -> dict[str, Any]:
+    leaf = _Arr([1, "a", None])
+    inner = _Obj({"k": leaf, "j": _Arr([leaf, leaf])})
+    return {
+        "attributes_version": 1,
+        "x_a": inner,
+        "x_b": inner,
+        "x_c": _Arr([inner, leaf, inner]),
+    }
+
+
+def _shared_nested() -> dict[str, Any]:
+    """Sharing inside sharing: `a` twice in `b`, `c` holding both, `c` twice in `d`."""
+
+    a: list[Any] = [0, {"z": None}]
+    b = _Arr([a, a])
+    c: dict[str, Any] = {"b": b, "a": a}
+    d = [c, c, b]
+    return {"attributes_version": 1, "x_d": d, "x_c": c, "x_a": a}
+
+
+SHARED_DOCUMENTS: list[Any] = [
+    pytest.param(_shared_plain, id="exact-types"),
+    pytest.param(_shared_subclasses, id="dict-and-list-subclasses"),
+    pytest.param(_shared_nested, id="nested-sharing"),
+]
+
+
+def _containers(value: object) -> list[object]:
+    """Every dict and list reachable from `value`, once per position: a
+    container shared by three positions is listed three times."""
+
+    found: list[object] = []
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            found.append(item)
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            found.append(item)
+            pending.extend(item)
+        assert len(found) < 100_000, "not a finite tree"
+    return found
+
+
+@pytest.mark.parametrize("make", SHARED_DOCUMENTS)
+def test_rule_5_a_shared_container_gives_its_unshared_equivalents_result(make: Factory) -> None:
+    document = make()
+    unshared = json.loads(json.dumps(document))
+    assert _size(unshared) <= 1024
+    expected = canonicalize_ip_attributes(unshared)
+
+    canonical = canonicalize_ip_attributes(document)
+    _assert_exact(canonical.document)
+    assert canonical.document == unshared == expected.document
+    assert canonical.text == expected.text == json.dumps(unshared, separators=(",", ":"))
+    assert canonical.size == expected.size == _size(unshared)
+    assert validate_ip_attributes(document) == expected.size
+
+
+@pytest.mark.parametrize("make", SHARED_DOCUMENTS)
+def test_rule_5_the_canonical_document_is_a_tree_of_new_containers(make: Factory) -> None:
+    """Rule 5: "the canonical document never shares one object between two
+    positions" -- and, by ruling A, holds none of the caller's."""
+
+    document = make()
+    sources = {id(container) for container in _containers(document)}
+    canonical = canonicalize_ip_attributes(document)
+    positions = [id(container) for container in _containers(canonical.document)]
+    assert len(positions) == len(_containers(document))
+    assert len(set(positions)) == len(positions)
+    assert sources.isdisjoint(positions)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(_shared_plain, id="exact-types"),
+        pytest.param(_shared_subclasses, id="dict-and-list-subclasses"),
+    ],
+)
+def test_rule_5_mutating_one_position_of_the_copy_leaves_every_other_alone(
+    make: Callable[[], dict[str, Any]],
+) -> None:
+    document = make()
+    unshared = json.loads(json.dumps(document))
+    canonical = canonicalize_ip_attributes(document)
+
+    copied: Any = canonical.document
+    copied["x_a"]["k"].append("changed")
+    copied["x_a"]["added"] = 1
+    assert copied["x_a"]["j"] == unshared["x_a"]["j"]
+    assert copied["x_b"] == unshared["x_b"]
+    assert copied["x_c"] == unshared["x_c"]
+    assert json.loads(json.dumps(document)) == unshared
+    assert canonical.text == json.dumps(unshared, separators=(",", ":"))
+
+
+def _repeated_at(target: int, shared: object) -> dict[str, Any]:
+    """`shared` repeated as often as fits in a list under `x_shared`, with an
+    `x_pad` string taking up the rest: exactly `target` compact bytes."""
+
+    items: list[object] = []
+    document: dict[str, Any] = {"attributes_version": 1, "x_pad": "", "x_shared": items}
+    while _size(document) <= target:
+        items.append(shared)
+    items.pop()
+    document["x_pad"] = "a" * (target - _size(document))
+    assert _size(document) == target
+    return document
+
+
+REPEATED_CONTAINERS: list[Any] = [
+    pytest.param(lambda: {"k": [1, 2]}, id="dict"),
+    pytest.param(lambda: [None, {"j": "v"}], id="list"),
+    pytest.param(lambda: _Obj({"k": _Arr([1, 2])}), id="dict-subclass"),
+    pytest.param(lambda: _Arr([None, _Obj({"j": "v"})]), id="list-subclass"),
+]
+
+
+@pytest.mark.parametrize("make", REPEATED_CONTAINERS)
+def test_rule_5_every_repeat_counts_in_full_toward_the_size_cap(make: Factory) -> None:
+    """Rule 5: "the running total grows exactly as if the container had been
+    read again" -- so one container repeated to exactly 1024 bytes is
+    accepted, and one more occurrence is not. Sharing is not refused."""
+
+    shared = make()
+    document = _repeated_at(1024, shared)
+    assert len(document["x_shared"]) > 50
+    canonical = canonicalize_ip_attributes(document)
+    assert validate_ip_attributes(document) == canonical.size == 1024
+    assert canonical.document == json.loads(json.dumps(document))
+
+    document["x_shared"].append(shared)
+    assert _size(document) > 1024
+    for entry in ("canonicalize", "validate"):
+        _assert_outcome(entry, document, None)
+
+
+def _emptied_dict() -> dict[str, int]:
+    """One live entry, `"": 0`, in a dict that held about 10**5: CPython keeps
+    a deleted entry's slot until the dict is next resized (assumption 63)."""
+
+    emptied = {f"k{i}": 0 for i in range(10**5)}
+    emptied[""] = 0
+    for i in range(10**5):
+        del emptied[f"k{i}"]
+    assert emptied == {"": 0}
+    return emptied
+
+
+def test_rule_5_a_dict_of_deleted_slots_shared_many_times_is_its_live_entries() -> None:
+    """Assumption 63's reproduction, as a result: the auditor's document --
+    one emptied dict shared 140 times under an `x_` key -- is accepted and is
+    the document built from `dict(emptied)`. No timing is asserted."""
+
+    emptied = _emptied_dict()
+    document: dict[str, object] = {"attributes_version": 1, "x_shared": [emptied] * 140}
+    rebuilt: dict[str, object] = {"attributes_version": 1, "x_shared": [dict(emptied)] * 140}
+    assert _size(document) <= 1024
+
+    canonical = canonicalize_ip_attributes(document)
+    assert canonical == canonicalize_ip_attributes(rebuilt)
+    assert canonical.document == {"attributes_version": 1, "x_shared": [{"": 0}] * 140}
+    assert validate_ip_attributes(document) == canonical.size == _size(document)
+
+
+def _cycle_through_two_lists() -> dict[str, object]:
+    a: list[object] = []
+    b = [a, a]
+    a.append(b)
+    return {"attributes_version": 1, "x_c": a}
+
+
+def _cycle_entered_at_the_shared_list() -> dict[str, object]:
+    a: list[object] = []
+    b = [a, a]
+    a.append(b)
+    return {"attributes_version": 1, "x_c": b}
+
+
+def _cycle_through_two_dicts() -> dict[str, object]:
+    d: dict[str, object] = {}
+    e = {"x": d, "y": d}
+    d["e"] = e
+    return {"attributes_version": 1, "x_c": e}
+
+
+CYCLES: list[Any] = [
+    pytest.param(_cycle_through_two_lists, id="a-holds-b-holds-a-twice"),
+    pytest.param(_cycle_entered_at_the_shared_list, id="entered-at-b"),
+    pytest.param(_cycle_through_two_dicts, id="two-dicts"),
+]
+
+
+@pytest.mark.parametrize("make", CYCLES)
+@pytest.mark.parametrize("entry", ["canonicalize", "validate"])
+def test_rule_5_a_container_met_again_while_it_is_being_read_is_a_cycle(
+    entry: str, make: Factory
+) -> None:
+    """Rule 5 / S7: an InvalidAttributesError, never a RecursionError --
+    `pytest.raises` lets any other type fail the test."""
+
+    _assert_outcome(entry, make(), None)
