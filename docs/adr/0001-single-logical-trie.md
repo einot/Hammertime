@@ -9,7 +9,10 @@ the original text is kept in place with dated notes, and Amendment 2 at the
 end states each replacement); amended 2026-09-22 (Amendment 3: the shard
 lease is taken under a per-process token, so a second process sharing a
 `member_id` is detected too — a pointer at Amendment 2 item 1, per
-ADR-0013 Amendment 6)
+ADR-0013 Amendment 6); amended 2026-09-23 (Amendment 4: the trie's
+`event_sequence` is its position in the hot-ip log, one number for every
+family it serves and not a count, per ADR-0017 — clause 4 and Amendment
+1's seventh assumption each carry a dated note)
 
 ## Context
 
@@ -143,6 +146,13 @@ above are unchanged.
 > negatively acknowledges what it fetched and did not handle, so nothing
 > is lost or double-counted (ADR-0013 decision 8). Clauses 2, 4 and 5 stand
 > as written ("rebalance time" in clause 5 now means handover time).
+
+> Amended 2026-09-23 (ADR-0017; Amendment 4 below): in clause 4, "for the
+> trie, its own count of hot-ip events applied so far" now reads "for the
+> trie, its position in the hot-ip log: one past the stream offset of the
+> last record it has handled". The number only grows, across restarts
+> too, and it is not a count (ADR-0017 decision 8). The rest of clause 4
+> stands, the detector's half included.
 
 **What is deliberately not promised.** Strong consistency between
 `GET /ip/{addr}` and `GET /prefix/{cidr}`; agreement at any instant between a
@@ -302,6 +312,13 @@ Assumptions (each a judgment call, push back individually):
 > are superseded; Amendment 2 states what replaces each. The remaining
 > assumptions stand.
 
+> Amended 2026-09-23 (ADR-0017; Amendment 4 below): the seventh
+> assumption's "Each family's trie has its own `event_sequence`" is
+> superseded. One trie service holds every family it serves and reads one
+> hot-ip log, so it has one `event_sequence`: its position in that log
+> (ADR-0017 decisions 5 and 8). The assumption's first sentence — the
+> family split does not change the model — stands.
+
 ## Amendment 2 (2026-09-21) — the model under NATS JetStream and static shard assignment (ADR-0013)
 
 Why: ADR-0013 replaces Apache Kafka with NATS JetStream as the durable
@@ -448,3 +465,43 @@ Assumptions made by this amendment (push back individually):
 * **No CHANGES entry from this ADR.** The two lines are ADR-0013
   Amendment 6 ruling 6's and are written by the change that implements
   it.
+
+## Amendment 4 (2026-09-23) — the trie's `event_sequence` is its position in the hot-ip log (ADR-0017)
+
+Why: ADR-0017 designs the trie service (epic #10). Its decision 8 records
+the answer to the question ADR-0010 Amendment 1 left open: the trie's
+`event_sequence` and the hot-ip log's stream sequence are one number. The
+repository owner decided that on 2026-09-23, on ADR-0017's
+recommendation. In ADR-0017's form, `event_sequence` is one past the
+stream offset of the last record the trie has handled. Two statements in
+this ADR describe the value as something else, and each now carries a
+dated note. The model itself —
+eventually consistent across IPs, ordered per IP — is unchanged, and so is
+every clause's reasoning.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended 2026-09-23" clause.
+* **Clause 4.** A dated blockquote, after the 2026-09-21 blockquote that
+  follows clause 6, re-reads "for the trie, its own count of hot-ip events
+  applied so far" as the trie's log position. Clause 4's text is
+  unchanged.
+* **Amendment 1's seventh assumption** ("The address-family split (one
+  writer per family) does not change the model. Each family's trie has its
+  own `event_sequence`; nothing above is cross-family."). A dated
+  blockquote, after the 2026-09-21 blockquote that follows the
+  assumptions, supersedes its second sentence and keeps its first. The
+  assumption's text is unchanged.
+
+Assumptions made by this amendment (push back individually):
+
+* **A pointer, not a re-ruling.** The unification is the repository
+  owner's decision, taken on ADR-0017's recommendation; its reasons and
+  its cost are recorded in ADR-0017 decision 8. This ADR only stops
+  describing the value as a count.
+* **"Nothing above is cross-family" still holds.** One log position is
+  shared by every family the trie serves. It is not a cross-family
+  ordering of IP state, which is what the clauses are about.
+* **No CHANGES entry from this ADR.** Slice 1 of epic #10 records the
+  trie's arrival (ADR-0017 Consequences). A value's definition changing
+  before any trie build has shipped is not an observable change.

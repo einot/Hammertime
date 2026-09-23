@@ -79,7 +79,11 @@ records wins a race A1 rules unspecified; the same over-determined claim is
 qualified where it also stands, in Amendment 6 ruling 2(c) and in decision
 7's `on_assigned` bullet; `AggregatorService.start()`'s docstring is brief
 C11's to fix; `docs/spec/README.md`'s §22 row gains ADR-0001 Amendment 3. No
-decision changes in substance and no code behaviour changes).
+decision changes in substance and no code behaviour changes); amended a
+ninth time 2026-09-23 (see "Amendment 9" — by ADR-0017: the open question
+decision 9 left to the trie epic is answered, and the trie's
+`event_sequence` is `replay_position + 1`, its position in the hot-ip log;
+two pointer notes in place, no decision here changes).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
@@ -1562,6 +1566,12 @@ JetStream stream has one sequence across all its subjects, and
   responses; ADR-0001 Amendment 1 clause 4, ADR-0010 decision 4) is
   **unchanged** and is a different number; whether the trie epic unifies
   the two is left to it (see the open question in the hand-off report).
+  *Decided 2026-09-23 by the repository owner, on ADR-0017's
+  recommendation, and recorded in ADR-0017 decision 8 (Amendment 9): the
+  two are unified. In ADR-0017's form, the trie's `event_sequence` is
+  `replay_position + 1`, one past the offset of the last hot-ip record it
+  has handled, so its read responses and `PrefixStatsChanged.sequence`
+  carry its log position and not a count.*
 * ADR-0010 decision 3's "the producer is flushed before the consumer
   position for the hot-ip topic is committed" becomes "the producer is
   flushed before a snapshot records a `replay_position` that covers the
@@ -2028,7 +2038,8 @@ not make. Push back on them individually.
   validation of `HAMMERTIME_BUS_BROKERS` (*done 2026-09-22, Amendment 4
   ruling S2: `validate_bus_url`*); consumer-config reconciliation
   in the provisioner; a byte cap on streams; a counter for redeliveries;
-  unifying `replay_position` and `event_sequence`; the `integration` job's
+  unifying `replay_position` and `event_sequence` (*done 2026-09-23 by
+  ADR-0017 decision 8, Amendment 9*); the `integration` job's
   re-enable (#52). *Added 2026-09-22 (Amendment 4): authentication on the
   bus and the store (NATS `authorization`, Valkey `requirepass`) plumbed
   through the services — assumption 13 states the boundary and decision 11
@@ -4920,3 +4931,50 @@ Configuration and "Failure shape, summarised" italics, Amendment 6 ruling
 and §22 rows; `docs/runbook.md`'s "Aggregator will not start" entry; and
 the R10 review report and this round's brief, both as relayed by the
 top-level session.
+
+## Amendment 9 (2026-09-23) — the trie epic's answer to decision 9's open question (ADR-0017)
+
+Why: decision 9 left the trie epic to decide whether the trie's
+`event_sequence` and its `replay_position` are one number, and
+Consequences listed the unification under "Not done here". The repository
+owner decided on 2026-09-23, on ADR-0017's recommendation, that the two
+are one, and ADR-0017 decision 8 records the decision and gives the value
+its form: the trie's `event_sequence` is `replay_position + 1`, one past
+the stream offset of the last hot-ip record it has handled. ADR-0010
+Amendment 1 had raised the same question for the owner, where this
+decision left it to the trie epic; the owner's decision makes that
+disagreement moot. The recommendation's reason is the one this ADR's
+Context item 3 gave for choosing JetStream: one monotonic stream
+sequence. A count would go backwards after a full replay of a log whose
+head has aged out, and a log position does not. Nothing in decision 9
+changes. The positional subscription, the
+readiness test and the detector's sequence rule all stand as written.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended a ninth time 2026-09-23" clause.
+* **Decision 9, second bullet.** An italic dated sentence after "whether
+  the trie epic unifies the two is left to it (see the open question in
+  the hand-off report)". The sentence it follows, including "is
+  **unchanged** and is a different number", is kept as the record of what
+  this ADR decided on 2026-09-21.
+* **Consequences, "Not done here, named".** An italic dated note after
+  "unifying `replay_position` and `event_sequence`".
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+130. **Two pointers, no ruling.** The unification is the repository
+     owner's decision, taken on ADR-0017's recommendation; its reasons
+     and what it costs are recorded in ADR-0017. This ADR only records
+     that its open question is closed, the precedent of ADR-0009
+     Amendment 6.
+131. **Decision 9's readiness test is unchanged in substance.** "Once the
+     last applied offset is `>= end_offset - 1`" reads, in ADR-0017's
+     terms, "once `event_sequence >= end_offset`". ADR-0017 counts a
+     record the trie skips as handled, so a malformed record at the tail
+     of the log does not hold readiness back. That refines "applied" to
+     "handled". It is not a change to the bus contract this ADR owns, and
+     it is left unedited here.
+132. **No CHANGES entry from this amendment.** The trie epic's slice 1
+     records the trie's arrival (ADR-0017 Consequences).

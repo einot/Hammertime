@@ -16,7 +16,10 @@ binary reference, an arena-backed Patricia production trie and the invariants
 both satisfy — adds pointer notes to §9, §11, §12, §27 and §46.5; ADR-0015 —
 prefix metadata in prefix-keyed side maps, the two combine directions and the
 per-IP attribute record, validated on write and coupled to the hot-count step
-— adds pointer notes to §9, §12, §16, §17, §46.2, §46.5, §46.8 and §46.9).
+— adds pointer notes to §9, §12, §16, §17, §46.2, §46.5, §46.8 and §46.9;
+ADR-0017 — the trie service: a positional-replay worker on one event loop,
+with its log position as `event_sequence` — rewords the §22 note and adds
+pointer notes to §28, §33 and §35).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -50,25 +53,25 @@ Section index used throughout the code:
 | 13, 38 | `HOT_PREFIX` predicate (single implementation) | `core/state/prefix.py`, `services/detector/rules/baseline.py`, `services/trie/query`, `docs/adr/0010` |
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` (`combine.py`, `local.py`), `docs/adr/0015` |
-| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013`, `docs/adr/0015` (Amendment 3 ruling 3: the codec's integer fields), `docs/adr/0016` (decisions 1 and 2: the schemas' numeric bounds) |
+| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `services/trie/worker.py` (the hot-ip consumer), `docs/adr/0004`, `docs/adr/0013`, `docs/adr/0015` (Amendment 3 ruling 3: the codec's integer fields), `docs/adr/0016` (decisions 1 and 2: the schemas' numeric bounds), `docs/adr/0017` (decisions 3 and 6) |
 | 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py` incl. `partition_for`), `packages/hammertime-store` (`ShardStateStore`, incl. the shard lease), `services/ingest/publisher.py`, `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0004`, `docs/adr/0011`, `docs/adr/0013` (decisions 1, 6, 7) |
-| 22 | Consistency model | `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0003` (Amendments 2, 3), `docs/adr/0011` (decisions 4, 5), `docs/adr/0013` (decisions 4, 5, 7, 8), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
+| 22 | Consistency model | `docs/adr/0001` (Amendments 1, 2, 3, 4), `docs/adr/0003` (Amendments 2, 3), `docs/adr/0011` (decisions 4, 5), `docs/adr/0013` (decisions 4, 5, 7, 8), `docs/adr/0017` (decision 8: `event_sequence` is the trie's log position; `as_of`), `services/trie/state.py`, `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |
 | 24, 25 | Out-of-order, bucket math | `services/aggregator/lateness.py`, `services/aggregator/worker.py`, `core/time/buckets.py`, `docs/adr/0002` (Amendment 1), `docs/adr/0011` |
 | 26 | Memory / retention | `services/aggregator/window/store.py`, `packages/hammertime-store` (`ShardStateStore`), `docs/adr/0011` |
 | 27 | Trie representation | `services/trie/structure/patricia.py`, `services/trie/structure/arena.py`, `docs/adr/0014` |
-| 28 | Atomicity | `services/trie/worker.py` |
-| 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010` |
+| 28 | Atomicity | `services/trie/worker.py`, `services/trie/state.py`, `docs/adr/0017` (decision 9: one event loop, no `await` inside a mutation or a read) |
+| 29 | Read path | `services/trie/query`, `services/detector/api.py`, `docs/protocol/read-api-v1.md`, `docs/adr/0010`, `docs/adr/0017` (decisions 9 and 15) |
 | 30, 39 | Processing algorithm (aggregator side) | `services/aggregator/worker.py`, `services/aggregator/transitions.py`, `core/state/transitions.py`, `docs/adr/0011`, `docs/adr/0016` (decision 3: a transition is encoded before it is persisted) |
 | 39 | Processing algorithm (trie update: `add_hot_ip` / `remove_hot_ip` / pruning) | `services/trie/structure/binary_trie.py`, `services/trie/structure/patricia.py`, `docs/adr/0014` |
-| 32, 33 | Persistence & snapshots | `services/trie/snapshot`, `packages/hammertime-bus` (`ConsumedMessage.offset`, positional `subscribe`), `tools/provision`, `docs/adr/0010` (Amendment 1), `docs/adr/0013` (decisions 2, 9) |
+| 32, 33 | Persistence & snapshots | `services/trie/snapshot`, `services/trie/worker.py` (replay on start), `services/trie/service.py`, `packages/hammertime-bus` (`ConsumedMessage.offset`, positional `subscribe`), `tools/provision`, `docs/adr/0010` (Amendments 1, 2), `docs/adr/0013` (decisions 2, 9), `docs/adr/0017` (decisions 3, 4, 8 and 16) |
 | 34 | Versioned configuration | `core/config`, `services/aggregator/reevaluate.py`, `docs/adr/0011` |
-| 35 | IPv6 readiness | `core/addressing` |
+| 35 | IPv6 readiness | `core/addressing`, `services/trie/config.py` (`HAMMERTIME_TRIE_FAMILIES`), `services/trie/state.py`, `docs/adr/0017` (decision 5) |
 | 36 | Security | `services/ingest/auth` |
 | 36.1-36.4 | Agent credentials (hashed tokens, rotation, provisioning) | `services/ingest/auth/agents.py`, `core/auth/tokens.py`, `tools/agent-token`, `schemas/agent_registry.v2.json`, `docs/adr/0006` |
 | 36.5-36.7 | Auth throttling, request cost, throttled responses | `services/ingest/auth`, `services/ingest/ratelimit`, `services/ingest/api/routes.py`, `docs/adr/0007`, `docs/adr/0008` |
-| 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `deploy/grafana` |
+| 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `services/trie/metrics.py`, `deploy/grafana`, `docs/adr/0017` (decision 12) |
 | 43 | Recommended initial implementation; reference components (event log, store, images) and their licence policy | `deploy/docker-compose.yml`, `docs/adr/0012` (Amendment 2), `docs/adr/0013` (decisions 11, 12) |
-| 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events` (`attributes.py`: the one §46.2 validator, called by `codec.py` and the trie's record map), `core/config`, `docs/adr/0005`, `docs/adr/0011`, `docs/adr/0015` |
+| 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/trie/worker.py` (the coupled step's caller; `attributes_rejected`), `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events` (`attributes.py`: the one §46.2 validator, called by `codec.py` and the trie's record map), `core/config`, `docs/adr/0005`, `docs/adr/0011`, `docs/adr/0015`, `docs/adr/0017` (decisions 6, 7 and 17) |
 | 46.5 | The derived count invariant `len(records) == hot_count(root)` | `services/trie/structure/invariants.py`, `packages/hammertime-testkit` (`invariants.py`), `services/trie/metadata/ip_attributes.py` (the record map and the coupled step), `docs/adr/0014`, `docs/adr/0015` |
-| 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `packages/hammertime-bus` (`nats.py` `bus_endpoints`, the §47.7 reduction of bus URLs for log records), `docs/adr/0009`, `docs/adr/0013` (Amendment 2), `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |
+| 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `packages/hammertime-bus` (`nats.py` `bus_endpoints`, the §47.7 reduction of bus URLs for log records), `docs/adr/0009`, `docs/adr/0013` (Amendment 2), `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md`, `docs/adr/0017` (decisions 4, 11 and 13: the trie's settings, readiness and drain) |

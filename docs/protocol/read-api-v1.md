@@ -7,9 +7,16 @@ reachable only inside the deployment (they are not TLS-terminated by the
 services and expose no write operations).
 
 All timestamps are RFC 3339 UTC with a `Z` suffix, as in every event schema.
-`event_sequence` is the responding service's own counter (§22, ADR-0003
-amendment): for the trie, the number of hot-IP events applied so far; for the
-detector, the `sequence` of the newest `PrefixStatsChanged` applied.
+`event_sequence` is the responding service's own position or counter (§22,
+ADR-0003 amendment):
+
+* for the trie, its position in `hammertime.hot-ip.v1`: one past the stream
+  offset of the last hot-ip record it has handled. It only grows, across
+  restarts too, and it is not a count of events (ADR-0017 decision 8);
+* for the detector, the `sequence` of the newest `PrefixStatsChanged` applied.
+
+The trie's `as_of` is the greatest `timestamp` among the hot-ip events it has
+applied. It is `null` until the trie has applied one (ADR-0017 decision 8).
 
 ## Admin endpoints — every service (§47)
 
