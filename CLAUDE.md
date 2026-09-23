@@ -164,7 +164,9 @@ session may finish and merge PRs itself — resolving merge conflicts
 hand), pushing the resolution, and merging — without delegating that work.
 This does not extend to designing the change being merged, only to landing
 it. Before merging, the full suite must pass (`uv run pytest -q`, `ruff
-check`, `ruff format --check`, `mypy`). There is no longer a standing
+check`, `ruff format --check`, `make typecheck`). A bare `mypy` names no
+targets and exits 2 without checking anything; `make typecheck` runs it
+over `packages services tools`. There is no longer a standing
 exception to that bar — the `integration` CI gap that used to be one is now
 handled as recorded under "Disabled CI coverage" below. Run those four
 commands so a failing one is actually visible: piping each to `tail` hides
