@@ -5,7 +5,9 @@ the accounting checks non-vacuous, structural versus derived observables, no
 transient over-allocation, the derived node counts; Amendment 2 — the free list
 is readable and the arena accounting is checked against it, a mutator may raise
 `InvariantViolation` for corruption it cannot walk past, `iter_prefix_counts`
-validates `min_length` eagerly)
+validates `min_length` eagerly; Amendment 2, correction — the reverse
+free-list clause is kept for diagnosis rather than coverage, and decision 8
+pins that the free-list clauses are checked before the `len(R)` comparisons)
 
 Scope note: this ADR settles the interfaces epic #8 implements against —
 `services/trie/src/hammertime/trie/structure/{__init__,node,binary_trie,patricia,arena,invariants}.py`
@@ -542,6 +544,13 @@ side-effect free and never repair anything.
   live_count` into a real statement — without them a live slot wrongly on the
   free list and a live slot wrongly unreachable cancel out and every accounting
   equality still holds (Amendment 2, A11).
+
+  The block is a set of requirements, not an evaluation order, with one
+  exception: **the free-list clauses are discharged before `len(R) ==
+  node_count` and `len(R) == arena.live_count`** (Amendment 2, correction). A
+  dead slot missing from `free_ids` fails those two count clauses as well, so
+  in the other order the failure is reported as a count mismatch and the leaked
+  slot is never named; in this one the message is the one that identifies it.
 * **`check_trie`** runs `check_patricia` **first** when handed a
   `PatriciaTrie`, then `check_hot_counts` and `check_no_orphaned_nodes`. The
   order matters: the logical checks traverse the structure, and their behaviour
@@ -1354,7 +1363,9 @@ Every edit outside this section, with the superseded wording quoted:
   `capacity == live_count + free_count` line was annotated "(the free list
   accounts for the rest)"; it is now marked as an identity kept for a
   counter-maintaining arena, and two `free_ids` clauses are added, with a
-  closing sentence on what they catch (A11).
+  closing sentence on what they catch (A11). *Amendment 2, correction* later
+  added one further paragraph there, pinning that the free-list clauses are
+  discharged before the two `len(R) ==` comparisons.
 * **Decision 8, cost paragraph.** Was: "Cost is O(hot_ip_count × bit_length),
   which is why…". Now adds the O(capacity) arena scan (A11).
 * **Assumption 18** — a dated blockquote pointing to A11, A12 and A13.
@@ -1422,13 +1433,37 @@ Assumptions:
   `dead = {1, 2}` and `free_ids = [1, 3]` where 3 is live, the counts agree and
   a live id is queued for reuse. I took completeness over encapsulation, in a
   package whose storage is already deliberately public.
-* **Both directions of the set equality, not just "every free id is dead".**
-  The reverse direction (every dead slot is on the free list) catches a leaked
-  dead slot, which is a leak of capacity rather than a correctness bug. I
-  included it because it is free once the scan exists and because
+* **Both directions of the set equality — but the reverse direction is kept
+  for diagnosis, not for coverage.** (Corrected 2026-09-23; the superseded
+  wording is quoted under *Amendment 2, correction*.) "Every id in `free_ids`
+  is in range and dead" and "no id twice" are what close the hole above. The
+  reverse direction — every dead slot is on the free list — catches nothing
+  that the clauses already there would let through, for decision 5's arena.
+  Write `F` for `set(free_ids)`, `D` for `{i : 0 <= i < capacity and
+  length[i] < 0}`, and `R` for the reachable set. The forward clauses give
+  `F ⊆ D` and `free_count == len(free_ids) == |F|`; the walk gives
+  `R ⊆ [0, capacity) \ D` with no id reached twice; and `live_count ==
+  capacity - len(free_ids)` by construction. So `|R| <= capacity - |D| <=
+  capacity - |F| == live_count`, and the clause `len(R) == live_count` forces
+  `|D| == |F|`, hence `F == D`. A dead slot left off `free_ids` therefore
+  always breaks `len(R) == live_count` too. What the reverse clause adds is the
+  *message*: discharged first (decision 8), it names the slot — "node id 41 has
+  length -1 (dead) but is not in arena.free_ids" — where the count clause says
+  only "5 nodes are reachable from the root but the arena holds 6 live slots",
+  which reads like a leaked *live* slot and sends the reader to the wrong bug.
+  I keep it for that, and because it is free once the scan exists and
   `capacity == peak live` is a promise this package makes (decision 5,
   assumption 16), so silently losing a slot is a broken promise even when no
   query answers wrongly.
+* **The reverse clause's diagnosis is only available if the free-list clauses
+  run first, so decision 8 now pins that order.** (Added 2026-09-23 with the
+  correction below.) `check_patricia` discharges the free-list clauses before
+  `len(R) == node_count` and `len(R) == arena.live_count`; the shipped check
+  already did, and says so in its docstring. Pinning it is what makes the
+  naming of the leaked slot a property a test may assert rather than an
+  accident of statement order. Nothing else in the block is ordered — the
+  remaining clauses may be discharged in any order, subject to the walk
+  necessarily preceding anything stated about `R`.
 * **An O(capacity) scan in `check_patricia` is acceptable.** `capacity` is
   bounded by the peak live node count, the check is already O(|R|) and is
   called only by debug builds and `trie-inspect --verify`. Stated in decision
@@ -1594,8 +1629,18 @@ joined by what A11-A13 add:
   out-of-range or negative child id, a one-child node, a wrong branch bit, a
   network with host bits set, and the storage-list-length clause (A2,
   decision 6).
-* `test-author` (A11): the new free-list clauses, each with a corruption that
-  only it can catch, plus `allocate(length=-1)` raising `ValueError`.
+* `test-author` (A11): the three forward free-list clauses — an entry outside
+  `[0, capacity)`, an entry that is live, and an entry listed twice — each with
+  a corruption that only it can catch. For each that means pairing the bad
+  entry with one live slot nobody links to (an `arena.allocate` on an otherwise
+  healthy trie, done *before* the entry is appended), so that `len(R) ==
+  live_count` still holds and cannot be what fires. The reverse clause has no
+  such corruption — it is implied by the forward clauses together with
+  `len(R) == live_count` (A11's second assumption, as corrected) — so pin its
+  **diagnosis** instead: release a slot, take that id back off `free_ids`, and
+  assert that `check_patricia` raises `InvariantViolation` with a message
+  naming that slot id, rather than the count mismatch the same state also
+  produces. Plus `allocate(length=-1)` raising `ValueError`.
 * `test-author` (A12): `PatriciaTrie.add_hot_ip` against a leaf whose count has
   been corrupted raises `InvariantViolation` and leaves every observable
   unchanged. No test may assert Patricia/binary equivalence on a corrupted
@@ -1610,3 +1655,76 @@ joined by what A11-A13 add:
 * `test-author`, optional, unchanged from Amendment 1: the three test files'
   module docstrings list assumptions that later amendments have pinned, and
   could cite the amendments instead.
+
+### Amendment 2, correction (2026-09-23) — the reverse free-list clause is kept for diagnosis, and its order is pinned
+
+`reviewer` raised, non-blocking, that A11's second assumption justified the
+reverse direction of the free-list set equality ("every slot with `length < 0`
+is in `free_ids`") as the clause that catches a leaked dead slot, and that the
+Follow-ups accordingly asked for a test in which each new clause has "a
+corruption that only it can catch" — while in fact the reverse direction is
+implied by the forward clauses together with `len(R) == live_count`, so no such
+corruption exists for it. The argument holds; it is reproduced in A11's
+assumption as rewritten. Its consequence is that the reverse clause's only
+value is the message it produces, which is available only if it is discharged
+before the count clauses — so that order, which the shipped `check_patricia`
+already used, is now pinned in decision 8.
+
+**No decision's required behaviour changes.** `check_patricia` discharges the
+same clauses, with the same messages, in the order the implementation already
+had; what changes is why the reverse clause is there, what a test of it must
+show, and that the order is now stated rather than incidental.
+
+Four edits, with the superseded wording quoted:
+
+* **Status line.** Named Amendment 1 and Amendment 2; now names this correction
+  too.
+* **A11, second assumption.** Was titled "**Both directions of the set
+  equality, not just "every free id is dead".**" and read: "The reverse
+  direction (every dead slot is on the free list) catches a leaked dead slot,
+  which is a leak of capacity rather than a correctness bug. I included it
+  because it is free once the scan exists and because `capacity == peak live`
+  is a promise this package makes (decision 5, assumption 16), so silently
+  losing a slot is a broken promise even when no query answers wrongly." Now
+  gives the derivation, keeps the clause for its message, and is followed by a
+  new assumption on the order the clauses are discharged in.
+* **Decision 8, `check_patricia` bullet.** A paragraph is appended after "…and
+  every accounting equality still holds (Amendment 2, A11)." stating that the
+  clause block is unordered except that the free-list clauses run before
+  `len(R) == node_count` and `len(R) == arena.live_count`. Nothing already
+  there was removed or reworded.
+* **Follow-ups, the `test-author` (A11) bullet.** Was: "the new free-list
+  clauses, each with a corruption that only it can catch, plus
+  `allocate(length=-1)` raising `ValueError`." Now asks for an isolating
+  corruption for the three forward clauses only, says what makes one isolating,
+  and asks for the reverse clause to be pinned by its diagnosis.
+
+Assumptions:
+
+* **The redundancy is conditional on decision 5's arena, and I state it that
+  way.** The derivation uses `live_count == capacity - len(free_ids)` and
+  `free_count == len(free_ids)`, which hold because both are derived. For an
+  arena that maintained those counters independently — the case the
+  `capacity == live_count + free_count` line is expressly kept for (A11,
+  ruling 2) — the derivation does not go through, and the reverse clause would
+  carry coverage of its own. Nobody asked which arena the claim was about; I
+  took the narrower, checkable one.
+* **Keeping the clause rather than deleting it.** Dropping the reverse
+  direction is defensible: it is implied, and the check would be shorter. I
+  keep it because the message is the only thing at the point of failure that
+  distinguishes a leaked *dead* slot from a leaked *live* one, and because
+  removing a clause would be a change to required behaviour, which a
+  correction of rationale should not smuggle in.
+* **The order is pinned narrowly.** Only "free-list clauses before the two
+  `len(R) ==` comparisons" is fixed — not a total order over the block —
+  because that is the only ordering the diagnosis depends on, and because the
+  shipped `check_patricia` already satisfies it, so no code has to change. I
+  assume the rest of the block stays an unordered set of requirements.
+* **What makes a forward-clause corruption isolating.** The Follow-ups now say
+  that each of the three forward clauses needs a compensating leaked live slot.
+  I derived that rather than being told it: without one, removing or adding a
+  `free_ids` entry moves `live_count` by one and `len(R) == live_count` fires
+  as well, so the corruption is no longer caught by that clause alone.
+* **No `CHANGES` entry.** Nothing a deployment can observe changes — same
+  clauses, same messages, same order as the code already ran in. Per the repo's
+  rule, an entry I am unsure about does not qualify, and this one is not close.
