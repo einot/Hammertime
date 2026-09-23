@@ -42,9 +42,10 @@ decisions 1 and 2): `RequestObservation`'s `sequence` (0 to 2**63 - 1),
 (>= 0). Where the schema states no maximum, none is added. A value outside
 its bounds is a `CodecError`; on decode the type check comes first, so an
 integral float such as `-1.0` is converted and then refused by the bound. The
-envelope's `schema_version`, `sequence` and `config_version` gain no bounds
-(ADR-0016 assumption 3), and `capacity` keeps its `[0-9]+` rule. Each bound is
-a module constant mirroring its schema (ADR-0016 assumption 10).
+envelope's `sequence` and `config_version` gain no bounds (ADR-0016 assumption
+3), its `schema_version` stays pinned to 1 (ADR-0016 decision 1), and
+`capacity` keeps its `[0-9]+` rule. Each bound is a module constant mirroring
+its schema (ADR-0016 assumption 10).
 
 A `HotIpAdded`/`HotIpRemoved` payload's `attributes` document goes through
 `hammertime.core.events.attributes.canonicalize_ip_attributes`, the one
@@ -487,6 +488,11 @@ def decode(data: bytes) -> EventEnvelope[EventPayload]:
         # gets to raise JSONDecodeError. A few KB of adversarial input is
         # enough to trigger this, so it must surface as CodecError too.
         raise CodecError("envelope JSON is nested too deeply to parse") from exc
+    except UnicodeDecodeError as exc:
+        # Also a ValueError subclass, so it must precede the clause below or
+        # it would be misreported as an oversized numeric literal. The
+        # exception text quotes offending bytes, so it is left out here.
+        raise CodecError("envelope is not valid UTF-8") from exc
     except ValueError as exc:
         # CPython's int-string conversion limit (default 4300 digits)
         # raises a bare ValueError from inside json.loads for an oversized
