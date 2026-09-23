@@ -440,7 +440,12 @@ class PrefixMetadataStore:
   family `ValueError` for an argument of the type they take. The check costs
   a pass over the existing declarations; `declare` is an operator action on a
   hand-written map (assumption 9), and lookups are unaffected. *(Added
-  2026-09-23, Amendment 1 ruling 6; assumption 47.)*
+  2026-09-23, Amendment 1 ruling 6; assumption 47.)* The prefix is named by
+  its canonical text, `str(prefix)` — what `Prefix.__str__` renders: the
+  network address, `/`, the length, as in `10.0.0.0/8` or `10.20.30.0/24`.
+  The same holds for IPv6, whose address part is the `ipaddress` module's
+  compressed form, as in `2001:db8::/32`. *(Clarified 2026-09-23, Amendment 1
+  ruling 6; assumption 47.)*
 
 ### 5. The per-IP attribute records: a read-only `Mapping[Address, IpAttributes]`, family-scoped, validated on every write by the one shared §46.2 validator, never interpreted
 
@@ -1213,6 +1218,21 @@ not dictate. Push back on them individually.
     and nothing per lookup. Naming the conflicting prefix in the message is
     what lets an operator find the other half of the conflict. Nothing running
     changes, since the store has no caller.
+    *(Added 2026-09-23, on the message's form: the prefix appears as
+    `str(prefix)` for both families. That is the text `Prefix.parse` reads
+    back, it is readable where `repr` would print the network as an integer,
+    and a test can build the expected text with `str()` from the same `Prefix`
+    instead of spelling it out. `Prefix.__str__` renders the network through
+    `Address.__str__`, which uses Python's `ipaddress` for both families
+    (`packages/hammertime-core/src/hammertime/core/addressing/address.py`,
+    lines 55-59). For IPv6 that is lowercase hexadecimal without leading
+    zeros, with the longest run of two or more zero groups — the first, on a
+    tie — collapsed to `::`: read in the installed CPython 3.12 standard
+    library, `/usr/lib/python3.12/ipaddress.py`, `_compress_hextets` and
+    `_string_from_ip_int`, lines 1782-1853. The project requires Python
+    `>=3.12`, and whether a later CPython renders any IPv6 address
+    differently was not checked — one more reason for a test to compute the
+    text rather than hard-code it.)*
 48. **The combine functions refuse a non-kind with a `TypeError`, check both
     documents whole, and check shape before combining** (Amendment 1 ruling
     7). Nothing specified what they do with a malformed operand. `TypeError`
@@ -1354,7 +1374,11 @@ still no `CHANGES` entry (assumption 27).
    prefixes neither of which contains the other may differ; reads then raise
    only the family `ValueError`. Before this, the text implied that such a
    declaration was accepted and that every read through both raised.
-   Assumption 47.
+   Assumption 47. Clarified the same day: the bullet's "raises `ValueError`
+   naming the key, both kinds and that prefix" did not say in what form the
+   prefix appears; an appended sentence with a dated note now says it is
+   `str(prefix)`, for IPv4 and IPv6 alike, and a dated note on assumption 47
+   records why.
 7. **Decision 3, new paragraph after the one ending "what gives `Override` its
    meaning": the combine functions check shape first.** An operand of
    `combine_values` that is not one of the three kinds is a `TypeError`
