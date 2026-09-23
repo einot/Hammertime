@@ -46,7 +46,14 @@ decision 6: `apply_hot_ip_added` / `apply_hot_ip_removed`). What is pinned:
 * the counters of decision 12, counted exactly as decision 6 says;
 * the apply-time `InvalidAttributesError` retries with `attributes=None`
   (decision 7), reached through the `apply_hot_ip_added` module global of
-  `hammertime.trie.worker` (Test seams);
+  `hammertime.trie.worker` (Test seams); both calls pass
+  `request_count=payload.window_count` as a keyword (ADR-0015 Amendment 5
+  ruling 7, and decisions 6 and 17 as noted);
+* the record's `request_count` (ADR-0015 Amendment 5 rulings 1 and 4): an
+  applied add stores its `window_count`, an `UNCHANGED` add replaces it, a
+  removal deletes it with the record, a skipped add sets nothing, and a
+  replay leaves each IP the count of its latest applied add
+  (`TestRequestCount`); `_view` compares counts as well as documents;
 * log records carry no document content (decision 12,
   `TestLogRecordsCarryNoDocumentContent`);
 * the log records of decision 12's table that the reviewer asked for, read
@@ -182,10 +189,12 @@ def _envelope(
     attributes: dict[str, Any] | None = None,
     timestamp: datetime | None = None,
     subject: str | None = _SAME,
+    window_count: int | None = None,
 ) -> EventEnvelope[Any]:
     """One hot-ip event as the aggregator emits it (ADR-0011 decision 4).
 
     `n` makes the envelope's identity -- and so its `event_id` -- distinct.
+    `window_count` defaults to 750 on a removal and 1200 on an add.
     """
 
     ts = timestamp if timestamp is not None else T0 + timedelta(seconds=n)
@@ -195,7 +204,7 @@ def _envelope(
             ip=ip,
             timestamp=ts,
             sequence=n + 1,
-            window_count=750,
+            window_count=750 if window_count is None else window_count,
             config_version=1,
             attributes=attributes,
         )
@@ -204,7 +213,7 @@ def _envelope(
             ip=ip,
             timestamp=ts,
             sequence=n + 1,
-            window_count=1200,
+            window_count=1200 if window_count is None else window_count,
             config_version=1,
             attributes=attributes,
         )
@@ -263,11 +272,23 @@ def _worker(
 
 
 def _view(worker: TrieWorker, family: AddressFamily = IPV4) -> tuple[object, ...]:
-    """Everything a family's pair holds, deep enough to compare before and after."""
+    """Everything a family's pair holds, deep enough to compare before and
+    after: each record's document and its `request_count` (ADR-0015
+    Amendment 5 ruling 2)."""
 
     fs = worker.state.of(family)
-    documents = {address: dict(fs.records[address]) for address in fs.records}
-    return (fs.trie.hot_ip_count, fs.trie.node_count, documents, fs.records.serialized_bytes)
+    records = {
+        address: (dict(record.attributes), record.request_count)
+        for address, record in fs.records.items()
+    }
+    return (fs.trie.hot_ip_count, fs.trie.node_count, records, fs.records.serialized_bytes)
+
+
+def _stored(worker: TrieWorker, ip: Address) -> tuple[dict[str, object], int]:
+    """The IP's record as (document, request_count)."""
+
+    record = worker.state.of(ip.family).records[ip]
+    return dict(record.attributes), record.request_count
 
 
 def _updates(worker: TrieWorker, family: str, event_type: str, result: str) -> int | float:
@@ -592,7 +613,7 @@ class TestReplayAndReadiness:
             check_trie(fs.trie)
             check_attribute_records(fs.trie, fs.records)
             for ip, document in documents.items():
-                assert dict(fs.records[ip]) == document
+                assert dict(fs.records[ip].attributes) == document
             assert state.as_of == T0 + timedelta(seconds=n - 1)
         finally:
             await worker.stop()
@@ -625,7 +646,7 @@ class TestReplayAndReadiness:
         await _publish(bus, _envelope(IP_A, 0, attributes={"attributes_version": 1, "weight": 9}))
         await _yield_until(lambda: fs.trie.hot_ip_count == 1)
 
-        assert dict(fs.records[IP_A]) == {"attributes_version": 1, "weight": 9}
+        assert dict(fs.records[IP_A].attributes) == {"attributes_version": 1, "weight": 9}
         assert worker.state.event_sequence == 1
         await _stop_and_join(worker, task)
         assert task.exception() is None
@@ -1014,7 +1035,7 @@ class TestAddsAndRemoves:
         fs = worker.state.of(IPV4)
         assert outcome is HotIpOutcome.APPLIED
         assert fs.trie.hot_ip_count == 1
-        assert dict(fs.records[IP_A]) == document
+        assert dict(fs.records[IP_A].attributes) == document
         assert worker.state.position == 0
         assert worker.state.event_sequence == 1
         assert worker.state.as_of == T0
@@ -1032,7 +1053,7 @@ class TestAddsAndRemoves:
 
         assert outcome is HotIpOutcome.UNCHANGED
         assert (fs.trie.hot_ip_count, fs.trie.node_count, len(fs.records)) == counts
-        assert dict(fs.records[IP_A]) == second
+        assert dict(fs.records[IP_A].attributes) == second
         assert worker.state.event_sequence == 2
         assert _updates(worker, "ipv4", "HotIpAdded", "unchanged") == 1
         assert _updates(worker, "ipv4", "HotIpAdded", "applied") == 1
@@ -1085,7 +1106,7 @@ class TestAddsAndRemoves:
         outcome = await worker.handle(_msg(_envelope(IP_A, 0, attributes=None), 0))
 
         assert outcome is HotIpOutcome.APPLIED
-        assert dict(worker.state.of(IPV4).records[IP_A]) == DEFAULT_DOCUMENT
+        assert dict(worker.state.of(IPV4).records[IP_A].attributes) == DEFAULT_DOCUMENT
 
     async def test_a_remove_carrying_attributes_stores_nothing(self) -> None:
         worker = _worker()
@@ -1272,7 +1293,7 @@ class TestFamilyNotServed:
         v6 = worker.state.of(IPV6)
         assert outcome is HotIpOutcome.APPLIED
         assert v6.trie.hot_ip_count == 1
-        assert dict(v6.records[IP_V6]) == DEFAULT_DOCUMENT
+        assert dict(v6.records[IP_V6].attributes) == DEFAULT_DOCUMENT
         assert _view(worker, IPV4) == before_v4
         assert _updates(worker, "ipv6", "HotIpAdded", "applied") == 1
         assert _updates(worker, "ipv4", "HotIpAdded", "applied") == 0
@@ -1531,10 +1552,13 @@ class TestApplyTimeAttributesRejection:
     `attributes_rejected{stage="apply"}`, log it." Reached through the module
     global the Test seams paragraph names."""
 
-    async def test_the_default_document_is_stored_and_the_event_is_applied(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        seen: list[object] = []
+    @staticmethod
+    def _rejecting(
+        seen: list[tuple[object, dict[str, Any]]],
+    ) -> Callable[..., bool]:
+        """A stand-in for `apply_hot_ip_added` that records each call's
+        document and keyword arguments, rejects every document that is not
+        `None`, and passes the rest to the real function."""
 
         def rejecting(
             trie: Any,
@@ -1544,12 +1568,18 @@ class TestApplyTimeAttributesRejection:
             *args: Any,
             **kwargs: Any,
         ) -> bool:
-            seen.append(attributes)
+            seen.append((attributes, dict(kwargs)))
             if attributes is not None:
                 raise InvalidAttributesError("rejected by the test's stand-in")
             return bool(apply_hot_ip_added(trie, records, address, attributes, *args, **kwargs))
 
-        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", rejecting)
+        return rejecting
+
+    async def test_the_default_document_is_stored_and_the_event_is_applied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[tuple[object, dict[str, Any]]] = []
+        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", self._rejecting(seen))
         worker = _worker()
         document = {"attributes_version": 1, "weight": 5}
 
@@ -1557,7 +1587,7 @@ class TestApplyTimeAttributesRejection:
 
         fs = worker.state.of(IPV4)
         assert outcome is HotIpOutcome.APPLIED
-        assert dict(fs.records[IP_A]) == DEFAULT_DOCUMENT
+        assert dict(fs.records[IP_A].attributes) == DEFAULT_DOCUMENT
         assert fs.trie.hot_ip_count == 1
         assert _rejected(worker, "apply") == 1
         assert _rejected(worker, "decode") == 0
@@ -1565,8 +1595,299 @@ class TestApplyTimeAttributesRejection:
         assert _updates_total(worker) == 1
         assert worker.state.event_sequence == 1
         # The retry passed no document.
-        assert seen[-1] is None
+        assert seen[-1][0] is None
         assert len(seen) == 2
+
+    async def test_both_calls_pass_the_window_count_and_the_retry_stores_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-0015 Amendment 5 rulings 4 and 7 / ADR-0017 decisions 6 and 17
+        as noted: both calls pass `request_count=payload.window_count` as a
+        keyword, so the default document is stored with the event's count --
+        the document was rejected, not the count."""
+
+        seen: list[tuple[object, dict[str, Any]]] = []
+        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", self._rejecting(seen))
+        worker = _worker()
+        document = {"attributes_version": 1, "weight": 5}
+
+        outcome = await worker.handle(
+            _msg(_envelope(IP_A, 0, attributes=document, window_count=1437), 0)
+        )
+
+        assert outcome is HotIpOutcome.APPLIED
+        assert len(seen) == 2
+        assert seen[0] == (document, {"request_count": 1437})
+        assert seen[1] == (None, {"request_count": 1437})
+        assert _stored(worker, IP_A) == (DEFAULT_DOCUMENT, 1437)
+        assert _rejected(worker, "apply") == 1
+
+    async def test_the_retry_over_a_hot_ip_replaces_its_count(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ruling 4: the recovery replaces the whole earlier record, count
+        included, with the default document and the event's count."""
+
+        worker = _worker()
+        earlier = {"attributes_version": 1, "weight": 9}
+        first = _msg(_envelope(IP_A, 0, attributes=earlier, window_count=1200), 0)
+        assert await worker.handle(first) is HotIpOutcome.APPLIED
+        seen: list[tuple[object, dict[str, Any]]] = []
+        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", self._rejecting(seen))
+
+        second = _envelope(IP_A, 1, attributes={"attributes_version": 1}, window_count=1501)
+        outcome = await worker.handle(_msg(second, 1))
+
+        assert outcome is HotIpOutcome.UNCHANGED
+        assert [kwargs for _document, kwargs in seen] == [{"request_count": 1501}] * 2
+        assert _stored(worker, IP_A) == (DEFAULT_DOCUMENT, 1501)
+
+
+_COUNT_ERRORS = [
+    pytest.param(ValueError("request_count must be at least 0"), id="ValueError"),
+    pytest.param(TypeError("request_count must be an int"), id="TypeError"),
+]
+
+
+class TestApplyTimeRequestCountError:
+    """ADR-0015 Amendment 5 ruling 3: "A count error therefore means a bug,
+    like decision 6's family `ValueError`, and the worker lets it propagate
+    (ADR-0017 decision 7). It is not an attributes rejection: it never takes
+    decision 6's `attributes=None` retry, and it is never counted in
+    `attributes_rejected`." Assumption 75: "The count comes before the
+    document so that a bug is never reported as a rejected document."
+
+    ADR-0017 decision 7, as noted for Amendment 5: `apply_hot_ip_added` raises
+    "`TypeError` for a `request_count` that is not an exact `int`, and
+    `ValueError` for a negative one, before the document and the trie. ...
+    Either is a bug and propagates, as the `apply_*` `ValueError` row says.
+    Neither is an attributes rejection, so neither takes the `attributes=None`
+    retry or counts in `attributes_rejected`." Decision 8: `position` moves
+    only for a handled record, and a propagated exception handles nothing.
+
+    The codec never delivers a bad `window_count`, so the error is raised by a
+    stand-in reached through the module global the Test seams paragraph
+    names, as `TestApplyTimeAttributesRejection` does."""
+
+    @staticmethod
+    def _raising(
+        error: Exception, seen: list[tuple[object, dict[str, Any]]]
+    ) -> Callable[..., bool]:
+        """A stand-in for `apply_hot_ip_added` that records each call's
+        document and keyword arguments, then raises `error` -- on every call,
+        so a retry would show up as a second entry in `seen`. It raises
+        before touching anything, as ruling 3's order requires of the real
+        function."""
+
+        def raising(
+            trie: Any,
+            records: Any,
+            address: Address,
+            attributes: Any = None,
+            *args: Any,
+            **kwargs: Any,
+        ) -> bool:
+            seen.append((attributes, dict(kwargs)))
+            raise error
+
+        return raising
+
+    @pytest.mark.parametrize("error", _COUNT_ERRORS)
+    async def test_on_an_empty_trie_it_propagates_and_changes_nothing(
+        self, error: Exception, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[tuple[object, dict[str, Any]]] = []
+        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", self._raising(error, seen))
+        worker = _worker()
+        before = _view(worker)
+        # A document that would be retried if the error were taken for an
+        # attributes rejection.
+        document = {"attributes_version": 1, "weight": 5}
+
+        with pytest.raises(type(error), match="request_count") as excinfo:
+            await worker.handle(_msg(_envelope(IP_A, 0, attributes=document, window_count=1437), 0))
+
+        # The stand-in's own exception, not a wrapper or a later one.
+        assert excinfo.value is error
+        # Exactly one call: no `attributes=None` retry.
+        assert seen == [(document, {"request_count": 1437})]
+        assert _rejected(worker, "apply") == 0
+        assert _rejected(worker, "decode") == 0
+        assert _updates_total(worker) == 0
+        assert worker.state.position is None
+        assert worker.state.event_sequence == 0
+        assert worker.state.as_of is None
+        assert _view(worker) == before
+        assert len(worker.state.of(IPV4).records) == 0
+        assert worker.state.of(IPV4).trie.hot_ip_count == 0
+
+    @pytest.mark.parametrize("error", _COUNT_ERRORS)
+    async def test_over_a_hot_ip_it_propagates_and_leaves_the_earlier_record(
+        self, error: Exception, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker = _worker()
+        earlier = {"attributes_version": 1, "weight": 9}
+        first = _msg(_envelope(IP_A, 0, attributes=earlier, window_count=1200), 0)
+        assert await worker.handle(first) is HotIpOutcome.APPLIED
+        before = (
+            _view(worker),
+            worker.state.position,
+            worker.state.event_sequence,
+            worker.state.as_of,
+            _updates_total(worker),
+        )
+        seen: list[tuple[object, dict[str, Any]]] = []
+        monkeypatch.setattr(trie_worker, "apply_hot_ip_added", self._raising(error, seen))
+        document = {"attributes_version": 1, "weight": 5}
+
+        with pytest.raises(type(error), match="request_count") as excinfo:
+            await worker.handle(_msg(_envelope(IP_A, 1, attributes=document, window_count=1501), 1))
+
+        assert excinfo.value is error
+        assert seen == [(document, {"request_count": 1501})]
+        assert _rejected(worker, "apply") == 0
+        assert _rejected(worker, "decode") == 0
+        # Only the first event's update was counted.
+        assert _updates_total(worker) == 1
+        assert (
+            _view(worker),
+            worker.state.position,
+            worker.state.event_sequence,
+            worker.state.as_of,
+            _updates_total(worker),
+        ) == before
+        assert worker.state.position == 0
+        assert worker.state.event_sequence == 1
+        assert _stored(worker, IP_A) == (earlier, 1200)
+
+
+def _key_mismatched_add(ip: Address, n: int, window_count: int) -> tuple[bytes, bytes | None]:
+    """A `HotIpAdded` for `ip` keyed by another IP: MALFORMED [key_mismatch]."""
+
+    other = IP_B if ip != IP_B else IP_C
+    return encode(_envelope(ip, n, window_count=window_count)), str(other).encode()
+
+
+def _decode_rejected_add(ip: Address, n: int, window_count: int) -> tuple[bytes, bytes | None]:
+    """A `HotIpAdded` for `ip` whose attributes the codec rejects at decode."""
+
+    envelope = _envelope(ip, n, attributes=DEFAULT_DOCUMENT, window_count=window_count)
+    return _with_attributes(envelope, DECODE_REJECTED), str(ip).encode()
+
+
+class TestRequestCount:
+    """ADR-0015 Amendment 5 rulings 1, 4 and 7, with ADR-0017 decisions 6, 7
+    and 17 as noted: the record's `request_count` is the `window_count` of the
+    most recent `HotIpAdded` the trie has applied for the IP; every applied
+    add replaces it, whatever `add_hot_ip` returned; `HotIpRemoved` deletes
+    it with the record; a skipped event sets nothing."""
+
+    async def test_an_applied_add_stores_the_window_count(self) -> None:
+        worker = _worker()
+        document = {"attributes_version": 1, "weight": 10}
+
+        outcome = await worker.handle(
+            _msg(_envelope(IP_A, 0, attributes=document, window_count=1437), 0)
+        )
+
+        assert outcome is HotIpOutcome.APPLIED
+        assert _stored(worker, IP_A) == (document, 1437)
+        assert type(worker.state.of(IPV4).records[IP_A].request_count) is int
+
+    async def test_an_unchanged_add_replaces_the_count(self) -> None:
+        worker = _worker()
+        first = _msg(_envelope(IP_A, 0, window_count=1200), 0)
+        assert await worker.handle(first) is HotIpOutcome.APPLIED
+        bytes_before = worker.state.of(IPV4).records.serialized_bytes
+
+        outcome = await worker.handle(_msg(_envelope(IP_A, 1, window_count=1033), 1))
+
+        assert outcome is HotIpOutcome.UNCHANGED
+        assert _stored(worker, IP_A) == (DEFAULT_DOCUMENT, 1033)
+        # Ruling 5: a write that changes only the count leaves the byte total.
+        assert worker.state.of(IPV4).records.serialized_bytes == bytes_before
+
+    async def test_a_redelivered_add_writes_its_own_count_again(self) -> None:
+        # Ruling 4: "A redelivered `HotIpAdded` writes the same values again."
+        worker = _worker()
+        envelope = _envelope(IP_A, 0, window_count=1300)
+        assert await worker.handle(_msg(envelope, 0)) is HotIpOutcome.APPLIED
+        before = _view(worker)
+
+        assert await worker.handle(_msg(envelope, 1)) is HotIpOutcome.UNCHANGED
+
+        assert _view(worker) == before
+        assert _stored(worker, IP_A) == (DEFAULT_DOCUMENT, 1300)
+
+    async def test_a_removal_deletes_the_record_and_its_count(self) -> None:
+        worker = _worker()
+        add_a = _msg(_envelope(IP_A, 0, window_count=1200), 0)
+        add_b = _msg(_envelope(IP_B, 1, window_count=1250), 1)
+        assert await worker.handle(add_a) is HotIpOutcome.APPLIED
+        assert await worker.handle(add_b) is HotIpOutcome.APPLIED
+
+        outcome = await worker.handle(_msg(_envelope(IP_A, 2, removed=True, window_count=790), 2))
+
+        records = worker.state.of(IPV4).records
+        assert outcome is HotIpOutcome.APPLIED
+        assert IP_A not in records
+        assert records.get(IP_A) is None
+        # The removal's own `window_count` is decoded and not used (ruling 7).
+        assert _stored(worker, IP_B) == (DEFAULT_DOCUMENT, 1250)
+
+        # A later add sets its own count; the old one is gone with the record.
+        add_a_again = _msg(_envelope(IP_A, 3, window_count=1100), 3)
+        assert await worker.handle(add_a_again) is HotIpOutcome.APPLIED
+        assert _stored(worker, IP_A) == (DEFAULT_DOCUMENT, 1100)
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(_key_mismatched_add, id="key-mismatch"),
+            pytest.param(_decode_rejected_add, id="attributes-rejected-at-decode"),
+        ],
+    )
+    async def test_a_malformed_add_for_a_hot_ip_leaves_the_earlier_count(
+        self, build: Callable[[Address, int, int], tuple[bytes, bytes | None]]
+    ) -> None:
+        # Ruling 1: "A `HotIpAdded` the worker skips sets nothing."
+        worker = _worker()
+        earlier = {"attributes_version": 1, "weight": 9}
+        first = _msg(_envelope(IP_A, 0, attributes=earlier, window_count=1200), 0)
+        assert await worker.handle(first) is HotIpOutcome.APPLIED
+        before = _view(worker)
+        value, key = build(IP_A, 1, 1600)
+
+        outcome = await worker.handle(_message(value, 1, key))
+
+        assert outcome is HotIpOutcome.MALFORMED
+        assert _view(worker) == before
+        assert _stored(worker, IP_A) == (earlier, 1200)
+
+    async def test_a_replay_gives_each_ip_the_count_of_its_latest_applied_add(self) -> None:
+        # Ruling 4: "After a replay, each record is the most recent applied
+        # `HotIpAdded`'s, whatever was stored before."
+        n = 6
+        bus = InMemoryBus()
+        for i in range(n):
+            await _publish(bus, _envelope(_ip(i + 1), i, window_count=1000 + 17 * i))
+        await _publish(bus, _envelope(_ip(1), n, window_count=4321))
+        await _publish(bus, _envelope(_ip(2), n + 1, removed=True, window_count=800))
+        worker = _worker(bus=bus)
+
+        await worker.start()
+        try:
+            fs = worker.state.of(IPV4)
+            assert worker.caught_up is True
+            expected = {_ip(i + 1): 1000 + 17 * i for i in range(2, n)}
+            expected[_ip(1)] = 4321
+            assert {ip: record.request_count for ip, record in fs.records.items()} == expected
+            for ip in expected:
+                assert dict(fs.records[ip].attributes) == DEFAULT_DOCUMENT
+            assert fs.trie.hot_ip_count == len(expected)
+            check_attribute_records(fs.trie, fs.records)
+        finally:
+            await worker.stop()
 
 
 MARKER = "S3CR3T-MARKER"

@@ -137,6 +137,13 @@ What was open, and blocks anyone who wants to write a test or a module:
 * #115 is designed and tracked on its own (decision 17). It can land at
   any point after slice 1.
 
+> Noted 2026-09-23 (ADR-0015 Amendment 5): #116 is designed. Its change
+> covers `IpAttributeRecords` (now a `Mapping[Address, IpRecord]`),
+> `record()` and `apply_hot_ip_added` (a required keyword-only
+> `request_count`), the worker's two calls, and
+> `schemas/hot_ip_event.v1.json` (`window_count` required). The row's "the
+> invariant checkers" do not change: both take the widened map as they are.
+
 ### 2. Slice 1's modules
 
 ```text
@@ -437,6 +444,13 @@ write of `apply_*` from the last write of `note_applied` (decision 9,
 R1). In slice 1 `handle()` contains no `await` at all besides taking the
 lock. Slice 2 publishes after step 5 (decision 14).
 
+> Noted 2026-09-23 (ADR-0015 Amendment 5, issue #116): step 4's two
+> `apply_hot_ip_added` calls each also pass
+> `request_count=payload.window_count`, as a keyword. The retry with
+> `attributes=None` passes it too, so the count survives a rejected
+> document. Both calls stay inside the synchronous section above. The
+> `HotIpRemoved` call is unchanged.
+
 The key and subject checks mirror the aggregator's ADR-0004 check on
 observations. Every in-repo producer of hot-ip events sets both to the
 IP's canonical text (ADR-0011 decision 4 step 4). A record that names one
@@ -457,6 +471,15 @@ that producer, and the trie does not guess which is meant
 | `bus.end_offset`, `bus.first_offset`, `subscribe` | any exception | Propagates out of `start()`: `start_failed`, exit 1. Not retried: the bus answered a moment before, at `NatsBus.start()`. |
 
 The worker catches no bare `Exception` anywhere.
+
+> Noted 2026-09-23 (ADR-0015 Amendment 5): `apply_hot_ip_added` also raises
+> `TypeError` for a `request_count` that is not an exact `int`, and
+> `ValueError` for a negative one, before the document and the trie. Neither
+> can come from the bus: the codec delivers `window_count` as an exact `int`
+> of at least 0 (ADR-0015 Amendment 3 ruling 3, ADR-0016 decision 1). Either
+> is a bug and propagates, as the `apply_*` `ValueError` row says. Neither is
+> an attributes rejection, so neither takes the `attributes=None` retry or
+> counts in `attributes_rejected`.
 
 ### 8. `event_sequence` is the trie's position in the log; `as_of` is the newest applied event time
 
@@ -1018,6 +1041,14 @@ written and removed in the same step.
   the count wrong. Both calls stay inside R1's synchronous section.
 * **For #116's attention:** the codec requires `window_count` on hot-ip
   events, while `schemas/hot_ip_event.v1.json` lists it as optional.
+
+> Noted 2026-09-23 (ADR-0015 Amendment 5): #116 is designed there. The
+> meaning above stands. `read-api-v1.md` now says the count comes from the
+> most recent `HotIpAdded` the trie has *applied*, because one the worker
+> skips sets nothing. The worker passes the count as
+> `request_count=payload.window_count`. The item for #116's attention is
+> settled: the codec is right, and the schema now lists `window_count` as
+> required on both event types.
 
 ## Test seams
 

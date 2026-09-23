@@ -278,6 +278,12 @@ redelivery. Whether a no-op event still emits `PrefixStatsChanged` remains the
 worker epic's call (ADR-0011 Consequences says so explicitly); `False` is the
 signal that lets it decide.
 
+> Noted 2026-09-23 (ADR-0015 Amendment 5, issue #116): the record replaced
+> here now holds a `request_count` beside the attribute document, and the two
+> are written and deleted together. A redundant `HotIpAdded` therefore also
+> replaces the count, with its own `window_count`, and a `HotIpRemoved`
+> deletes the count with the document. This decision is otherwise unchanged.
+
 **"Never an error" is a statement about intact tries.** On a trie that already
 satisfies §12, no add or remove — redundant or not — raises anything but
 decision 1's family `ValueError`. A mutator that *discovers*, mid-walk, that
@@ -598,6 +604,15 @@ test. Epic #9 owns the map, its schema validation, and its lifecycle; this epic
 owns the one arithmetic statement §46.5 makes about it. When one process holds
 both families, the caller passes that family's subset — the check's family
 assertion is what catches getting that wrong.
+
+> Noted 2026-09-23 (ADR-0015 Amendment 5, issue #116): the map epic #9 built
+> is now a `Mapping[Address, IpRecord]` rather than a `Mapping[Address,
+> IpAttributes]`. Each value holds an address's attribute document and its
+> `request_count`. It is still a `Collection[Address]`, so
+> `check_attribute_records` and testkit's `assert_attribute_records_match`
+> (decision 10) take it unchanged. Neither reads a value, and neither gains a
+> clause: the count is stored in the record's own entry, so it exists for
+> exactly the addresses the three clauses above already compare.
 
 ### 10. `hammertime-testkit` gets test-facing assertions that recompute independently
 

@@ -115,9 +115,12 @@ Malformed address -> `400`.
 
 * `state` — `"HOT"` iff the IP's `/32` (or `/128`) node has `hot_count == 1`,
   else `"COLD"` (§12).
-* `request_count` — the `window_count` carried on the IP's most recent
-  `HotIpAdded`; `0` while COLD. The trie keeps no counters (§18), so this is
-  the count *at transition time*, not a live value.
+* `request_count` — the `window_count` carried on the most recent
+  `HotIpAdded` the trie has applied for the IP; `0` while COLD. One applied
+  while the IP is already HOT replaces it, and only a `HotIpAdded` sets it.
+  The trie keeps no counters (§18), and the aggregator publishes nothing
+  between transitions, so this is the count *at transition time*, not a live
+  value (ADR-0015 Amendment 5).
 * `attributes` — present iff `state == "HOT"`: the stored `IpAttributes`
   record for the IP (§46.5-46.7). An absent `attributes` on the event is
   stored, and returned, as `{"attributes_version": 1}`.
