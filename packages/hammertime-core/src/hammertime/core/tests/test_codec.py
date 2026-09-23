@@ -634,7 +634,7 @@ _ENCODE_INTEGER_FIELDS: list[Any] = [
     *(
         pytest.param(event_type, "envelope", name, id=f"{event_type}-envelope-{name}")
         for event_type in EVENT_TYPES
-        for name in ("sequence", "config_version")
+        for name in _ENVELOPE_INTEGER_FIELDS
     ),
     pytest.param("RequestObservation", "payload", "sequence", id="observation-sequence"),
     pytest.param("RequestObservation", "payload", "window_seconds", id="window_seconds"),
@@ -663,9 +663,18 @@ def test_encode_rejects_anything_but_an_int_in_an_integer_field(
     event_type: str, where: str, field: str, bad: object
 ) -> None:
     """Assumption 66: stricter than decode -- an integral float would break
-    the `event_id` round trip."""
+    the `event_id` round trip. `schema_version` is not in `_ENVELOPE_FIELDS`
+    (the valid envelope leaves it to its default), so it is passed here."""
 
-    envelope = _envelope(event_type, where, field, bad)
+    envelope: EventEnvelope[Any]
+    if (where, field) == ("envelope", "schema_version"):
+        payload = _envelope(event_type).payload
+        wrong: Any = bad
+        envelope = EventEnvelope(
+            event_type=event_type, payload=payload, schema_version=wrong, **_ENVELOPE_FIELDS
+        )
+    else:
+        envelope = _envelope(event_type, where, field, bad)
     with pytest.raises(CodecError):
         encode(envelope)
 
