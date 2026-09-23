@@ -1,6 +1,6 @@
 """Encode/decode events; schema-version negotiation and forward compatibility.
 
-Spec: section 19, section 32
+Spec: section 19, section 32, section 46.2; ADR-0015 decision 5
 
 The wire format is JSON. Every message is an `EventEnvelope` (see
 `envelope.py`) with a `payload` object whose field names match the relevant
@@ -17,16 +17,22 @@ literal), or `hammertime.core.errors.InvalidAddressError` (from a malformed
 `ip` field) escape: every failure mode -- unknown `event_type`,
 unknown/unsupported `schema_version`, or malformed bytes -- surfaces as
 `CodecError`.
+
+A `HotIpAdded`/`HotIpRemoved` payload's `attributes` document is checked by
+`hammertime.core.events.attributes.validate_ip_attributes`, the one
+implementation of the section 46.2 rules, on encode and on decode (ADR-0015
+decision 5). Its `InvalidAttributesError` becomes a `CodecError` chained
+`from` it, so `CodecError.__cause__` identifies every attributes rejection
+(ADR-0015 assumption 32).
 """
 
 import json
-import math
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 from hammertime.core.addressing.address import Address
-from hammertime.core.errors import CodecError, InvalidAddressError
+from hammertime.core.errors import CodecError, InvalidAddressError, InvalidAttributesError
+from hammertime.core.events.attributes import validate_ip_attributes
 from hammertime.core.events.envelope import SCHEMA_VERSION, EventEnvelope
 from hammertime.core.events.models import (
     HotIpAdded,
@@ -47,22 +53,6 @@ _KNOWN_EVENT_TYPES = frozenset({"RequestObservation", "PrefixStatsChanged"}) | _
 #: (services/ingest/src/hammertime/ingest/validation/limits.py) is not yet
 #: implemented, so this is currently the only place that bounds it.
 _MAX_OBSERVATIONS = 10_000
-
-# schemas/ip_attributes.v1.json (spec section 46, ADR-0005): registered
-# names, the experimental-namespace pattern, and the size/count caps.
-# Enforced here, not just by a separate jsonschema pass, because this codec
-# is used directly for internal bus messages that may not go through
-# schema validation.
-_REGISTERED_ATTRIBUTE_KEYS = frozenset({"attributes_version", "weight"})
-_EXPERIMENTAL_ATTRIBUTE_KEY = re.compile(r"^x_[a-z0-9_]{1,48}$")
-_MAX_ATTRIBUTES_BYTES = 1024
-_MAX_ATTRIBUTES_KEYS = 16
-_MAX_WEIGHT = 1_000_000
-#: Highest attributes_version this build understands the registered fields
-#: of. Spec section 46.2: a document carrying a higher version MUST be
-#: stored/echoed verbatim and MUST NOT be interpreted -- an unregistered
-#: name is only a rejectable typo *within* a version this build knows.
-_KNOWN_ATTRIBUTES_VERSION = 1
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -133,124 +123,16 @@ def _decode_request_observation(data: dict[str, Any]) -> RequestObservation:
         raise CodecError(f"malformed RequestObservation payload: {data!r}") from exc
 
 
-def _is_json_integer(value: Any) -> bool:
-    """Whether `value` satisfies JSON Schema's `"type": "integer"`.
+def _check_attributes(attributes: object) -> None:
+    """Apply the section 46.2 rules (ADR-0015 decision 5) as a `CodecError`.
 
-    That means any JSON number with no fractional part, independent of its
-    literal form -- `1.0` is a valid integer per JSON Schema even though
-    `isinstance(1.0, int)` is False in Python. `bool` is deliberately
-    excluded even though `isinstance(True, int)` is True in Python.
-    """
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
-        return True
-    return isinstance(value, float) and math.isfinite(value) and value.is_integer()
-
-
-def _check_json_safe(value: Any, *, path: str = "attributes") -> None:
-    """Reject non-finite floats and lone UTF-16 surrogates anywhere in `value`.
-
-    Python's `json` module accepts `NaN`/`Infinity`/`-Infinity` by default
-    (not valid JSON per RFC 8259) and permits a lone surrogate code point in
-    a string (a valid Python `str`, not valid UTF-8) -- both round-trip
-    silently through `json.loads`/`json.dumps` but corrupt or crash any
-    strict downstream consumer (a schema validator, a non-Python parser, a
-    UTF-8 store). Only reachable through `x_`-prefixed values today, since
-    every registered field is already type/range-checked elsewhere.
-    """
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise CodecError(f"{path} contains a non-finite number ({value!r}), not valid JSON")
-        return
-    if isinstance(value, str):
-        if any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
-            raise CodecError(f"{path} contains an unpaired UTF-16 surrogate, not valid UTF-8")
-        return
-    if isinstance(value, dict):
-        for key, sub_value in value.items():
-            _check_json_safe(sub_value, path=f"{path}.{key}")
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _check_json_safe(item, path=f"{path}[{index}]")
-        return
-    # bool, int, None: always safe.
-
-
-def _check_attributes_size(attributes: dict[str, Any]) -> None:
-    try:
-        size = len(json.dumps(attributes, separators=(",", ":")).encode("utf-8"))
-    except (TypeError, ValueError) as exc:
-        raise CodecError(f"attributes could not be serialized: {exc}") from exc
-    if size > _MAX_ATTRIBUTES_BYTES:
-        raise CodecError(
-            f"attributes is {size} bytes serialized, exceeding the maximum of "
-            f"{_MAX_ATTRIBUTES_BYTES} (schemas/ip_attributes.v1.json)"
-        )
-
-
-def _validate_attributes(attributes: Any) -> None:
-    """Enforce schemas/ip_attributes.v1.json's shape and size caps.
-
-    Spec section 46, ADR-0005. Applied on both the encode and decode paths.
+    The validator's message never contains a document value, so repeating it
+    here is safe; the `InvalidAttributesError` itself is the cause.
     """
     try:
-        _validate_attributes_unchecked(attributes)
-    except RecursionError as exc:
-        # A deeply nested x_-prefixed value (e.g. a few hundred nested `[`)
-        # can blow the interpreter's recursion limit inside the size-check
-        # json.dumps or the safety walk below, at a call depth shallower
-        # than decode()'s own top-level json.loads guard -- must not be
-        # allowed to escape as anything but CodecError either.
-        raise CodecError("attributes is nested too deeply to validate") from exc
-
-
-def _validate_attributes_unchecked(attributes: Any) -> None:
-    if not isinstance(attributes, dict):
-        raise CodecError(f"attributes must be a JSON object, got {type(attributes).__name__}")
-
-    if len(attributes) > _MAX_ATTRIBUTES_KEYS:
-        raise CodecError(
-            f"attributes has {len(attributes)} keys, exceeding the maximum of "
-            f"{_MAX_ATTRIBUTES_KEYS} (schemas/ip_attributes.v1.json maxProperties)"
-        )
-
-    version = attributes.get("attributes_version")
-    if version is None:
-        raise CodecError("attributes missing required field: attributes_version")
-    if not _is_json_integer(version) or version < 1:
-        raise CodecError(f"attributes.attributes_version must be an integer >= 1, got {version!r}")
-
-    if version > _KNOWN_ATTRIBUTES_VERSION:
-        # Spec section 46.2: "A document carrying an attributes_version
-        # higher than a consumer understands MUST be stored and echoed
-        # verbatim and MUST NOT be interpreted." This build only knows
-        # version 1's registered names, so it cannot validate a higher
-        # version's fields as anything but opaque data -- skip the
-        # registered/x_ key-name and weight-semantics checks, but still
-        # enforce the structural wire-hygiene bounds every version shares.
-        _check_json_safe(attributes)
-        _check_attributes_size(attributes)
-        return
-
-    for key in attributes:
-        if key in _REGISTERED_ATTRIBUTE_KEYS or _EXPERIMENTAL_ATTRIBUTE_KEY.fullmatch(key):
-            continue
-        raise CodecError(
-            f"attributes has unregistered key {key!r}: must be one of "
-            f"{sorted(_REGISTERED_ATTRIBUTE_KEYS)} or match ^x_[a-z0-9_]{{1,48}}$"
-        )
-
-    if "weight" in attributes:
-        weight = attributes["weight"]
-        if not _is_json_integer(weight) or not 0 <= weight <= _MAX_WEIGHT:
-            raise CodecError(
-                f"attributes.weight must be an integer in [0, {_MAX_WEIGHT}], got {weight!r}"
-            )
-
-    _check_json_safe(attributes)
-    _check_attributes_size(attributes)
+        validate_ip_attributes(attributes)
+    except InvalidAttributesError as exc:
+        raise CodecError(f"invalid attributes: {exc}") from exc
 
 
 def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) -> dict[str, Any]:
@@ -264,7 +146,7 @@ def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) ->
         "config_version": payload.config_version,
     }
     if payload.attributes is not None:
-        _validate_attributes(payload.attributes)
+        _check_attributes(payload.attributes)
         document["attributes"] = payload.attributes
     return document
 
@@ -288,13 +170,11 @@ def _decode_hot_ip_event(event_type: str, data: dict[str, Any]) -> HotIpAdded | 
     attributes: dict[str, object] | None = None
     if "attributes" in data:
         raw_attributes = data["attributes"]
-        if raw_attributes is None:
-            # schemas/ip_attributes.v1.json's top-level type is "object";
-            # an explicit `"attributes": null` fails that and must be
-            # rejected, not silently treated the same as the key being
-            # absent entirely (data.get(...) alone can't tell them apart).
-            raise CodecError("attributes must be a JSON object, not null")
-        _validate_attributes(raw_attributes)
+        # An explicit `"attributes": null` is not the key being absent: it is
+        # a document that is not a JSON object (S1), and goes through the
+        # validator like every other rejection so that its CodecError carries
+        # the InvalidAttributesError cause too (ADR-0015 decision 5).
+        _check_attributes(raw_attributes)
         attributes = raw_attributes
 
     if event_type == "HotIpAdded":
