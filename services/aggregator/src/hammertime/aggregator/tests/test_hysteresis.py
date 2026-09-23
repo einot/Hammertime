@@ -470,8 +470,10 @@ class TestTheEmittedRemoveEvent:
 
 
 class TestPersistBeforePublish:
-    """Decision 4 step 2: "the durable HOT set is updated **before** the event
-    exists"; a failure there aborts the transition.
+    """Decision 4 step 2, with its 2026-09-23 note (ADR-0016 decision 3): "the
+    durable HOT set is updated **before** the event is published"; a failure
+    there aborts the transition. The event is built and encoded before that
+    write, so step 2's original "before the event exists" no longer holds.
 
     Why it matters (decision 4's own reasoning): the opposite order can leave
     the trie holding an IP no owner knows about -- the permanent section 12
