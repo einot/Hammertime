@@ -2,7 +2,10 @@
 
 Status: accepted, amended 2026-09-23 (Amendment 1 — the arena's name, what makes
 the accounting checks non-vacuous, structural versus derived observables, no
-transient over-allocation, the derived node counts)
+transient over-allocation, the derived node counts; Amendment 2 — the free list
+is readable and the arena accounting is checked against it, a mutator may raise
+`InvariantViolation` for corruption it cannot walk past, `iter_prefix_counts`
+validates `min_length` eagerly)
 
 Scope note: this ADR settles the interfaces epic #8 implements against —
 `services/trie/src/hammertime/trie/structure/{__init__,node,binary_trie,patricia,arena,invariants}.py`
@@ -207,7 +210,12 @@ Semantics, in the order a reader needs them:
   model MUST remain equivalent to the binary trie". Descent is by child link:
   the stored count decides only whether a prefix is *yielded*, never whether
   the walk continues past it, so a node whose count has been corrupted to zero
-  hides its own prefixes and nothing else (Amendment 1, A3).
+  hides its own prefixes and nothing else (Amendment 1, A3). `L` outside
+  `[0, bit_length]` is a `ValueError`, exactly as on `ancestor_counts`, and it
+  is raised **when the method is called**, not when the returned iterator is
+  first advanced — so neither implementation's `iter_prefix_counts` may itself
+  be a generator function: it validates, then returns an iterator (Amendment 2,
+  A13).
 * **`iter_hot_addresses()`** yields the currently HOT addresses in ascending
   numeric order (the same DFS, at leaf level). It is what the snapshot epic
   serializes and what the invariants recompute from. It is **structural**: it
@@ -268,6 +276,16 @@ redelivery. Whether a no-op event still emits `PrefixStatsChanged` remains the
 worker epic's call (ADR-0011 Consequences says so explicitly); `False` is the
 signal that lets it decide.
 
+**"Never an error" is a statement about intact tries.** On a trie that already
+satisfies §12, no add or remove — redundant or not — raises anything but
+decision 1's family `ValueError`. A mutator that *discovers*, mid-walk, that
+the invariant is already broken in a way it cannot proceed past without
+corrupting the structure raises `InvariantViolation` instead, before mutating
+anything (Amendment 2, A12). That is not a second kind of no-op event: it
+cannot be produced by any sequence of `add_hot_ip`/`remove_hot_ip` calls, only
+by a prior bug or by external writes to the storage, and the event that
+triggered it is not at fault.
+
 ### 4. Pruning is mandatory in both implementations: the structure is a pure function of the current hot set
 
 A node whose `hot_count` reaches zero is removed, in the binary trie and in the
@@ -309,6 +327,7 @@ class NodeArena:
     length: list[int]        # the node's prefix length; -1 marks a free slot
     hot_count: list[int]     # §12's count for that node
     child: list[NodeId]      # two entries per node: child[2 * nid + bit]
+    free_ids: list[NodeId]   # released slots, LIFO: the last is allocated next
 
     def allocate(self, *, network: int, length: int, hot_count: int = 0) -> NodeId: ...
     def release(self, node_id: NodeId) -> None: ...
@@ -332,10 +351,11 @@ What it promises:
    IDs / cache-friendly contiguous memory" as far as CPython lets one go. This
    is a structural claim, discharged by the representation, **not** by a timing
    test (see Assumptions).
-2. **`allocate` reuses before it grows.** Released ids go on a LIFO free list
-   and are handed back first; the slab grows only when the free list is empty,
-   i.e. only when `live_count == capacity`, and then by **exactly one node's
-   worth of slots** — one entry appended to `network`, `length` and
+2. **`allocate` reuses before it grows.** Released ids go on the LIFO free list
+   `free_ids` — `free_count == len(free_ids)`, its last entry the next one
+   handed out — and are handed back first; the slab grows only when that list is
+   empty, i.e. only when `live_count == capacity`, and then by **exactly one
+   node's worth of slots** — one entry appended to `network`, `length` and
    `hot_count`, two to `child` — so `capacity` rises by exactly 1 per growth
    and `capacity == len(network) == len(length) == len(hot_count) ==
    len(child) // 2` at all times. A fresh arena pre-allocates nothing
@@ -361,11 +381,25 @@ What it promises:
    nodes" a quantity a caller can measure: sampling `node_count` at operation
    boundaries and taking the running maximum gives the same number, exactly,
    and `arena.capacity` must equal it.
-3. **A released slot is detectably dead.** `release` writes `-1` into
-   `length`, so `is_live` is one comparison, a double `release` is a
-   `ValueError`, and the invariant checks can assert that every reachable child
-   id is live. A released slot's other fields are stale by design and must not
-   be read.
+3. **A released slot is detectably dead, and the free list holds exactly the
+   dead slots.** `release` writes `-1` into `length`, so `is_live` is one
+   comparison, a double `release` is a `ValueError`, and the invariant checks
+   can assert that every reachable child id is live. A released slot's other
+   fields are stale by design and must not be read. `length` is therefore the
+   *only* record of liveness, which is why `allocate` rejects a negative
+   `length` with a `ValueError`: a slot that was allocated but reads as dead
+   would make `is_live` meaningless. The free list is bookkeeping *over* that
+   record rather than a second copy of it, and must agree with it exactly:
+
+   ```text
+   set(free_ids) == {i : 0 <= i < capacity and length[i] < 0}
+   free_ids contains no id twice
+   ```
+
+   Neither clause is implied by `live_count == capacity - free_count`, which is
+   an identity of this implementation and cannot fail however corrupt the arena
+   is; these two are what make `check_patricia`'s arena accounting non-vacuous,
+   and they are the reason `free_ids` is readable at all (Amendment 2, A11).
 4. **`clear()` resets the slab to empty** — `capacity == 0`, `live_count == 0`,
    `free_count == 0`, every storage list truncated — so a trie reused after
    `clear()` re-establishes the bound above from scratch. It resets the
@@ -492,14 +526,22 @@ side-effect free and never repair anything.
   no id is reached twice                    (no cycle, no shared subtree)
   len(R) == node_count                      (iter_nodes / the metric agree with reachability)
   len(R) == arena.live_count                (no live slot is unreachable: a leak)
-  capacity == live_count + free_count       (the free list accounts for the rest)
+  capacity == live_count + free_count       (an identity of decision 5's arena; kept
+                                             for an arena that maintains counters)
+  set(arena.free_ids) == the dead slots     (i.e. == {i : arena.length[i] < 0}, both
+  no id in arena.free_ids appears twice      directions; Amendment 2, A11)
   len(R) == 2 * leaves - 1                  (non-empty trie; leaves counted by the walk)
   leaves == hot_ip_count                    (non-empty trie)
   ```
 
   An id that is out of range, not live, or reached twice is an
   `InvariantViolation` — never an `IndexError`, a `ValueError` or a hang: the
-  walk tests liveness before reading any field and carries a visited set.
+  walk tests liveness before reading any field and carries a visited set. The
+  same holds for the free list: an entry outside `[0, capacity)` is reported,
+  not indexed with. The two free-list clauses are what turn `len(R) ==
+  live_count` into a real statement — without them a live slot wrongly on the
+  free list and a live slot wrongly unreachable cancel out and every accounting
+  equality still holds (Amendment 2, A11).
 * **`check_trie`** runs `check_patricia` **first** when handed a
   `PatriciaTrie`, then `check_hot_counts` and `check_no_orphaned_nodes`. The
   order matters: the logical checks traverse the structure, and their behaviour
@@ -510,9 +552,11 @@ side-effect free and never repair anything.
   it. `check_trie` is the one entry point a debug build or the inspect tool
   calls.
 
-Cost is O(hot_ip_count × bit_length), which is why the module docstring's
-"cheap enough for debug builds" is honest for a trie whose size §26 bounds by
-the hot set, and why nothing on the hot path calls it unconditionally.
+Cost is O(hot_ip_count × bit_length), plus O(capacity) for `check_patricia`'s
+scan of `arena.length` (capacity is decision 5's peak live node count, so that
+term is bounded by the hot set too). That is why the module docstring's "cheap
+enough for debug builds" is honest for a trie whose size §26 bounds by the hot
+set, and why nothing on the hot path calls it unconditionally.
 
 ### 9. §46.5's derived invariant is expressed as a `Collection[Address]`, so this epic never touches the record map
 
@@ -720,6 +764,14 @@ reader sees the assumption next to the ruling it is an assumption of.
 18. **`ValueError` for a family mismatch, an out-of-range `min_length`, and a
     double `release`; no new error types.** `InvariantViolation` is reserved for
     a broken structural invariant, i.e. for `invariants.py`.
+
+    > Amended 2026-09-23: "i.e. for `invariants.py`" was too strong. Amendment 2
+    > A12 also allows a *mutator* to raise `InvariantViolation` when it detects
+    > a broken invariant it cannot walk past, which is still "a broken
+    > structural invariant" and is never raised for bad arguments. A11 adds a
+    > third `ValueError`: `NodeArena.allocate` with a negative `length`. The
+    > `min_length` clause now covers `iter_prefix_counts` as well as
+    > `ancestor_counts` (A13).
 19. **The structure is not thread-safe and does not try to be.** §28's
     single-writer model (ADR-0001) is the whole mechanism; how readers get a
     consistent view — a versioned snapshot pointer, per the `worker.py` stub's
@@ -984,6 +1036,13 @@ Ruling, in two parts.
    field and carries a visited set, so a corrupted arena is a diagnosed failure
    and never an `IndexError`, a stale-field misreading or a non-terminating
    walk.
+
+   > Amended 2026-09-23: the `capacity == arena.live_count + arena.free_count`
+   > line of that block is an identity of decision 5's arena and can never
+   > fail — this item's own reasoning about vacuous checks applies to it, and
+   > was missed. Amendment 2 A11 keeps the line and adds the two clauses that
+   > give the arena accounting its force, comparing `arena.free_ids` against
+   > the `length` array. The rest of the block stands as written.
 
    Because the logical checks traverse the structure too, and their behaviour
    on a broken *representation* is undefined, `check_trie` runs `check_patricia`
@@ -1253,3 +1312,301 @@ decision here. Shipped code: none affected.
   the assumptions A1-A4 and A8 as unpinned. They are pinned now, and the
   docstrings could cite the amendment instead — cosmetic, and only worth a pass
   if those files are being edited anyway.
+
+## Amendment 2 (2026-09-23) — the free list is readable and the arena accounting is checked against it, a mutator may raise `InvariantViolation` for corruption it cannot walk past, `iter_prefix_counts` validates `min_length`
+
+Why: epic #8's structure is now implemented
+(`services/trie/src/hammertime/trie/structure/`, six modules with content)
+against decisions 1-11 and Amendment 1, with tests, and `reviewer` raised five
+non-blocking findings. Two are test gaps and are recorded under *Follow-ups*;
+the other three turn on interface questions this ADR had not settled — one of
+them a hole in a check Amendment 1 itself specified — and are ruled here as
+A11-A13. Unlike Amendment 1, which bound a `coder` brief against six empty
+stubs, **all three bind code that exists**: A11 and A13 require changes to it,
+A12 ratifies what is already there. Each item says whether the point was (a)
+already determined, (b) genuinely unspecified and ruled now, or (c)
+deliberately left open.
+
+As with Amendment 1, decision bodies were rewritten in place so that a reader
+sees the rule now in force, and earlier amendment sections are left as the
+historical record they are, with a dated pointer where a ruling has moved on.
+Every edit outside this section, with the superseded wording quoted:
+
+* **Status line.** Named Amendment 1 only; now names this one too.
+* **Decision 2, `iter_prefix_counts` bullet.** Said nothing about
+  `min_length` validation. Now: out of `[0, bit_length]` is a `ValueError`
+  raised at call time, and the method may not be a generator function (A13).
+* **Decision 3, new closing paragraph** (*"Never an error" is a statement about
+  intact tries*). Decision 3's title and body said a redundant add or remove is
+  "never an error" without saying what a mutator does when it finds the trie
+  already broken (A12).
+* **Decision 5, the `NodeArena` sketch.** Listed four storage lists; now lists
+  `free_ids` as the fifth (A11).
+* **Decision 5, promise 2.** Was: "Released ids go on a LIFO free list and are
+  handed back first; the slab grows only when the free list is empty". Now
+  names `free_ids`, `free_count == len(free_ids)` and which end is reused (A11).
+* **Decision 5, promise 3.** Was titled "**A released slot is detectably
+  dead.**" and ended "A released slot's other fields are stale by design and
+  must not be read." Now also states that `length` is the only liveness record,
+  that `allocate` rejects a negative `length`, and the two clauses tying
+  `free_ids` to the dead slots (A11).
+* **Decision 8, `check_patricia` bullet.** The clause block's
+  `capacity == live_count + free_count` line was annotated "(the free list
+  accounts for the rest)"; it is now marked as an identity kept for a
+  counter-maintaining arena, and two `free_ids` clauses are added, with a
+  closing sentence on what they catch (A11).
+* **Decision 8, cost paragraph.** Was: "Cost is O(hot_ip_count × bit_length),
+  which is why…". Now adds the O(capacity) arena scan (A11).
+* **Assumption 18** — a dated blockquote pointing to A11, A12 and A13.
+* **Amendment 1, A2** — a dated blockquote recording that the
+  `capacity == live_count + free_count` line of its own clause block is
+  vacuous, and pointing to A11.
+
+### A11. The free list is readable as `arena.free_ids`, and `check_patricia` checks it against the `length` array
+
+**Classification: (b), genuinely unspecified — and a defect in Amendment 1 A2.**
+`check_patricia`'s clause `capacity == live_count + free_count` cannot fail.
+`live_count` is `capacity - free_count` by construction
+(`len(length) - len(free_ids)`), so the equality is an identity, and A2's own
+argument against vacuous checks — "a check that took the implementation's own
+answer for the quantity it is checking would pass by construction" — applies to
+it. Nothing in the package checks that the free list holds exactly the dead
+slots.
+
+The hole is not theoretical. Put a live, *reachable* id on the free list and
+leave one unrelated live slot unreachable: `live_count` under-counts the live
+slots by one and the reachability walk misses one, the two errors cancel,
+`len(R) == live_count` passes, `capacity == live_count + free_count` passes
+because it always does, and the next `allocate()` hands back an id that is
+still linked into the trie and overwrites it. That is exactly the
+"slot recycled while still referenced" bug class decision 7 names as one of the
+reasons this package has an oracle at all.
+
+Ruling, in three parts.
+
+1. **The free list is part of the arena's interface, named `free_ids`**, a
+   `list[NodeId]` alongside `network`, `length`, `hot_count` and `child`, LIFO
+   with its last entry the next one handed out, and `free_count ==
+   len(free_ids)`. It is readable and writable for the same reason the other
+   storage lists are (assumption 13, Amendment 1 A1's third assumption): the
+   invariant checks and `tools/trie-inspect` must read it, and the tests inject
+   corruption by writing the arena's documented storage. `PatriciaTrie` itself
+   never touches it — only `allocate`, `release` and `clear` do.
+2. **`check_patricia` discharges the new free-list clauses**, stated in
+   decision 5's promise 3 and decision 8's block: every id in `free_ids` is in
+   range and has `length < 0`, every slot with `length < 0` is in `free_ids`
+   (i.e. set equality both ways), and no id appears in `free_ids` twice. The existing
+   `capacity == live_count + free_count` line stays — it costs one comparison
+   and is not an identity for an arena that maintained its counters — but its
+   annotation now says it cannot fail for decision 5's arena, so nobody reads
+   it as the accounting check again. With the new clauses, `len(R) ==
+   live_count` finally says what it was meant to say: the reachable set is
+   *exactly* the live set.
+3. **`NodeArena.allocate` rejects a negative `length` with a `ValueError`.**
+   This is what makes clause 2 well founded: `length < 0` is the only record of
+   deadness, so a slot that is allocated and simultaneously reads as dead would
+   make both `is_live` and the dead-slot set meaningless. The shipped
+   implementation already does this; it was never written down.
+
+Assumptions:
+
+* **`free_ids`, not `free`, and not a read accessor.** `arena.free` reads like
+  a method (`arena.free(nid)`) at a call site; `free_ids` pairs with
+  `free_count`. A `free_ids()` accessor returning a tuple would also close the
+  hole, and would be the more defensive design — but it would make the
+  "no id twice" clause untestable through documented storage, since nothing
+  outside the arena could then produce a duplicated entry, and Amendment 1 A1
+  already ruled that corruption is injected by writing the arena's public
+  storage. A `dead_count` property instead of a readable list would be cheaper
+  still and would catch most of the hole, but not all of it: with
+  `dead = {1, 2}` and `free_ids = [1, 3]` where 3 is live, the counts agree and
+  a live id is queued for reuse. I took completeness over encapsulation, in a
+  package whose storage is already deliberately public.
+* **Both directions of the set equality, not just "every free id is dead".**
+  The reverse direction (every dead slot is on the free list) catches a leaked
+  dead slot, which is a leak of capacity rather than a correctness bug. I
+  included it because it is free once the scan exists and because
+  `capacity == peak live` is a promise this package makes (decision 5,
+  assumption 16), so silently losing a slot is a broken promise even when no
+  query answers wrongly.
+* **An O(capacity) scan in `check_patricia` is acceptable.** `capacity` is
+  bounded by the peak live node count, the check is already O(|R|) and is
+  called only by debug builds and `trie-inspect --verify`. Stated in decision
+  8's cost paragraph so it is a considered cost, not an accident.
+* **No sixth check.** Decision 8 fixes five names and `__init__.py` re-exports
+  them; a `check_arena` would be a public-surface change for arena accounting
+  that decision 8 already assigns to `check_patricia`. Nothing changes for
+  `BinaryTrie`, which has no arena (A5).
+* **`live_count` stays O(1) and derived.** Defining it as a count of slots with
+  `length >= 0` would make it independently true but turn
+  `PatriciaTrie.node_count` — which returns it — into an O(capacity) property
+  on a metrics path (§37's `trie_nodes`). Keeping it derived and checking it is
+  the same trade A2 made for `node_count`.
+* **`tools/trie-inspect` is not in scope.** Whether it prints the free list is
+  that tool's call; this item only makes the list readable.
+
+### A12. A mutator may raise `InvariantViolation` for corruption it cannot walk past, before mutating anything
+
+**Classification: (b).** `PatriciaTrie.add_hot_ip` reaches a node at
+`length == bit_length` whose network equals the address only when `contains()`
+has already said the address is not HOT — i.e. only when that leaf's stored
+count is not 1, which no sequence of public calls can produce. The shipped code
+raises `InvariantViolation` there. Assumption 18 reserved that exception for
+`invariants.py`, so the guard was outside the ADR as written, and `BinaryTrie`
+in the same state does not raise (it increments the corrupted leaf and its
+path). Neither behaviour was decided.
+
+Ruling: **allowed, and required**, narrowly.
+
+1. A mutator that discovers, mid-walk, a broken structural invariant it cannot
+   proceed past without corrupting the structure or reading an unallocated slot
+   raises `InvariantViolation`, with decision 8's message content (the spec
+   section, the node id at fault, and the two values that disagree). It does
+   **not** repair, does not return `False`, and does not continue.
+2. **It raises before mutating anything.** The trie is left exactly as it was,
+   so no half-updated path is observable (§28) and the caller may fail without
+   having applied part of an event.
+3. **There is exactly one such site in this package**:
+   `PatriciaTrie.add_hot_ip` finding a `bit_length`-long node for the address
+   whose count is not 1. `remove_hot_ip` needs none — its walk stops at the
+   first node of length `bit_length`, which is the node `contains()` answered
+   from, so a `True` from `contains()` guarantees the walk is well defined —
+   and the query walks return `0` rather than descending past a divergence. No
+   implementation should add speculative checks elsewhere: this is a ruling
+   about a case that has nowhere to go, not a licence to validate on the hot
+   path.
+4. **`BinaryTrie` is not required to match.** §27's equivalence, and every
+   differential test that carries it, bind tries that satisfy §12. On a trie
+   that is already corrupt the two implementations may differ, and no test may
+   assert equivalence across a corrupted state.
+5. **For the worker epic (§28):** an `InvariantViolation` out of a mutator is
+   not a per-event validation error. The event that triggered it is not
+   malformed, retrying it will not help, and dead-lettering it hides a
+   structure that is already wrong. It means this process's in-memory trie is
+   untrustworthy and must be rebuilt from the snapshot plus replay (§33,
+   ADR-0011, ADR-0013) rather than kept in service. Whether that is a crash, a
+   shard stop with an alert, or an automatic reload is the worker epic's
+   decision, exactly as decision 1 left the other-family event to it.
+
+Assumptions:
+
+* **Allowing the raise rather than removing it.** The alternatives, all
+  rejected: returning `False` (reports a corrupt leaf as an ordinary redundant
+  add, and the trie stays broken); setting the count to 1 and carrying on
+  (repair — decision 8 already rules that the checks never repair, and a
+  mutator is a worse place to do it silently); dropping the guard (the walk
+  then steps to `NO_NODE` and indexes the storage lists with `-1`, which in
+  Python reads the last slot instead of failing, so the operation would mutate
+  an unrelated node's counts); and incrementing the leaf and its path to match
+  `BinaryTrie` (makes the corruption worse and still leaves a leaf whose count
+  is not 1). A loud failure that changes nothing is the only one of the five
+  that neither hides the bug nor compounds it.
+* **`InvariantViolation`, not `ValueError`.** Nothing is wrong with the
+  argument; §12's invariant is broken.
+  `hammertime.core.errors.InvariantViolation` already exists and its docstring
+  already names §12.
+* **"Exactly one site" is a statement about the current algorithms.** I derived
+  it by reading the shipped walks rather than by proof: `contains()` and
+  `remove_hot_ip` follow the same links and stop at the same node. An
+  implementation that made those two walks differ would need this clause
+  re-examined, and should say so rather than adding a second raise site
+  quietly.
+* **Asymmetry with the oracle is accepted rather than removed.** Requiring
+  `BinaryTrie` to raise too would make the two agree everywhere, including on
+  corrupt input, at the cost of a count comparison in the oracle's add path and
+  of code whose only purpose is to reproduce a failure mode. Decision 7 wants
+  the oracle obviously correct and minimal, and equivalence over corrupt tries
+  is not a property anything needs. The consequence — a differential test must
+  not compare corrupted tries — is a test rule, listed under *Follow-ups*.
+* **The worker's response is constrained, not chosen.** I state what it must
+  not do (swallow, retry, dead-letter as malformed) because those are the
+  readings that would turn a corrupt structure into silent wrong answers, and
+  leave the mechanism to the worker epic. Nothing in the spec dictates either.
+
+### A13. `iter_prefix_counts(min_length=...)` validates its argument, at call time
+
+**Classification: (b).** Decision 2 gives `ancestor_counts` an explicit "`L`
+outside `[0, bit_length]` is a `ValueError`" and says nothing of the kind for
+`iter_prefix_counts`, which takes a `min_length` with the same name, the same
+meaning and the same natural range. Both shipped implementations therefore
+accept anything: a negative value yields every prefix, an oversized one yields
+none, and in both cases the caller is silently answered a question it did not
+ask.
+
+Ruling: `iter_prefix_counts` validates `min_length` exactly as
+`ancestor_counts` does — `0 <= min_length <= bit_length`, otherwise a
+`ValueError` naming the range and the family — and validates it **when the
+method is called**, not when the returned iterator is first advanced.
+Consequently neither implementation's `iter_prefix_counts` may be a generator
+function; each validates and then returns an iterator (for example by
+delegating to a private generator). `iter_hot_addresses` and `iter_nodes` take
+no arguments and are unchanged, as is testkit's `TrieView.iter_prefix_counts()`
+(decision 10), which declares no `min_length`.
+
+Assumptions:
+
+* **Validate rather than clamp.** Clamping (`max(min_length, 0)`, and an empty
+  result above `bit_length`) is defensible and is what the code does today by
+  accident. I chose the error because the same parameter on the same Protocol
+  already raises on `ancestor_counts`, and an interface whose two
+  length-filtered methods disagree about a bad argument is a trap for the query
+  epic that will call both.
+* **Eagerly, at the cost of the methods no longer being generator functions.**
+  A lazy check surfaces the `ValueError` at whatever later point first advances
+  the iterator, which may be inside a serializer or a comprehension far from
+  the mistake; decision 1's "the family is checked before any other argument"
+  (A9) already sets call-time validation as this package's habit. The cost is
+  one extra private method per implementation.
+* **`bit_length` itself stays a legal value** (it selects the host routes
+  alone), as it is for `ancestor_counts`.
+* **No `CHANGES` entry.** Assumption 25 still holds: nothing outside this
+  package's own tests calls `iter_prefix_counts` yet, so no deployment
+  behaviour changes. The entry belongs to the change that makes the trie
+  service consume the structure.
+* **Nothing is ruled about the read API.** `docs/protocol/read-api-v1.md`'s
+  `GET /prefixes/hot` takes `?minimal=true` and no length parameter today; if
+  the query epic ever exposes one, translating a user value into a 4xx is its
+  job, not this package's.
+
+### Follow-ups (not part of this amendment; for the top-level session to dispatch)
+
+Amendment 1's four follow-ups are **still open and still wanted** — none of
+them was done when the structure landed. Restated with what each must show, and
+joined by what A11-A13 add:
+
+* `test-author`: no randomized test calls `check_trie` or `check_patricia`.
+  Consequence (2) of this ADR says the second acceptance criterion is
+  "`check_trie` after every step of a randomized sequence", and only the
+  testkit `assert_*` helpers run there today. The service-side checks must run
+  on every step of the property-test sequences as well; they are a different
+  audience and a different failure mode (decision 10, rule 2), and
+  `check_patricia`'s representation clauses have no other randomized coverage.
+* `test-author`: decision 1's `ValueError` is asserted only for `add_hot_ip`
+  and `remove_hot_ip`; `contains`, `hot_count`, `ancestor_counts` and
+  `longest_matching_prefix` need it too, as does the both-wrong call where the
+  family must be reported ahead of a bad `min_length` (A9).
+* `test-author`: `arena.capacity == len(network) == len(hot_count) ==
+  len(child) // 2`, growth by exactly one slot, and LIFO reuse order are
+  pinned only indirectly, through `test_oscillation_never_grows_the_arena`'s
+  `(node_count, capacity)` pairs (A4, decision 5 promise 2).
+* `test-author`: `check_patricia`'s representation clauses are largely
+  untested — the cycle and shared-subtree clauses ("no id reached twice"), an
+  out-of-range or negative child id, a one-child node, a wrong branch bit, a
+  network with host bits set, and the storage-list-length clause (A2,
+  decision 6).
+* `test-author` (A11): the new free-list clauses, each with a corruption that
+  only it can catch, plus `allocate(length=-1)` raising `ValueError`.
+* `test-author` (A12): `PatriciaTrie.add_hot_ip` against a leaf whose count has
+  been corrupted raises `InvariantViolation` and leaves every observable
+  unchanged. No test may assert Patricia/binary equivalence on a corrupted
+  trie.
+* `test-author` (A13): both implementations reject a `min_length` outside
+  `[0, bit_length]` on `iter_prefix_counts`, at call time rather than on first
+  advance, and `min_length == bit_length` is accepted.
+* `coder` (A11, A13): the arena's `free_ids`, `check_patricia`'s free-list
+  clauses, and eager `min_length` validation in both implementations. A12
+  requires no code change — the shipped guard already conforms — beyond citing
+  the amendment where the guard is written.
+* `test-author`, optional, unchanged from Amendment 1: the three test files'
+  module docstrings list assumptions that later amendments have pinned, and
+  could cite the amendments instead.
