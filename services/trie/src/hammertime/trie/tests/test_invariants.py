@@ -1075,6 +1075,45 @@ class TestFreeListClauses:
         with pytest.raises(InvariantViolation):
             check_trie(trie)
 
+    def test_a_dead_slot_missing_from_the_free_list_is_caught(self, family: AddressFamily) -> None:
+        """A11's reverse clause: every slot with `length < 0` is in `free_ids`.
+        Slot y is released, then popped off the free list by hand, so it is
+        dead but unlisted -- a leaked slot that no `allocate` will ever reuse.
+
+        Unlike the cases above, this state also breaks a pre-A11 clause:
+        decision 5 makes `live_count == capacity - free_count`, so the leak
+        inflates `live_count` past `len(R)` and `len(R) == live_count` fires
+        too. A11 keeps the reverse clause anyway for diagnosis: it names the
+        leaked slot. Decision 8 pins that a message names the node id at
+        fault, so the `check_patricia` message must mention y. Many slots are
+        freed first so that y's id (41) differs from every count in play (5,
+        6, 36, 42) and cannot match the message by coincidence."""
+
+        trie = _adds_only(family)
+        arena = trie.arena
+        extra = [arena.allocate(network=0, length=0) for _ in range(37)]
+        assert extra == list(range(5, 42))
+        for node in extra:
+            arena.release(node)
+        assert arena.free_ids[-1] == 41
+        y = arena.free_ids.pop()
+        assert y == 41
+        assert arena.is_live(y) is False
+        assert arena.length[y] < 0
+        assert y not in arena.free_ids
+        dead = {i for i in range(arena.capacity) if arena.length[i] < 0}
+        assert dead == {*arena.free_ids, y}
+        # Decision 5: capacity == len(length); live_count == capacity - free_count.
+        assert arena.capacity == len(arena.length) == 42
+        assert arena.free_count == len(arena.free_ids) == 36
+        assert arena.live_count == arena.capacity - arena.free_count == 6
+        assert len(list(trie.iter_nodes())) == 5  # len(R), walked by link (A3)
+        with pytest.raises(InvariantViolation) as excinfo:
+            check_patricia(trie)
+        assert str(y) in str(excinfo.value), str(excinfo.value)
+        with pytest.raises(InvariantViolation):
+            check_trie(trie)
+
     @pytest.mark.parametrize("where", ["capacity", "no-node"])
     def test_an_out_of_range_free_list_entry_is_caught(
         self, family: AddressFamily, where: str
