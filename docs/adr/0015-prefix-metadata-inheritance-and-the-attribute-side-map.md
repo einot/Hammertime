@@ -1,6 +1,21 @@
 # ADR 0015 — Prefix metadata lives in prefix-keyed side maps: two combine directions, and the per-IP attribute record coupled to the hot-count step
 
-Status: accepted
+Status: accepted; amended 2026-09-23 (see "Amendment 1" at the end — three
+gaps `test-author` hit while writing epic #9's tests from this ADR, and four
+more found while ruling them, are ruled: decision 2's worked example is
+corrected, because a `/23` at 25 % *is* the mean of its two `/24` halves at
+50 % and 0 %, and a `/24` beside a `/25` now shows that averaging is wrong;
+`prefix in store` raises the family `ValueError` for a `Prefix` of the other
+family and answers `False` for anything that is not a `Prefix`; `declare`
+refuses a document that is not a `Mapping` of `str` to
+`Tags`/`Bitmask`/`Override` with a `TypeError`, and a declaration that would
+give a key two kinds on one path with a `ValueError`; each value type checks
+its field's type when it is built; and the combine functions refuse an
+operand that is not one of the three kinds with a `TypeError`. Each edit is
+in place with a dated note and is listed there. Only the path ruling changes
+a behaviour the text implied — such a declaration used to be accepted, and
+every read through it failed; the other rulings correct an example, confirm
+a reading or state what was unstated)
 
 Scope note: this ADR settles the interfaces epic #9 ("Metadata inheritance &
 hot-count aggregation") implements against —
@@ -182,9 +197,23 @@ def ancestor_stats(
 * **`capacity` and `hot_ratio` are functions of the prefix and the count, never
   of the parts.** `hot_ratio` is recomputed at each level from that level's
   `hot_count` and `capacity`; ratios are never summed or averaged upward. This
-  is the mistake the type exists to prevent: a `/24` holding 128 HOT addresses
-  is at 50 %, and with an empty sibling `/24` its parent `/23` is at 25 % —
-  which is neither the sum nor the mean of its children's ratios.
+  is the mistake the type exists to prevent. A `/24` holding 128 HOT addresses
+  is at 50 %; beside an empty sibling `/24`, their parent `/23` holds 128 of
+  512 addresses, 25 % — not the sum of the two ratios (50 %). It is their
+  mean, though, as it always is for the two equal halves of a prefix (halves
+  holding `h0` and `h1` under a parent of capacity `c` give
+  `(h0 / (c/2) + h1 / (c/2)) / 2 == (h0 + h1) / c`), so equal halves cannot
+  tell recomputing from averaging. Parts of unequal size can: under a `/23`, a
+  `/24` holding 128 HOT addresses (50 %) and a `/25` beside it holding 64
+  (50 %) give the parent 192 of 512, 37.5 % — neither the sum (100 %) nor the
+  mean (50 %) of the parts' ratios, nor their capacity-weighted mean (192 of
+  the 384 addresses the parts cover, 50 %). Summing and averaging are each
+  right only for particular shapes of parts — the mean for two equal halves,
+  the sum for shards that report the same prefix (assumption 15) — whereas
+  the summed `hot_count` over the parent's own `capacity` is right for every
+  shape, and is all that `aggregate` and `PrefixStats` compute. *(Corrected
+  2026-09-23, Amendment 1 ruling 1; the superseded sentence is quoted
+  there.)*
 * **`hot_ratio` (float) is for presentation only** — `read-api-v1.md`'s
   `hot_ratio`, `schemas/prefix_stats_event.v1.json`'s optional `hot_ratio`. It
   delegates to `Prefix.hot_ratio`, which computes the ratio exactly as a
@@ -259,6 +288,18 @@ registry keyed by name and not on a guess from the underlying Python type (an
 a declaration can say which). Two different kinds under one key is a
 declaration error — `ValueError` naming the key and both kinds — not a merge.
 
+**Every value is checked when it is built**, so no malformed value exists for
+`declare` or `combine` to meet — which is why both ask only which kind a value
+is. `Tags.values` must be a `frozenset` whose every member is a `str`
+(`Tags.of(*names)` builds one); `Bitmask.bits` must be an `int` that is not a
+`bool`, and `>= 0`; `Override.value` must be a `str` or an `int`, a `bool`
+included (assumption 3's three types). A wrong type is a `TypeError` from the
+constructor — `Tags(frozenset({1}))`, `Tags({"a"})`, `Tags.of("a", 1)`,
+`Bitmask("3")`, `Bitmask(True)`, `Override(None)`, `Override([1])` and
+`Override(1.5)` all raise one — while `Bitmask(-1)`, the right type with a bad
+value, stays assumption 5's `ValueError`. The messages' wording is not part of
+the contract. *(Added 2026-09-23, Amendment 1 ruling 5; assumption 46.)*
+
 A document is a mapping from name to value. `combine(a, b)` takes the union of
 the keys; a key present in both is `combine_values(a[k], b[k])`, a key present
 in one is carried through unchanged — so **absence is the per-key identity**,
@@ -267,6 +308,19 @@ ancestor contributes nothing and can be skipped rather than stored as an empty
 document. `combine_path(documents)` is the left fold of `combine` over an
 iterable ordered **least-specific first**, starting from `EMPTY_METADATA`;
 that order is §16's path order and is what gives `Override` its meaning.
+
+**The combine functions check their operands' shape before they combine
+anything**, with the `TypeError` `declare` uses (decision 4). An operand of
+`combine_values` that is not a `Tags`, `Bitmask` or `Override` is a
+`TypeError` whatever the other operand is; the mixed-kind `ValueError` is only
+for two valid values of different kinds. `combine` checks both documents whole
+— each must be a `Mapping` of `str` to one of the three kinds — before it
+combines any key, so a malformed entry under a key only one operand holds is
+refused rather than carried into the result, and a pair of documents that is
+both malformed and mixed-kind is the `TypeError`. When the fault is a value
+under a `str` key, the message names that key. `combine_path` is the left fold
+of `combine`, so it raises at the first step that fails, in iteration order.
+*(Added 2026-09-23, Amendment 1 ruling 7; assumption 48.)*
 
 Laws every kind must satisfy, and which the tests pin:
 
@@ -332,12 +386,61 @@ class PrefixMetadataStore:
   descendant, and there is no propagation to bound.
 * **Family-scoped**, like everything else in this service (ADR-0014 decision
   1): a `Prefix` or `Address` of the other family is a `ValueError` naming both
-  families, checked before any other argument.
+  families, checked before any other argument. `prefix in store` is included:
+  `__contains__` raises that `ValueError` for a `Prefix` of the other family
+  rather than answering `False`, as `a in records` does (decision 5,
+  assumption 39), because `False` would read as "nothing declared" — the
+  routing bug assumption 8 scopes the store per family to catch. *(Stated
+  explicitly 2026-09-23, Amendment 1 ruling 2; assumption 43.)* The family
+  rule applies to a `Prefix` or `Address` in the place a method expects one,
+  and `__contains__` expects a `Prefix`: an argument that is not a `Prefix` at
+  all — an `Address` of either family, a `str`, `None`, an unhashable object
+  — is not a key of any family and is simply absent: `False`, never an
+  exception, as a non-`Address` is for `a in records` (decision 5). An
+  `Address` is not read as its host route. *(Added 2026-09-23, Amendment 1
+  ruling 4; assumption 45.)*
 * `declare` replaces any existing declaration for that exact prefix and stores
   an immutable copy of the document; `revoke` returns whether anything was
   removed; `declarations()` yields every declaration sorted ascending by
   `(length, network)`, which is the fold order and is deterministic across
   runs.
+* **`declare` refuses a document that is not `Metadata`, with a `TypeError`.**
+  The document must be a `collections.abc.Mapping` whose every key is a `str`
+  and every value an instance of `Tags`, `Bitmask` or `Override`. Anything
+  else is a `TypeError`: a non-mapping, a non-`str` key, or a bare value such
+  as an `int`, a `str` or a `set`. A non-mapping includes `None` — unlike
+  `record()`, `declare` has no default document, and `revoke` is the explicit
+  removal (assumption 10) — and a list of `(name, value)` pairs, even though
+  `dict()` would accept one. When the fault is a value under a `str` key, the
+  message names that key. A bare value is refused rather than wrapped for
+  decision 3's reason: an `int` is a `Bitmask` or an `Override` only because a
+  declaration says which. The check runs after the family check, so a
+  `Prefix` of the other family with a bad document is the family
+  `ValueError`. It runs on the copy `declare` would store and completes
+  before the store changes: a refused `declare` leaves the store's length, its
+  `declarations()` and any earlier declaration on that prefix exactly as they
+  were. It checks each value's kind, not its contents: every value's own rules
+  are enforced when it is built (decision 3). A document with several faults
+  may be reported for any of them. *(Added 2026-09-23, Amendment 1 ruling 3;
+  assumption 44.)*
+* **`declare` refuses a declaration that would give a key two kinds on one
+  path**, so that no read of the store can meet decision 3's mixed-kind
+  `ValueError`. After the family and document checks, and before the store
+  changes, `declare(P, document)` compares each key of `document` with the
+  declaration on every other prefix that contains `P` or that `P` contains; if
+  one holds the same key with a different kind, it raises `ValueError` naming
+  the key, both kinds and that prefix, and the store is unchanged. `P`'s own
+  current declaration, which the call would replace, is not compared. Two
+  prefixes neither of which contains the other may use one key with different
+  kinds, since no path passes through both — though a later declaration of
+  that key on a prefix containing both is then refused, since it must
+  conflict with one of them. With values checked when they are built
+  (decision 3) and documents at `declare`, it follows that `local`,
+  `inherited`, `effective_for_prefix` and `effective` raise nothing but the
+  family `ValueError` for an argument of the type they take. The check costs
+  a pass over the existing declarations; `declare` is an operator action on a
+  hand-written map (assumption 9), and lookups are unaffected. *(Added
+  2026-09-23, Amendment 1 ruling 6; assumption 47.)*
 
 ### 5. The per-IP attribute records: a read-only `Mapping[Address, IpAttributes]`, family-scoped, validated on every write by the one shared §46.2 validator, never interpreted
 
@@ -695,14 +798,18 @@ not dictate. Push back on them individually.
 3. **`Override.value` is `str | int | bool`.** Nothing specified a type. `None`
    is excluded so that "declared as nothing" and "not declared" stay distinct;
    containers are excluded because a container with an override rule is almost
-   always a `Tags` in disguise.
+   always a `Tags` in disguise. *(Enforcement stated 2026-09-23, Amendment 1
+   ruling 5: any other type — `None`, a container, a `float` — is a
+   `TypeError` from the constructor; assumption 46.)*
 4. **Idempotence is required of every kind.** Nothing asked for it; all three
    kinds have it for free, and requiring it means a declaration applied twice,
    or a path folded twice, cannot drift. It does bar a future "sum" or "append"
    kind — which is deliberate, and is the point at which someone should amend
    this ADR rather than quietly add one.
 5. **`Bitmask.bits >= 0`, enforced with `ValueError`.** A negative mask ORs to
-   a nonsense width in Python's arbitrary-precision integers.
+   a nonsense width in Python's arbitrary-precision integers. *(Amendment 1
+   ruling 5, 2026-09-23, adds a type check ahead of it: a `bits` that is not an
+   `int`, or that is a `bool`, is a `TypeError`; assumption 46.)*
 6. **No key grammar for metadata names, and no `x_` namespace.** §46 has both
    because its documents cross the wire and are produced by another service;
    metadata does neither yet. Adding a grammar later invalidates no stored
@@ -728,6 +835,12 @@ not dictate. Push back on them individually.
 10. **`declare` stores whatever document it is given, including
     `EMPTY_METADATA`.** Treating an empty document as a revoke would be a
     convenience that makes `len(store)` mean two things. `revoke` is explicit.
+    *(Qualified 2026-09-23, Amendment 1 rulings 3 and 6: "whatever document"
+    now means any well-formed document that gives no key a second kind on its
+    path — `declare` refuses a malformed one with a `TypeError` and a
+    path-conflicting one with a `ValueError`. The point of this assumption
+    stands: `EMPTY_METADATA`, which is well-formed and conflicts with nothing,
+    is stored as a declaration, never read as a revoke.)*
 11. **`local`, `inherited`, `effective_for_prefix` and `effective` are four
     separate methods.** Two would do (`local` and `effective`). I kept all four
     because the epic's acceptance criterion is precisely that local and
@@ -997,6 +1110,120 @@ not dictate. Push back on them individually.
     instance, decoding the event and reporting its document as rejected instead
     of failing the envelope) is a change to the codec's contract and its tests,
     and needs its own decision; it is listed as open under Consequences.
+43. **`prefix in store` raises for a `Prefix` of the other family**
+    (Amendment 1 ruling 2). Decision 4 stated the family rule without
+    exception, and this confirms that reading rather than choosing a new one;
+    it is recorded because the question was a fair one. `False` — what a
+    container conventionally answers for something it does not hold — is
+    defensible, since an IPv6 prefix is never declared in an IPv4 store. I
+    kept the `ValueError` because assumption 8 scopes the store per family
+    precisely so that a foreign prefix is caught rather than read as "nothing
+    declared"; because decision 5 and assumption 39 made the same call for
+    `a in records`; and because a store that raised from `local(p)` but not
+    from `p in store` would reject one read and answer another about the same
+    prefix. The cost is assumption 39's: a caller holding a prefix of unknown
+    family checks `prefix.family` before asking.
+44. **A document `declare` cannot store is a `TypeError`, checked after the
+    family and before anything changes, by each value's kind rather than its
+    contents** (Amendment 1 ruling 3). The ADR fixed the document's type
+    (`Metadata`) and that the family is checked first, and nothing else about
+    a bad document. Refusing a bare value rather than wrapping it is decision
+    3's rule, not a new call. The rest is mine:
+    * *`TypeError`, not `ValueError`.* The argument is of the wrong type, and
+      Python's own convention is `TypeError` for that and `ValueError` for a
+      right-typed argument with a bad value — the side `Bitmask(-1)` and all
+      of ADR-0014 assumption 18's `ValueError`s fall on. It also lets a caller
+      or a test tell a malformed document from the family `ValueError` (a
+      routing bug) by type rather than by message. Decision 3's mixed-kind
+      `ValueError` is a different case: there each value is a valid kind, and
+      the fault is a conflict between two declarations.
+    * *Neither `InvalidAttributesError` nor a new `HammertimeError`.* The
+      former is the error for §46.2's wire-borne document, and metadata has
+      no wire form. A domain error type would signal bad *input*; until a
+      declaration source exists (assumption 7) every caller is in-process
+      code, so a malformed document is a bad *call* — and whatever source is
+      designed later has to parse its own format before it can build a value
+      at all.
+    * *All-or-nothing, checked on the copy that is stored.* Nothing required
+      it; it mirrors `record()` (decision 5), so every stored declaration is
+      one that passed the check and a refused call leaves no trace.
+    * *Kind, not contents.* Each kind's rules live in one place, where the
+      value is built, rather than being repeated by the store.
+    * *`None` is refused rather than read as "empty".* `record()` has a
+      default document because §46.5 and `read-api-v1.md` define one; nothing
+      defines a default declaration, and assumption 10 already keeps "declared
+      empty" (`EMPTY_METADATA`) distinct from "not declared".
+    * *The message names the offending key when that key is a `str`.* Its
+      wording is otherwise not part of the contract, and neither is which
+      fault is reported for a document with several — the terms decision 5
+      sets for the attribute validator.
+45. **`__contains__` answers `False` for anything that is not a `Prefix`**
+    (Amendment 1 ruling 4) — an `Address` of either family, a `str`, `None`,
+    an unhashable object. Nothing specified it, and `__contains__` takes
+    `object` (Python's container protocol), so it needs an answer for every
+    object. `False` mirrors decision 5's "a key that is not an `Address` at all
+    is simply absent", so the store and the record map treat a wrong-typed
+    probe alike. The alternative, a `TypeError`, would catch an `Address`
+    passed where a `Prefix` was meant; I did not take it because `in` asks
+    about membership, and something that can never be a member is not a
+    routing bug the way a right-typed key of the wrong family is
+    (assumption 43). An unhashable argument answers `False` as well, not with
+    the `TypeError` a bare `dict` lookup would raise, so the type test comes
+    before any lookup. Reading an `Address` as its host route was rejected: it
+    would give `in` a meaning no other store method has.
+46. **Each value type checks its field's type when it is built — `TypeError`
+    for a wrong type, `ValueError` only for `Bitmask(-1)`** (Amendment 1
+    ruling 5). Decision 3 and assumptions 3 and 5 gave the types and one range
+    rule, not how the types are enforced. My calls:
+    * *At construction, not at `declare` or `combine`.* Each value is checked
+      once, where it is made, so whatever holds a `Tags`, `Bitmask` or
+      `Override` holds a valid one, and `declare` and `combine` need only ask
+      which kind a value is (rulings 3 and 7).
+    * *`TypeError`*, by the convention assumption 44 sets out.
+    * *`Tags.values` must already be a `frozenset`, not any iterable of
+      `str`.* Coercing would read `Tags("abc")` as the three tags `a`, `b` and
+      `c`, and a mutable `set` inside a `Tags` would make decision 4's
+      "immutable copy" of a document mutable after all, since the copy shares
+      its values. `Tags.of(*names)` is the convenience for everything else.
+      No grammar applies to a member, as none applies to a key
+      (assumption 6).
+    * *`Bitmask` refuses a `bool`*, as the §46.2 rules do where an integer is
+      meant (S3, R2; assumption 33): a truth value is not a mask, and
+      `Bitmask(True)` would otherwise compare equal to `Bitmask(1)`.
+    * *`Override` accepts exactly assumption 3's types*, subclasses included
+      — an `IntEnum` or `StrEnum` member passes, as assumption 33 lets
+      subclasses through S4 — and refuses a `float` because the declared type
+      has none.
+47. **Two kinds for one key on one path are refused at `declare`, rather than
+    left to fail at read** (Amendment 1 ruling 6). This changes what the text
+    implied: `declare` accepted each well-formed document on its own, and
+    every read through two declarations that gave a key different kinds
+    raised decision 3's `ValueError`. Decision 3 calls that "a declaration
+    error", and left there it would surface at every later read of a subtree
+    — in a query, far from the declaration and from whoever could fix it —
+    rather than at the one call that made it. The alternative, keeping the
+    implied behaviour, is defensible for a store nothing populates yet
+    (assumption 7) and adds no code; I chose the refusal so that the query
+    epic inherits a store whose reads fail only for a routing bug. The rule is
+    path-scoped because that is exactly the set of stores whose reads can
+    fail; a store-wide "one kind per key" rule would be simpler to check but
+    would refuse declarations no read ever combines, and it is a registry by
+    first use, which assumption 2 declined. It costs a pass over the
+    declarations per `declare` — cheap for assumption 9's hand-written map —
+    and nothing per lookup. Naming the conflicting prefix in the message is
+    what lets an operator find the other half of the conflict. Nothing running
+    changes, since the store has no caller.
+48. **The combine functions refuse a non-kind with a `TypeError`, check both
+    documents whole, and check shape before combining** (Amendment 1 ruling
+    7). Nothing specified what they do with a malformed operand. `TypeError`
+    follows assumption 44. Checking every entry of both documents, not only
+    the keys they share, means a malformed entry cannot pass through
+    `combine` into a result that looks valid; the union already visits every
+    entry, so the check costs nothing that matters. Checking shape first makes
+    the exception's type independent of iteration order when a pair is both
+    malformed and mixed-kind. `combine_path` is not required to check every
+    document before it folds, because it takes any iterable, a generator
+    included, and would have to materialize it to do so.
 
 ## Consequences
 
@@ -1066,3 +1293,80 @@ not dictate. Push back on them individually.
   (assumption 25); and whether a `HotIpAdded` whose document fails validation
   at decode should still deliver its transition, which would change the
   codec's contract (assumption 42).
+
+## Amendment 1 (2026-09-23) — the three gaps `test-author` hit writing epic #9's tests, and four more found while ruling them
+
+Why: `test-author`, writing
+`services/trie/src/hammertime/trie/tests/test_metadata.py` from this ADR
+alone, reported one statement that was false, one rule whose reach was
+unclear and one behaviour the ADR left open, each with the reading its tests
+had taken (rulings 1-3). Ruling those turned up four more points the ADR left
+to whoever implemented it — `__contains__` given something that is not a
+`Prefix`, how the value types enforce their field types, one key with two
+kinds on one path, and the combine functions given something that is not one
+of the three kinds — and the coordinating session asked for them to be ruled
+here as well, so that `coder` is not left to guess (rulings 4-7). Each is
+ruled in place with a dated note, and every edit is listed here with the
+superseded wording quoted, following ADR-0009 Amendment 1's convention.
+Ruling 1 corrects an illustration and ruling 2 confirms decision 4's literal
+reading; rulings 3, 4, 5 and 7 state behaviour the ADR had left unstated;
+ruling 6 changes one behaviour the text implied (assumption 47). No schema,
+wire format or config key changes, and the store has no caller, so there is
+still no `CHANGES` entry (assumption 27).
+
+1. **Decision 2, first bullet: the worked example is corrected.** Was: "This
+   is the mistake the type exists to prevent: a `/24` holding 128 HOT
+   addresses is at 50 %, and with an empty sibling `/24` its parent `/23` is
+   at 25 % — which is neither the sum nor the mean of its children's
+   ratios." The mean of 50 % and 0 % is 25 %, and for the two equal halves of
+   any prefix the mean of their ratios always equals the parent's. The bullet
+   now keeps that example for what it does show (the sum is wrong), states
+   the identity, and adds a `/24` at 128 beside a `/25` at 64 under a `/23`:
+   37.5 %, against a sum of 100 % and a mean, plain or capacity-weighted over
+   the parts, of 50 %. The bullet's first two sentences are unchanged, and so
+   is the rule: ratios are recomputed, never combined.
+2. **Decision 4, "Family-scoped" bullet: `prefix in store` raises.** One
+   sentence and the dated note are appended: `__contains__` raises the
+   family `ValueError` for a `Prefix` of the other family rather than
+   answering `False`. Nothing already there changed. Assumption 43.
+3. **Decision 4, new bullet: `declare` refuses a malformed document with a
+   `TypeError`** — a non-mapping (`None` and a list of pairs included), a
+   non-`str` key, or a value that is not a `Tags`, `Bitmask` or `Override` —
+   after the family check, on the copy it would store, and before the store
+   changes. Inserted after the bullet beginning "`declare` replaces any
+   existing declaration"; nothing already there changed. Assumption 44.
+4. **Decision 4, "Family-scoped" bullet: anything that is not a `Prefix` is
+   absent from the store.** Two sentences and a dated note are appended after
+   ruling 2's: `__contains__` answers `False`, and never raises, for an
+   argument that is not a `Prefix` — an `Address` of either family included —
+   and does not read an `Address` as its host route. Assumption 45.
+5. **Decision 3, new paragraph after the one ending "not a merge": each value
+   type checks its field's type when it is built.** `Tags.values` is a
+   `frozenset` of `str`; `Bitmask.bits` an `int` that is not a `bool`, and
+   `>= 0`; `Override.value` a `str` or an `int`, a `bool` included. A wrong
+   type is a `TypeError` from the constructor; `Bitmask(-1)` stays a
+   `ValueError`. Dated notes are appended to assumptions 3 and 5; nothing
+   already in either changed. Assumption 46.
+6. **Decision 4, new bullet after ruling 3's: `declare` refuses a key with two
+   kinds on one path**, with a `ValueError` naming the key, both kinds and the
+   conflicting prefix, after the family and document checks and before the
+   store changes. `P`'s own replaced declaration is not compared, and
+   prefixes neither of which contains the other may differ; reads then raise
+   only the family `ValueError`. Before this, the text implied that such a
+   declaration was accepted and that every read through both raised.
+   Assumption 47.
+7. **Decision 3, new paragraph after the one ending "what gives `Override` its
+   meaning": the combine functions check shape first.** An operand of
+   `combine_values` that is not one of the three kinds is a `TypeError`
+   whatever the other is; `combine` checks both documents whole, by
+   `declare`'s rule, before it combines any key, so a pair both malformed and
+   mixed-kind is the `TypeError`; `combine_path` raises at its first failing
+   step. Assumption 48.
+
+Also: the status line, which read "Status: accepted", gained this
+amendment's clause; assumptions 43 to 48 are new; and assumption 10, which
+reads "`declare` stores whatever document it is given, including
+`EMPTY_METADATA`." and on its own would now contradict rulings 3 and 6, is
+left as written with a dated note appended: "whatever document" means any
+well-formed document that gives no key a second kind on its path, and
+`EMPTY_METADATA` is still stored as a declaration.
