@@ -16,7 +16,7 @@ binary reference, an arena-backed Patricia production trie and the invariants
 both satisfy — adds pointer notes to §9, §11, §12, §27 and §46.5; ADR-0015 —
 prefix metadata in prefix-keyed side maps, the two combine directions and the
 per-IP attribute record, validated on write and coupled to the hot-count step
-— adds pointer notes to §9, §12, §16, §17, §46.5, §46.8 and §46.9).
+— adds pointer notes to §9, §12, §16, §17, §46.2, §46.5, §46.8 and §46.9).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -50,7 +50,7 @@ Section index used throughout the code:
 | 13, 38 | `HOT_PREFIX` predicate (single implementation) | `core/state/prefix.py`, `services/detector/rules/baseline.py`, `services/trie/query`, `docs/adr/0010` |
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
 | 16, 17 | Prefix metadata inheritance | `services/trie/metadata` (`combine.py`, `local.py`), `docs/adr/0015` |
-| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013` |
+| 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013`, `docs/adr/0015` (Amendment 3 ruling 3: the codec's integer fields) |
 | 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py` incl. `partition_for`), `packages/hammertime-store` (`ShardStateStore`, incl. the shard lease), `services/ingest/publisher.py`, `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0004`, `docs/adr/0011`, `docs/adr/0013` (decisions 1, 6, 7) |
 | 22 | Consistency model | `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0003` (Amendments 2, 3), `docs/adr/0011` (decisions 4, 5), `docs/adr/0013` (decisions 4, 5, 7, 8), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
 | 23 | Dedup | `services/ingest/dedup`, `docs/adr/0003`, `docs/adr/0004` |

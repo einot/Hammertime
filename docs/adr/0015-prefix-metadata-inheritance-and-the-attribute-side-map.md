@@ -24,7 +24,18 @@ work is bounded by the size cap before it reads anything; nothing but
 `InvalidAttributesError` can come out of a document; and the record map keeps
 each record as its canonical JSON text and decodes a fresh document on every
 read, which reverses assumption 18's "Reads are not copied". Rulings A, B and
-D change shipped code; ruling C is the contract they make true)
+D change shipped code; ruling C is the contract they make true); amended a
+third time the same day (see "Amendment 3" at the end — four low-severity items
+from the re-review of Amendment 2's implementation are ruled. An integer in an
+attribute document has at most 640 decimal digits (new rule S8), so every
+stored record decodes whatever the interpreter's integer-string limit. Each
+distinct container in a document is read at most once, and Amendment 2's
+"bounded work" is narrowed to what is actually bounded. The codec's integer
+fields accept JSON integers only, and the encoder writes no non-finite number;
+the aggregator therefore skips, as malformed, an observation message with a
+non-integer in such a field instead of applying a coerced value or, for an
+infinity, stopping, which is this ADR's one `CHANGES` entry. `a in records`
+answers without decoding the record)
 
 Scope note: this ADR settles the interfaces epic #9 ("Metadata inheritance &
 hot-count aggregation") implements against —
@@ -38,7 +49,12 @@ half of §46 (§46.2, §46.3, §46.5-§46.9). It does **not** design the trie
 service's worker (§28), its read API (§29, ADR-0010 decision 4), the
 `PrefixStatsChanged` publisher (ADR-0010 decision 3), the snapshot (§32, §33,
 §46.8) or the cached `prefix_state` (§9, §12) — it states only what those need
-from this module and names the seam.
+from this module and names the seam. *(Widened 2026-09-23, Amendment 3 ruling
+3: this ADR also rules how `hammertime.core.events.codec` converts its integer
+fields and `capacity` on decode and what its encoder refuses. That defect
+predates epic #9 and is not about attributes. It is ruled here because it
+broke decision 5's "`CodecError` only" row, and no other ADR rules the codec's
+scalar fields. Assumption 64.)*
 
 It amends no prior ADR. It **implements** two that bind it: ADR-0005 decision 5
 ("the trie validates shape and size before storing") and ADR-0014 decision 9
@@ -496,8 +512,9 @@ class IpAttributeRecords(Mapping[Address, IpAttributes]):
     def discard(self, address: Address) -> bool: ...
     def clear(self) -> None: ...
 
-    # Mapping — __contains__, get, keys, items, values come from the ABC.
+    # Mapping — get, keys, items, values come from the ABC.              (Amendment 3)
     def __getitem__(self, address: Address) -> IpAttributes: ...
+    def __contains__(self, key: object) -> bool: ...    # decodes nothing  (Amendment 3)
     def __iter__(self) -> Iterator[Address]: ...
     def __len__(self) -> int: ...
 ```
@@ -568,6 +585,8 @@ structural — every document, whatever its attributes_version
   S7  nesting too deep to walk or serialize, a self-referencing
       structure, and a shared subtree repeated past the cap are
       rejections — never a RecursionError or ValueError                  cycles are NEW
+  S8  every integer, at any depth, has at most 640 decimal digits, the
+      sign not counted: -10**640 < n < 10**640                           NEW (Amendment 3)
 
 registry — only when attributes_version <= 1, the highest version this
 build knows (§46.2: a higher version is stored and echoed verbatim and
@@ -580,7 +599,12 @@ is not interpreted)
 
 *(Rows S1, S4, S6 and S7 amended 2026-09-23, Amendment 2 rulings A and B; the
 superseded rows are quoted there. Every rule applies to the canonical copy, not
-to the caller's object.)*
+to the caller's object.)* *(Row S8 added 2026-09-23, Amendment 3 ruling 1;
+assumptions 61 and 62. 640 digits is the most that every legal CPython
+configuration converts in both directions, so a stored record can always be
+decoded again. The check is an exact comparison on the copied integer, made
+after the bit-length check of "Bounded work", and never converts the
+integer to text.)*
 
 S4 and S7-on-cycles change nothing for wire input: `json.loads` produces only
 JSON-model types, string keys and acyclic structures. They exist because the
@@ -644,6 +668,13 @@ moment the total passes 1024:
    alone shows that its decimal form would push the total past 1024.
 4. The read is iterative: it holds an explicit stack of pending containers and
    never recurses per nesting level.
+5. Each distinct source container — a `dict` or a `list`, by identity — is
+   read at most once. A container met again after it has been read in full is
+   not read again: its canonical copy is copied in its place. The copy is a
+   fresh tree, so the canonical document never shares one object between two
+   positions, and the running total grows exactly as if the container had been
+   read again. A container met again while it is still being read is a cycle,
+   rejected under S7. *(Added 2026-09-23, Amendment 3 ruling 2; assumption 63.)*
 
 Each figure under-counts the real compact size, so no document whose compact
 encoding is at most 1024 bytes can be rejected by the bound; the exact size is
@@ -654,6 +685,19 @@ after O(1024) work. Nesting cannot pass 512 levels, since each level costs two
 bytes, so neither the iterative read nor the final (recursive) serialization of
 the copy can meet an unbounded depth. And no rejection depends on CPython's
 integer-to-string conversion limit.
+
+**What the cap does not bound** *(added 2026-09-23, Amendment 3 ruling 2;
+assumption 63)*. The cap bounds what is *read*. It does not bound one other
+cost: reading a `dict` means passing over its entry table, and that table can
+hold far more slots than the dict has live entries. CPython keeps the slot of
+a deleted entry until the dict is next resized, and iteration steps over it.
+One call's work is therefore O(1024) values read and copied, plus one pass over
+the entry table of each *distinct* dict in the document. Rule 5 makes it one
+pass however many times the dict is shared; without it the pass repeated with
+every occurrence. The pass is proportional to memory the caller has already
+allocated for that dict, not to the document's size. No read through the
+dict's own slots can skip it, and refusing a dict for its allocation history
+would reject documents §46.2 accepts.
 
 **What can come out** *(added 2026-09-23, Amendment 2 ruling C; assumptions 55
 and 56)*. Because nothing a document's own types define is ever called, the
@@ -687,7 +731,23 @@ serialization of the canonical copy: a `RecursionError` or `ValueError` from
 `json.dumps` there becomes an `InvalidAttributesError`. On an exact-typed,
 finite, bounded copy, that can only mean an interpreter configured with an
 integer-to-string limit below what S6 admits, or a caller already at the edge
-of the stack.
+of the stack. *(Amended 2026-09-23, Amendment 3 ruling 1: with S8 the first
+case cannot arise, because every legal limit converts every integer S8 admits.
+The `ValueError` half of the conversion stays as a backstop.)*
+
+**Three rows that hold because of Amendment 3** *(added 2026-09-23, Amendment 3
+rulings 1, 3 and 4)*:
+* `records[a]` cannot raise the integer-string limit's `ValueError` on a
+  stored record, because S8 admits only integers that every legal
+  configuration parses. `ValueError` from a read therefore still means only
+  "the other family".
+* `a in records` answers from the stored keys without decoding anything.
+* The codec's "`CodecError` only" holds for `decode` over every field of the
+  bytes it is given, not just `attributes`: an integer field now accepts only
+  a JSON integer, so a non-finite number can no longer escape its conversion
+  as an `OverflowError`. On `encode`, an integer field that does not hold an
+  `int`, a `capacity` that cannot be written as a decimal string, and a
+  non-finite float anywhere are each a `CodecError` too (ruling 3).
 
 **An `InvalidAttributesError` message never contains a value from the
 document.** It names the rule broken and, where that helps, the offending key —
@@ -746,7 +806,11 @@ The record map itself:
   rest on it: what is stored is exactly what was checked, and nobody holds a
   reference into it. *(Amended 2026-09-23, Amendment 2 ruling D, which
   replaces the bullet "Stored records are private deep copies", quoted there;
-  assumptions 57-59.)*
+  assumptions 57-59.)* Membership, `a in records`, is answered from the stored
+  keys and decodes nothing: `False` for anything that is not an `Address`,
+  the family `ValueError` for an `Address` of the other family, and otherwise
+  whether a record is stored. *(Added 2026-09-23, Amendment 3 ruling 4;
+  assumption 68.)*
 * **`serialized_bytes` is §46.8's `ip_attribute_bytes`**: the total length of
   the stored canonical texts — each the size S6 measured — so a default record
   counts 24 bytes, the length of `{"attributes_version":1}`; kept up to date by
@@ -1145,7 +1209,12 @@ not dictate. Push back on them individually.
     messages are not a behaviour anyone can depend on. Per `CLAUDE.md`'s "if you are unsure whether a change qualifies,
     it does not". The entry belongs to the change that makes the trie service
     do something. (Same reasoning as ADR-0014 assumption 25, and recorded here
-    so the implementing change does not have to re-derive it.)
+    so the implementing change does not have to re-derive it.) *(Qualified
+    2026-09-23, Amendment 3: decode now tightens in two more places, S8 and
+    the codec's integer fields, and the second changes what a running
+    aggregator does with a malformed observation message. That one change
+    carries a `CHANGES` entry; assumption 69 gives it and says why. What this
+    assumption says about epic #9's own modules stands.)*
 28. **No schema changes.** `schemas/ip_attributes.v1.json` and
     `schemas/hot_ip_event.v1.json` are unchanged and were re-read for this
     design; `validate_ip_attributes` implements the attribute schema's rules
@@ -1271,7 +1340,10 @@ not dictate. Push back on them individually.
     ipv4_records` raises rather than returning `False`, because
     `Mapping.__contains__` and `get` only absorb `KeyError` — which is the
     point. `check_attribute_records` and `assert_attribute_records_match` only
-    iterate and take `len`, so neither is affected.
+    iterate and take `len`, so neither is affected. *(Amended 2026-09-23,
+    Amendment 3 ruling 4: `in` no longer goes through `Mapping.__contains__`.
+    The map's own `__contains__` raises the same `ValueError` on purpose
+    (assumption 68), so the outcome is unchanged; `get` is as described.)*
 40. **Validation runs once per write, and the step after the trie mutation
     cannot fail.** Nothing dictated how `apply_hot_ip_added` avoids validating
     twice. The contract is what decision 6 states; the obvious implementation is
@@ -1497,7 +1569,12 @@ not dictate. Push back on them individually.
     whose `ValueError` the shipped code had to catch. One edge remains: an
     interpreter configured with a limit below the roughly 1,020 digits S6 can
     admit will reject such an integer through ruling C's narrow conversion —
-    as `InvalidAttributesError`, never as a `ValueError`.
+    as `InvalidAttributesError`, never as a `ValueError`. *(Superseded
+    2026-09-23 by Amendment 3 ruling 1: "One edge remains" no longer holds.
+    S8 admits at most 640 digits, and no legal configuration converts fewer.
+    Worse, the edge also struck reads: a record stored under a higher limit
+    could not be decoded after the limit was lowered, a `ValueError` the table
+    reserves for the family. Assumption 61.)*
 55. **No blanket `except Exception`.** Once nothing a document defines is
     called, the only exceptions a document can cause are the rules' own. A
     catch-all would add nothing for documents. What it would do is turn a bug in
@@ -1509,7 +1586,11 @@ not dictate. Push back on them individually.
     must not be answered by storing a default. The one narrow conversion — a
     `RecursionError` or `ValueError` from serializing the canonical copy — stays
     because both are conditions of the interpreter, which a document of legal
-    shape can still meet.
+    shape can still meet. *(Qualified 2026-09-23, Amendment 3 ruling 1: since
+    S8 a document of legal shape can no longer meet the `ValueError`. Every
+    legal limit prints every integer S8 admits, and the copy holds no cycle
+    and no non-finite float, so that half is a backstop only. The
+    `RecursionError` half is unchanged.)*
 56. **The threat model is data, not code.** The guarantees hold for any value
     an in-process producer can build — any nesting, sharing, cycle, size,
     subclass or override — and they hold because none of that value's code
@@ -1554,13 +1635,307 @@ not dictate. Push back on them individually.
     escaping is deterministic. A snapshot may therefore write `records[a]` back
     through the codec's serialization, or keep texts, and either way a load
     reproduces the stored bytes. I added no public accessor for the raw text:
-    nothing needs one yet, and it would widen the map's surface.
+    nothing needs one yet, and it would widen the map's surface. *(Amended
+    2026-09-23, Amendment 3 ruling 1: as written this held only while the
+    interpreter's integer-to-string limit stayed where it was when the text was
+    produced. S8 removes that condition: every integer in a stored text has at
+    most 640 digits, and every legal configuration parses and prints those.)*
 60. **Still no `CHANGES` entry** (assumption 27). For exact-type input — all
     wire input, and everything this project's producer builds — acceptance,
     sizes and encoded bytes are unchanged. What changes is observable only to
     in-process callers passing subclasses, non-`dict` mappings, or documents
     built to exhaust the old walk, and none of that is a deployment's
-    behaviour.
+    behaviour. *(Qualified 2026-09-23, Amendment 3: this covers Amendment 2's
+    changes only. Amendment 3 narrows what decode accepts, and one of its
+    changes, to the codec's integer fields, is visible to a running aggregator
+    and carries a `CHANGES` entry; assumption 69.)*
+61. **S8's number is 640, taken from CPython, not from §46.2** (Amendment 3
+    ruling 1). Primary sources, all from CPython's 3.12 branch:
+    * `Include/internal/pycore_long.h` defines `_PY_LONG_MAX_STR_DIGITS_THRESHOLD`
+      as 640 and the default limit, `_PY_LONG_DEFAULT_MAX_STR_DIGITS`, as 4300.
+    * `Python/sysmodule.c` (`sys.set_int_max_str_digits`) and
+      `Python/initconfig.c` (`PYTHONINTMAXSTRDIGITS`,
+      `-X int_max_str_digits`) accept only a limit of 0 or of at least that
+      threshold.
+    * `Objects/longobject.c` raises when printing an integer only if its
+      unsigned digit count is greater than the limit (`strlen_nosign >
+      max_str_digits`), and when parsing one only if `digits >
+      max_str_digits`. Both comparisons sit inside an outer test against
+      `_PY_LONG_MAX_STR_DIGITS_THRESHOLD` (on the printing side that count
+      includes the sign), so an integer of at most 640 digits is never
+      refused, whatever the limit.
+
+    So an integer of at most 640 digits converts in both directions under
+    every configuration any process can have, and one of 641 does not under
+    the lowest. I read these files through a fetch tool that quotes and
+    summarizes; the constants and comparisons above are quoted, and the tests
+    pin the one premise they can see, `sys.int_info.str_digits_check_threshold
+    >= 640`. *(Checked again 2026-09-23 while completing this amendment. The
+    header is installed here and was read directly:
+    `/usr/include/python3.12/internal/pycore_long.h`, lines 29-42, defines
+    both constants and describes the threshold as one that "Acts as a
+    guaranteed minimum size limit for bignums that applications can expect
+    from CPython". The three `.c` files were fetched again from
+    `raw.githubusercontent.com/python/cpython/3.12/`, through the same kind of
+    quoting tool, and each quoted condition above was found as stated,
+    including the outer test.)* Alternatives rejected:
+    * *Documenting the edge instead.* `ValueError` from a read would then mean
+      either a routing bug or an interpreter setting changed since the record
+      was written, and a reader could not tell which. §46.8's snapshot fidelity
+      would also depend on how the loading process was configured.
+    * *A tighter "interoperable" cap* (2**53, 64 bits). There is no spec basis
+      for one, and it would refuse integers §46.2 admits for the sake of other
+      languages' parsers, which the pass-through rule leaves to consumers.
+    * *Reading the threshold from `sys.int_info` at run time.* A wire rule must
+      not vary with the interpreter; the test pins the premise instead.
+    * *Decoding stored text with a `parse_int` that converts a long digit
+      string in pieces* (added while completing this amendment). That would
+      make the map's own reads independent of the limit with no new rule. It
+      was rejected for three reasons. It puts a hand-written integer parser on
+      the read path. It does nothing for a snapshot read back through the
+      codec, or by another consumer. And it leaves the next point open.
+
+    One more thing S8 settles (also added while completing this amendment).
+    Before it, whether `decode` accepted an attribute integer of 641 to about
+    1,020 digits depended on the decoding process's limit: the default
+    accepted it, and a limit of 640 failed it at parse. With S8 every process
+    refuses it. What still varies is the *cause*. Under a limit below the
+    integer's length, `json.loads` fails before the validator runs, so the
+    `CodecError` carries no `InvalidAttributesError` and assumption 37's worker
+    does not count it in `attributes_rejected`. That was already so above
+    4,300 digits under the default limit, and it changes no outcome.
+62. **S8 narrows what decode accepts, like S5 on keys, at no cost to any
+    producer** (ruling 1). A hot-ip event whose attributes hold an integer of
+    641 to about 1,020 digits used to be accepted and is now a `CodecError`,
+    and — assumption 42 — the event is lost at decode. R2 caps `weight` at
+    1,000,000, this project's aggregator writes no other number, and an integer
+    that long is nothing the §46.2 document exists to carry. No stored record
+    predates S8 and needs migrating: the record map lives in memory, no
+    snapshot format has shipped, and the trie service has no worker yet.
+    *(Added while completing this amendment.)*
+    * *S8 is a bound, like the size cap, not a narrowing of "any JSON value".*
+      §46.2 says an `x_` key carries "any JSON value", and its "Bounds" list
+      already caps how large that value may be. S8 adds a second bound of the
+      same kind and still admits every kind of JSON value it admitted before.
+      That is why it is recorded as a pointer note under §46.2's bounds and
+      the section's own text is unchanged. I tried to check RFC 8259 on
+      whether JSON itself lets an implementation limit the numbers it
+      accepts, but its hosts are blocked by this environment's egress proxy.
+      That was not checked, and nothing here rests on it.
+    * *It reaches the registered names too.* An `attributes_version` of 641
+      to about 1,020 digits used to pass S3 as a version above 1 and was
+      stored verbatim. It is now refused. A `weight` that long was already
+      refused by R2.
+63. **Each distinct container is read once, and the work claim is narrowed to
+    match** (ruling 2).
+    * *The evidence.* The auditor's reproduction, repeated by the session, is a
+      plain dict with 10**6 deleted slots and one live entry, shared 140 times
+      under an `x_` key: 1,012 compact bytes, so accepted. It took 0.17 s,
+      against 0.0015 s for one `dict(E)`, because the pass over the entry table
+      repeated with every occurrence. CPython's `Objects/dictobject.c` (3.12)
+      shows why. Deleting an item marks its hash-index slot `DKIX_DUMMY` and
+      sets the key and value of its entry to NULL. The entry stays in the
+      entries array, still counted in `dk_nentries`, until the dict is
+      resized, and iteration steps over it. `ma_used`, what `len()` reports,
+      counts only the live ones. I read that through a summarizing fetch, so
+      the measurement, not my reading, is the evidence. *(Reworded while
+      completing this amendment, after a second fetch of the file. The draft
+      quoted "Dummy slots cannot be made Unused again", which describes the
+      hash index, as though it described the entries iteration walks. It also
+      said that only `.popitem()` shrinks the entries count; the file shows
+      `popitem()` decrementing `dk_nentries`, and a resize rebuilding the
+      array, but the fetch did not show that nothing else does.)*
+    * *Why both fix and narrow.* Reading each container once removes the factor
+      sharing puts on the pass: up to about 500, since an emptied dict costs 2
+      bytes per occurrence. Narrowing the claim is honest about the pass that
+      remains. Nothing that reads a dict through its own slots can avoid it,
+      and refusing a dict for its allocation history would be a rule §46.2 does
+      not have.
+    * *Why strings are not included.* A string's cost is its length, which the
+      bound already charges on every occurrence.
+    * *The memo.* It is keyed by the `id()` of containers read in full. The
+      document keeps every source object alive for the whole call, so no id is
+      reused within it. The copy made for a repeat is itself iterative — for
+      instance, the stored canonical copy read through the same reader, whose
+      dicts are freshly built and so hold no deleted slots.
+    * *What is tested.* The once-per-container property shows only in time, so
+      it is reviewed rather than tested; ADR-0014 assumption 17 already rules
+      out wall-clock assertions in CI. The tests pin that the result is
+      unchanged and that the canonical document stays a tree.
+    * *What a repeat charges* (added while completing this amendment). It
+      charges what reading the container again would have charged, meaning
+      the running bound's own figure for it, not its exact compact size.
+      Charging the exact size would also be sound, since neither figure
+      over-counts, but it would need a second measure of size beside the
+      running one. The choice cannot be seen from outside. Both figures
+      reject nothing of at most 1024 bytes, and the exact size is measured
+      afterwards either way.
+    * *Lists as well as dicts* (added while completing this amendment).
+      Iterating a list touches exactly its items, which the bound already
+      charges, so only dicts need rule 5 for the work claim. It covers lists
+      too so that there is one rule for "met again", one memo, and one reason
+      the canonical document is a tree.
+    * *Sharing is not refused* (added while completing this amendment). A
+      document that repeats a container is valid JSON-model input once
+      copied, because its copy is a tree. A producer can build one without
+      meaning to, for instance one constant dict placed under two keys.
+      Refusing it would reject documents §46.2 accepts.
+64. **The codec's integer fields accept exactly a JSON integer, by S3's
+    definition** (ruling 3): an `int` that is not a `bool`, or a finite `float`
+    with no fractional part. That is JSON Schema's `"integer"`, which every
+    schema here uses for these fields. *(Corrected 2026-09-23, while
+    completing this amendment. The payload schemas use it; the envelope has no
+    schema file. Its three integer fields are `int` in `EventEnvelope`
+    (`hammertime.core.events.envelope`), and the same rule is applied to
+    them. JSON Schema Validation 2020-12, §6.1.1, defines `"integer"` as
+    matching "any number with a zero fractional part". That was read at
+    `json-schema.org/draft/2020-12/json-schema-validation` through a quoting
+    fetch tool.)*
+    * *The minimal fix* — add `OverflowError` to the `except` tuples — was
+      rejected. `int()` also silently accepts what the schemas forbid: `"5"`,
+      `true` (as 1) and `5.9` (truncated to 5). The last is worse than lax:
+      `sequence` feeds `event_id` (ADR-0003, ADR-0004), so a truncated sequence
+      can take another event's identity.
+    * *Exact `int` only* was rejected too. JSON Schema admits `5.0`, a
+      non-Python producer may write it, and S3 and R2 already accept it.
+    * *Which fields* (added while completing this amendment). The rule covers
+      every field the codec converts to `int` on decode, and no other: the
+      three envelope fields and the eight payload fields ruling 3 lists. A
+      payload property the codec does not read, such as
+      `hot_ip_event.v1.json`'s `shard`, is not checked, because it is
+      ignored.
+    * *In the codec, not in the aggregator* (added while completing this
+      amendment). ADR-0011 decision 3 step 1 already says that any decode
+      failure is `MALFORMED` and that "A poison message never stops the
+      consumer". The aggregator's `_decode` relies on the codec's contract and
+      catches only `CodecError`. Keeping that contract in the codec fixes
+      every consumer at once. Widening the aggregator's `except` would fix
+      one, and a catch-all there would also turn a codec bug into a silently
+      dropped message (assumption 55's reason, applied to the consumer).
+    * *`OverflowError` joins the `except` tuples anyway* (added while
+      completing this amendment). Once the type check is in, nothing in those
+      blocks can raise it. It is added so that a field added later without
+      the check still fails as a `CodecError`. This is my call, and it costs
+      nothing.
+65. **`capacity` accepts only a string of ASCII decimal digits.** The schema
+    says "decimal string". Python's `int()` also accepts a sign, surrounding
+    whitespace, underscores and non-ASCII decimal digits, none of which the
+    schema means, and a JSON number, which it forbids. No length cap is added:
+    an over-long string meets `int()`'s own limit, whose `ValueError` is a
+    `CodecError`, and the largest capacity §3 defines, 2**128, has 39 digits.
+    *(Added while completing this amendment.)* At least one digit is
+    required, so `""` is refused. Leading zeros are accepted, so `"007"`
+    decodes as 7. "Decimal string" does not forbid them, and refusing them
+    would add a rule the schema does not state. The encoder never writes one,
+    because it writes the decimal string of an `int`.
+66. **The encoder refuses what the decoder would refuse, and writes no
+    non-finite number** (ruling 3).
+    * Each integer field must hold an `int` that is not a `bool`. This is
+      stricter than decode, which also admits an integral `float`, because a
+      float would break the `event_id` round trip: the id is derived from the
+      value's text, and `5.0` is not `5`. *(Added while completing this
+      amendment.)* JSON Schema Core 2020-12, §6.3 ("Mathematical Integers"),
+      says the same for any producer: "integer JSON numbers SHOULD NOT be
+      encoded with a fractional part". That was read at
+      `json-schema.org/draft/2020-12/json-schema-core` through a quoting fetch
+      tool. A subclass of `int` other than `bool`, such as an `IntEnum`
+      member, is accepted, as the payload models' `int` annotations allow,
+      and `json` writes it as its number. This is my call. Refusing
+      subclasses would buy nothing here, because the envelope is built by
+      this project's own code. Decision 5's hostile-subclass threat model is
+      about attribute documents, not envelope fields.
+    * `capacity` must be such an `int` and `>= 0`, so that its decimal string
+      is digits only. *(Added while completing this amendment.)* That string
+      is produced where the encoder turns failures into a `CodecError`, so a
+      capacity too long for the interpreter's integer-string limit is a
+      `CodecError`, not the `ValueError` that `str()` raises. Decode refuses
+      such a string through `int()`'s own limit (assumption 65), so the
+      encoder refuses what the decoder would. No producer comes near it:
+      §3's largest capacity has 39 digits.
+    * `json.dumps(..., allow_nan=False)` makes a non-finite float anywhere a
+      `ValueError`, which the encoder already turns into a `CodecError`. The
+      json module's own docstring says the flag refuses `nan`, `inf` and
+      `-inf` "in strict compliance of the JSON specification"
+      (`/usr/lib/python3.12/json/__init__.py`, lines 200-203). Canonical
+      attributes never hold one (S4), so the flag is a backstop for every
+      other field.
+67. **Decode does not reject `NaN` or `Infinity` at parse time.**
+    `json.loads(..., parse_constant=...)` could; the same docstring, lines
+    325-328, offers it for exactly this, and it would make decode strict JSON.
+    I did not take it, because those tokens matter in only two places. In an
+    integer field ruling 3 now rejects them. Inside `attributes` S4 rejects
+    them, with the `InvalidAttributesError` cause that assumption 37's
+    `attributes_rejected` count depends on; rejecting them at parse would turn
+    that into an unattributed envelope error. In an ignored field they change
+    nothing.
+68. **Overriding `__contains__` is consistent with decision 5's table**
+    (ruling 4). The inherited `Mapping.__contains__` goes through
+    `__getitem__`, which decodes a whole record to answer yes or no. The
+    override answers from the stored keys:
+    * `False` for anything that is not an `Address` (decision 5: "a key that
+      is not an `Address` at all is simply absent");
+    * the family `ValueError` for the other family (assumption 39);
+    * otherwise, whether a record is stored.
+
+    The outcomes are the same, without the decode. `get`, `values` and `items`
+    still go through `__getitem__`, because they need the document.
+    *(Added while completing this amendment.)* The type test comes before any
+    lookup, so an unhashable argument — a `list`, a `dict` — answers `False`,
+    as it did through the inherited method and as assumption 45 rules for
+    `prefix in store`. `a in records.keys()` gives the same answers, because
+    the ABC's keys view asks the map's own `__contains__`
+    (`/usr/lib/python3.12/_collections_abc.py`, lines 865-866:
+    `return key in self._mapping`).
+69. **One `CHANGES` entry for Amendment 3, for the aggregator** (assumptions
+    27, 60). *(Reversed 2026-09-23, while completing this amendment. The
+    draft this amendment began with was headed "No `CHANGES` entry for
+    Amendment 3". Its list and its last paragraph are kept below, and the
+    reasons for reversing it follow them.)* Rulings 1 and 3 newly reject only
+    values no producer in this project writes:
+    * an integer of more than 640 digits in an attribute document;
+    * a string, boolean, fractional or non-finite number in an integer field;
+    * a `capacity` that is not a string of digits.
+
+    The bus is internal. What changes for a deployment is that a malformed
+    message on it is now a `CodecError` — logged, counted and skipped, as the
+    aggregator's consume loop already promises for poison messages — rather
+    than an `OverflowError` that stopped the loop.
+
+    Why that last paragraph is a reason *for* an entry:
+    * *Who runs it.* The codec's decode has one consumer running today: the
+      aggregator, on `hammertime.observations.v1`. The trie service, which
+      will read hot-ip events, and the detector, which will read prefix-stats
+      events, do not run yet. The record map has no production caller. So S8,
+      and everything ruling 3 changes for hot-ip and prefix-stats messages,
+      changes nothing a deployment runs, and assumption 27's reasoning holds
+      for them.
+    * *What the aggregator did before.* A string, boolean or fraction in an
+      integer field was coerced and applied. An infinity raised
+      `OverflowError` out of `decode`. That ended the consume task, and with
+      it the service: `run_exited`, exit 1. The message stayed
+      unacknowledged, to be delivered again.
+    * *What it does now.* Each is `MALFORMED`: logged, counted in
+      `observations_rejected`, and acknowledged. ADR-0011 decision 3 step 1
+      had already promised this.
+    * *Why that qualifies.* It is changed behaviour of a running service,
+      visible in its exit status, its log and a metric, which is `CLAUDE.md`'s
+      "changed behaviour". `CHANGES` already records how the aggregator
+      treats its bus input (a redelivered observation acknowledged without
+      being applied again), and failures that became clean errors (a
+      malformed registry file reported without a traceback). The draft's
+      reason, that the bus is internal and no producer here writes such a
+      message, bounds how often this happens. It does not stop an operator
+      seeing it when it does.
+    * *Why not `BREAKING`.* No deployment needs to act. Every producer here
+      already writes integers, and the schemas already required them.
+
+    The entry is one line, for the change that implements ruling 3:
+
+        Aggregator counts an observation message whose integer field holds a string, boolean, fraction or infinity as malformed (observations_rejected) and skips it, instead of coercing the value or, for an infinity, stopping
+
+    `CHANGES` is outside this ADR's scope. The line is recorded here so the
+    implementing change does not have to re-derive it, as assumption 27 did
+    for epic #9.
 
 ## Consequences
 
@@ -1582,6 +1957,12 @@ not dictate. Push back on them individually.
   `test_ip_attributes.py` must pass unmodified. *(Amended 2026-09-23,
   Amendment 2: the codec now sends and decodes the canonical copy, and for
   exact-type input — all wire input — the bytes it produces are unchanged.)*
+  *(Amended 2026-09-23, Amendment 3: two more exceptions to "not wire
+  behaviour". Decode refuses an attribute integer of more than 640 digits
+  (S8) and a non-integer in any integer field (ruling 3). Encode refuses an
+  integer field that does not hold an `int`, and never writes `NaN` or
+  `Infinity`. The bytes every producer here writes are unchanged, and
+  `test_ip_attributes.py` must still pass unmodified.)*
 * Both acceptance criteria map to statements a test can assert without reading
   the implementation: (1) `aggregate` is order-independent, associative under
   regrouping and has an identity, and `combine` is associative/idempotent with
@@ -1620,13 +2001,24 @@ not dictate. Push back on them individually.
 * No schema changes; no wire-format changes (S5's key rule narrows what decode
   accepts, but only by strings that cannot be encoded as UTF-8 in the first
   place); no new dependency; no `CHANGES` entry (assumptions 27, 28).
+  *(Amended 2026-09-23, Amendment 3. Decode narrows twice more, both times
+  only by values no producer here writes: S8 caps an attribute integer at 640
+  digits, and the codec's integer fields accept JSON integers only. The
+  encoder no longer writes a non-finite number. Still no schema or
+  wire-format change. There is now one `CHANGES` entry, because the second
+  narrowing changes what the running aggregator does with such a message;
+  assumptions 62 and 69.)*
 * Spec pointer notes added by this ADR: §9 (where `local_metadata` lives), §12
   (what is combined upward, and that `hot_ratio` is not), §16 and §17 (the
   prefix-keyed store and the two fold directions), §46.5 (the module that holds
   the record map, validates it and applies the coupled step), §46.8 (which
   object answers each metric, and who counts rejections) and §46.9 (validation
   on write; no values in messages). `docs/spec/README.md`'s index is updated
-  for §16/§17, §46 and §46.5.
+  for §16/§17, §46 and §46.5. *(Amended 2026-09-23, Amendment 3: a pointer
+  note on §46.2 is added — where the bounds are enforced, and S8 — and the
+  README's list of ADR-0015's notes now includes §46.2. The README's §19 row
+  also names this ADR, for ruling 3's rules on the codec's integer fields.
+  §19 itself gets no note, because it says nothing about wire types.)*
 * **Open, and deliberately not settled here:** how an operator declares prefix
   metadata, and whether declarations are durable (assumption 7) — that is a
   config/protocol design of its own, and until it exists the store has no
@@ -1805,7 +2197,11 @@ met, about 2**40-2**65 visits, and would hang the single writer. A flat
 
 At most 1024 values are ever read, and no document of at most 1024 bytes can
 be rejected by the bound (assumption 54). This is S6 applied early, not a new
-limit.
+limit. *(Narrowed 2026-09-23 by Amendment 3 ruling 2. The cap bounds what is
+read, but reading a dict also passes over its entry table, deleted slots
+included, and that pass is not bounded by the cap. Amendment 3 makes it one
+pass per distinct dict and says so in decision 5, "What the cap does not
+bound". The heading's "The work is bounded" should be read in that sense.)*
 
 **C. Nothing but `InvalidAttributesError` comes out of a document.** The
 shipped code converted only `RecursionError`, `TypeError` and `ValueError`.
@@ -1980,3 +2376,292 @@ why reads still return a view in assumption 58.
   message." Now names `canonicalize_ip_attributes`, says the document is read
   once into a canonical copy and that only the copy is checked, stored and
   sent, and adds that the work is bounded by the size cap before reading.
+
+## Amendment 3 (2026-09-23) — integers capped at 640 digits, each container read once, the codec's integer fields made strict, `in` without a decode
+
+Why: Amendment 2 is implemented (head `a2810d8`, all four gates green,
+3388 tests passing). `reviewer`'s re-review and `security-auditor`'s
+supervised re-audit confirm that its rulings A-D are closed, and they raised
+four low-severity items. Each item is ruled below, in place, with dated
+notes. All four change shipped code; ruling 4's change leaves every outcome
+decision 5's table states as it was. *(This amendment was drafted by one
+architect session and completed by a second the same day, before either was
+committed. "Completed by a second session", at the end of this section, lists
+what the second added or changed.)*
+
+**1. An attribute integer has at most 640 decimal digits: new rule S8**
+(reviewer; assumptions 61 and 62).
+* *The finding.* `records[a]` decodes stored text with `json.loads`. S6
+  admitted integers the default limit prints (about 1,020 digits) but a
+  lower legal limit cannot parse, which fails in two ways:
+  - If `sys.set_int_max_str_digits` lowers the limit after such a record is
+    stored, the read raises `ValueError`, which decision 5's table reserves
+    for a family mismatch.
+  - A snapshot holding such a text cannot be parsed by a process started
+    with `PYTHONINTMAXSTRDIGITS=640`.
+
+  Either way assumption 59's fixed point fails.
+* *The ruling.* S8 (decision 5's table) refuses any integer of more than 640
+  decimal digits, sign not counted. 640 is the lowest limit any configuration
+  can set, and CPython raises only when a digit count *exceeds* the limit, so
+  every stored integer now prints and parses under every legal setting.
+  - Reads cannot raise that `ValueError`.
+  - Assumption 59's fixed point holds whatever the limit.
+  - `decode` refuses such an integer under every limit, where before
+    whether it was accepted depended on the decoding process's limit
+    (assumption 61).
+  - The `ValueError` half of ruling C's narrow conversion becomes
+    unreachable, and stays as a backstop.
+  - Assumption 54's "One edge remains" is superseded.
+  - The check is an exact comparison on the copied integer, after "Bounded
+    work"'s bit-length check.
+* *What it costs.* S6 admitted integers of up to about 1,020 digits; 641 to
+  1,020 are now refused, on the wire too. That includes an
+  `attributes_version` that long, which S3 alone passed (assumption 62). No
+  producer writes one.
+
+**2. Each distinct container is read at most once, and the work guarantee is
+narrowed to what that achieves** (auditor, reproduced by the session;
+assumption 63).
+* *The finding.* The running bound charges a nested dict by `dict.__len__`,
+  its live entries. But `dict.items` walks CPython's whole entry table,
+  deleted slots included, and walks it again for every shared occurrence.
+  "At most 1024 values read" held; "work bounded by the size cap" (decision 5,
+  Amendment 2 ruling B, the §46.9 note) did not. The session's measurement is
+  in assumption 63.
+* *The fix.* "Bounded work" gains rule 5. A container, dict or list, met again
+  after it has been read in full is not read again; a fresh copy of its
+  canonical copy takes its place, and the running total grows as though it
+  had been read. The canonical document stays a tree.
+* *The narrowing.* The new paragraph "What the cap does not bound" states the
+  one cost that remains: one pass over each *distinct* dict's entry table.
+  That pass is proportional to memory the caller already allocated, and it is
+  paid once however often the dict is shared.
+* *Why both.* The fix removes the factor that sharing put on the pass. The
+  narrowing is honest about the pass that no read through a dict's own slots
+  can avoid.
+
+**3. The codec's integer fields accept JSON integers only, and the encoder
+writes no non-finite number** (auditor; pre-existing on master `dd5bd6b`;
+assumptions 64-67).
+* *The finding.* `decode` converted integer fields with `int()` and caught
+  only `TypeError` and `ValueError`. `json.loads` accepts `Infinity`, and
+  `int(float("inf"))` raises `OverflowError`. That escaped `decode` as a
+  non-`CodecError`, against decision 5's "`CodecError` only" row, and the
+  aggregator's `_decode`, which catches only `CodecError`, would lose its
+  consume loop with the message unacknowledged. *(Stated exactly while
+  completing this amendment: the exception ends the aggregator's consume
+  task, and with it the service, `run_exited` with exit 1, against ADR-0011
+  decision 3 step 1's "A poison message never stops the consumer".)*
+
+*Decode.* Each integer field accepts exactly a JSON integer — S3's
+definition: an `int` that is not a `bool`, or a finite `float` with no
+fractional part — and converts it to `int`. The integer fields are every field
+the codec converts to `int`: the payload fields the schemas type `"integer"`,
+and the envelope's three, which `EventEnvelope` types as `int` since no schema
+file describes the envelope. *(Worded so while completing this amendment; the
+draft read "Each field the schemas type `"integer"`", which left out the
+envelope. Assumption 64.)* Anything else is a `CodecError`: a string, a
+boolean, a fractional or non-finite number, `null`, an array or an object. The
+fields are:
+* in the envelope, `schema_version`, `sequence` and `config_version`;
+* in `RequestObservation`, `sequence`, `window_seconds` and each
+  observation's `request_count`;
+* in `HotIpAdded` and `HotIpRemoved`, `sequence`, `window_count` and
+  `config_version`;
+* in `PrefixStatsChanged`, `hot_count` and `sequence`.
+
+`capacity`, a decimal string in the schema, accepts exactly a `str` of ASCII
+digits `[0-9]+`, converted with `int()`, and nothing else. So `""` is refused
+and leading zeros are accepted (assumption 65). With these checks
+`OverflowError` cannot arise. The conversions' `except` tuples add it anyway,
+so that a field added later without the check still fails as a `CodecError`.
+
+*Encode.*
+* Each integer field must hold an `int` that is not a `bool`, and `capacity`
+  must hold such an `int` `>= 0`; otherwise a `CodecError`. A subclass of
+  `int` other than `bool`, such as an `IntEnum` member, is accepted
+  (assumption 66).
+* `capacity`'s decimal string is produced where a failure becomes a
+  `CodecError`, so a capacity too long for the interpreter's integer-string
+  limit is a `CodecError`, not a `ValueError` (assumption 66).
+* The envelope is serialized with `allow_nan=False`, so a non-finite float
+  anywhere is a `CodecError`, not `NaN` on the wire.
+* Canonical attributes never hold one (S4), so this is a backstop for the
+  other fields.
+
+*`CHANGES`.* One entry, because the running aggregator now skips, as
+malformed, an observation message it used to apply with a coerced value or
+stop on. The line is in assumption 69. *(Added while completing this
+amendment. It reverses the draft's "No `CHANGES` entry"; assumption 69 says
+why.)*
+
+*What is not changed.* Decode does not reject `NaN` or `Infinity` tokens at
+parse time (assumption 67). Schema minimums and maximums are not added
+(below).
+
+**4. `a in records` answers without decoding the record** (reviewer). The
+override — `False` for a non-`Address`, the family `ValueError`, then key
+membership — gives the same outcomes decision 5's table and assumption 39
+already require. It is recorded in decision 5's reads bullet and in
+assumption 68, and, since the second session, in decision 5's interface
+sketch, whose comment had listed `__contains__` among the methods the ABC
+supplies.
+
+### Found while ruling, not ruled here (for the top-level session to schedule)
+
+* **`decode`'s error messages embed `repr` of whole payloads.** Examples are
+  `malformed RequestObservation payload: {data!r}` and `malformed observation
+  entry: {item!r}`, and the hot-ip path redacts only `attributes`. A large
+  payload therefore makes an equally large message. This predates Amendment 2
+  and is outside these findings; it wants the same "bounded, never the value"
+  rule decision 5 applies to attribute messages.
+* **String fields are coerced with `str()`.** `agent_id`, `event_id` and
+  `prefix` accept any JSON value; a number `5` becomes `"5"`. This is lax in
+  the same way ruling 3 fixes for integers, but it cannot raise, so it is not
+  part of these findings.
+* **The schemas' `minimum` and `maximum` are not enforced by the codec.**
+  Examples: `sequence >= 0`, `window_seconds` 1-3600, `request_count <= 10**9`.
+  Out of scope here.
+* **The description of `x_` values in `schemas/ip_attributes.v1.json`** could
+  mention S8 beside the 1024-byte cap it already names ("not expressible
+  here"). It is a description-only edit to `schemas/`, which this dispatch was
+  limited to `docs/` and did not make.
+
+### Follow-ups (for the top-level session to dispatch)
+
+* `test-author`, covering rulings 1-4 and the boundary cases the coordinator
+  listed: documents of exactly 1024 compact bytes built from `null`, `true`,
+  `false`, negative floats, negative ints and escaped non-ASCII strings, each
+  accepted, with one more item rejected. Rulings 1, 2 and the boundary cases
+  belong in `test_attribute_validation.py` (and, for the record map,
+  `test_metadata.py`); ruling 4 in `test_metadata.py`; ruling 3 in
+  `test_codec.py`, since it concerns the codec's own fields, not attributes.
+* `coder`, for rulings 1-4, with assumption 69's `CHANGES` line in the same
+  change as ruling 3.
+
+### Every edit outside this section, with the superseded wording quoted
+
+* **Status line.** Gained a clause naming this amendment; nothing removed.
+* **Scope note.** Gains a dated note: ruling 3 reaches the codec's integer
+  fields and `capacity`, beyond epic #9's files. Nothing removed.
+* **Decision 5, the interface sketch.** The comment above `__getitem__` was
+  "# Mapping — __contains__, get, keys, items, values come from the ABC.". It
+  no longer names `__contains__`, and a `__contains__` line is added
+  (ruling 4).
+* **Decision 5, the rules table.** Row S8 is added after S7. A second dated
+  note follows the Amendment 2 note after the table; that note is unchanged.
+* **Decision 5, "Bounded work".** Rule 5 is added after rule 4, and the new
+  paragraph "What the cap does not bound" follows the consequences
+  paragraph. Nothing in rules 1-4 or in that paragraph was reworded.
+* **Decision 5, the narrow-conversion paragraph under "What can come out".**
+  It still reads "that can only mean an interpreter configured with an
+  integer-to-string limit below what S6 admits, or a caller already at the
+  edge of the stack", and now has a dated note that S8 removes the first case.
+  It is followed by a new paragraph, "Three rows that hold because of
+  Amendment 3".
+* **Decision 5, the reads bullet** ("The map keeps each record as its
+  canonical text, and decodes a fresh document on every read"). One sentence
+  on membership is appended; nothing removed.
+* **Assumption 54.** Gains a dated note: "One edge remains: an interpreter
+  configured with a limit below the roughly 1,020 digits S6 can admit will
+  reject such an integer through ruling C's narrow conversion — as
+  `InvalidAttributesError`, never as a `ValueError`." is superseded.
+* **Assumption 59.** Gains a dated note: the fixed point now holds whatever
+  the interpreter's integer-string limit.
+* **Assumptions 27, 39, 55 and 60** each gain a dated note; nothing in them
+  was reworded. The conclusions of 27 and 60, "No `CHANGES` entry for this
+  epic" and "Still no `CHANGES` entry", now cover their own changes only,
+  because assumption 69 gives this amendment one entry. In 39, "because
+  `Mapping.__contains__` and `get` only absorb `KeyError`" no longer explains
+  `in`, which the map now answers itself, with the same `ValueError`. In 55,
+  the `ValueError` half of "both are conditions of the interpreter, which a
+  document of legal shape can still meet" no longer holds, and that half is a
+  backstop only.
+* **Assumptions 61-69** are new.
+* **Amendment 2, ruling B.** The paragraph ending "This is S6 applied early,
+  not a new limit." gains a dated note narrowing the heading "The work is
+  bounded by the size cap before anything is read."
+* **Consequences, the "`hammertime-core` changes shape but not wire
+  behaviour" bullet.** Gains a second dated note naming this amendment's
+  exceptions to "not wire behaviour"; nothing removed.
+* **Consequences, the "No schema changes; no wire-format changes" bullet.**
+  Gains a dated note; nothing removed. The bullet's own "no `CHANGES` entry
+  (assumptions 27, 28)" is left as written; the note says this amendment
+  carries one.
+* **Consequences, the "Spec pointer notes added by this ADR" bullet.** Gains a
+  dated note naming the §46.2 note and the README's §19 row; nothing removed.
+* **Spec §46.2** gains an ADR-0015 pointer note for S8.
+* **Spec §46.9's ADR-0015 note.** Was: "The validator accepts only the JSON data
+  model, bounds its work by the size cap before reading, and never puts a
+  document value into an exception message." Now: it accepts only the JSON
+  data model, bounds what it reads by the size cap, reads each container of
+  the document at most once, and never puts a document value into an
+  exception message.
+* **`docs/spec/README.md`, the preamble.** ADR-0015's list of sections with
+  pointer notes gains §46.2.
+* **`docs/spec/README.md`, the §19 row.** Its last column was "`core/events`,
+  `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`),
+  `tools/provision`, `docs/adr/0004`, `docs/adr/0013`". It gains
+  "`docs/adr/0015` (Amendment 3 ruling 3: the codec's integer fields)".
+
+### Completed by a second session
+
+The first session was stopped just after writing the text above, before
+anything was committed. A second architect session checked the draft against
+decisions 1-8, Amendments 1-2, ADR-0005, ADR-0014 and the code at `a2810d8`,
+kept every ruling, and changed the following:
+* **Reversed one conclusion: the `CHANGES` entry.** The draft's assumption 69
+  said "No `CHANGES` entry for Amendment 3". It now gives one line, for the
+  aggregator, and says why. The status line and ruling 3 now name the entry.
+  The draft's note on the Consequences bullet "No schema changes; no
+  wire-format changes" read "Still no schema, wire-format or `CHANGES`
+  change"; it now says there is one entry. New notes on assumptions 27 and 60
+  point to it.
+* **Corrected.**
+  - Ruling 3 and assumption 64 said the integer fields were those "the
+    schemas type `"integer"`". The envelope's three have no schema, so the
+    fields are now defined as those the codec converts to `int`.
+  - The status line's "under every legal interpreter configuration", ruling
+    1's "holds unconditionally" and assumption 59's note's "S8 makes it
+    unconditional" claimed more than S8 gives. They now say "whatever the
+    interpreter's integer-string limit" or "removes that condition".
+  - "Three rows"' codec bullet said "holds for every field". It now says
+    what holds for `decode` and what for `encode`.
+  - Ruling 3's finding said the aggregator "would lose its consume loop". A
+    note now says what that means: the service stops with exit 1, against
+    ADR-0011 decision 3 step 1.
+  - The "Why" paragraph said "Rulings 1-3 change shipped code; ruling 4
+    confirms an implementation change against decision 5's table". Ruling 4
+    needs code too, so it now says all four change shipped code.
+  - The §46.2 pointer note's last sentence read "No producer writes an
+    integer anywhere near that long". It now says "No producer in this
+    project".
+  - Assumption 63's evidence bullet quoted CPython's comment on the hash
+    index as though it described the entries array. It now says what the
+    source shows about deleted entries.
+* **Stated what the draft left open.**
+  - Encode accepts an `int` subclass, and `capacity`'s decimal string cannot
+    escape as a `ValueError` (assumption 66; both also in ruling 3).
+  - `capacity` requires a digit and accepts leading zeros (assumption 65).
+  - A repeated container is charged as a re-read would be. Lists are covered
+    by rule 5 too, and sharing is not refused (assumption 63).
+  - An unhashable argument to `in` answers `False` (assumption 68).
+  - Ruling 3 is fixed in the codec, not in the aggregator's `except`
+    (assumption 64). The draft's ruling 3 already added `OverflowError` to
+    the `except` tuples; assumption 64 now records that as a judgment call.
+* **Added evidence and one more alternative.**
+  - Assumption 61: the installed CPython header and a second fetch of the
+    three `.c` files; the outer threshold test; the chunked-`parse_int`
+    alternative; and the fact that S8 also makes decode's outcome independent
+    of the limit. Ruling 1 gains that last point, and names
+    `attributes_version` under "What it costs".
+  - Assumption 62: S8 read as a bound, not a narrowing of "any JSON value",
+    and its reach to `attributes_version`.
+  - Assumptions 64 and 66: JSON Schema 2020-12's definitions.
+  - The follow-ups name the test file for each ruling, and put the `CHANGES`
+    line with `coder`.
+* **Edits the draft missed.** The scope note; the interface sketch's
+  `__contains__`; dated notes on assumptions 27, 39, 55 and 60; the second note on
+  the Consequences bullet "`hammertime-core` changes shape but not wire
+  behaviour"; and the README's §19 row. All are listed above.

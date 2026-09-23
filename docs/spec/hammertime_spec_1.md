@@ -2692,6 +2692,16 @@ serialized size   <= 1024 bytes
 key count         <= 16
 ```
 
+> **ADR-0015:** these bounds are enforced in one place,
+> `hammertime.core.events.attributes`, which both the codec and the trie
+> service's record map call. The size is measured on the compact,
+> ASCII-escaped encoding. Amendment 3 adds one more bound: every integer in the
+> document, at any depth, has at most 640 decimal digits. That is the most
+> every legal CPython configuration converts in both directions, so a stored
+> record can always be decoded again, whatever the process's
+> integer-string limit. No producer in this project writes an integer anywhere
+> near that long.
+
 ## 46.3 Attribute registry
 
 | Name | Type | Produced by | Meaning |
@@ -2894,8 +2904,9 @@ are stored and echoed as opaque data.
 > through the built-in types' own slots, into a canonical copy. Only that copy
 > is checked, stored and sent, and nothing the document's own types define is
 > ever run (Amendment 2). The validator accepts only the JSON data model, bounds
-> its work by the size cap before reading, and never puts a document value into
-> an exception message.
+> what it reads by the size cap, reads each container of the document at most
+> once (Amendment 3), and never puts a document value into an exception
+> message.
 
 ---
 
