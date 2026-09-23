@@ -247,7 +247,9 @@ class MessageBus(Protocol):
     is identical either way (ADR-0009 decision 3). Moved here from
     `hammertime.aggregator.worker` by ADR-0013 decision 3, which also puts
     `end_offset` here so that the trie and the detector type their bus by
-    the interface rather than as `InMemoryBus | NatsBus`.
+    the interface rather than as `InMemoryBus | NatsBus`. `first_offset`
+    joins it so that a positional reader can tell whether the log still
+    holds anything below the end it read (ADR-0013 Amendment 10).
     """
 
     def producer(self) -> Producer: ...
@@ -262,13 +264,34 @@ class MessageBus(Protocol):
         meaning on a 1-based stream and a 0-based list (ADR-0013 decision 9,
         assumptions 20 and 33). It is what ADR-0009 decision 4's readiness
         ("replayed to the log end as it stood when `start()` began") reads
-        at `start()`: the service has replayed to the log end once every
-        delivered message with `offset < end_offset` has been applied, i.e.
-        once the last applied offset is `>= end_offset - 1`, or immediately
-        when `end_offset <= start_offset`. A positional subscription
+        at `start()`. A positional reader also reads `first_offset` after
+        it, both before subscribing, and passes every offset below
+        `max(start_offset, first_offset)`: the log holds no record there it
+        can be delivered. It has replayed to the log end once every offset
+        below `end_offset` is handled or passed -- at once when
+        `max(start_offset, first_offset) >= end_offset`, otherwise once the
+        last offset it handled is `>= end_offset - 1` (ADR-0013 decision 9
+        as amended by Amendment 10). A positional subscription
         filtered to a subset of partitions cannot use this test (the last
         message in the stream may be on a subject it does not receive), so
         the trie and the detector subscribe with `partitions=None`. `async`
         on every implementation: on `NatsBus` it is a broker round trip.
+        """
+        ...
+
+    async def first_offset(self, topic: str) -> int:
+        """The offset of the first message the log still retains for `topic`.
+
+        It is the message a positional subscription with `start_offset=0`
+        starts from. When the log retains no message it is
+        `end_offset(topic)`, the offset the next appended message will
+        receive, so "the log holds no message below `end`" is the single
+        comparison `first_offset(topic) >= end`. It raises what
+        `end_offset` raises: `KeyError` for an unregistered topic on
+        `NatsBus`, and `RuntimeError` before `NatsBus.start()`. Read at one
+        instant, `first_offset <= end_offset`; read after `end_offset`, it
+        may exceed it. `0` for every topic on `InMemoryBus`, which never
+        discards. `async` on every implementation (ADR-0013 decision 3,
+        Amendment 10).
         """
         ...

@@ -4,13 +4,20 @@ Spec: section 19, section 22, section 28, section 33, section 46.5; ADR-0017
 decisions 3-10 and 12 (ADR-0013 decision 9, ADR-0014 A12, ADR-0015 decision 6).
 
 Consumption (decision 3). One positional, whole-topic subscription to
-`hammertime.hot-ip.v1` (`partitions=None`, no listener), starting at `0` on a
-fresh state and at `position + 1` on a restored one. Nothing is ever
-acknowledged; the service closes the consumer, with the bus, after `stop()`.
+`hammertime.hot-ip.v1` (`partitions=None`, no listener), starting at
+`state.event_sequence` as it stands after readiness step 3 below. Nothing is
+ever acknowledged; the service closes the consumer, with the bus, after
+`stop()`.
 
-Readiness (decision 4). `start()` reads `end_offset` *before* it subscribes
-and keeps it as `replay_target`, then hands messages to `handle()` until the
-worker is caught up -- `end <= start_offset`, or `event_sequence >= end`.
+Readiness (decision 4; ADR-0013 decision 9 as amended by Amendment 10).
+`start()` reads `end_offset`, then `first_offset`, both *before* it
+subscribes, and keeps `end` as `replay_target`. If `first` is past
+`event_sequence`, the log holds no record the trie has not read below
+`first` -- aged out, purged, or never written -- so, under the lock and
+unless `stop()` has begun, it passes them with `state.note_passed(first -
+1)`. It then subscribes from `event_sequence` and hands messages to
+`handle()` until the worker is caught up: `event_sequence >= end`. A log that
+holds nothing to replay is therefore caught up at once.
 
 One message, one of six outcomes (decision 6), decided in this order:
 `REDELIVERED` (offset not past the position), `MALFORMED` (codec refusal,
@@ -24,6 +31,7 @@ payload not a hot-ip event, key or subject not the payload's IP),
 Atomicity (decision 9). Single-writer ownership on one event loop is the
 mechanism; there is no copy-on-write and no versioned snapshot pointer. The
 worker changes `TrieState` only inside `handle()` and `apply_config()`, and
+`start()`'s step 3 is one `note_passed` call under the lock, and
 `handle()` awaits nothing but the worker's lock: the apply step
 (`apply_hot_ip_added` / `apply_hot_ip_removed`, both synchronous) and
 `state.note_applied` run with no `await` between them (R1). Every reader
@@ -116,7 +124,6 @@ class TrieWorker:
         self._stopped = False
         self._stream: AsyncIterator[ConsumedMessage] | None = None
         self._replay_target: int | None = None
-        self._start_offset: int | None = None
         # Families already warned about as not served (decision 5).
         self._unserved_seen: set[AddressFamily] = set()
 
@@ -137,33 +144,43 @@ class TrieWorker:
 
     @property
     def caught_up(self) -> bool:
-        """Decision 4: `end <= start_offset`, or `event_sequence >= end`."""
+        """Decision 4: `False` until subscribed, then `event_sequence >= replay_target`."""
         end = self._replay_target
-        start = self._start_offset
-        if end is None or start is None:
+        if end is None or self._stream is None:
             return False
-        return end <= start or self._state.event_sequence >= end
+        return self._state.event_sequence >= end
 
     # --- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        """Read the log end, subscribe positionally, replay until caught up (decision 4).
+        """Read the log's bounds, pass what it no longer holds, subscribe, replay (decision 4).
 
         A second call returns at once. If the subscription ends before the
         worker is caught up this is a `RuntimeError`; if `stop()` begins
         first, this returns without being caught up. Exceptions from
-        `end_offset`, `subscribe`, the iterator and `handle()` propagate.
+        `end_offset`, `first_offset`, `subscribe`, the iterator and
+        `handle()` propagate.
         """
+        # 1. Already subscribed.
         if self._stream is not None:
             return
+        # 2. The end first, then the first retained offset, both before
+        # subscribing ("Why `end` is read first").
         end = await self._bus.end_offset(HOT_IP.name)
         self._replay_target = end
-        position = self._state.position
-        start_offset = 0 if position is None else position + 1
+        first = await self._bus.first_offset(HOT_IP.name)
+        # 3. Pass every offset below `first` the trie has not read (R1: one
+        # `note_passed` under the lock), unless `stop()` has begun.
+        if first > self._state.event_sequence:
+            async with self._lock:
+                if not self._stopping.is_set() and first > self._state.event_sequence:
+                    self._state.note_passed(first - 1)
+        # 4. Subscribe from the next offset the trie will read.
+        start_offset = self._state.event_sequence
         stream = await self._consumer.subscribe(HOT_IP.name, start_offset=start_offset)
-        self._start_offset = start_offset
         self._stream = stream
 
+        # 5. Replay until caught up.
         ended = await self._pump(stream, until=lambda: self.caught_up)
         if ended is _Pump.STOPPED:
             return
@@ -171,9 +188,11 @@ class TrieWorker:
             raise RuntimeError(
                 "the hot-ip subscription ended before the replay reached the log end"
             )
+        # 6. Replay complete.
         logger.info(
-            "replay_complete start_offset=%d replay_target=%d event_sequence=%d",
+            "replay_complete start_offset=%d first_offset=%d replay_target=%d event_sequence=%d",
             start_offset,
+            first,
             end,
             self._state.event_sequence,
         )

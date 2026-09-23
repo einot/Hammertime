@@ -10,6 +10,15 @@ other service's. `app.state.readiness` holds the service's `Readiness`, and a
 `ServiceNotReady` raised by any route is rendered as `not_ready_response`, so
 slice 3's read routes need only raise it.
 
+The app serves the routes it declares and nothing else (ADR-0017 decision
+13, assumption 31): it is built with `openapi_url=None, docs_url=None,
+redoc_url=None`, so FastAPI's `/openapi.json`, `/docs`,
+`/docs/oauth2-redirect` and `/redoc` answer 404 like any undeclared path.
+The admin port has no authentication, and the two documentation pages would
+load third-party scripts into an operator's browser. Slice 3's read routes
+follow the same rule: `docs/protocol/read-api-v1.md` is their contract, not a
+generated schema.
+
 Every route and dependency is `async def` (ADR-0017 decision 9, R3): FastAPI
 runs a plain `def` one in a threadpool, and no thread but the event loop's
 may touch `TrieState`.
@@ -34,7 +43,7 @@ from hammertime.core.runtime import (
 
 def create_app(readiness: Readiness) -> FastAPI:
     """The trie's FastAPI app, sharing `readiness` with the service."""
-    app = FastAPI(title="hammertime-trie")
+    app = FastAPI(title="hammertime-trie", openapi_url=None, docs_url=None, redoc_url=None)
     app.state.readiness = readiness
 
     async def service_not_ready(request: Request, exc: Exception) -> Response:

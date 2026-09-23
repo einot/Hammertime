@@ -5,16 +5,18 @@ decisions 2, 8 and 9.
 
 `TrieState` holds one `PatriciaTrie` and one `IpAttributeRecords` per address
 family served (section 35's separate roots; ADR-0014 decision 1, ADR-0015
-decision 5), the log position of the last hot-ip record handled, `as_of` and
-the detection configuration in force. The read path, `/metrics` and the
+decision 5), the log position (the last offset handled or passed), `as_of`
+and the detection configuration in force. The read path, `/metrics` and the
 snapshot epic depend on this module rather than on the worker, which depends
 on the bus.
 
-The log position (decision 8): `position` is the offset of the last hot-ip
-record the worker has *handled* -- applied, unchanged, malformed or of a
-family not served -- and `None` before the first. `event_sequence` is `0`
-when `position` is `None` and `position + 1` otherwise: the offset of the
-next record the trie will read, which is also `end_offset`'s convention.
+The log position (decision 8): `position` is the last offset the worker
+has *handled* -- a record applied, unchanged, malformed or of a family not
+served -- or *passed*: an offset below the first record the log retains,
+which `start()` found the trie had not read (decision 4 step 3). It is
+`None` before the first of either. `event_sequence` is `0` when `position`
+is `None` and `position + 1` otherwise: the offset of the next record the
+trie will read, which is also `end_offset`'s convention.
 `as_of` is the greatest payload timestamp among applied (or unchanged)
 events, so it never goes backwards.
 
@@ -87,7 +89,7 @@ class TrieState:
 
     @property
     def position(self) -> int | None:
-        """Offset of the last hot-ip record handled; `None` before the first."""
+        """The last offset handled or passed (decision 8); `None` before the first."""
         return self._position
 
     @property
@@ -115,6 +117,14 @@ class TrieState:
         self._position = offset
         if self._as_of is None or timestamp > self._as_of:
             self._as_of = timestamp
+
+    def note_passed(self, offset: int) -> None:
+        """Record that the log holds no unread record at or below `offset` (decision 4 step 3).
+
+        Sets `position` only; `as_of` does not move.
+        """
+        self._check_offset(offset)
+        self._position = offset
 
     def adopt_config(self, config: DetectionConfig) -> None:
         """Replace the configuration in force; compares no versions (decision 10)."""

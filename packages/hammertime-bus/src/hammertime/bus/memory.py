@@ -24,7 +24,10 @@ What it models, per ADR-0013 decision 3 (`hammertime.bus.memory`):
   topic (ADR-0011 assumption 22, unchanged);
 * `end_offset(topic)`, the offset the next appended message will receive,
   is the log length (`0` for a topic never published to), the same
-  readiness number `NatsBus` derives from `last_seq + 1` (decision 9).
+  readiness number `NatsBus` derives from `last_seq + 1` (decision 9);
+* `first_offset(topic)` is `0` for every topic: the log never discards, so
+  `0` is a non-empty log's first index and an empty log's `end_offset`
+  (Amendment 10). No retention or purge is modelled.
 """
 
 import asyncio
@@ -85,6 +88,15 @@ class InMemoryBus:
         # A `defaultdict` read: an unknown topic gets an empty log entry,
         # which is exactly what its first publish or subscribe would create.
         return len(self._logs[topic])
+
+    async def first_offset(self, topic: str) -> int:
+        """The first offset the log retains: always `0`, since it never discards.
+
+        For a non-empty log that is its first index; for an empty one it is
+        also its `end_offset` (ADR-0013 decision 3, Amendment 10). `async`
+        like `NatsBus.first_offset`, a broker round trip there.
+        """
+        return 0
 
     async def _append(
         self, topic: str, key: bytes | None, value: bytes, message_id: str | None
