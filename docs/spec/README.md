@@ -13,7 +13,10 @@ a pointer note to §43; ADR-0013 — NATS JetStream as the event log, static
 shard assignment — rewords the §20, §22, §24, §33, §43 and §47.2 notes;
 ADR-0014 — the trie structure package: one trie per address family, a pruned
 binary reference, an arena-backed Patricia production trie and the invariants
-both satisfy — adds pointer notes to §9, §11, §12, §27 and §46.5).
+both satisfy — adds pointer notes to §9, §11, §12, §27 and §46.5; ADR-0015 —
+prefix metadata in prefix-keyed side maps, the two combine directions and the
+per-IP attribute record, validated on write and coupled to the hot-count step
+— adds pointer notes to §9, §12, §16, §17, §46.5, §46.8 and §46.9).
 §36 has since gained subsections: §36.1-36.4 from ADR-0006 (hashed agent
 credentials, registry document, rotation, provisioning), §36.5-36.7 from
 ADR-0007 (failed-authentication throttling) and ADR-0008 (observation-scaled
@@ -46,7 +49,7 @@ Section index used throughout the code:
 | 8-12 | Binary IP trie & invariants | `services/trie/structure` (`node.py`, `binary_trie.py`, `invariants.py`), `packages/hammertime-testkit` (`invariants.py`), `docs/adr/0014` |
 | 13, 38 | `HOT_PREFIX` predicate (single implementation) | `core/state/prefix.py`, `services/detector/rules/baseline.py`, `services/trie/query`, `docs/adr/0010` |
 | 13, 14, 31 | Prefix classification & scoring | `services/detector` |
-| 16, 17 | Prefix metadata inheritance | `services/trie/metadata` |
+| 16, 17 | Prefix metadata inheritance | `services/trie/metadata` (`combine.py`, `local.py`), `docs/adr/0015` |
 | 19 | Event-driven internals | `core/events`, `packages/hammertime-bus` (`interface.py`, `memory.py`, `nats.py`), `tools/provision`, `docs/adr/0004`, `docs/adr/0013` |
 | 20, 21 | Sharding & aggregation | `services/aggregator/sharding/assignment.py`, `packages/hammertime-bus` (`AssignmentListener`, `topics.py` incl. `partition_for`), `packages/hammertime-store` (`ShardStateStore`, incl. the shard lease), `services/ingest/publisher.py`, `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0004`, `docs/adr/0011`, `docs/adr/0013` (decisions 1, 6, 7) |
 | 22 | Consistency model | `docs/adr/0001` (Amendments 1, 2, 3), `docs/adr/0003` (Amendments 2, 3), `docs/adr/0011` (decisions 4, 5), `docs/adr/0013` (decisions 4, 5, 7, 8), `docs/protocol/read-api-v1.md` (`as_of`, `event_sequence`) |
@@ -66,6 +69,6 @@ Section index used throughout the code:
 | 36.5-36.7 | Auth throttling, request cost, throttled responses | `services/ingest/auth`, `services/ingest/ratelimit`, `services/ingest/api/routes.py`, `docs/adr/0007`, `docs/adr/0008` |
 | 37 | Observability | `core/telemetry`, `services/aggregator/metrics.py`, `deploy/grafana` |
 | 43 | Recommended initial implementation; reference components (event log, store, images) and their licence policy | `deploy/docker-compose.yml`, `docs/adr/0012` (Amendment 2), `docs/adr/0013` (decisions 11, 12) |
-| 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events`, `core/config`, `docs/adr/0005`, `docs/adr/0011` |
-| 46.5 | The derived count invariant `len(records) == hot_count(root)` | `services/trie/structure/invariants.py`, `packages/hammertime-testkit` (`invariants.py`), `docs/adr/0014` |
+| 46 | Per-IP attributes (weight, extensibility) | `services/trie/metadata/ip_attributes.py`, `services/aggregator/transitions.py`, `core/state/weight.py`, `core/events` (`attributes.py`: the one §46.2 validator, called by `codec.py` and the trie's record map), `core/config`, `docs/adr/0005`, `docs/adr/0011`, `docs/adr/0015` |
+| 46.5 | The derived count invariant `len(records) == hot_count(root)` | `services/trie/structure/invariants.py`, `packages/hammertime-testkit` (`invariants.py`), `services/trie/metadata/ip_attributes.py` (the record map and the coupled step), `docs/adr/0014`, `docs/adr/0015` |
 | 47 | Service process lifecycle (entry points, readiness, config reload, shutdown, exit codes, log records) | `core/runtime.py`, `core/telemetry/logging.py`, `services/*/__main__.py`, `services/*/service.py`, `packages/hammertime-store` (`validate_redis_url`), `packages/hammertime-bus` (`nats.py` `bus_endpoints`, the §47.7 reduction of bus URLs for log records), `docs/adr/0009`, `docs/adr/0013` (Amendment 2), `docs/protocol/read-api-v1.md`, `docs/protocol/observation-v1.md` (not-ready 503), `docs/spec/integration-scenarios.md` |

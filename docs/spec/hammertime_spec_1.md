@@ -454,6 +454,15 @@ Metadata explicitly attached to this prefix.
 > attributes are a separate mechanism stored beside the trie, not in this node;
 > the node layout above is unchanged. See Section 46.
 
+> **ADR-0015:** it lives in `services/trie/metadata/local.py`, a map keyed by
+> `Prefix` held beside the trie and holding no reference to it. Pruning is
+> mandatory (Section 11, ADR-0014) and a Patricia node does not exist for every
+> prefix (Section 27), so a declaration stored on a node would be destroyed by
+> the removal that emptied it and would have nowhere to live inside a
+> compressed edge. A declaration's lifetime is independent of hot state
+> (Section 46.6). `prefix_state` is unaffected by this and remains the query
+> epic's.
+
 ### `prefix_state`
 
 Derived classification such as:
@@ -611,6 +620,14 @@ assuming both children are represented and the node has no separate `/32` semant
 > is also what `tools/trie-inspect --verify` runs. The leaf rule
 > `hot_count(/32) ∈ {0, 1}` is the trie's only membership test: there is no
 > separate hot-IP set that could drift away from the counts.
+
+> **ADR-0015:** stated as an algebra, the upward combine is integer addition —
+> associative, commutative, identity `0` — which is what makes a subtree
+> summable in any order or grouping. `capacity` and `hot_ratio` (Section 3) are
+> *not* combined: each is recomputed at its own level from that level's
+> `hot_count` and prefix length, never summed or averaged from the children's.
+> `services/trie/metadata/combine.py`'s `PrefixStats` is the single derivation,
+> and `Prefix.hot_ratio` the single piece of arithmetic behind it.
 
 This invariant is more important than cached `prefix_state`.
 
@@ -814,6 +831,18 @@ The trie SHOULD NOT assume that all metadata is mergeable by simple union.
 > attributes (Section 46) are not inherited and are not combined along the path;
 > the two mechanisms share no namespace.
 
+> **ADR-0015:** `combine()` is defined per metadata *type* by the value itself,
+> not by a registry of names: `Tags` unions, `Bitmask` ORs, `Override` takes the
+> more specific declaration — the three examples above, and nothing assumed
+> mergeable by union. A document combines key-wise, absence being the per-key
+> identity. The fold runs least-specific first, `/0` through `/bit_length`
+> inclusive (`combine_path`), which is what gives `Override` its meaning: the
+> path's order is the priority order. Every rule is associative and idempotent
+> and has an identity; `Tags` and `Bitmask` are commutative and `Override`
+> deliberately is not, so order-independence is required of the *upward*
+> `hot_count` aggregate (Section 12) rather than of this fold.
+> `services/trie/metadata/combine.py`.
+
 ---
 
 # 17. Do Not Materialize Inherited Metadata by Default
@@ -837,6 +866,13 @@ Instead:
 and a lookup accumulates metadata along the path.
 
 This avoids potentially enormous update propagation.
+
+> **ADR-0015:** `PrefixMetadataStore.declare()` writes exactly one key, and a
+> lookup costs `bit_length + 1` probes of the declaration map — independent
+> both of how many declarations exist and of how many addresses beneath them
+> are HOT. `local(P)`, `inherited(P)` (strict ancestors) and
+> `effective_for_prefix(P)` are separate reads, so what a prefix declares is
+> never confused with what it inherits, and neither is materialized anywhere.
 
 ---
 
@@ -2749,6 +2785,23 @@ len(record)        == hot_count(root)          per address family
 > and a `HotIpRemoved` for an unknown address deletes nothing and leaves
 > `hot_count` untouched, the equality survives every redelivery.
 
+> **ADR-0015:** the map is `services/trie/metadata/ip_attributes.py`'s
+> `IpAttributeRecords`, a read-only `Mapping[Address, IpAttributes]` (hence
+> already the `Collection[Address]` the checks above take) with `record()` and
+> `discard()` as its only mutators. It validates every document before storing
+> it, whatever path the document arrived by, with
+> `hammertime.core.events.attributes.validate_ip_attributes` — the same
+> function the codec calls, so the Section 46.2 rules exist once (ADR-0005
+> decision 5, ADR-0014 decision 9). The two lines above are applied by
+> `apply_hot_ip_added` / `apply_hot_ip_removed` in a fixed order: validate the
+> document, then update the trie, then the record map. A rejected document
+> (`InvalidAttributesError`) therefore changes neither, and since `add_hot_ip`
+> may raise `InvariantViolation` before mutating anything (ADR-0014 Amendment 2,
+> A12), recording before it would turn that diagnosed corruption into a
+> violation of this invariant. The record is written or deleted whatever the
+> mutator returned. An absent `attributes` is stored as
+> `{"attributes_version": 1}`, and no stored document is ever interpreted.
+
 Because attributes are reconstructed from the same event replay as the trie
 (Section 32), they require no separate durability or consistency mechanism.
 
@@ -2805,6 +2858,17 @@ ip_attribute_bytes        total serialized size of stored records
 attributes_rejected       documents rejected for size or shape
 ```
 
+> **ADR-0015:** `ip_attribute_records` is `len(records)` and
+> `ip_attribute_bytes` is `IpAttributeRecords.serialized_bytes`, kept up to
+> date on every write from the size the validator measures (the compact
+> encoding the codec writes). `attributes_rejected` is counted by the trie
+> service code that handles a rejection — the worker, for an
+> `InvalidAttributesError` or for a `CodecError` whose `__cause__` is one, and
+> the snapshot loader for a document it cannot restore — never by the record
+> map, the validator or the codec. A document rejected by the record map does
+> not stop its HOT transition from being applied (Section 46.1): the worker
+> applies it again with no document, which stores the default.
+
 ## 46.9 Security
 
 A validator compiling `schemas/hot_ip_event.v1.json` MUST resolve its `$ref` to
@@ -2818,6 +2882,13 @@ forbids an agent from declaring `IP = HOT`. A producer MUST validate size and
 shape before storing, and no attribute value may be used in an authorization,
 routing, or rate-limiting decision — including unrecognised `x_` values, which
 are stored and echoed as opaque data.
+
+> **ADR-0015:** the trie service validates before storing as well as on decode:
+> its record map runs every document through
+> `hammertime.core.events.attributes.validate_ip_attributes`, the codec's own
+> rules moved into one public function, so a snapshot file or an in-process
+> producer is no way around Section 46.2. The validator accepts only the JSON
+> data model and never puts a document value into an exception message.
 
 ---
 
