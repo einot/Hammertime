@@ -54,13 +54,21 @@ their wire keys: the envelope's `schema_version`, `sequence` and
 `config_version`, and the payload keys the schemas name. Each test first
 checks that the key it tampers with is on the wire as an integer, so a key
 that is not there fails the test rather than being added and ignored.
+
+ADR-0016 decisions 1 and 2 (issue #112) are tested in the last section: each
+of the eight payload integer fields is refused, on decode and on encode,
+outside the inclusive `minimum` and `maximum` its schema file states -- read
+from `schemas/` here, not restated (assumption 10) -- while the envelope's
+integer fields stay unbounded (assumption 3). An out-of-range message is built
+by editing encoded JSON, because `encode` no longer produces one (assumption 4).
 """
 
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import IntEnum
-from typing import Any
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import pytest
 from hammertime.core.addressing.address import Address
@@ -761,3 +769,308 @@ def test_encode_writes_no_non_finite_float_in_any_field(
     envelope = _envelope(event_type, "payload", field, non_finite)
     with pytest.raises(CodecError):
         encode(envelope)
+
+
+# ==========================================================================
+# ADR-0016 decisions 1 and 2: the codec enforces each payload integer field's
+# schema `minimum` and `maximum`, inclusive, on decode and on encode. The
+# envelope's integer fields stay unbounded (assumption 3). Bounds are read
+# from the schema files, not restated here (assumption 10), so a schema edit
+# the codec does not follow fails the suite.
+# ==========================================================================
+
+
+class _Bound(NamedTuple):
+    """One row of ADR-0016 decision 1's table.
+
+    `path` is the wire path `_wire_value`/`_tamper_field` take; `where` and
+    `field` are what `_bounds_envelope` overrides on the model constructor;
+    `schema` and `pointer` locate the property inside `schemas/`.
+    """
+
+    event_type: str
+    path: tuple[str | int, ...]
+    where: str
+    field: str
+    schema: str
+    pointer: tuple[str, ...]
+
+
+_BOUNDED_FIELDS: list[_Bound] = [
+    _Bound(
+        "RequestObservation",
+        ("payload", "sequence"),
+        "payload",
+        "sequence",
+        "observation.v1.json",
+        ("properties", "sequence"),
+    ),
+    _Bound(
+        "RequestObservation",
+        ("payload", "window_seconds"),
+        "payload",
+        "window_seconds",
+        "observation.v1.json",
+        ("properties", "window_seconds"),
+    ),
+    _Bound(
+        "RequestObservation",
+        ("payload", "observations", 0, "request_count"),
+        "observation",
+        "request_count",
+        "observation.v1.json",
+        ("properties", "observations", "items", "properties", "request_count"),
+    ),
+    *(
+        _Bound(
+            event_type,
+            ("payload", name),
+            "payload",
+            name,
+            "hot_ip_event.v1.json",
+            ("properties", name),
+        )
+        for event_type in ("HotIpAdded", "HotIpRemoved")
+        for name in ("sequence", "window_count", "config_version")
+    ),
+    _Bound(
+        "PrefixStatsChanged",
+        ("payload", "hot_count"),
+        "payload",
+        "hot_count",
+        "prefix_stats_event.v1.json",
+        ("properties", "hot_count"),
+    ),
+    _Bound(
+        "PrefixStatsChanged",
+        ("payload", "sequence"),
+        "payload",
+        "sequence",
+        "prefix_stats_event.v1.json",
+        ("properties", "sequence"),
+    ),
+]
+
+
+def _schemas_dir() -> Path:
+    """`schemas/`, found by walking up from this file (ADR-0016 assumption 10)."""
+
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "schemas" / "observation.v1.json").is_file():
+            return parent / "schemas"
+    raise AssertionError("no schemas/observation.v1.json above this test file")
+
+
+def _schema_property(bound: _Bound) -> dict[str, Any]:
+    target: Any = json.loads((_schemas_dir() / bound.schema).read_text(encoding="utf-8"))
+    for key in bound.pointer:
+        assert key in target, f"{bound.schema}: {key!r} missing on the way to {bound.pointer!r}"
+        target = target[key]
+    assert isinstance(target, dict)
+    return target
+
+
+def _schema_bounds(bound: _Bound) -> tuple[int | None, int | None]:
+    """`(minimum, maximum)` as the schema states them; `None` where absent.
+    An absent `maximum` means unbounded (decision 1's "none")."""
+
+    prop = _schema_property(bound)
+    minimum = prop.get("minimum")
+    maximum = prop.get("maximum")
+    assert minimum is None or type(minimum) is int, (bound, minimum)
+    assert maximum is None or type(maximum) is int, (bound, maximum)
+    return minimum, maximum
+
+
+# Decision 1: "Such a field accepts any JSON integer at or above its minimum
+# that `json.loads` can parse." Any large value will do; this one has 31 digits.
+_LARGE = 10**30
+
+
+def _bound_id(bound: _Bound) -> str:
+    return f"{bound.event_type}-{bound.field}"
+
+
+_IN_RANGE: list[Any] = []
+_OUT_OF_RANGE: list[Any] = []
+for _b in _BOUNDED_FIELDS:
+    _min, _max = _schema_bounds(_b)
+    if _min is not None:
+        _IN_RANGE.append(pytest.param(_b, _min, id=f"{_bound_id(_b)}-minimum"))
+        _OUT_OF_RANGE.append(pytest.param(_b, _min - 1, id=f"{_bound_id(_b)}-minimum-minus-1"))
+    if _max is not None:
+        _IN_RANGE.append(pytest.param(_b, _max, id=f"{_bound_id(_b)}-maximum"))
+        _OUT_OF_RANGE.append(pytest.param(_b, _max + 1, id=f"{_bound_id(_b)}-maximum-plus-1"))
+    else:
+        _IN_RANGE.append(pytest.param(_b, _LARGE, id=f"{_bound_id(_b)}-unbounded-large"))
+
+
+def _bounds_envelope(
+    event_type: str, where: str | None = None, field: str | None = None, value: object = None
+) -> EventEnvelope[Any]:
+    """`_envelope`, except that a `PrefixStatsChanged` carries a capacity of
+    2**128, so that no `hot_count` used below exceeds it. ADR-0016 assumption
+    11 leaves `hot_count <= capacity` unchecked; this keeps the tests
+    independent of that open item."""
+
+    if event_type != "PrefixStatsChanged":
+        return _envelope(event_type, where, field, value)
+    fields: dict[str, dict[str, Any]] = {
+        "envelope": dict(_ENVELOPE_FIELDS),
+        "payload": {**_PAYLOAD_FIELDS[event_type], "capacity": 2**128},
+    }
+    if where is not None and field is not None:
+        assert field in fields[where], (where, field)
+        fields[where][field] = value
+    payload = PrefixStatsChanged(**fields["payload"])
+    return EventEnvelope(event_type=event_type, payload=payload, **fields["envelope"])
+
+
+def test_the_bounded_fields_are_the_eight_payload_integer_fields() -> None:
+    """ADR-0016 decision 1: "every payload field the codec converts to `int`:
+    the eight in ADR-0015 Amendment 3 ruling 3's list" -- the same list the
+    type-rule tests above use, with the hot-ip fields on both event types."""
+
+    assert {(b.event_type, b.path) for b in _BOUNDED_FIELDS} == set(_PAYLOAD_INTEGER_FIELDS)
+    assert len(_BOUNDED_FIELDS) == len(_PAYLOAD_INTEGER_FIELDS)
+
+
+@pytest.mark.parametrize("bound", _BOUNDED_FIELDS, ids=_bound_id)
+def test_every_bounded_field_has_a_minimum_in_its_schema(bound: _Bound) -> None:
+    """ADR-0016 decision 1's table gives every row a `minimum`. A schema file
+    that lost one would silently drop the lower-bound cases above, so it
+    fails here instead."""
+
+    minimum, _maximum = _schema_bounds(bound)
+    assert minimum is not None, f"{bound.schema} states no minimum for {bound.field}"
+
+
+@pytest.mark.parametrize(("bound", "value"), _IN_RANGE)
+def test_decode_accepts_a_payload_integer_at_its_schema_bound(bound: _Bound, value: int) -> None:
+    """ADR-0016 decision 1: the bounds are inclusive (JSON Schema Validation
+    2020-12 §6.2.2, §6.2.4), so the minimum and the maximum decode to exactly
+    that int. Where the schema states no maximum, a large value decodes."""
+
+    data = encode(_bounds_envelope(bound.event_type))
+    assert type(_wire_value(data, bound.path)) is int
+
+    decoded: Any = decode(_tamper_field(data, bound.path, value))
+
+    decoded_value = _decoded_field(decoded, bound.path)
+    assert type(decoded_value) is int
+    assert decoded_value == value
+
+
+@pytest.mark.parametrize(("bound", "value"), _OUT_OF_RANGE)
+def test_decode_refuses_a_payload_integer_outside_its_schema_bounds(
+    bound: _Bound, value: int
+) -> None:
+    """ADR-0016 decision 1: minimum - 1 and maximum + 1 are a `CodecError`,
+    never a `ValueError` or anything else."""
+
+    data = encode(_bounds_envelope(bound.event_type))
+    assert type(_wire_value(data, bound.path)) is int
+
+    with pytest.raises(CodecError):
+        decode(_tamper_field(data, bound.path, value))
+
+
+_REQUEST_COUNT_PATH: tuple[str | int, ...] = ("payload", "observations", 0, "request_count")
+
+
+def test_decode_converts_an_integral_float_before_checking_the_bound() -> None:
+    """ADR-0016 decision 1: an integral float such as `-1.0` is first
+    converted to `-1`, then refused by the bound, as a `CodecError`."""
+
+    data = encode(_bounds_envelope("RequestObservation"))
+    assert type(_wire_value(data, _REQUEST_COUNT_PATH)) is int
+    tampered = _tamper_field(data, _REQUEST_COUNT_PATH, -1.0)
+    assert b"-1.0" in tampered
+
+    with pytest.raises(CodecError):
+        decode(tampered)
+
+
+def test_decode_accepts_the_request_count_maximum_as_an_integral_float() -> None:
+    """ADR-0016 decision 1 with ADR-0015 assumption 64: `1000000000.0` is a
+    JSON integer at the inclusive maximum and decodes to the int."""
+
+    data = encode(_bounds_envelope("RequestObservation"))
+    assert type(_wire_value(data, _REQUEST_COUNT_PATH)) is int
+    tampered = _tamper_field(data, _REQUEST_COUNT_PATH, 1000000000.0)
+    assert b"1000000000.0" in tampered
+
+    decoded: Any = decode(tampered)
+
+    value = _decoded_field(decoded, _REQUEST_COUNT_PATH)
+    assert type(value) is int
+    assert value == 1000000000
+
+
+@pytest.mark.parametrize(("bound", "value"), _OUT_OF_RANGE)
+def test_encode_refuses_a_payload_integer_outside_its_schema_bounds(
+    bound: _Bound, value: int
+) -> None:
+    """ADR-0016 decision 2: the encoder refuses what the decoder would refuse
+    (ADR-0015 assumption 66, extended to the bounds)."""
+
+    envelope = _bounds_envelope(bound.event_type, bound.where, bound.field, value)
+
+    with pytest.raises(CodecError):
+        encode(envelope)
+
+
+@pytest.mark.parametrize(("bound", "value"), _IN_RANGE)
+def test_encode_accepts_a_payload_integer_at_its_schema_bound_and_round_trips(
+    bound: _Bound, value: int
+) -> None:
+    """ADR-0016 decision 2: a boundary value is in range, so it encodes, and
+    `decode(encode(e)) == e`."""
+
+    envelope = _bounds_envelope(bound.event_type, bound.where, bound.field, value)
+
+    data = encode(envelope)
+
+    assert _wire_value(data, bound.path) == value
+    assert decode(data) == envelope
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("sequence", -1, id="sequence-minus-1"),
+        pytest.param("config_version", 0, id="config_version-0"),
+    ],
+)
+@pytest.mark.parametrize("event_type", EVENT_TYPES)
+def test_the_envelope_integer_fields_stay_unbounded(
+    event_type: str, field: str, value: int
+) -> None:
+    """ADR-0016 assumption 3: no bounds on the envelope's `sequence` and
+    `config_version` ("The tests pin the current choice, so it cannot change
+    unnoticed"). With an in-range payload, both encode and round-trip."""
+
+    envelope = _bounds_envelope(event_type, "envelope", field, value)
+
+    data = encode(envelope)
+
+    assert _wire_value(data, (field,)) == value
+    assert decode(data) == envelope
+
+
+def test_decode_refuses_a_request_count_of_4300_digits() -> None:
+    """ADR-0016 context, second trigger: `10**4300 - 1` has 4,300 digits, so
+    `json.loads` still parses it -- this relies on CPython's default
+    integer-string limit of 4,300 digits (ADR-0015 assumption 61), as
+    `test_decode_rejects_an_oversized_numeric_literal_as_codec_error` does.
+    Before ADR-0016 it decoded; decision 1's maximum now refuses it."""
+
+    value = 10**4300 - 1
+    # Printable under the default limit; one more digit would not be.
+    assert len(str(value)) == 4300
+    data = encode(_bounds_envelope("RequestObservation"))
+    assert type(_wire_value(data, _REQUEST_COUNT_PATH)) is int
+    tampered = _tamper_field(data, _REQUEST_COUNT_PATH, value)
+
+    with pytest.raises(CodecError):
+        decode(tampered)
