@@ -364,7 +364,13 @@ class TrieWorker:
         5's other writers.
         """
         try:
-            return apply_hot_ip_added(fs.trie, fs.records, payload.ip, payload.attributes)
+            return apply_hot_ip_added(
+                fs.trie,
+                fs.records,
+                payload.ip,
+                payload.attributes,
+                request_count=payload.window_count,
+            )
         except InvalidAttributesError:
             self._metrics.increment("attributes_rejected", stage="apply")
             logger.warning(
@@ -373,7 +379,9 @@ class TrieWorker:
                 message.partition,
                 message.offset,
             )
-            return apply_hot_ip_added(fs.trie, fs.records, payload.ip, None)
+            return apply_hot_ip_added(
+                fs.trie, fs.records, payload.ip, None, request_count=payload.window_count
+            )
 
     def _decode(self, message: ConsumedMessage) -> HotIpAdded | HotIpRemoved | _Malformed:
         """Decision 6 step 2: the payload, or the reason token it is `MALFORMED` for.
