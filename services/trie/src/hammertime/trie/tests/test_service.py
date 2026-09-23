@@ -26,19 +26,37 @@ Choices of this file's own:
   never returns; waiting for the worker is a bounded `asyncio.sleep(0)` loop.
 * `startup_fields()`'s `config_path` and `config_version` are asserted as
   present only; their value types are not pinned by decision 13.
+* Readiness after an interrupted replay (decision 4: the service "marks
+  itself ready -- unless `stop()` has begun or the worker is not caught up")
+  uses `_ScriptedBus`, whose stream yields one message and then waits for
+  the test to `feed()` another. The worker is built by the test and handed
+  to `TrieService`, so the test can stop the worker alone.
+* Who closes what (decision 13): `build_service` "passes the `NatsBus` it
+  built, if any, as `transport`", and `run()` "closes the transport it
+  built". So a `transport=` handed to `TrieService` is started by `start()`
+  and closed by `run()`, and a bus injected into `build_service` is never
+  closed. The transport is a `_FakeTransport` with `start()` and `close()`,
+  and the injected bus is an `InMemoryBus` wrapper with a counting
+  `close()`. Whether `stop()` alone, with no `run()`, closes the transport
+  is not stated, and is not asserted.
 """
-
-from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import httpx
 import pytest
+from hammertime.bus.interface import (
+    AssignmentListener,
+    ConsumedMessage,
+    Consumer,
+    MessageBus,
+    Producer,
+)
 from hammertime.bus.memory import InMemoryBus
 from hammertime.bus.topics import HOT_IP
 from hammertime.core.addressing.address import Address, AddressFamily
@@ -60,6 +78,7 @@ AN_HOUR = 3600.0
 
 T0 = datetime.fromtimestamp(1_800_000_000, tz=UTC)
 IP_A = Address.parse("10.20.30.1")
+IP_B = Address.parse("10.20.30.2")
 
 # `docs/spec/integration-scenarios.md` section 2.1, identical to
 # `config/detection.v1.json`.
@@ -161,6 +180,119 @@ def _client(service: TrieService) -> httpx.AsyncClient:
 
 def _media_type(response: httpx.Response) -> str:
     return response.headers["content-type"].split(";")[0].strip()
+
+
+def _message(ip: Address, offset: int) -> ConsumedMessage:
+    return ConsumedMessage(
+        topic=TOPIC,
+        partition=0,
+        offset=offset,
+        key=str(ip).encode(),
+        value=encode(_envelope(ip, offset)),
+    )
+
+
+def _worker_on(bus: MessageBus) -> TrieWorker:
+    state = TrieState(families=frozenset({IPV4}), config=DETECTION_CONFIG)
+    return TrieWorker(bus=bus, state=state, metrics=TrieMetrics())
+
+
+class _HeldStream:
+    """Yields its queued messages, then waits until `feed()` queues another."""
+
+    def __init__(self, messages: Iterable[ConsumedMessage]) -> None:
+        self._queue = list(messages)
+        self._arrived = asyncio.Event()
+        self.waiting = False
+
+    def feed(self, message: ConsumedMessage) -> None:
+        self._queue.append(message)
+        self._arrived.set()
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> ConsumedMessage:
+        while not self._queue:
+            self._arrived.clear()
+            self.waiting = True
+            try:
+                await self._arrived.wait()
+            finally:
+                self.waiting = False
+        return self._queue.pop(0)
+
+
+class _HeldConsumer:
+    def __init__(self, stream: _HeldStream) -> None:
+        self._stream = stream
+
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+        start_offset: int | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        return self._stream
+
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        raise AssertionError("the trie acknowledged a positional subscription")
+
+    async def close(self) -> None:
+        return None
+
+
+class _ScriptedBus:
+    """A bus whose log end is `end` and whose one consumer reads `stream`."""
+
+    def __init__(self, stream: _HeldStream, *, end: int) -> None:
+        self._end = end
+        self._consumer = _HeldConsumer(stream)
+
+    def producer(self) -> Producer:
+        return InMemoryBus().producer()
+
+    def consumer(self, group_id: str) -> Consumer:
+        return self._consumer
+
+    async def end_offset(self, topic: str) -> int:
+        return self._end
+
+
+class _ClosableBus:
+    """An `InMemoryBus` with a `close()` that counts the calls made to it."""
+
+    def __init__(self) -> None:
+        self.inner = InMemoryBus()
+        self.closed = 0
+
+    def producer(self) -> Producer:
+        return self.inner.producer()
+
+    def consumer(self, group_id: str) -> Consumer:
+        return self.inner.consumer(group_id)
+
+    async def end_offset(self, topic: str) -> int:
+        return await self.inner.end_offset(topic)
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class _FakeTransport:
+    """Stands in for the `NatsBus` that `build_service` builds under `nats`."""
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.closed = 0
+
+    async def start(self) -> None:
+        self.started += 1
+
+    async def close(self) -> None:
+        self.closed += 1
 
 
 class TestConstruction:
@@ -362,3 +494,97 @@ class TestRunAndStop:
                 await asyncio.wait_for(service.run(), timeout=10.0)
         finally:
             await service.stop()
+
+
+class TestReadinessAfterAnInterruptedReplay:
+    """Decision 4: `TrieService.start()` "marks itself ready -- unless `stop()`
+    has begun or the worker is not caught up"."""
+
+    async def _assert_not_ready(self, service: TrieService) -> None:
+        assert service.ready is False
+        async with _client(service) as client:
+            readyz = await client.get("/readyz")
+        assert readyz.status_code == 503
+        assert readyz.content != b'{"status":"ready"}'
+
+    async def test_stop_during_the_replay_leaves_the_service_not_ready(
+        self, config_path: Path
+    ) -> None:
+        stream = _HeldStream([_message(IP_A, 0)])
+        worker = _worker_on(_ScriptedBus(stream, end=3))
+        service = TrieService(_settings(config_path), worker, DETECTION_CONFIG)
+        task = asyncio.create_task(service.start())
+        await _yield_until(lambda: stream.waiting)
+
+        await service.stop()
+        stream.feed(_message(IP_B, 1))
+        await asyncio.wait_for(task, timeout=10.0)
+
+        assert worker.caught_up is False
+        await self._assert_not_ready(service)
+
+    async def test_a_worker_not_caught_up_leaves_the_service_not_ready(
+        self, config_path: Path
+    ) -> None:
+        # Only the worker is stopped: the service's own `stop()` has not begun,
+        # so what keeps it unready is that the worker is not caught up.
+        stream = _HeldStream([_message(IP_A, 0)])
+        worker = _worker_on(_ScriptedBus(stream, end=3))
+        service = TrieService(_settings(config_path), worker, DETECTION_CONFIG)
+        task = asyncio.create_task(service.start())
+        await _yield_until(lambda: stream.waiting)
+
+        await worker.stop()
+        stream.feed(_message(IP_B, 1))
+        try:
+            await asyncio.wait_for(task, timeout=10.0)
+
+            assert worker.caught_up is False
+            await self._assert_not_ready(service)
+        finally:
+            await service.stop()
+
+
+class TestWhoClosesTheBus:
+    """Decision 13: `run()` "closes the transport it built" -- the `NatsBus`
+    that `build_service` passes as `transport` -- and nothing else."""
+
+    async def test_a_transport_is_started_by_start_and_closed_by_run(
+        self, config_path: Path
+    ) -> None:
+        bus = InMemoryBus()
+        transport = _FakeTransport()
+        service = TrieService(
+            _settings(config_path),
+            _worker_on(bus),
+            DETECTION_CONFIG,
+            transport=transport,  # type: ignore[arg-type]
+        )
+
+        await service.start()
+        # Decision 4: "when it built a `NatsBus` itself, it starts the bus".
+        assert transport.started == 1
+        task = asyncio.create_task(asyncio.wait_for(service.run(), timeout=10.0))
+        trie = service.state.of(IPV4).trie
+        await _publish(bus, _envelope(IP_A, 0))
+        await _yield_until(lambda: trie.hot_ip_count == 1)
+
+        await service.stop()
+        await task
+
+        assert transport.closed >= 1
+
+    async def test_an_injected_bus_is_not_closed(self, config_path: Path) -> None:
+        bus = _ClosableBus()
+        service = build_service(_settings(config_path), bus=bus)
+
+        await service.start()
+        task = asyncio.create_task(asyncio.wait_for(service.run(), timeout=10.0))
+        trie = service.state.of(IPV4).trie
+        await _publish(bus.inner, _envelope(IP_A, 0))
+        await _yield_until(lambda: trie.hot_ip_count == 1)
+
+        await service.stop()
+        await task
+
+        assert bus.closed == 0

@@ -24,8 +24,6 @@ under `memory` the value is not read. What the trie stores for
 succeeds.
 """
 
-from __future__ import annotations
-
 import dataclasses
 from pathlib import Path
 

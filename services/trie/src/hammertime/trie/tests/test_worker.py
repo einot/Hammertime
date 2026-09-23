@@ -14,6 +14,11 @@ decision 6: `apply_hot_ip_added` / `apply_hot_ip_removed`). What is pinned:
 * `start()` reads `end_offset` before subscribing, keeps it as
   `replay_target`, and handles messages until caught up (`end <= S`, or
   `event_sequence >= end`); a second `start()` returns at once (decision 4);
+* `start()` subscribes with `subscribe(HOT_IP.name, start_offset=S)`,
+  `partitions=None` and no listener, where `S` is `0` for a fresh state and
+  `position + 1` for one that already has a position (decision 3); a stream
+  that ends before the worker is caught up is a `RuntimeError`, and once
+  `stop()` has begun `start()` returns without being caught up (decision 4);
 * `handle()` returns one of six outcomes, in decision 6's order:
   REDELIVERED (offset not past `position`), MALFORMED (codec error; payload not
   a hot-ip event; key or subject not the payload's IP), FAMILY_NOT_SERVED,
@@ -26,11 +31,17 @@ decision 6: `apply_hot_ip_added` / `apply_hot_ip_removed`). What is pinned:
 * the apply-time `InvalidAttributesError` retries with `attributes=None`
   (decision 7), reached through the `apply_hot_ip_added` module global of
   `hammertime.trie.worker` (Test seams);
-* log records carry no document content (decision 12) -- the one log
-  assertion in this file, `TestLogRecordsCarryNoDocumentContent`;
+* log records carry no document content (decision 12,
+  `TestLogRecordsCarryNoDocumentContent`);
+* the log records of decision 12's table that the reviewer asked for, read
+  through `caplog` on the `hammertime.trie.worker` logger (Test seams):
+  `malformed_hot_ip_event` at WARNING with each decision 6 reason token,
+  `redelivered_hot_ip_event` at WARNING, and `family_not_served` at WARNING
+  the first time per family per process and DEBUG after;
 * R1 of decision 9: a concurrent reader sees `len(records) ==
-  hot_ip_count == event_sequence` at every resume while a burst of distinct
-  adds is consumed from offset 0 (`TestReadersSeeWholeEvents`).
+  hot_ip_count == event_sequence` at every resume while bursts of distinct
+  adds are consumed from offset 0, and it resumes at least once strictly
+  between 0 and the last event (`TestReadersSeeWholeEvents`).
 
 Choices of this file's own:
 
@@ -47,20 +58,41 @@ Choices of this file's own:
 * The hot-ip envelope is shaped as ADR-0011 decision 4 has the aggregator
   shape it: `agent_id="aggregator-shard-0"`, `subject` and key the IP's
   canonical text, `window_count` present (the codec requires it).
+* The order of `start()`'s bus calls and its `subscribe` arguments are read
+  off `_SpyBus`, which wraps an `InMemoryBus` and satisfies ADR-0013
+  decision 3's `MessageBus` and `Consumer` protocols. The two early exits of
+  `start()` use `_ScriptedBus`, whose stream yields exactly the messages a
+  test queues and then either ends or waits for the next `feed()`. After
+  `stop()` the test feeds one more message rather than ending the stream:
+  which of the two rules wins when the stream ends *after* `stop()` has
+  begun is not something decision 4 says.
+* A log field is read as the `name=value` token after the event name
+  (decision 12: "Each message starts with the event name, followed by
+  `key=value` fields").
+* "The first time per family per process" (decision 12's table) is checked
+  in a fresh interpreter, because pytest runs every test in one process and
+  another test may already have met IPv6. The child imports this file by
+  path and uses its helpers; it runs no event loop longer than the handles.
 """
-
-from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+import subprocess
+import sys
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Self
 
 import hammertime.trie.worker as trie_worker
 import pytest
-from hammertime.bus.interface import ConsumedMessage
+from hammertime.bus.interface import (
+    AssignmentListener,
+    ConsumedMessage,
+    Consumer,
+    MessageBus,
+    Producer,
+)
 from hammertime.bus.memory import InMemoryBus
 from hammertime.bus.topics import HOT_IP
 from hammertime.core.addressing.address import Address, AddressFamily
@@ -269,6 +301,188 @@ def _corrupt_single_leaf(worker: TrieWorker, ip: Address) -> None:
     trie.arena.hot_count[trie.root] = 0
 
 
+LOGGER = "hammertime.trie.worker"
+
+
+def _logged(caplog: pytest.LogCaptureFixture, event: str) -> list[logging.LogRecord]:
+    """The worker's records whose message starts with `event` (decision 12)."""
+
+    found: list[logging.LogRecord] = []
+    for record in caplog.records:
+        words = record.getMessage().split()
+        if record.name == LOGGER and words and words[0] == event:
+            found.append(record)
+    return found
+
+
+def _field(record: logging.LogRecord, name: str) -> str | None:
+    """The value of the record's `name=value` field, or `None` if it has none."""
+
+    for word in record.getMessage().split()[1:]:
+        key, sep, value = word.partition("=")
+        if sep and key == name:
+            return value.strip("\"'")
+    return None
+
+
+class _SpyConsumer:
+    """Delegates to a real consumer and records `subscribe`'s arguments."""
+
+    def __init__(self, inner: Consumer, calls: list[tuple[str, object]]) -> None:
+        self._inner = inner
+        self._calls = calls
+
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+        start_offset: int | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        arguments = {
+            "topic": topic,
+            "partitions": partitions,
+            "listener": listener,
+            "start_offset": start_offset,
+        }
+        self._calls.append(("subscribe", arguments))
+        return await self._inner.subscribe(
+            topic, partitions=partitions, listener=listener, start_offset=start_offset
+        )
+
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        await self._inner.ack(messages)
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+class _SpyBus:
+    """An `InMemoryBus` whose `consumer`, `end_offset` and `subscribe` calls are
+    recorded, in the order they are made."""
+
+    def __init__(self) -> None:
+        self.inner = InMemoryBus()
+        self.calls: list[tuple[str, object]] = []
+
+    def producer(self) -> Producer:
+        return self.inner.producer()
+
+    def consumer(self, group_id: str) -> Consumer:
+        self.calls.append(("consumer", group_id))
+        return _SpyConsumer(self.inner.consumer(group_id), self.calls)
+
+    async def end_offset(self, topic: str) -> int:
+        self.calls.append(("end_offset", topic))
+        return await self.inner.end_offset(topic)
+
+
+def _subscriptions(calls: list[tuple[str, object]]) -> list[object]:
+    return [arguments for name, arguments in calls if name == "subscribe"]
+
+
+def _positional(start_offset: int) -> dict[str, object]:
+    """Decision 3's subscription: the whole topic, no listener, from `start_offset`."""
+
+    return {"topic": TOPIC, "partitions": None, "listener": None, "start_offset": start_offset}
+
+
+class _ScriptedStream:
+    """Yields the queued messages in order. When none is queued it ends, or, if
+    `hold`, waits until `feed()` queues another."""
+
+    def __init__(self, messages: Iterable[ConsumedMessage], *, hold: bool) -> None:
+        self._queue = list(messages)
+        self._hold = hold
+        self._arrived = asyncio.Event()
+        self.waiting = False
+        self.taken = 0
+
+    def feed(self, message: ConsumedMessage) -> None:
+        self._queue.append(message)
+        self._arrived.set()
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> ConsumedMessage:
+        while not self._queue:
+            if not self._hold:
+                raise StopAsyncIteration
+            self._arrived.clear()
+            self.waiting = True
+            try:
+                await self._arrived.wait()
+            finally:
+                self.waiting = False
+        self.taken += 1
+        return self._queue.pop(0)
+
+
+class _ScriptedConsumer:
+    def __init__(self, stream: _ScriptedStream, calls: list[tuple[str, object]]) -> None:
+        self._stream = stream
+        self._calls = calls
+
+    async def subscribe(
+        self,
+        topic: str,
+        *,
+        partitions: Iterable[int] | None = None,
+        listener: AssignmentListener | None = None,
+        start_offset: int | None = None,
+    ) -> AsyncIterator[ConsumedMessage]:
+        arguments = {
+            "topic": topic,
+            "partitions": partitions,
+            "listener": listener,
+            "start_offset": start_offset,
+        }
+        self._calls.append(("subscribe", arguments))
+        return self._stream
+
+    async def ack(self, messages: Iterable[ConsumedMessage]) -> None:
+        # Decision 3: "Nothing is acknowledged and nothing is committed."
+        raise AssertionError("the trie acknowledged a positional subscription")
+
+    async def close(self) -> None:
+        return None
+
+
+class _ScriptedBus:
+    """A bus whose log end is `end` and whose one consumer reads `stream`."""
+
+    def __init__(self, stream: _ScriptedStream, *, end: int) -> None:
+        self.stream = stream
+        self.calls: list[tuple[str, object]] = []
+        self._end = end
+        self._consumer = _ScriptedConsumer(stream, self.calls)
+
+    def producer(self) -> Producer:
+        return InMemoryBus().producer()
+
+    def consumer(self, group_id: str) -> Consumer:
+        self.calls.append(("consumer", group_id))
+        return self._consumer
+
+    async def end_offset(self, topic: str) -> int:
+        self.calls.append(("end_offset", topic))
+        return self._end
+
+
+def _worker_on(bus: MessageBus, state: TrieState | None = None) -> TrieWorker:
+    if state is None:
+        state = TrieState(families=ONLY_V4, config=_config())
+    return TrieWorker(bus=bus, state=state, metrics=TrieMetrics())
+
+
+def _added(i: int) -> ConsumedMessage:
+    """A `HotIpAdded` for `_ip(i + 1)` at offset `i`."""
+
+    return _msg(_envelope(_ip(i + 1), i), i)
+
+
 class TestConstants:
     def test_the_consumer_group(self) -> None:
         assert CONSUMER_GROUP == "hammertime-trie"
@@ -371,6 +585,119 @@ class TestReplayAndReadiness:
 
         with pytest.raises(RuntimeError):
             await worker.run()
+
+
+class TestStartRules:
+    """Decision 3 (the subscription and its start offset) and decision 4
+    (`start()`'s steps and its two early exits)."""
+
+    async def test_end_offset_is_read_before_subscribing(self) -> None:
+        bus = _SpyBus()
+        for i in range(3):
+            await _publish(bus.inner, _envelope(_ip(i + 1), i))
+        worker = _worker_on(bus)
+        # Decision 6: "The constructor takes the consumer from `bus`".
+        assert bus.calls == [("consumer", CONSUMER_GROUP)]
+
+        await worker.start()
+        try:
+            # Decision 4 step 2: "It reads `end = await bus.end_offset(HOT_IP.name)`
+            # *before* subscribing"; step 3 subscribes (decision 3).
+            assert bus.calls[1:] == [("end_offset", TOPIC), ("subscribe", _positional(0))]
+            assert worker.replay_target == 3
+            assert worker.caught_up is True
+            assert worker.state.event_sequence == 3
+        finally:
+            await worker.stop()
+
+    async def test_a_state_with_a_position_is_replayed_from_the_next_offset(self) -> None:
+        bus = _SpyBus()
+        for i in range(5):
+            await _publish(bus.inner, _envelope(_ip(i + 1), i))
+        state = TrieState(families=ONLY_V4, config=_config())
+        state.note_handled(2)
+        worker = _worker_on(bus, state)
+
+        await worker.start()
+        try:
+            # Decision 3: "`S` is ... `state.position + 1` otherwise".
+            assert _subscriptions(bus.calls) == [_positional(3)]
+            fs = state.of(IPV4)
+            assert worker.replay_target == 5
+            assert worker.caught_up is True
+            assert state.position == 4
+            assert state.event_sequence == 5
+            assert set(fs.records) == {_ip(4), _ip(5)}
+            assert fs.trie.hot_ip_count == 2
+        finally:
+            await worker.stop()
+
+    async def test_a_state_already_at_the_log_end_takes_no_message(self) -> None:
+        # Decision 4: caught up means `end <= S`. The stream ends at once, so
+        # taking a message would end the replay in a `RuntimeError`.
+        stream = _ScriptedStream([], hold=False)
+        bus = _ScriptedBus(stream, end=3)
+        state = TrieState(families=ONLY_V4, config=_config())
+        state.note_handled(2)
+        worker = _worker_on(bus, state)
+
+        await worker.start()
+        try:
+            assert _subscriptions(bus.calls) == [_positional(3)]
+            assert stream.taken == 0
+            assert worker.replay_target == 3
+            assert worker.caught_up is True
+            assert state.event_sequence == 3
+        finally:
+            await worker.stop()
+
+    async def test_a_stream_that_ends_before_the_log_end_is_a_runtime_error(self) -> None:
+        # Decision 4 step 4: "If the iterator ends before that, `start()` raises
+        # `RuntimeError`."
+        stream = _ScriptedStream([_added(0)], hold=False)
+        worker = _worker_on(_ScriptedBus(stream, end=3))
+
+        try:
+            with pytest.raises(RuntimeError):
+                await worker.start()
+            assert stream.taken == 1
+            assert worker.state.position == 0
+            assert worker.caught_up is False
+        finally:
+            await worker.stop()
+
+    async def test_stop_during_the_replay_returns_without_catching_up(self) -> None:
+        # Decision 4 step 4: "If `stop()` has begun, `start()` returns without
+        # being caught up."
+        stream = _ScriptedStream([_added(0)], hold=True)
+        worker = _worker_on(_ScriptedBus(stream, end=3))
+        task = asyncio.create_task(worker.start())
+        await _yield_until(lambda: stream.waiting)
+        assert worker.state.position == 0
+
+        await worker.stop()
+        # Decision 13: once `stop()` has begun, a message that arrives is not
+        # applied -- `handle()` returns STOPPED if it is handed one.
+        stream.feed(_added(1))
+        await asyncio.wait_for(task, timeout=10.0)
+
+        assert worker.replay_target == 3
+        assert worker.caught_up is False
+        assert worker.state.position == 0
+        assert _ip(2) not in worker.state.of(IPV4).records
+
+    async def test_start_after_stop_returns_without_catching_up(self) -> None:
+        bus = InMemoryBus()
+        for i in range(3):
+            await _publish(bus, _envelope(_ip(i + 1), i))
+        worker = _worker(bus=bus)
+
+        await worker.stop()
+        await asyncio.wait_for(worker.start(), timeout=10.0)
+
+        assert worker.caught_up is False
+        assert worker.state.position is None
+        assert worker.state.of(IPV4).trie.hot_ip_count == 0
 
 
 class TestAddsAndRemoves:
@@ -530,14 +857,17 @@ def _no_subject() -> tuple[bytes, bytes | None]:
     return encode(_envelope(IP_A, 1, subject=None)), str(IP_A).encode()
 
 
+# Each case with decision 6 step 2's reason token. Every case fails exactly one
+# of the step's checks: the key cases carry the right subject, and the subject
+# cases the right key.
 MALFORMED_CASES = [
-    pytest.param(_not_json, id="not-json"),
-    pytest.param(_request_observation, id="payload-request-observation"),
-    pytest.param(_prefix_stats_changed, id="payload-prefix-stats-changed"),
-    pytest.param(_key_of_another_ip, id="key-names-another-ip"),
-    pytest.param(_no_key, id="key-is-none"),
-    pytest.param(_subject_of_another_ip, id="subject-names-another-ip"),
-    pytest.param(_no_subject, id="subject-is-none"),
+    pytest.param(_not_json, "codec", id="not-json"),
+    pytest.param(_request_observation, "payload_type", id="payload-request-observation"),
+    pytest.param(_prefix_stats_changed, "payload_type", id="payload-prefix-stats-changed"),
+    pytest.param(_key_of_another_ip, "key_mismatch", id="key-names-another-ip"),
+    pytest.param(_no_key, "key_mismatch", id="key-is-none"),
+    pytest.param(_subject_of_another_ip, "subject_mismatch", id="subject-names-another-ip"),
+    pytest.param(_no_subject, "subject_mismatch", id="subject-is-none"),
 ]
 
 # Rejected by the codec's attribute validator on decode: a key rule R1 refuses.
@@ -554,10 +884,26 @@ class TestMalformed:
         assert outcome is HotIpOutcome.APPLIED
         return worker
 
-    @pytest.mark.parametrize("build", MALFORMED_CASES)
-    async def test_it_is_skipped_and_counted(
-        self, build: Callable[[], tuple[bytes, bytes | None]]
+    @staticmethod
+    def _assert_logged_once(caplog: pytest.LogCaptureFixture, reason: str) -> None:
+        # Decision 12: `malformed_hot_ip_event`, warning, with `topic`,
+        # `partition`, `offset` and `reason` (a decision 6 token).
+        records = _logged(caplog, "malformed_hot_ip_event")
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert _field(records[0], "reason") == reason
+        assert _field(records[0], "offset") == "1"
+        assert _field(records[0], "partition") == "0"
+        assert _field(records[0], "topic") == TOPIC
+
+    @pytest.mark.parametrize(("build", "reason"), MALFORMED_CASES)
+    async def test_it_is_skipped_counted_and_logged_with_its_reason(
+        self,
+        build: Callable[[], tuple[bytes, bytes | None]],
+        reason: str,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
         worker = await self._worker_with_one_applied_event()
         before = _view(worker)
         as_of = worker.state.as_of
@@ -575,8 +921,10 @@ class TestMalformed:
         assert worker.state.as_of == as_of
         assert _updates_total(worker) == updates
         assert _rejected(worker, "decode") == 0
+        self._assert_logged_once(caplog, reason)
 
-    async def test_attributes_rejected_at_decode(self) -> None:
+    async def test_attributes_rejected_at_decode(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
         worker = await self._worker_with_one_applied_event()
         before = _view(worker)
         as_of = worker.state.as_of
@@ -592,6 +940,7 @@ class TestMalformed:
         assert IP_A not in worker.state.of(IPV4).records
         assert worker.state.position == 1
         assert worker.state.as_of == as_of
+        self._assert_logged_once(caplog, "invalid_attributes")
 
 
 class TestFamilyNotServed:
@@ -624,6 +973,91 @@ class TestFamilyNotServed:
         assert _updates(worker, "ipv6", "HotIpAdded", "applied") == 1
         assert _updates(worker, "ipv4", "HotIpAdded", "applied") == 0
         assert _skipped(worker, "family_not_served") == 0
+
+    async def test_every_such_event_is_logged_and_a_repeat_at_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Decision 12: `family_not_served`, with `family`, `topic`, `partition`
+        # and `offset`; "debug after" the first time per family per process.
+        # Whether this is that first time depends on the tests run before it
+        # in this process, so the WARNING is checked in a fresh process below.
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        worker = _worker(families=ONLY_V4)
+
+        for offset in range(2):
+            outcome = await worker.handle(_msg(_envelope(IP_V6, offset), offset))
+            assert outcome is HotIpOutcome.FAMILY_NOT_SERVED
+
+        records = _logged(caplog, "family_not_served")
+        assert [_field(record, "offset") for record in records] == ["0", "1"]
+        assert records[1].levelno == logging.DEBUG
+        for record in records:
+            assert _field(record, "family") == "ipv6"
+            assert _field(record, "partition") == "0"
+            assert _field(record, "topic") == TOPIC
+
+    def test_the_first_per_family_in_a_process_is_a_warning(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", _FAMILY_LOG_SCRIPT, __file__],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        assert report["outcomes"] == ["family_not_served"] * 5
+        # An IPv4-only worker meets IPv6 three times, then an IPv6-only worker
+        # meets IPv4 twice: the first of each family is a warning.
+        assert report["levels"] == ["WARNING", "DEBUG", "DEBUG", "WARNING", "DEBUG"]
+
+
+# Run by `test_the_first_per_family_in_a_process_is_a_warning` in a fresh
+# interpreter; `sys.argv[1]` is this file, imported by path for its helpers.
+_FAMILY_LOG_SCRIPT = """
+import asyncio
+import importlib.util
+import json
+import logging
+import sys
+
+spec = importlib.util.spec_from_file_location("trie_worker_tests", sys.argv[1])
+tests = importlib.util.module_from_spec(spec)
+sys.modules["trie_worker_tests"] = tests
+spec.loader.exec_module(tests)
+
+
+class Keep(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.levels = []
+
+    def emit(self, record):
+        words = record.getMessage().split()
+        if words and words[0] == "family_not_served":
+            self.levels.append(record.levelname)
+
+
+async def main():
+    keep = Keep()
+    logger = logging.getLogger("hammertime.trie.worker")
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(keep)
+    outcomes = []
+    v4_only = tests._worker(families=frozenset({tests.IPV4}))
+    for offset in range(3):
+        message = tests._msg(tests._envelope(tests.IP_V6, offset), offset)
+        outcomes.append(str((await v4_only.handle(message)).value))
+    v6_only = tests._worker(families=frozenset({tests.IPV6}))
+    for offset in range(2):
+        message = tests._msg(tests._envelope(tests.IP_A, offset), offset)
+        outcomes.append(str((await v6_only.handle(message)).value))
+    print(json.dumps({"levels": keep.levels, "outcomes": outcomes}))
+
+
+asyncio.run(main())
+"""
 
 
 class TestRedelivered:
@@ -668,6 +1102,26 @@ class TestRedelivered:
         await self._assert_redelivered(worker, _msg(_envelope(IP_C, 2), 0))
 
         assert IP_C not in worker.state.of(IPV4).records
+
+    async def test_it_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Decision 6 step 1: "The record `redelivered_hot_ip_event` is logged";
+        # decision 12: warning, with `topic`, `partition`, `offset`, `position`.
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        worker = _worker()
+        assert await worker.handle(_msg(_envelope(IP_A, 0), 0)) is HotIpOutcome.APPLIED
+        assert await worker.handle(_msg(_envelope(IP_B, 1), 1)) is HotIpOutcome.APPLIED
+        assert _logged(caplog, "redelivered_hot_ip_event") == []
+
+        outcome = await worker.handle(_msg(_envelope(IP_C, 2), 0))
+
+        assert outcome is HotIpOutcome.REDELIVERED
+        records = _logged(caplog, "redelivered_hot_ip_event")
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert _field(records[0], "offset") == "0"
+        assert _field(records[0], "position") == "1"
+        assert _field(records[0], "partition") == "0"
+        assert _field(records[0], "topic") == TOPIC
 
 
 class TestAByteIdenticalRecordAtANewOffset:
@@ -846,19 +1300,20 @@ class TestReadersSeeWholeEvents:
 
     async def test_every_resume_sees_a_consistent_state(self) -> None:
         k = 200
+        burst = 50
         bus = InMemoryBus()
         worker = _worker(bus=bus)
         await worker.start()
         assert worker.state.event_sequence == 0
         state = worker.state
         fs = state.of(IPV4)
-        samples = 0
+        # Every distinct `event_sequence` the sampler resumed at.
+        seen: set[int] = set()
 
         async def sampler() -> None:
-            nonlocal samples
             for _ in range(100_000):
-                samples += 1
                 assert len(fs.records) == fs.trie.hot_ip_count == state.event_sequence
+                seen.add(state.event_sequence)
                 if state.event_sequence == k:
                     return
                 await asyncio.sleep(0)
@@ -866,13 +1321,26 @@ class TestReadersSeeWholeEvents:
 
         run_task = asyncio.create_task(worker.run())
         sampler_task = asyncio.create_task(sampler())
-        for i in range(k):
-            await _publish(bus, _envelope(_ip(i + 1), i))
+
+        async def sampled(target: int) -> None:
+            # The worker idles at `target` until the next burst is published,
+            # so the sampler resumes there; stop early if the sampler failed.
+            await _yield_until(lambda: target in seen or sampler_task.done())
+
+        for first in range(0, k, burst):
+            for i in range(first, first + burst):
+                await _publish(bus, _envelope(_ip(i + 1), i))
+            if first + burst < k:
+                await sampled(first + burst)
 
         await asyncio.wait_for(sampler_task, timeout=10.0)
         await _stop_and_join(worker, run_task)
 
-        assert samples >= 1
+        # Non-vacuous: the check above ran at states strictly between the
+        # first event and the last, not only at 0 and `k`.
+        between = {v for v in seen if 0 < v < k}
+        assert between, seen
+        assert {50, 100, 150} <= between
         assert state.event_sequence == k
         assert len(fs.records) == fs.trie.hot_ip_count == k
 

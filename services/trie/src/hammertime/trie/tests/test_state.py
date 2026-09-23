@@ -19,8 +19,6 @@ decision 8 (`position`, `event_sequence`, `as_of`):
 * `adopt_config` "compares no versions" (decision 10).
 """
 
-from __future__ import annotations
-
 from datetime import UTC, datetime, timedelta
 
 import pytest

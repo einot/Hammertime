@@ -29,8 +29,6 @@ Label *values* outside the documented sets (e.g. `result="bogus"`) are not
 exercised: decision 12 constrains label names, not values.
 """
 
-from __future__ import annotations
-
 from datetime import UTC, datetime
 
 import pytest
