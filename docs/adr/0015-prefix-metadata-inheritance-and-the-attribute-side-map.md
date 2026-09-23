@@ -2505,7 +2505,12 @@ parse time (assumption 67). Schema minimums and maximums are not added
 (below). *(Superseded 2026-09-23 by ADR-0016 decisions 1 and 2; Amendment
 4. Each payload integer field the codec reads is now refused, on decode and
 on encode, outside the `minimum` and `maximum` its schema states. The
-envelope's three integer fields still get no bounds.)*
+envelope's three integer fields still get no bounds.)* *(Corrected 2026-09-23
+after review, Amendment 4: "The envelope's three integer fields still get no
+bounds" was imprecise. Two of them, `sequence` and `config_version`, get none
+(ADR-0016 assumption 3). The third, `schema_version`, is pinned to exactly 1
+(ADR-0016 decision 1: "still pinned to 1"): `decode` and `encode` both refuse
+any other value as a `CodecError`.)*
 
 **4. `a in records` answers without decoding the record** (reviewer). The
 override — `False` for a non-`Address`, the family `ValueError`, then key
@@ -2697,7 +2702,11 @@ Every edit outside this section:
 * **Amendment 3, ruling 3, "*What is not changed.*"** A dated note follows
   "Schema minimums and maximums are not added (below)." It says that
   ADR-0016 decisions 1 and 2 add them, and that the envelope's three integer
-  fields still get none. The sentence itself is kept.
+  fields still get none. The sentence itself is kept. *(Corrected 2026-09-23
+  after review: "the envelope's three integer fields still get none" was
+  imprecise, here and in the note. `sequence` and `config_version` get none;
+  `schema_version` is pinned to exactly 1. A second dated note, after the
+  first, says so. See "Corrected after review" below.)*
 * **Amendment 3, "Found while ruling, not ruled here", third bullet.** A
   dated note says ADR-0016 rules it.
 
@@ -2706,3 +2715,34 @@ What is **not** changed: ruling 3's type rule and its list of fields;
 "`CodecError` only" rows. ADR-0016 builds on all of them. **No `CHANGES`
 entry** for this amendment by itself: ADR-0016's implementing change carries
 one line (its assumption 12).
+
+### Corrected after review (2026-09-23)
+
+Review of issue #112's change found that this amendment, in the note it
+added to ruling 3's "*What is not changed.*" and in its bullet above, said
+the envelope's three integer fields get no bounds. Two of them, `sequence`
+and `config_version`, get none (ADR-0016 assumption 3). The third,
+`schema_version`, is pinned to exactly 1: `decode` and `encode` both refuse
+any other value as a `CodecError` (`hammertime.core.events.codec`, read in
+this repository). ADR-0016 already says so precisely: its decision 1 lists
+"the envelope's `schema_version` (still pinned to 1), `sequence` and
+`config_version` (assumption 3)" as not changed.
+
+Every edit these corrections make is an insertion. Where one corrects
+existing wording, that wording is kept, and quoted here:
+
+* **Amendment 3, ruling 3, "*What is not changed.*"** A second dated note
+  after the first, whose last sentence is "The envelope's three integer
+  fields still get no bounds."
+* **This amendment, the "Amendment 3, ruling 3" bullet.** A dated
+  correction after "and that the envelope's three integer fields still get
+  none. The sentence itself is kept."
+* **This amendment.** This subsection.
+
+Assumptions made by these corrections (push back individually):
+
+* **Annotated, not reworded.** Both sentences are kept, each with a dated
+  correction after it, because the status line and this amendment say
+  nothing in this ADR is reworded. Push back if a reworded note, with the
+  old sentence quoted, is preferred.
+* **No `CHANGES` entry.** Wording only; the codec's behaviour is unchanged.

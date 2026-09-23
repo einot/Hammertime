@@ -484,3 +484,15 @@ Nothing was removed anywhere. Each edit is an insertion:
     `services/aggregator/transitions.py`, `core/state/transitions.py`,
     `docs/adr/0011`". It gains "`docs/adr/0016` (decision 3: a transition is
     encoded before it is persisted)".
+* **Added 2026-09-23 after review.** Review found two places where the edits
+  above said more than holds. Each is corrected by dated insertions, listed
+  under "Corrected after review" at the end of the amendment concerned:
+  * ADR-0011's blockquote after decision 4's step 5, and its Amendment 8,
+    called step 2 unchanged. But step 2's "the durable HOT set is updated
+    **before** the event exists" no longer holds under decision 3. Step 2
+    gains a nested dated blockquote saying so: the event is still published
+    after the durable write. Both "unchanged" claims gain dated corrections.
+    So does ADR-0011's status line, since decision 4 now gains two notes.
+  * ADR-0015's note in Amendment 3 ruling 3, and its Amendment 4, said the
+    envelope's three integer fields get no bounds. `schema_version` is pinned
+    to 1, as decision 1 says. A dated correction follows each.
