@@ -115,12 +115,16 @@ name. ASSUMPTIONS for this class:
    this one is a test seam the ADR does not pin (the name comes from the
    review finding that asked for these tests), and if the implementation
    renames it, the fixture changes, not the assertions.
-6. That an unregistered topic on an *unstarted* bus is a `KeyError` rather
-   than a `RuntimeError` -- the topic lookup comes first -- is the
-   dispatcher's reading. Decision 3 rules the same order for
+6. RULED 2026-09-23 by ADR-0013 Amendment 11; no longer an assumption, kept
+   under its number because Amendment 11 cites it as "their ASSUMPTION 6".
+   An unregistered topic on an *unstarted* bus is a `KeyError` rather than a
+   `RuntimeError` -- the topic lookup comes first. Decision 3's dated
+   paragraph "Which error, when both apply": "An unregistered topic is
+   therefore a `KeyError` whether or not the bus has started, and
+   `RuntimeError("NatsBus is not started")` is raised only for a registered
+   topic before `start()`." This is the order decision 3 already gave
    `NatsConsumer.subscribe()` ("raised with the other argument checks before
-   the broker is contacted", Amendment 1 C5.6) but its text on the two offset
-   reads names both errors without ruling which wins when both apply.
+   the broker is contacted", Amendment 1 C5.6).
 """
 
 import copy
@@ -883,9 +887,10 @@ class TestNatsBusOffsetReads:
 
     @pytest.mark.parametrize("method", _OFFSET_READS)
     async def test_an_unregistered_topic_is_a_key_error_before_start(self, method: str) -> None:
-        # ASSUMPTION 6: the topic lookup comes first, so an unstarted bus
-        # still answers an unregistered topic with `KeyError`, not
-        # `RuntimeError`.
+        # ADR-0013 Amendment 11 (formerly ASSUMPTION 6): the topic lookup
+        # comes first, so an unstarted bus still answers an unregistered
+        # topic with `KeyError`, not `RuntimeError` -- "a `KeyError` whether
+        # or not the bus has started".
         bus = NatsBus(_SERVERS)
 
         with pytest.raises(KeyError):
