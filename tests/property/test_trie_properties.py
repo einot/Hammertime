@@ -195,7 +195,7 @@ def test_every_step_keeps_every_invariant(
 ) -> None:
     """Sections 11, 12, 46.5 and decision 5's capacity bound, after every step."""
 
-    pool, operations = _draw_stream(data, family)
+    _pool, operations = _draw_stream(data, family)
     extra = data.draw(st.lists(prefixes(family), max_size=3), label="extra probes")
     root = Prefix(family=family, network=0, length=0)
 
