@@ -18,7 +18,14 @@ assumption on the minimum length each carry a dated note); amended a fourth
 time 2026-09-24 (see "Amendment 4" at the end — by ADR-0017 Amendment 3:
 decision 3's 2026-09-21 note says the snapshot alone records the
 invariant, and a trie start now also reads how far its stats reached from
-the last message of the prefix-stats log; decision 3 carries a dated note)
+the last message of the prefix-stats log; decision 3 carries a dated note);
+amended a fifth time 2026-09-24 (see "Amendment 5" at the end — by ADR-0017
+Amendment 4: decision 1's predicate refuses arguments outside its domain;
+IPv6's `matched_prefixes` are `/104`, `/112` and `/120`; `GET
+/prefixes/hot` lists each served family's prefixes from its reporting floor
+to the host route; a query for a family the trie does not hold is refused;
+the trie keeps no cached `prefix_state`; decisions 1, 2, 4 and 5, one
+assumption and one Consequences bullet carry dated notes)
 
 Scope note: this ADR pins down the interfaces the cross-service tests of
 issue #26 (`docs/spec/integration-scenarios.md`) observe the pipeline through,
@@ -86,6 +93,15 @@ never disagree about whether a prefix qualifies *for the same*
 propagation delay §22 already allows, which both responses expose via
 `event_sequence`.
 
+> Amended 2026-09-24 (ADR-0017 Amendment 4 ruling 1; Amendment 5): the
+> function checks its arguments before it compares. A `hot_count` or
+> `capacity` that is not an `int`, or is a `bool`, is a `TypeError`. A
+> `capacity` below 1, or a `hot_count` below 0 or above `capacity`, is a
+> `ValueError`. Within that domain the docstring's "iff" is exact. The
+> trie's read routes are its first callers. For the detector, a
+> `PrefixStatsChanged` whose `hot_count` exceeds its `capacity` raises here,
+> and what its worker then does is the detector epic's to rule.
+
 ### 2. v1 emits exactly two prefix states; `BOT_NETWORK` is reserved
 
 `PrefixState.NORMAL` and `PrefixState.HOT_PREFIX` are the only values a v1
@@ -100,6 +116,14 @@ hot_prefixes            number of prefixes currently HOT_PREFIX (all lengths)
 bot_network_candidates  number of prefixes in the minimal set (§31)
 classification_changes  count of NORMAL <-> HOT_PREFIX edges observed
 ```
+
+> Noted 2026-09-24 (ADR-0017 Amendment 4, its assumption 111; Amendment 5):
+> under the default document a `/28` whose sixteen addresses are all HOT
+> qualifies. The most specific qualifying prefixes of §42's example, the
+> 156 HOT addresses from `10.20.30.1`, are therefore eight `/28`s, not the
+> `/24` §42 calls a candidate. That follows from this decision's reading
+> and from §13. Whether §42 should be read otherwise is raised for the
+> repository owner with ADR-0017 Amendment 4, and is not ruled here.
 
 ### 3. The trie emits `PrefixStatsChanged` for every ancestor from a minimum length down to the host route
 
@@ -184,6 +208,27 @@ is a valid, zero-valued, `NORMAL`/`COLD` answer, not a 404: absence of a node
 > `as_of` is the greatest `timestamp` among the hot-ip events it has
 > applied, and `null` until it has applied one.
 
+> Amended 2026-09-24 (ADR-0017 Amendment 4 rulings 2 and 5; Amendment 5):
+> three things this decision left open for the trie are settled.
+>
+> 1. IPv6's `matched_prefixes` are `/104`, `/112` and `/120`. In both
+>    families they are the ancestors with 24, 16 and 8 host bits, so IPv4's
+>    stay `/8`, `/16` and `/24`.
+> 2. `GET /prefixes/hot` lists, for each family the trie serves, every
+>    prefix from that family's reporting floor (decision 3, as noted) to the
+>    host route that holds a HOT address and is `HOT_PREFIX`, IPv4 before
+>    IPv6. "Every `HOT_PREFIX` node" reads "every such prefix": the Patricia
+>    trie has no node for every prefix (ADR-0014 decision 6). A request
+>    finds the list by a walk that descends only where a prefix could
+>    qualify, and the trie keeps no index.
+> 3. A query for an address or a prefix of a family the trie does not serve
+>    is `400`. The zero-valued answer above is the trie's statement that
+>    nothing beneath a prefix is hot, and it can make none about a family it
+>    does not hold.
+>
+> The grammar, the order of the checks and the error texts are
+> `read-api-v1.md`'s.
+
 ### 5. The detector's read API reflects classification immediately; debounce applies to alerts only
 
 `GET /detections` lists every prefix whose latest known stats qualify, with
@@ -197,6 +242,12 @@ which the prefix most recently entered `HOT_PREFIX` (reset when it leaves).
 On a configuration change (ADR-0009 decision 6) the detector re-runs decision
 1 over every prefix it holds stats for; the trie re-evaluates `state` lazily at
 read time and eagerly for the cached `prefix_state` (§12).
+
+> Amended 2026-09-24 (ADR-0017 Amendment 4 ruling 5; Amendment 5): the trie
+> keeps no cached `prefix_state`. It re-evaluates `state` lazily at read
+> time only, and "eagerly for the cached `prefix_state` (§12)" has nothing
+> to act on. Adopting the new document is the trie's whole re-evaluation
+> (ADR-0017 decision 10).
 
 ### 6. An observation's delta lands in exactly one bucket
 
@@ -244,6 +295,10 @@ It is never used to spread the delta. This is what
 * **`matched_prefixes` reports IPv4 lengths 8, 16 and 24.** §29's example
   shows exactly those three; returning all 32 ancestors is noise. A query
   parameter can widen this later without breaking the default.
+
+  > Settled 2026-09-24 (ADR-0017 Amendment 4 ruling 2; Amendment 5): IPv6
+  > reports `/104`, `/112` and `/120`, the ancestors with as many host bits
+  > as IPv4's three.
 * **Zero-valued answers instead of 404 for unknown prefixes/IPs.** A 404 would
   force every client to special-case "not hot" versus "not found" when the
   trie means the same thing by both.
@@ -267,6 +322,9 @@ It is never used to spread the delta. This is what
 * `schemas/prefix_stats_event.v1.json` is unchanged (`hot_ratio` was already
   optional; the trie now always sets it). No `CHANGES` entry for that; the
   read APIs themselves get one line each when they ship.
+
+  > Noted 2026-09-24 (ADR-0017 Amendment 4 ruling 11; Amendment 5): the
+  > trie's read API ships with four lines, which that ruling gives.
 * The trie's outbound volume is ~25 messages per transition. `trie_updates`
   and `hot_transition_to_prefix_update_latency` (§37) remain the signals
   that say when this, or ADR-0001's single writer, needs revisiting.
@@ -494,3 +552,56 @@ Assumptions made by this amendment (push back individually):
   The note stops this ADR's text from saying what no longer holds.
 * **No CHANGES entry from this amendment.** ADR-0017 Amendment 3 ruling 7
   gives the implementing change's line.
+
+## Amendment 5 (2026-09-24) — the trie's read API as designed: the predicate's domain, IPv6's matched prefixes, what `GET /prefixes/hot` lists, a family not served, and no cached `prefix_state` (ADR-0017 Amendment 4)
+
+Why: ADR-0017 Amendment 4 designs slice 3 of epic #10: this ADR's predicate
+(decision 1) and the trie's half of its read API (decision 4). It settles
+five things this ADR left open, stated for IPv4 only, or stated for a cache
+the trie does not keep:
+
+* decision 1 gave the comparison and not its domain;
+* the assumption on `matched_prefixes` gave IPv4's lengths only;
+* decision 4 said `GET /prefixes/hot` lists "every `HOT_PREFIX` node", and
+  said neither which lengths nor which families;
+* nothing said what a query for a family the trie does not hold answers;
+* decision 5 has the trie re-evaluate "eagerly for the cached
+  `prefix_state`", and the trie keeps none.
+
+Designing it also showed what decision 2's reading of §42 yields under the
+default document. That is raised for the repository owner, and is not ruled
+here.
+
+Decisions 3 and 6 are unchanged, and so is the text of every decision.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended a fifth time 2026-09-24" clause.
+* **Decision 1.** A dated blockquote after its last paragraph: the argument
+  checks.
+* **Decision 2.** A dated blockquote after the metrics block: §42's
+  minimal set under the default document.
+* **Decision 4.** A dated blockquote after its 2026-09-23 note: three
+  settlements.
+* **Decision 5.** A dated blockquote after its second paragraph: no cached
+  `prefix_state`.
+* **Assumptions, "`matched_prefixes` reports IPv4 lengths 8, 16 and 24."** A
+  dated blockquote under the bullet.
+* **Consequences, the bullet on `schemas/prefix_stats_event.v1.json`.** A
+  dated blockquote under the bullet.
+
+Assumptions made by this amendment (push back individually):
+
+* **Pointer notes, not rewritten decisions.** The rulings, their reasons and
+  their alternatives are ADR-0017 Amendment 4's (rulings 1, 2 and 5;
+  assumptions 90 to 94, 98, 100 and 111). The notes stop this ADR from
+  leaving open what is now settled.
+* **The detector's list inherits the family order.** `read-api-v1.md`
+  orders the detector's list "same as the trie's list", so IPv4 before IPv6
+  binds it too. The detector epic may revisit that; nothing here designs
+  the detector.
+* **The note on decision 2 records a consequence, not a ruling.** The
+  numbers follow from §13 and the reading decision 2 already made. Whether
+  that reading should change is the owner's question.
+* **No CHANGES entry from this amendment.** ADR-0017 Amendment 4 ruling 11
+  gives the implementing change's lines.

@@ -1126,7 +1126,10 @@ not dictate. Push back on them individually.
    mean a `CHANGES` entry, a schema and a protocol change well outside an epic
    whose file list is four modules. So the store ships with a programmatic API
    and no wire source — the same "designed now, enabled later" shape ADR-0005
-   used for `sources`. Named as an open item in Consequences.
+   used for `sources`. Named as an open item in Consequences. *(Noted
+   2026-09-24, ADR-0017 Amendment 4 ruling 6: the trie's read API reads and
+   returns no prefix metadata, so this open item does not block it. How an
+   operator declares metadata stays open.)*
 8. **The store is family-scoped.** Nothing forces it: a `Prefix` carries its
    family, so one store could hold both and simply never match across them.
    I scoped it per family for consistency with ADR-0014 decision 1 and because
@@ -2269,7 +2272,12 @@ Each judgment call made on top of those is below.
   *(Amended 2026-09-23, Amendment 5: the `request_count` decision is made.
   `IpAttributeRecords.get(ip)` returns an `IpRecord`, or `None` while the IP
   is COLD. Its `attributes` is §46.7's `attributes`, and its `request_count`
-  is `GET /ip/{addr}`'s.)*
+  is `GET /ip/{addr}`'s.)* *(Amended 2026-09-24, ADR-0017 Amendment 4:
+  `evaluate_prefix_state` is designed there (ruling 1), and the trie keeps
+  no cached `prefix_state` (ruling 5). `GET /prefix/{cidr}` and
+  `matched_prefixes` read `hot_count` and derive `capacity` and `hot_ratio`
+  from the prefix, as `PrefixStats` does; `GET /ip/{addr}` reads the
+  address's `IpRecord`.)*
 * **The snapshot epic** must persist the record map (§46.8) and must not
   persist the metadata store (decision 8). Every document it restores is
   validated by `record()` or `apply_hot_ip_added()` (decision 5); it decides
@@ -2313,7 +2321,9 @@ Each judgment call made on top of those is below.
   at decode should still deliver its transition, which would change the
   codec's contract (assumption 42). *(Amended 2026-09-23, Amendment 5:
   whether `request_count` joins the per-IP record is settled. It does, by the
-  repository owner's ruling on #116.)*
+  repository owner's ruling on #116.)* *(Noted 2026-09-24, ADR-0017
+  Amendment 4 ruling 6: how an operator declares prefix metadata is still
+  open, and the trie's read API does not need it.)*
 
 ## Amendment 1 (2026-09-23) — the three gaps `test-author` hit writing epic #9's tests, and four more found while ruling them
 
@@ -3306,6 +3316,12 @@ change that implements it. The count first becomes visible with ADR-0017's
 slice 3, whose `GET /ip/{addr}` entry covers it. That entry should say that
 `request_count` is the count at the IP's most recent applied transition, not
 a live one, so that no reader takes it for a live count.
+
+> Noted 2026-09-24 (ADR-0017 Amendment 4 ruling 11): slice 3's implementing
+> change carries that entry: `GET /ip/{addr} returns request_count, the
+> window_count of the most recent HotIpAdded the trie applied for the
+> address: its count at transition time, not a live count, and 0 while the
+> address is COLD`.
 
 ### Follow-ups (for the top-level session to dispatch)
 

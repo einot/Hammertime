@@ -39,6 +39,17 @@ marks nothing. Whether to cap the streams is left with the owner and is
 not ruled. Decisions 1, 4, 6, 7, 12, 13, 14 and 16, the Test seams,
 Consequences and Amendment 2 carry dated notes. ADR-0010 (Amendment 4) and
 ADR-0013 (Amendment 13) carry notes.
+Amended a fourth time 2026-09-24 (see "Amendment 4" at the end), to design
+slice 3, the read API. `evaluate_prefix_state` joins `hammertime.core.state`
+and checks its arguments. The three routes, their inputs, bodies and
+refusals are settled, a family the trie does not hold included. The routes
+check readiness before anything else and read `TrieState` with no `await`.
+The trie keeps no cached `prefix_state`: `GET /prefixes/hot` walks only the
+prefixes whose count could qualify. The read API needs no prefix metadata,
+and `prefix_queries` counts by route and result. The port's exposure is left
+with the owner and is not ruled. Decisions 1, 2, 9, 10, 12, 13 and 15, the
+Test seams and Consequences carry dated notes. ADR-0010 (Amendment 5) and
+ADR-0015 carry notes, and so does `docs/protocol/read-api-v1.md`.
 
 Scope note. This ADR settles what epic #10 ("Trie worker, publisher &
 read-side query API") is built against. It splits the epic into slices
@@ -181,6 +192,13 @@ What was open, and blocks anyone who wants to write a test or a module:
 > snapshot epic's place in the order rests on this decision's own reasons
 > again.
 
+> Noted 2026-09-24 (Amendment 4): slice 3 is designed. Its change also
+> covers the `prefix_queries` counter in `metrics.py`, the `create_app` call
+> in `service.py`, the re-export of `evaluate_prefix_state` from
+> `hammertime.core.state`, and `CHANGES` (Amendment 4 ruling 11). It changes
+> nothing in `worker.py`, `state.py`, `publisher.py` or `config.py`, and adds
+> no key to `.env.example`.
+
 ### 2. Slice 1's modules
 
 ```text
@@ -218,6 +236,15 @@ not touch `publisher.py`, `query/views.py` or `snapshot/`.
 > `hammertime.trie.metadata`, `hammertime-bus` and `hammertime-core`, and
 > `worker` imports `publisher`. `state` and `query.app` import none of it.
 > The paragraph above describes slice 1 and stays true of it.
+
+> Amended 2026-09-24 (Amendment 4 ruling 8): slice 3 makes `create_app` take
+> `state`, `metrics` and `min_prefix_lengths` as required keywords after
+> `readiness`, and fills in `query/views.py`. `query.app` then imports
+> `hammertime-core`, FastAPI and Starlette, `state`, `metrics` and
+> `query.views`. `query.views` imports `state` and `hammertime-core`, and may
+> import `hammertime.trie.structure` and `hammertime.trie.metadata`. Neither
+> imports `worker`, `publisher`, `service` or `hammertime-bus`. The module
+> table's `query/app.py` row and the import list above describe slice 1.
 
 ```python
 # hammertime.trie.state   Spec: §22, §28, §33, §35, §46.5
@@ -739,6 +766,15 @@ candidate, `GET /prefixes/hot`.
 > the publish is awaited, readers see the event whole, with
 > `event_sequence` past it and its stats not yet all in the log (§22).
 
+> Amended 2026-09-24 (Amendment 4 rulings 4 and 5): the read API keeps R2
+> and R3. A read route's handler is `async def` with no `await` in it: its
+> readiness check, its reads of `TrieState` and the building of its response
+> run in one synchronous call. No route, dependency or handler is a plain
+> `def`, and nothing is handed to a thread. `GET /prefixes/hot`, the one long
+> read, keeps no index: it walks only the prefixes whose `hot_count` is at
+> least `max(minimum_hot_ips, 1)`, and Amendment 4 ruling 5 bounds what that
+> costs the writer.
+
 ### 10. Configuration changes: adopted by the state, under the worker's lock
 
 * **Wiring.** `TrieService` builds
@@ -756,6 +792,10 @@ candidate, `GET /prefixes/hot`.
   reader once `poll_once()` has awaited it, and not before (§47.3).
 * **Slice 3.** If slice 3 caches `prefix_state`, it extends `apply_config`
   to refresh the cache before it adopts.
+
+> Amended 2026-09-24 (Amendment 4 ruling 5): slice 3 caches nothing. The
+> trie keeps no `prefix_state`, `apply_config` is unchanged, and adopting the
+> document stays the whole re-evaluation.
 
 ### 11. Settings
 
@@ -893,6 +933,11 @@ through the runner's `exception` field.
 > `hammertime.prefix-stats.v1` that the worker cannot use. It carries fixed
 > tokens and numbers only, and nothing the message holds.
 
+> Amended 2026-09-24 (Amendment 4 ruling 9): slice 3 adds `prefix_queries`,
+> a counter labelled `route` (`prefix`, `ip`, `prefixes_hot`) and `result`
+> (`ok`, `invalid`, `family_not_served`, `not_ready`). The read routes write
+> no log record.
+
 ### 13. Lifecycle and shutdown
 
 ```python
@@ -1017,6 +1062,12 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
 > with it: `stop()` sets the flag, takes the lock, and awaits the flush,
 > whose exception propagates.
 
+> Amended 2026-09-24 (Amendment 4 ruling 8): `TrieService` builds its app as
+> `create_app(readiness, state=worker.state, metrics=worker.metrics,
+> min_prefix_lengths=...)`, with the floors it passes the worker. The app
+> keeps the `create_app` bullet's three `None` URLs, and the read routes are
+> declared on it under that bullet's rule.
+
 ### 14. The publisher (slice 2): what is decided now
 
 1. **Only a change is published.** An event whose outcome is `APPLIED`
@@ -1124,6 +1175,14 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
    * what a query for a family not served answers (recommendation: 400);
    * the IPv6 `matched_prefixes` lengths;
    * `prefix_queries`' labels.
+
+> Settled 2026-09-24 (Amendment 4): item 6's five points. `GET
+> /prefixes/hot` keeps no index, and each request walks only the prefixes
+> whose count could qualify (ruling 5). It covers each served family's
+> `[L_F, bit_length]` (ruling 2). A query for a family the trie does not
+> serve is `400` (ruling 2). IPv6's `matched_prefixes` are `/104`, `/112` and
+> `/120` (ruling 2). `prefix_queries` is labelled `route` and `result`
+> (ruling 9). Item 4 stands: no route needs prefix metadata (ruling 6).
 
 ### 16. What the snapshot epic inherits
 
@@ -1283,6 +1342,10 @@ written and removed in the same step.
 > to `build_service`, implements `last_value`. A double that returns
 > `None` keeps the replay publishing everything. Amendment 3's "Test
 > seams" describes the rest.
+
+> Added 2026-09-24 (Amendment 4): the read routes are reached through
+> `create_app` with a `TrieState` a test writes itself, or through
+> `TrieService.app`. Amendment 4's "Test seams" describes both.
 
 ## Questions this ADR closes
 
@@ -1588,6 +1651,9 @@ Assumptions 26-32 were added by the revision of 2026-09-23 (see
   * `Add trie service: consumes hammertime.hot-ip.v1 and applies each HotIpAdded/HotIpRemoved to the trie and the address's attribute record in one step, serving GET /healthz, GET /readyz and GET /metrics on HAMMERTIME_TRIE_QUERY_BIND (default 0.0.0.0:8081)`
   * `Trie service replays hammertime.hot-ip.v1 from the oldest retained record on every start and reports ready only once the replay has reached the log end as it stood at startup; a replay that outlasts HAMMERTIME_STARTUP_TIMEOUT_S fails the start`
   * `Add HAMMERTIME_TRIE_FAMILIES (default ipv4): the address families the trie service holds; a hot-ip event for any other family is skipped and counted`
+
+  > Noted 2026-09-24 (Amendment 4 ruling 11): slice 3's implementing change
+  > adds four lines, none `BREAKING`.
 * **Security posture.**
   * The trie trusts `hammertime.hot-ip.v1`, which is inside the boundary
     ADR-0013 assumption 13 states.
@@ -1599,6 +1665,15 @@ Assumptions 26-32 were added by the revision of 2026-09-23 (see
   * The admin app serves its three routes and nothing else: no OpenAPI
     schema, and no documentation page that loads scripts from a CDN
     (decision 13).
+
+  > Amended 2026-09-24 (Amendment 4 ruling 7): "Slice 1 exposes no domain
+  > endpoint" describes slice 1. Slice 3 serves the read API on the same
+  > port, with no authentication. It tells any client that reaches the port
+  > which addresses are HOT, with their request counts and attribute
+  > documents, and which prefixes are `HOT_PREFIX`. A client that repeats
+  > `GET /prefixes/hot` delays the writer by one walk each time. The port's
+  > exposure is still the owner's question, raised again with this ADR's
+  > Amendment 4 and not ruled there.
 
 ## Sources
 
@@ -3486,3 +3561,737 @@ Read on 2026-09-24 for this amendment. No web source was consulted.
 * Python's `datetime` holds the years 1 to 9999 (`datetime.MINYEAR` and
   `datetime.MAXYEAR`), and `astimezone` raises `OverflowError` past them, as
   the auditor's finding reports. Nothing was run here.
+
+## Amendment 4 (2026-09-24) — slice 3 designed: the read API
+
+Why: decision 15 fixed five things about slice 3 (items 1 to 5) and left
+five to its own design (item 6). The dispatch for this design asked for
+those five, and for more:
+
+* the exact routes, parameters and response shapes against
+  `read-api-v1.md`, and the answers to a malformed address or CIDR, to one
+  of the wrong family, and to a family the trie does not serve;
+* how the reads keep decision 9's R2 and R3;
+* whether the read API needs §16's prefix metadata (ADR-0015 assumption 7);
+* what the read routes answer before `start()` has caught up;
+* the port they share with the admin routes, which
+  `HAMMERTIME_TRIE_QUERY_BIND` exposes on all interfaces, and whether they
+  change the question ADR-0013 left with the owner;
+* authentication and rate limiting;
+* how the security audit treats untrusted path input;
+* metrics and log records under decision 12's rules;
+* the `CHANGES` lines, `request_count`'s meaning among them (ADR-0015
+  Amendment 5 ruling 11).
+
+Decision 15's items 1 to 5, ADR-0010's decisions and `read-api-v1.md`'s
+rules are not re-opened: every ruling below builds on them. This ADR,
+ADR-0010, ADR-0015 and `read-api-v1.md` are on master, so nothing merged is
+rewritten. Each place whose text is now incomplete or no longer true carries
+a dated note, and "Edits" lists them.
+
+### Ruling 1. `evaluate_prefix_state`, in `hammertime.core.state.prefix`
+
+```python
+# hammertime.core.state.prefix   Spec: §13, §38; ADR-0010 decision 1; ADR-0017 Amendment 4 ruling 1
+def evaluate_prefix_state(hot_count: int, capacity: int, config: DetectionConfig) -> PrefixState: ...
+```
+
+* **What it answers.** `PrefixState.HOT_PREFIX` when `hot_count >=
+  config.minimum_hot_ips` and `Fraction(hot_count, capacity) >=
+  config.minimum_hot_ratio`, and `PrefixState.NORMAL` otherwise, exactly as
+  ADR-0010 decision 1 has it. The ratio is compared exactly, against the
+  exact value of the configured float, so a ratio equal to that value
+  qualifies. It never answers `BOT_NETWORK` (ADR-0010 decision 2). It may
+  leave the ratio uncomputed when the count test fails.
+* **What it refuses,** before it compares:
+  * a `hot_count` or a `capacity` that is not an `int`, or is a `bool`:
+    `TypeError`;
+  * a `capacity` below 1: `ValueError`;
+  * a `hot_count` below 0, or above `capacity`: `ValueError`.
+
+  Types are checked before values. A message names the argument and the
+  rule, never the value, and its wording is not part of the contract.
+* **The one place the comparison is written.** `hammertime.core.state`
+  re-exports it beside `evaluate_ip_state`. Nothing else in the repository
+  compares a count with `minimum_hot_ips` or a ratio with
+  `minimum_hot_ratio` (§30's rule, applied to prefixes by ADR-0010
+  decision 1).
+* **Its callers.** In slice 3, the trie's read routes. The detector's
+  `rules/baseline.py` adopts it with the detector epic. A
+  `PrefixStatsChanged` whose `hot_count` exceeds its `capacity` will then
+  raise here. ADR-0016 assumption 11 left that cross-field check open, and
+  what the detector does with such a message is that epic's to rule.
+
+### Ruling 2. The three routes
+
+All three are `GET` routes on decision 13's app. Another method on their
+paths answers FastAPI's 405, and a path none of them matches gets the
+framework's answer, as any undeclared path does.
+
+| Route | Input | Body on `200`: exactly these keys |
+| --- | --- | --- |
+| `GET /prefix/{cidr}` | `{cidr}`: everything after `/prefix/` (Starlette's `path` convertor). Query parameters are ignored. | `prefix`, `hot_ips`, `capacity`, `hot_ratio`, `state`, `as_of`, `event_sequence`, `config_version` |
+| `GET /ip/{addr}` | `{addr}`: everything after `/ip/` (the `path` convertor). Query parameters are ignored. | `ip`, `state`, `request_count`, `attributes` while HOT only, `matched_prefixes`, `as_of`, `event_sequence`, `config_version` |
+| `GET /prefixes/hot` | `minimal`, read from the raw query. Other query parameters are ignored. | `prefixes`, `as_of`, `event_sequence`, `config_version` |
+
+An item of `matched_prefixes` or `prefixes` holds exactly `prefix`,
+`hot_ips`, `capacity`, `hot_ratio` and `state`.
+
+**Parsing `{cidr}`.** The checks run in this order, and the first that fails
+decides the answer:
+
+1. The text holds a `/`, and is split at the first one into an address text
+   and a length text. Else `malformed prefix`.
+2. The length text is one to three ASCII digits and nothing else. Else
+   `malformed prefix`.
+3. `Address.parse` accepts the address text. Else `malformed prefix`.
+4. The length is at most the address's `bit_length`. Else `prefix length
+   out of range`.
+5. No bit of the address is set below the length. Else `host bits set`.
+6. The trie serves the address's family. Else `address family not served`.
+
+**Parsing `{addr}`.** `Address.parse` accepts the text, else `malformed
+address`. Then the trie serves its family, else `address family not
+served`.
+
+**Parsing `minimal`.** Absent means `false`. Given once, as exactly `true`
+or `false`, it means that. Anything else — another value, an empty one, or
+the parameter given more than once — is `minimal must be true or false`.
+
+**A refusal** is `400`, `Content-Type: application/json`, with the body
+`{"detail":"<text>"}`, where the text is one of the six above. The texts are
+fixed. No response repeats any part of the request's path or query.
+
+**A family the trie does not serve is refused,** and not answered with
+zeros. ADR-0010 decision 4's zero-valued answer is the trie's statement that
+nothing beneath a prefix is hot, and the trie can make no statement about a
+family it does not hold. Decision 15 recommended this.
+
+**The bodies.**
+
+* **`GET /prefix/{cidr}`.** `prefix` is `str(prefix)`. `hot_ips` is
+  `trie.hot_count(prefix)` (decision 15 item 3). `capacity` is
+  `prefix.capacity()`, `hot_ratio` is `prefix.hot_ratio(hot_ips)`, and
+  `state` is `evaluate_prefix_state(hot_ips, capacity, config)`.
+* **`GET /ip/{addr}`.** `ip` is `str(address)`. `state` is `"HOT"` when
+  `trie.contains(address)`, else `"COLD"`. While HOT, `request_count` is
+  `records[address].request_count`, and `attributes` is
+  `records[address].attributes` as a JSON object. While COLD,
+  `request_count` is `0` and `attributes` is absent (ADR-0015 Amendment 5
+  ruling 1).
+  * A HOT address with no record is a state §46.5 forbids. The route then
+    raises `InvariantViolation`, with a message that names §46.5 and nothing
+    of the request, and FastAPI answers `500`. The read path neither repairs
+    the state nor ends the process.
+  * `matched_prefixes` are the address's ancestors with 24, 16 and 8 host
+    bits, shortest first: `/8`, `/16`, `/24` for IPv4, as `read-api-v1.md`
+    has them, and `/104`, `/112`, `/120` for IPv6. They are present whether
+    the address is HOT or COLD. Each item is shaped as `GET /prefix/{cidr}`'s
+    body without the three envelope keys.
+* **`GET /prefixes/hot`.** For each family the trie serves, with `L_F` that
+  family's reporting floor (`HAMMERTIME_TRIE_MIN_PREFIX_LENGTH`, or
+  `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6`; Amendment 2 ruling 1),
+  `prefixes` holds every prefix of that family whose length is from `L_F` to
+  `bit_length`, whose `hot_ips` is at least 1, and whose `state` is
+  `HOT_PREFIX`. With `minimal=true` it keeps only those with no listed
+  prefix of the same family strictly inside them. IPv4 entries come before
+  IPv6 ones; within a family the order is length descending, then network
+  ascending. Ruling 5 says how the list is found.
+
+  For example, under the default document, the 156 HOT addresses
+  `10.20.30.1` to `10.20.30.156` of §42 give 21 prefixes: eight `/28`s
+  (`10.20.30.16/28` to `10.20.30.128/28`, each 16 of 16), five `/27`s,
+  three `/26`s, two `/25`s, `10.20.30.0/24`, `10.20.30.0/23` and
+  `10.20.28.0/22` (156 of 1,024). With `minimal=true` the list is the eight
+  `/28`s: a fully HOT `/28` meets a `minimum_hot_ips` of 16 at a ratio of 1.
+* **The envelope.** `as_of` is `null`, or the codec's rendering of a
+  timestamp: `YYYY-MM-DDTHH:MM:SS` in UTC, then `.ffffff` only when the
+  microseconds are not zero, then `Z`. `event_sequence` is
+  `state.event_sequence`, and `config_version` is
+  `state.config.config_version`.
+
+**Rendering.** A route builds its body as plain JSON data and returns a
+Starlette `JSONResponse` built from it: compact, UTF-8, `Content-Type:
+application/json`. FastAPI then encodes and validates nothing. A body's
+parsed value is the contract, not its bytes.
+
+### Ruling 3. The readiness gate comes first
+
+* **Before the input.** Each read route checks readiness before it looks at
+  its input. While the service is not ready it raises `ServiceNotReady`,
+  which decision 13's handler renders as `503` with `/readyz`'s body
+  (ADR-0009 A4): `{"status":"starting"}` from construction until `start()`
+  marks the service ready, and `{"status":"stopping"}` from the moment
+  `stop()` begins. So while the service is not ready a malformed request is
+  `503`, not `400` (§47.2: domain read endpoints "MUST answer 503 while the
+  service is not ready").
+* **What ready means for a read.** `TrieService.start()` marks the service
+  ready only once the worker has caught up (decision 4). A ready trie has
+  therefore handled or passed every hot-ip record the log held when
+  `start()` began.
+* **Who sees `starting`.** `run()` binds the socket after `start()` has
+  returned (§47.6; ADR-0009 A8), so over the network the trie answers
+  nothing before it is ready. An in-process caller of `TrieService.app`
+  sees `starting`. A request in flight when `stop()` begins sees
+  `stopping`.
+
+### Ruling 4. R2 and R3 on the read routes
+
+* **One synchronous call per request.** A read route's handler is `async
+  def` and holds no `await`. Its readiness check, its parse, every read of
+  `TrieState` and the building of its response run in that one call. It
+  reads `state.config` once, and every `state` and the `config_version` in
+  its body come from that read. So a body describes the state between two
+  whole events, with that state's `event_sequence`, `as_of` and
+  `config_version` (decision 15 items 1 and 2).
+* **Plain functions.** `query.views` holds the parsing and the building of
+  the three bodies. Its functions are neither coroutines nor generators, and
+  each returns data that holds no reference into the trie or the record
+  map.
+* **One thread.** No route, dependency or exception handler of the app is a
+  plain `def` (R3). Nothing in `query` calls `run_in_threadpool` or
+  `asyncio.to_thread`, or uses `BackgroundTasks` or `StreamingResponse`. No
+  route returns a value for FastAPI to serialize.
+* **No new writer, and no lock.** The worker stays the only writer of
+  `TrieState` (decision 2; R1). The read routes take no lock: with no
+  `await` inside a read none is needed, and taking the worker's would make a
+  read wait behind the publish of an event already applied (Amendment 2
+  ruling 3).
+
+### Ruling 5. `GET /prefixes/hot` walks only where a prefix could qualify, and the trie keeps no index
+
+**The walk.** For each family `F` the trie serves, with `m =
+max(config.minimum_hot_ips, 1)`:
+
+1. It starts at `F`'s `/0`, and stops at once if its `trie.hot_count` is
+   below `m`.
+2. At each prefix it visits, it reads each child's count with
+   `trie.hot_count`, and visits the child only if that count is at least
+   `m`.
+3. It evaluates each visited prefix whose length is from `L_F` to
+   `bit_length` with `evaluate_prefix_state`, and lists it when the answer
+   is `HOT_PREFIX`.
+
+The walk uses the `HotTrie` protocol only (ADR-0014 decision 2). It reads
+neither `PatriciaTrie.arena` nor `PatriciaTrie.root`, and calls none of
+`iter_prefix_counts`, `iter_hot_addresses` and `iter_nodes`, each of which
+runs over the whole hot set.
+
+**Why nothing is lost.** No prefix counts more HOT addresses than a prefix
+that contains it (§12). Below a prefix with fewer than `m`, no prefix meets
+`minimum_hot_ips`, and when `m` is 1, none holds a HOT address.
+
+**What it costs.** Write `H` for the family's HOT addresses and `N` for its
+prefixes, of any length, that hold at least `m` of them. The walk visits
+those `N` and reads at most `2N + 1` counts, each an O(`bit_length`) walk of
+the structure (ADR-0014 decision 6). The prefixes of one length are
+disjoint, so `N <= (bit_length + 1) * floor(H / m)`: about `2H` for IPv4 at
+the default `m` of 16. What follows is an estimate, not a measurement
+(assumption 97):
+
+* a hundred thousand HOT addresses spread evenly over the IPv4 space give an
+  `N` near 8,000, and a request of about a tenth of a second;
+* a million give roughly ten times that;
+* HOT addresses packed as §42's are give an `N` of the same order as the
+  list the request returns.
+
+While a walk runs the writer waits, which is decision 9's stated cost, so a
+client that repeats the request delays the writer by one walk each time.
+Ruling 7 records that as a residual of the port's exposure.
+
+**Why the trie keeps no index.** Decision 15 named the alternative: §12's
+cached `prefix_state`, an index of `HOT_PREFIX` prefixes kept by the writer.
+It is not built, for four reasons (assumption 98).
+
+* *It moves the cost onto the writer.* Every event that changes the hot set
+  would re-evaluate its `bit_length - L_F + 1` ancestors (25 at the
+  defaults) inside R1's section, the startup replay included. The replay is
+  the trie's tightest budget until the snapshot epic lands (Consequences).
+* *It is derived state to keep exact.* It would be built once the replay
+  catches up, updated in R1's section, and rebuilt in `apply_config` and
+  after a snapshot restore. Each is a place where the index and the trie
+  could disagree, and each needs tests of its own.
+* *It saves most where it matters least.* It pays off when many prefixes
+  hold `m` HOT addresses and still fail the ratio: HOT addresses spread
+  thinly over the space. Where they cluster, as a bot network's do, most
+  prefixes the walk visits are listed anyway.
+* *No request is cheaper than its answer.* The index would not bound a
+  request whose list is long, and a long list is what a clustered bot
+  network produces.
+
+So `apply_config` is unchanged (decision 10), and ADR-0010 decision 5's
+"eagerly for the cached `prefix_state`" has nothing to act on (ADR-0010
+Amendment 5).
+
+**What would change it.** A measurement that the walk dominates, in the
+integration job (#52) or in a deployment. The index above is then the next
+step. A pruned iterator in the structure package would cut the walk's
+constant without an index, and would amend ADR-0014's `HotTrie`. Neither is
+designed here.
+
+### Ruling 6. The read API needs no prefix metadata
+
+* No route reads or returns §16's metadata. `create_app` takes no
+  `PrefixMetadataStore`, and nothing in epic #10 holds one (decision 15 item
+  4, which stands).
+* ADR-0015 assumption 7's open question — how an operator declares prefix
+  metadata — therefore does not block slice 3, and this amendment raises
+  nothing for the owner on it. When a declaration source is designed,
+  ADR-0005's "`GET /ip/{ip}` returns both, separately keyed" comes due as an
+  additive field (decision 15 item 4).
+
+### Ruling 7. The port: shared, unauthenticated, not rate limited; its exposure stays with the owner
+
+* **The read routes share the admin app,** and so the admin port,
+  `HAMMERTIME_TRIE_QUERY_BIND` (default `0.0.0.0:8081`; decision 11). A
+  second port would need a second server, a second key and a second answer
+  to readiness, and nothing asks for one.
+* **What slice 3 changes about the port.** Until now it served `/healthz`,
+  `/readyz` and an empty `/metrics`. From slice 3 it tells any client that
+  reaches it which addresses are HOT, with each one's `request_count` and
+  attribute document, and which prefixes are `HOT_PREFIX`. Each read also
+  runs on the event loop the writer shares (ruling 4), so a client that
+  repeats `GET /prefixes/hot` delays the writer by one walk per request
+  (ruling 5). `read-api-v1.md` expects these endpoints to be reachable only
+  inside the deployment. The reference compose file publishes the port on
+  every host interface (`8081:8081`).
+* **No authentication.** `read-api-v1.md`'s "No authentication in v1" stands
+  and is not re-opened. An operator credential would need a design of its
+  own — a secret, a key and rotation, as §36.1 to §36.4 are for agents — and
+  no requirement asks for one in v1. A deployment that exposes the port
+  beyond its trust boundary puts an authenticating proxy or a network policy
+  in front of it.
+* **No rate limit, and nothing in its place.** §36.5 records that an
+  in-process bucket cannot protect the accept queue, and the port knows no
+  identity to charge beyond the peer address. Two other mechanisms were
+  weighed. A response memo keyed by `event_sequence` and the configuration
+  would still walk once per event while events arrive, and so bounds nothing
+  under load. A lock around the walk does not by itself let the writer in
+  between two walks, since no walk awaits. Ruling 5's bound on one request
+  is what the design offers.
+* **The port's exposure is the owner's question, and is not ruled.**
+  ADR-0013 left "the services' own ports (8080-8083, 9090)" with the owner
+  (its assumption 13, as amended by Amendment 4 ruling S1), and this ADR's
+  Consequences said so of `8081`. Slice 3 makes the answer matter more. The
+  question was raised again on 2026-09-24 with this amendment. What each
+  answer means is set out here, so that it can be decided from this text:
+  * *`8081` published on `127.0.0.1` only,* as ADR-0013 did for `4222`,
+    `8222` and `6379`. The bind inside the container stays `0.0.0.0:8081`:
+    Prometheus scrapes `trie:8081` over the compose network
+    (`deploy/prometheus.yml`), and the healthcheck calls `127.0.0.1` inside
+    the container. Operators on the host keep their access. The same
+    reasoning covers `8082`, `8083` and `9090`, but not ingest's `8080`,
+    which agents must reach and §36 authenticates.
+  * *`8081` kept on every interface.* Any host that reaches the machine
+    reads the hot set and can delay the writer, which argues for designing
+    authentication for the read routes.
+  * *Left to each deployment,* with `.env.example` saying what the port
+    discloses.
+
+  Until the owner answers, ADR-0013 decision 11 and this ADR's decision 11
+  stand.
+
+### Ruling 8. `create_app`, and the service's wiring
+
+```python
+# hammertime.trie.query.app   Spec: §22, §29, §31, §46.7, §47; ADR-0017 decisions 9, 13 and 15, Amendment 4
+def create_app(readiness: Readiness, *, state: TrieState, metrics: TrieMetrics,
+               min_prefix_lengths: Mapping[AddressFamily, int]) -> FastAPI: ...
+```
+
+* **What it keeps.** Decision 13's app: `FastAPI(title="hammertime-trie",
+  openapi_url=None, docs_url=None, redoc_url=None)`, `app.state.readiness`,
+  the `ServiceNotReady` handler and the three admin routes, unchanged. It
+  adds ruling 2's three routes, under decision 13's rule that
+  `read-api-v1.md`, not a generated schema, is their contract.
+* **What it checks.** `min_prefix_lengths` holds an entry for each family
+  `state` serves, an integer from 0 to that family's `bit_length`. Else
+  `create_app` raises `ValueError`. It keeps a copy.
+* **The service.** `TrieService` builds its app with `state=worker.state`,
+  `metrics=worker.metrics` and the floors it passes the worker (decision 13
+  as amended by Amendment 2).
+* **No defaults.** `query.app` must not import `publisher`, where
+  `DEFAULT_MIN_PREFIX_LENGTHS` lives (decision 2 as amended), and the
+  service already holds the floors.
+* **Imports.** As decision 2's note of 2026-09-24 (this amendment) says.
+
+### Ruling 9. Metrics and log records
+
+| Series | Kind | Labels | Meaning |
+| --- | --- | --- | --- |
+| `prefix_queries` | counter | `route` (`prefix`, `ip`, `prefixes_hot`), `result` (`ok`, `invalid`, `family_not_served`, `not_ready`) | §37: the requests a read route answered, each counted once. `ok` is a `200`; `family_not_served` the `400` whose text is `address family not served`; `invalid` any other `400`; `not_ready` a `503`. |
+
+* Not counted: a request the framework answers (a `404` or `405`), a `500`,
+  and the admin routes.
+* Decision 12's rules hold: strict names and label names, label values
+  compared as text, rendering the telemetry epic's.
+* **No log record.** The read routes write none, per request or per
+  refusal. What they would carry is request content, and decision 12 keeps
+  the trie's own records to fixed tokens and numbers.
+* **uvicorn's access record is unchanged.** The service's uvicorn runs with
+  `log_config=None`, so the record reaches the root logger's JSON handler,
+  as it already does for the admin routes. It carries the request line.
+  uvicorn percent-quotes the path, h11 admits only visible ASCII in the
+  request target, and the JSON renderer escapes the rest (Sources).
+* A `500` from ruling 2's `InvariantViolation` is logged by the server with
+  its traceback, and its message carries nothing of the request.
+
+### Ruling 10. Untrusted input, and how the security audit treats it
+
+The request is untrusted: the port has no authentication (ruling 7). The
+server decodes the path's percent-escapes before routing, so `{cidr}` and
+`{addr}` may hold any character, a NUL or a newline included, up to the
+server's own limit on the request line.
+
+* **Where it goes.** Only into ruling 2's parse: one split at `/`, a check
+  of at most three ASCII digits, and `Address.parse`, which calls
+  `ipaddress.ip_address`, the parse ingest runs on an agent's address.
+  Nothing converts an unbounded digit string, builds a pattern, a path or a
+  format string from it, logs it, or keys state on it. Apart from the
+  counter, a request leaves nothing behind.
+* **Every input a route receives is answered.** Each reaches `200`, `400`
+  or `503`. None reaches `422`, because no parameter is declared for FastAPI
+  to validate, and none reaches `500`, which only ruling 2's forbidden state
+  causes. The bullet on the framework's routing, below, says what never
+  reaches a read route.
+* **Nothing is echoed.** A refusal carries one of six fixed texts, and a
+  `200` body names only the canonical text of what was parsed.
+* **What `Address.parse` accepts, the read API accepts,** and it answers for
+  the address `Address.parse` returns, as ingest counts it (assumption 88).
+* **The framework's routing.** Starlette matches `^/prefix/(?P<cidr>.*)$`
+  with `re.match` (Sources). A path with a newline before its end matches no
+  route and gets the framework's `404`. A single newline at the very end is
+  left out of the captured text.
+* **What the audit checks:** that every input is answered and none is echoed
+  or logged; that the walk's cost follows ruling 5 and no input steers it
+  (only `minimal` is read, and it does not change the walk); what the routes
+  disclose; and that no thread reaches `TrieState`. The port's exposure is
+  the owner's open question (ruling 7), and its residuals are recorded
+  there, not re-found.
+
+### Ruling 11. `CHANGES`
+
+The implementing change adds four lines at the top, in this order. None is
+`BREAKING`: no build that serves the trie's read API has shipped, and every
+line adds to what the trie serves.
+
+    Add the trie read API on HAMMERTIME_TRIE_QUERY_BIND, with no authentication: GET /prefix/{cidr}, GET /ip/{addr} and GET /prefixes/hot[?minimal=true], each carrying as_of, event_sequence and config_version, answering 503 with the /readyz body until the trie is ready, and 400 for a malformed address or prefix or an address family the trie does not hold
+    Trie read API classifies a prefix HOT_PREFIX when hot_count >= minimum_hot_ips and hot_count/capacity >= minimum_hot_ratio under the detection config in force; GET /prefixes/hot lists every such prefix holding a HOT address, from the family's minimum reporting length (HAMMERTIME_TRIE_MIN_PREFIX_LENGTH, HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6) to the host route, IPv4 first, then longest first, and with minimal=true only those with no such prefix inside them
+    GET /ip/{addr} returns request_count, the window_count of the most recent HotIpAdded the trie applied for the address: its count at transition time, not a live count, and 0 while the address is COLD
+    GET /ip/{addr} returns matched_prefixes for the address's ancestors with 24, 16 and 8 host bits: /8, /16 and /24 for IPv4, /104, /112 and /120 for IPv6
+
+What gets no line (assumption 108): `prefix_queries`, since `/metrics`
+renders nothing until the telemetry epic; `evaluate_prefix_state` and
+`create_app`'s signature, which nothing outside the repository calls.
+
+### Test seams
+
+* **The app on its own.** `create_app(readiness, state=..., metrics=...,
+  min_prefix_lengths=...)` needs no bus and no worker. A test builds a
+  `TrieState`, writes it with the worker's own calls — `apply_hot_ip_added`
+  or `apply_hot_ip_removed` on `state.of(family)`'s trie and records, then
+  `state.note_applied(offset, timestamp)` — marks a `Readiness` ready
+  itself, and sends requests through `httpx.ASGITransport`. The worker is
+  the only production writer (decision 2), and a test is not production.
+* **The configuration.** `state.adopt_config(config)` changes the document
+  in force between two requests. A `DetectionConfig` built in the test may
+  carry a `minimum_hot_ips` of 0, which the schema forbids and neither the
+  loader nor the model refuses. It shows that only prefixes holding a HOT
+  address are listed.
+* **The service.** `TrieService.app` serves the same routes. A test
+  publishes hot-ip events to an `InMemoryBus`, awaits `start()`, and reads
+  what the replay applied; `build_service`'s floors reach the app as they
+  reach the worker.
+* **The forbidden state.** `records.discard(address)` on a HOT address
+  leaves the state §46.5 forbids. Through `httpx.ASGITransport`, whose
+  default re-raises an application's exception, a request for `GET
+  /ip/{addr}` then raises `InvariantViolation` in the test.
+* **Independent expectations.** A test can compute a list of HOT prefixes
+  from the addresses it made HOT and §3's formulas, with exact fractions,
+  without calling into the trie.
+* **What no test can see.** R2 and R3 are structural: a handler with no
+  `await` cannot interleave with the writer. The reviewer checks them. No
+  test measures time (ADR-0014 assumption 17).
+
+### Questions this amendment closes
+
+| Question | Left open by | Ruled in |
+| --- | --- | --- |
+| How does `GET /prefixes/hot` avoid a full scan per request? | decision 15 item 6 | ruling 5: a walk that descends only where a prefix could qualify; no index |
+| Which lengths does `GET /prefixes/hot` cover? | decision 15 item 6 | ruling 2: each served family's `[L_F, bit_length]` |
+| What does a query for a family not served answer? | decision 15 item 6 | ruling 2: `400`, `address family not served` |
+| Which lengths are IPv6's `matched_prefixes`? | decision 15 item 6; ADR-0010's assumption on `matched_prefixes` | ruling 2: `/104`, `/112`, `/120` |
+| What are `prefix_queries`' labels? | decision 12; decision 15 item 6 | ruling 9 |
+| Does the trie cache `prefix_state`? | decision 10; ADR-0010 decision 5; ADR-0014 assumption 21; ADR-0015 Consequences | ruling 5: no |
+| Does the read API need prefix metadata? | ADR-0015 assumption 7; decision 15 item 4 | ruling 6: no |
+| What do the read routes answer before the trie is ready? | §47.2; `read-api-v1.md` | ruling 3 |
+| Should the trie's port be reachable beyond its host? | ADR-0013 assumption 13; Consequences | not ruled: with the owner (ruling 7) |
+
+### Edits
+
+**In this ADR.** Each is a dated note; no text is replaced.
+
+* **Status.** A paragraph on this amendment, after Amendment 3's.
+* **Decision 1.** A note after its Amendment 3 note: what else slice 3's
+  change covers.
+* **Decision 2.** A note after its Amendment 2 note: `create_app`'s keywords
+  and the imports.
+* **Decision 9.** A note after its Amendment 2 note: R2 and R3 on the read
+  routes, and `GET /prefixes/hot`.
+* **Decision 10.** A note after the "Slice 3." bullet: no cache.
+* **Decision 12.** A note after its Amendment 3 note: `prefix_queries`, and
+  no record.
+* **Decision 13.** A note after its Amendment 3 note: the service's
+  `create_app` call.
+* **Decision 15.** A note after item 6: item 6 settled, and item 4
+  standing.
+* **Test seams.** A note after its Amendment 3 note.
+* **Consequences.** A note under the `CHANGES` bullet, and one under the
+  "Security posture" bullet.
+* **This section.**
+
+**In other documents.** No wording is replaced, except in
+`docs/spec/README.md`'s index, whose cells gain entries and are quoted
+below.
+
+* **`docs/adr/0010-read-apis-and-shared-prefix-predicate.md`** (Amendment
+  5): a clause at the end of the status line; dated notes after decision
+  1's last paragraph, after decision 2's metrics block, after decision 4's
+  2026-09-23 note, after decision 5's second paragraph, under the
+  assumption "`matched_prefixes` reports IPv4 lengths 8, 16 and 24.", and
+  under the Consequences bullet on `schemas/prefix_stats_event.v1.json`; an
+  "Amendment 5" section.
+* **`docs/adr/0015-prefix-metadata-inheritance-and-the-attribute-side-map.md`**:
+  italic dated notes at the end of assumption 7, of the Consequences bullet
+  "**The query epic**" and of the Consequences bullet "**Open, and
+  deliberately not settled here:**"; a dated blockquote after Amendment 5
+  ruling 11. No status clause and no amendment section (assumption 110).
+* **`docs/protocol/read-api-v1.md`**: dated blockquotes after the
+  preamble's first paragraph, after the trie's `as_of` paragraph, after the
+  paragraph that begins "Every domain endpoint below answers exactly like
+  `GET /readyz`", after the first paragraph of `GET /prefix/{cidr}`, after
+  the first paragraph and after the `matched_prefixes` bullet of `GET
+  /ip/{addr}`, after the paragraph of `GET /prefixes/hot[?minimal=true]`,
+  and after the paragraph of "Errors" (assumption 109).
+* **`docs/spec/README.md`** (assumption 112). Five rows gain entries; none
+  loses one.
+  * §13, 38: was "`core/state/prefix.py`, `services/detector/rules/baseline.py`,
+    `services/trie/query`, `docs/adr/0010`", and gains "`docs/adr/0017`
+    (Amendment 4 ruling 1: the predicate's arguments)".
+  * §13, 14, 31: was "`services/detector`", and gains "`services/trie/query`
+    (`GET /prefixes/hot`, `?minimal=true` for §31), `docs/adr/0017`
+    (Amendment 4 rulings 2 and 5)".
+  * §29: its ADR-0017 entry was "`docs/adr/0017` (decisions 9 and 15)", and
+    gains "Amendment 4: the read API as designed".
+  * §37: its ADR-0017 entry ended "Amendment 3 ruling 1: `replay_complete`'s
+    `republish_from` and the `prefix_stats_last_ignored` record", and gains
+    "Amendment 4 ruling 9: `prefix_queries`".
+  * §47: its ADR-0017 entry was "`docs/adr/0017` (decisions 4, 11 and 13:
+    the trie's settings, readiness, admin routes and drain)", and gains
+    "Amendment 4 ruling 3: the read routes answer 503 until the trie is
+    ready".
+
+No spec section, schema or other protocol document changes.
+
+### Assumptions
+
+Each is a judgment call that decision 15, the spec and the earlier ADRs do
+not make. Push back on them individually; numbering continues the ADR's
+list.
+
+87. **The `path` convertor for both parameters.** `{cidr}` needs it, since
+    an IPv4 CIDR holds a `/`. `{addr}` takes it as well, so that
+    `/ip/10.0.0.1/32` meets the read API's `400` rather than the
+    framework's `404`: every request under `/prefix/` or `/ip/` is answered
+    by the route.
+88. **The length grammar is stricter than `Prefix.parse`, and the address is
+    exactly `Address.parse`.** `Prefix.parse` reads a missing length as the
+    host route, and hands the length to `int()`, which accepts a sign,
+    surrounding whitespace, underscores between digits and non-ASCII
+    decimal digits (Python's documented behaviour, not run here). A read
+    API asked about a prefix should be given the whole of it, so the length
+    must be one to three ASCII digits. Leading zeros are allowed, since the
+    grammar counts digits, and the answer names the canonical text. The
+    address part is left to `Address.parse`, so the read API resolves an
+    address text as ingest does. That includes whatever
+    `ipaddress.ip_address` accepts beyond the dotted and colon forms; an
+    IPv6 scope such as `fe80::1%eth0` is one such form in the Python this
+    repository targets, and `Address.parse` drops it. That is recalled from
+    Python's documentation and was not re-read for this amendment; the
+    audit confirms it (ruling 10).
+89. **The order of the checks is fixed, and so are the six texts.** The
+    order gives every input one answer. The texts are fixed so that a client
+    may show them and a test can pin that nothing is echoed. That makes
+    their wording part of this contract, unlike the exception messages of
+    ADR-0016 or of ruling 1, which no client reads.
+90. **A family not served is `400`, with a text of its own.** Decision 15
+    recommended `400`. A zero-valued answer would claim that nothing is hot
+    where the trie knows nothing. `404` stays with paths the app does not
+    serve, and `422` is FastAPI's validation shape, which `read-api-v1.md`
+    does not use. A text of its own lets an operator tell a deployment
+    choice from a typing mistake.
+91. **IPv6 `matched_prefixes` are `/104`, `/112` and `/120`,** the ancestors
+    holding as many addresses as IPv4's `/8`, `/16` and `/24`: Amendment 2
+    ruling 1's reasoning for `/104`. The allocation boundaries `/32`, `/48`
+    and `/64` were the alternative. Under the v1 predicate they are always
+    `NORMAL` (Amendment 2 ruling 1), which ADR-0010's assumption on
+    `matched_prefixes` counts as noise. A query parameter can add lengths
+    later without changing the default.
+92. **`GET /prefixes/hot` covers `[L_F, bit_length]`.** Decision 15
+    recommended it, so that the trie's list and the detector's, which hears
+    only those lengths, can agree. A prefix shorter than `L_F` that
+    qualifies — possible only under a document with a tiny
+    `minimum_hot_ratio` — is answered by `GET /prefix/{cidr}` and not
+    listed.
+93. **Only prefixes that hold a HOT address are listed.** `read-api-v1.md`
+    said "every node", and a prefix with no HOT address has none. The rule
+    decides something only under a document whose `minimum_hot_ips` is
+    below 1. The schema forbids that, but neither the loader nor
+    `DetectionConfig` refuses it. `evaluate_prefix_state` then calls an
+    empty prefix `HOT_PREFIX` when `minimum_hot_ratio` is 0 as well, and no
+    list could hold every such prefix. `GET /prefix/{cidr}` still reports
+    what the predicate says.
+94. **IPv4 before IPv6, and no family parameter.** Any fixed order would
+    do. Grouping by family keeps each family's part in `read-api-v1.md`'s
+    order. The detector's list, which `read-api-v1.md` orders "same as the
+    trie's list", follows the same rule (ADR-0010 Amendment 5).
+95. **`minimal` is exactly `true` or `false`, given at most once; other
+    parameters are ignored.** `true` and `false` are how JSON writes
+    booleans, and how httpx encodes them in a query (Sources). Accepting
+    `1`, `yes` or `True` as well would make the contract whatever FastAPI's
+    parser accepts. Ignoring unknown parameters is the common practice, at
+    the price that a misspelt `minimal` returns the full list.
+96. **The gate comes before the parse.** §47.2 has a domain endpoint answer
+    `503` while the service is not ready, whatever it was asked. Gating
+    first also keeps a service that is not ready from doing any work for a
+    request.
+97. **The walk's figures are estimates.** They count point queries, and
+    take a few microseconds for each query and each evaluation in CPython.
+    Nothing was measured. The integration job (#52) is where to measure
+    them.
+98. **No index, and no cached `prefix_state`, in v1** (ruling 5). The
+    writer-side cost of an index is estimated in the same way: about 25
+    re-evaluations and one ancestor walk for each state-changing event,
+    tens of microseconds, against a replayed record that costs about as
+    much to decode and apply. That estimate carries the first reason, and
+    it was not measured either.
+99. **The walk reads `hot_count` point by point, and not the arena.** A
+    depth-first walk over `PatriciaTrie.arena` would be faster by a
+    constant. It would copy ADR-0014 decision 6's traversal outside the
+    structure package and bind the read path to the Patricia
+    representation, while ADR-0014 decision 5 names the arena's readers as
+    the invariant checks, `tools/trie-inspect` and the structure's tests.
+    `HotTrie` is the surface later epics may rely on (ADR-0014 decision 2).
+    A pruned iterator added to that surface is the way to the faster walk,
+    and is left to an amendment of ADR-0014.
+100. **`evaluate_prefix_state` checks its arguments.** ADR-0010 decision 1
+     gave the comparison, not its domain. Outside `capacity >= 1` and `0 <=
+     hot_count <= capacity` the ratio means nothing, and `Fraction(n, 0)`
+     would raise `ZeroDivisionError`. The detector will pass it values from
+     the wire. `TypeError` for a wrong type and `ValueError` for a wrong
+     value follow ADR-0015 assumption 44. A `bool` is refused because it is
+     not a count.
+101. **A HOT address with no record is a `500`.** The route could answer
+     `HOT` with no `attributes`, breaking `read-api-v1.md`'s "present iff
+     HOT", or answer with the default document, reporting a record nobody
+     stored. Raising names the broken invariant instead. The read path does
+     not own recovery: corruption is diagnosed by the worker's mutators and
+     `tools/trie-inspect --verify` (ADR-0014 A12). Only a test that corrupts
+     the state reaches the case.
+102. **No authentication, no rate limit, no memo and no lock** (ruling 7).
+     Each would be a mechanism sized for a threat whose size the exposure
+     question decides, and that question is the owner's. A deployment that
+     exposes the port has standard means to put in front of it.
+103. **No record from the read routes, and uvicorn's access record left as
+     it is.** Turning the access record off for the trie alone would set it
+     apart from ingest's and the aggregator's servers, which run uvicorn
+     the same way, and the record is an operator's only trace of who asked
+     what. Its content is the request line, quoted as ruling 9 says.
+104. **`prefix_queries` counts all three routes, by route and result.** §37
+     names the series and nothing more. One series for the read API's load,
+     split by `route`, is of more use than a count of `GET /prefix/{cidr}`
+     alone. `result` tells refusals from answers without making the status
+     code a label.
+105. **`create_app` takes the state, the metrics and the floors as required
+     keywords.** A default floor would need `publisher`'s constant, which
+     `query.app` must not import (decision 2 as amended). Requiring an
+     entry only for the families served spares a test that holds IPv4 alone
+     from naming IPv6.
+106. **Bodies are Starlette `JSONResponse`s built from plain data.**
+     Returning a `dict` would run FastAPI's encoder, and a response model
+     its validation, over data the route already controls. Starlette's
+     rendering is compact, UTF-8 and refuses a non-finite number, and
+     nothing the trie stores holds one: ADR-0015's validator refuses them.
+107. **`as_of` is rendered as the codec renders timestamps.** One form
+     across the event schemas and the read API. The read path writes the
+     form itself, since the codec's formatter is private.
+108. **`CHANGES`: four lines, none `BREAKING`, and none for the counter,
+     `evaluate_prefix_state` or `create_app`.** The third line is ADR-0015
+     Amendment 5 ruling 11's: it says that `request_count` is not a live
+     count. The fourth records IPv6's lengths, which are new.
+109. **Dated notes in `read-api-v1.md`, not edits in place.** The dispatch
+     asked for dated notes in merged text. This ADR's first change set and
+     ADR-0015 Amendment 5 had edited that document in place. Its readers
+     now meet each new rule beside the text it refines.
+110. **Pointer notes in ADR-0015, with no status clause and no amendment
+     section,** as ADR-0015 assumption 83 and this ADR's assumption 39 did:
+     no ruling of ADR-0015 changes. ADR-0010 gains Amendment 5, as it gained
+     Amendments 3 and 4, because its decision 4 gains rulings.
+111. **The minimal set reaches `/28`, and `integration-scenarios.md` is not
+     edited here.** Under the default document a fully HOT `/28` qualifies,
+     so §42's 156 addresses have eight `/28`s as their most specific
+     qualifying prefixes, not the `/24` §42 calls a candidate. ADR-0010's
+     assumption "`BOT_NETWORK` unused in v1" treats §42's wording as
+     descriptive, and this amendment follows `read-api-v1.md`'s definition.
+     Whether §42 should be read otherwise is raised for the repository owner
+     with this amendment, and is not ruled. `docs/spec/integration-scenarios.md`
+     §4 step 2, §5 step 7 and §6 steps 2 and 3 expect lists that assume no
+     prefix below `/24` qualifies. Those scenarios are #52's, and are
+     reported with this amendment's hand-off rather than edited here.
+112. **`docs/spec/README.md` gains entries** in the five rows whose mapping
+     this amendment extends, as each amendment of this ADR has done, and
+     loses none.
+
+### Sources
+
+Read on 2026-09-24 for this amendment. No web source was consulted.
+
+* FastAPI 0.141.1 as installed (`uv.lock`),
+  `.venv/lib/python3.12/site-packages/fastapi/routing.py`: a route added
+  with `@app.get` gets the methods `{"GET"}` (`methods = ["GET"]` when none
+  are given), so `HEAD` answers 405; `APIRoute.matches` calls
+  `self.path_regex.match(route_path)`; the request handler passes a returned
+  `Response` through and serializes anything else; `run_endpoint_function`
+  awaits a coroutine endpoint and runs any other in `run_in_threadpool`.
+  Taken from it: rulings 2, 4 and 10.
+* Starlette 1.6.0 as installed: `starlette/convertors.py`,
+  `PathConvertor.regex = ".*"`; `starlette/routing.py`, `compile_path`
+  builds the pattern from `"^"`, the escaped literal parts and each
+  convertor's group, and ends it with `"$"`. Taken from it: the `path`
+  convertor, and ruling 10's routing note, which also rests on Python's
+  `re` semantics for `.` and `$` as recalled, not re-read.
+* uvicorn 0.53.0 as installed: `uvicorn/protocols/http/h11_impl.py` sets
+  the scope's path to `unquote(raw_path.decode("ascii"))`, and logs the
+  access record `'%s - "%s %s HTTP/%s" %d'` over the client, the method,
+  `get_path_with_query_string(scope)`, the version and the status when the
+  access logger has handlers; `httptools_impl.py` does the same;
+  `uvicorn/protocols/utils.py`'s `get_path_with_query_string` percent-quotes
+  the path with `urllib.parse.quote`; `uvicorn/config.py` configures the
+  `uvicorn.access` logger only from a `log_config`. h11 as installed,
+  `h11/_abnf.py`: `request_target = r"{vchar}+"` with `vchar =
+  r"[\x21-\x7e]"`. Taken from it: rulings 9 and 10.
+* httpx as installed, `httpx/_utils.py`: `primitive_value_to_str` writes
+  `True` as `"true"` and `False` as `"false"`. Taken from it: assumption 95.
+* Repository files: `packages/hammertime-core/src/hammertime/core/addressing/address.py`
+  (`Address.parse` wraps `ipaddress.ip_address`) and `prefix.py`
+  (`Prefix.parse` reads a missing length as `bit_length` and converts the
+  length with `int()`); `core/config/loader.py` (types checked, the
+  schema's minimums not) and `models.py` (no check on `minimum_hot_ips`);
+  `core/events/codec.py` (`_format_timestamp`); `core/events/attributes.py`
+  (S5 and the refusal of a non-finite number); `core/runtime.py`
+  (`Readiness`, `ServiceNotReady`, `not_ready_response`);
+  `services/trie/src/hammertime/trie/` `query/app.py`, `service.py`,
+  `state.py`, `metrics.py`, `structure/patricia.py` and `metadata/`;
+  `deploy/docker-compose.yml` and `deploy/prometheus.yml`;
+  `schemas/detection_config.v1.json` (`minimum_hot_ips` has `minimum` 1);
+  `docs/spec/integration-scenarios.md`.
