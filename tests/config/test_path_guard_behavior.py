@@ -44,6 +44,19 @@ is `true`, a number, an array or an object is refused with the
 could-not-be-checked denial; an absent, `null` or `false` path behaves as
 before. The tests at the end of this module encode it. Those that expect a NUL
 or non-string refusal fail until brief C4 lands.
+
+ADR-0018 decision 18 (fourth amendment) requires a guarded path to be in plain
+form. The guard matches a path exactly as written and resolves nothing, so a
+path such as `<repo>/tests/../packages/x.py` used to match the test-author's
+`tests/*` and reach a file its policy guards. A path is out of plain form when
+one of its `/`-separated components is exactly `.` or `..`, when it contains
+`//`, or when its first character is `~`. Such a path is refused with the
+plain-form denial, whatever it would resolve to, even when its target is in
+scope; `..foo`, `x..y`, `...` and `.hidden` are ordinary names. The rule runs
+after the routing, only under a guarded policy, after decision 17's NUL gate
+and the project-root check, and before every glob list. The tests after
+decision 17's encode it. Those that expect the plain-form denial fail until
+brief C5 lands.
 """
 
 import json
@@ -1041,3 +1054,420 @@ def test_the_not_checked_denial_is_decision_17s_text(tool_name: str, field: str)
     reason = assert_not_checked_denied(result, f"a {tool_name} whose {field} is 42")
     assert reason.startswith(DENIAL_PREFIX), reason
     assert NOT_CHECKED_PHRASE in reason, reason
+
+
+# --- decision 18: paths in plain form ---------------------------------------
+#
+# ADR-0018's fourth amendment (2026-09-24), brief T3. Every path below that is
+# not in plain form is built by string concatenation, never through `pathlib`:
+# `pathlib` collapses `.` components and repeated slashes, so the guard would be
+# handed a plain path and the test would pass or fail for the wrong reason.
+# `json.dumps` in the helpers sends each string unchanged. `under_repo` is used
+# only for paths that are already plain.
+
+# Decision 18's plain-form denial, verbatim, with the ADR's blockquote line breaks
+# joined by single spaces. It is ASCII only.
+PLAIN_FORM_MESSAGE = (
+    "Hammertime path guard: the path contains a '.' or '..' component, a '//' "
+    "or a leading '~'. This guard matches a path exactly as written and resolves "
+    "none of these, so it cannot vet the file or directory the tool would "
+    "actually use. Give the path without any of them. The tool call is refused."
+)
+
+# Decision 18's table of phrases the tests pin.
+PLAIN_FORM_PHRASE = "a '.' or '..' component"
+
+# Decision 18's three confirmed cases, and the relative spelling of the first.
+TESTKIT_TRAVERSAL = "packages/hammertime-testkit/../hammertime-core/src/hammertime/core/window.py"
+TESTKIT_TRAVERSAL_PATH = f"{REPO_ROOT}/{TESTKIT_TRAVERSAL}"
+DOCS_TRAVERSAL_PATH = f"{REPO_ROOT}/docs/../services/ingest/x.py"
+TESTS_TRAVERSAL_PATH = f"{REPO_ROOT}/tests/../packages/x.py"
+
+
+def repo_relative_id(path: str) -> str:
+    """A test id for `path` that does not depend on where the checkout lives."""
+    return path.replace(str(REPO_ROOT), "<repo>")
+
+
+def run_configured(
+    agent_name: str,
+    tools: frozenset[str],
+    tool_name: str,
+    path: str,
+) -> subprocess.CompletedProcess[str]:
+    """`path` sent by `agent_name`, with its own `agent_type`, under its policy
+    for `tools` as configured in `.claude/settings.json`."""
+    policy, script = configured_policy(agent_name, tools)
+    return run_with_path(tool_name, path, policy=policy, agent_type=agent_name, script=script)
+
+
+def assert_plain_form_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 18's plain-form denial: exit 2, the JSON deny, and its phrase."""
+    reason = assert_denied(result, what)
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert PLAIN_FORM_PHRASE in reason, (
+        f"expected decision 18's plain-form denial for {what}, not another refusal.\n"
+        f"reason: {reason!r}"
+    )
+    return reason
+
+
+def assert_denied_otherwise(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Refused, and by something other than decision 18's plain-form denial."""
+    reason = assert_denied(result, what)
+    assert PLAIN_FORM_PHRASE not in reason, (
+        f"expected {what} to be refused, but not with decision 18's plain-form denial.\n"
+        f"reason: {reason!r}"
+    )
+    return reason
+
+
+# Decision 18, brief T3 item 1: the three confirmed cases. Each row is an id, the
+# agent, its policy's tools, the tool, the path out of plain form, a path in the
+# policy's scope that shares its leading part, and the target's plain path.
+
+CONFIRMED_CASES: list[tuple[str, str, frozenset[str], str, str, str, str]] = [
+    (
+        "test-author-Read-testkit-to-core",
+        "test-author",
+        READ_GREP_GLOB,
+        "Read",
+        TESTKIT_TRAVERSAL_PATH,
+        TESTKIT_FILE,
+        IMPLEMENTATION_FILE,
+    ),
+    (
+        "architect-Write-docs-to-services",
+        "architect",
+        EDIT_WRITE,
+        "Write",
+        DOCS_TRAVERSAL_PATH,
+        SPEC_FILE,
+        "services/ingest/x.py",
+    ),
+    (
+        "architect-Edit-docs-to-services",
+        "architect",
+        EDIT_WRITE,
+        "Edit",
+        DOCS_TRAVERSAL_PATH,
+        SPEC_FILE,
+        "services/ingest/x.py",
+    ),
+    (
+        "test-author-Write-tests-to-packages",
+        "test-author",
+        EDIT_WRITE,
+        "Write",
+        TESTS_TRAVERSAL_PATH,
+        TOP_LEVEL_TEST_FILE,
+        "packages/x.py",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "tools", "tool_name", "path", "in_scope", "target"),
+    [case[1:] for case in CONFIRMED_CASES],
+    ids=[case[0] for case in CONFIRMED_CASES],
+)
+def test_a_confirmed_traversal_gets_the_plain_form_denial(
+    agent_name: str,
+    tools: frozenset[str],
+    tool_name: str,
+    path: str,
+    in_scope: str,
+    target: str,
+) -> None:
+    """Decision 18: a `..` after a prefix the policy allows or exempts used to
+    match that prefix's glob wherever the `..` then led. The two controls keep
+    the refusal from passing vacuously: the leading part is in scope, and the
+    target's plain path is refused by the glob lists, not by the rule."""
+    allowed = run_configured(agent_name, tools, tool_name, under_repo(in_scope))
+    assert_allowed(allowed, f"{agent_name} {tool_name} of {in_scope}")
+    direct = run_configured(agent_name, tools, tool_name, under_repo(target))
+    assert_denied_otherwise(direct, f"{agent_name} {tool_name} of {target}")
+    result = run_configured(agent_name, tools, tool_name, path)
+    assert_plain_form_denied(result, f"{agent_name} {tool_name} of {path!r}")
+
+
+# Decision 18, brief T3 item 2: a Grep's or a Glob's `path`.
+
+SEARCH_CASES = [
+    ("Grep", "tests/../packages"),
+    ("Glob", f"{REPO_ROOT}/tests/../services"),
+    ("Grep", "tests/.."),
+    ("Grep", ".."),
+    ("Glob", f"{REPO_ROOT}/.."),
+    ("Grep", "./tests"),
+    ("Glob", "tests/."),
+    ("Grep", f"{REPO_ROOT}//packages"),
+    ("Glob", "tests//config"),
+    ("Grep", "~"),
+    ("Grep", "~/x"),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path"),
+    SEARCH_CASES,
+    ids=[f"{tool}-{repo_relative_id(path)}" for tool, path in SEARCH_CASES],
+)
+def test_a_search_path_out_of_plain_form_is_refused(tool_name: str, path: str) -> None:
+    """Decision 18: the rule reads the value the script vets, `file_path` falling
+    back to `path`, so a search's `path` is held to it as a `file_path` is. A
+    `tests/..` would otherwise pass the `tests/*` exemption and search the whole
+    project."""
+    result = run_configured("test-author", READ_GREP_GLOB, tool_name, path)
+    assert_plain_form_denied(result, f"test-author {tool_name} of {path!r}")
+
+
+def test_a_search_path_with_a_single_trailing_slash_is_plain() -> None:
+    """Decision 18: a single trailing `/` is plain, so `tests/` gets the verdict
+    the glob lists give it."""
+    result = run_configured("test-author", READ_GREP_GLOB, "Grep", "tests/")
+    assert_allowed(result, "test-author Grep of 'tests/'")
+
+
+# Decision 18, brief T3 item 3: the coder.
+
+CODER_CASES = [
+    ("services-to-docs-adr", f"{REPO_ROOT}/services/../docs/adr/x.md"),
+    ("dot-uv-lock", f"{REPO_ROOT}/./uv.lock"),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for _, path in CODER_CASES],
+    ids=[case_id for case_id, _ in CODER_CASES],
+)
+def test_the_coder_is_refused_a_path_out_of_plain_form(path: str) -> None:
+    """Decision 18: the rule covers the coder's Edit and Write as it covers every
+    in-scope call under a guarded policy."""
+    result = run_configured("coder", EDIT_WRITE, "Write", path)
+    assert_plain_form_denied(result, f"coder writing {path!r}")
+
+
+def test_the_coder_is_refused_its_own_target_spelled_with_a_dotdot() -> None:
+    """Decision 18: the rule resolves nothing, so a target in the coder's scope
+    spelled with a `..` is refused too, while its plain path is allowed."""
+    allowed = run_configured("coder", EDIT_WRITE, "Write", under_repo(TRIE_QUERY_FILE))
+    assert_allowed(allowed, f"coder writing {TRIE_QUERY_FILE}")
+    path = f"{REPO_ROOT}/services/trie/../trie/src/hammertime/trie/query/app.py"
+    result = run_configured("coder", EDIT_WRITE, "Write", path)
+    assert_plain_form_denied(result, f"coder writing {path!r}")
+
+
+def test_the_coder_is_refused_a_dotdot_from_its_worktree(tmp_path: Path) -> None:
+    """Decision 18: from a worktree, with `cwd` the worktree and
+    CLAUDE_PROJECT_DIR the main checkout, as in the module's worktree cases. The
+    rule looks only at the path's own components."""
+    policy, script = configured_policy("coder", EDIT_WRITE)
+    path = f"{tmp_path}/services/../.claude/settings.json"
+    result = run_guard(
+        "Write",
+        policy=policy,
+        file_path=path,
+        agent_type="coder",
+        cwd=str(tmp_path),
+        project_dir=str(REPO_ROOT),
+        script=script,
+    )
+    assert_plain_form_denied(result, "coder writing <worktree>/services/../.claude/settings.json")
+
+
+# Decision 18, brief T3 item 4: `.`, `//` and a leading `~` in file paths.
+
+FORM_CASES: list[tuple[str, str, frozenset[str], str, str]] = [
+    (
+        "test-author-Read-dot",
+        "test-author",
+        READ_GREP_GLOB,
+        "Read",
+        f"{REPO_ROOT}/./{IMPLEMENTATION_FILE}",
+    ),
+    (
+        "test-author-Read-double-slash",
+        "test-author",
+        READ_GREP_GLOB,
+        "Read",
+        f"{REPO_ROOT}//{IMPLEMENTATION_FILE}",
+    ),
+    (
+        "test-author-Read-leading-double-slash",
+        "test-author",
+        READ_GREP_GLOB,
+        "Read",
+        "/" + f"{REPO_ROOT}/{IMPLEMENTATION_FILE}",
+    ),
+    (
+        "test-author-Read-relative-dotdot",
+        "test-author",
+        READ_GREP_GLOB,
+        "Read",
+        TESTKIT_TRAVERSAL,
+    ),
+    (
+        "architect-Write-dot-in-scope",
+        "architect",
+        EDIT_WRITE,
+        "Write",
+        f"{REPO_ROOT}/docs/./x.md",
+    ),
+    (
+        "architect-Write-double-slash-in-scope",
+        "architect",
+        EDIT_WRITE,
+        "Write",
+        f"{REPO_ROOT}/docs//x.md",
+    ),
+    (
+        "test-author-Write-leading-tilde",
+        "test-author",
+        EDIT_WRITE,
+        "Write",
+        "~/tests/x.py",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "tools", "tool_name", "path"),
+    [case[1:] for case in FORM_CASES],
+    ids=[case[0] for case in FORM_CASES],
+)
+def test_a_dot_a_double_slash_or_a_leading_tilde_is_refused(
+    agent_name: str,
+    tools: frozenset[str],
+    tool_name: str,
+    path: str,
+) -> None:
+    """Decision 18: a `.` component, a `//` anywhere, a leading `~`, and a `..` in
+    a relative path are each out of plain form. The architect's two paths name
+    targets in its own scope and are refused all the same."""
+    result = run_configured(agent_name, tools, tool_name, path)
+    assert_plain_form_denied(result, f"{agent_name} {tool_name} of {path!r}")
+
+
+def test_the_architect_may_write_that_docs_file_in_plain_form() -> None:
+    """Decision 18: the control for the architect's `docs/./x.md` and
+    `docs//x.md`. Their plain form is in its scope and allowed."""
+    result = run_configured("architect", EDIT_WRITE, "Write", under_repo("docs/x.md"))
+    assert_allowed(result, "architect writing docs/x.md")
+
+
+# Decision 18, brief T3 item 5: order and boundaries.
+
+
+def test_the_nul_gate_runs_before_the_plain_form_rule() -> None:
+    """Decision 18, and decision 17: a path with both a NUL and a `..` gets the
+    NUL denial, because the rule runs after the NUL gate."""
+    path = f"{REPO_ROOT}/tests/../x\x00y"
+    result = run_guard("Write", policy=DENY_TESTS, file_path=path)
+    reason = assert_nul_denied(result, f"a Write of {path!r}")
+    assert PLAIN_FORM_PHRASE not in reason, reason
+
+
+PROJECT_ROOT_SPELLINGS = [
+    ("dot", "."),
+    ("dot-slash", "./"),
+    ("absolute", str(REPO_ROOT)),
+    ("trailing-slash", f"{REPO_ROOT}/"),
+    ("trailing-dot", f"{REPO_ROOT}/."),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for _, path in PROJECT_ROOT_SPELLINGS],
+    ids=[case_id for case_id, _ in PROJECT_ROOT_SPELLINGS],
+)
+def test_the_project_root_keeps_its_own_denial(path: str) -> None:
+    """Decision 18 and assumption 41: the rule runs after the project-root check,
+    so each spelling of the root keeps the handling it had, and a Grep of it is
+    refused, but not with the plain-form denial."""
+    result = run_configured("test-author", READ_GREP_GLOB, "Grep", path)
+    assert_denied_otherwise(result, f"test-author Grep of {path!r}")
+
+
+def test_the_plain_form_rule_does_not_police_a_caller_outside_the_policy_scope() -> None:
+    """Decision 18: the rule runs after the routing, so a call with no
+    `agent_type` (the top-level session) passes through untouched. As everywhere
+    in this module, that exit 0 is routing, not approval."""
+    policy, script = configured_policy("coder", EDIT_WRITE)
+    path = f"{REPO_ROOT}/services/../docs/adr/x.md"
+    result = run_guard("Write", policy=policy, file_path=path, script=script)
+    assert_allowed_silently(result, f"a top-level session Write of {path!r}")
+
+
+@pytest.mark.parametrize("tool_name", ["Read", "Write"])
+def test_the_plain_form_rule_does_not_run_under_a_policy_that_constrains_no_paths(
+    tool_name: str,
+) -> None:
+    """Decision 18: the rule runs only under a guarded policy, so an entry that
+    constrains no paths still denies nothing."""
+    result = run_guard(tool_name, policy={}, file_path=TESTS_TRAVERSAL_PATH)
+    assert_allowed(result, f"a {tool_name} of {TESTS_TRAVERSAL_PATH!r} with no path policy")
+
+
+# Decision 18, brief T3 item 6: ordinary names are not components.
+
+ORDINARY_NAME_CASES: list[tuple[str, frozenset[str], str, str]] = [
+    ("architect", EDIT_WRITE, "Write", f"{REPO_ROOT}/docs/..notes.md"),
+    ("architect", EDIT_WRITE, "Write", f"{REPO_ROOT}/docs/x..y.md"),
+    ("architect", EDIT_WRITE, "Write", f"{REPO_ROOT}/docs/.../x.md"),
+    ("architect", EDIT_WRITE, "Write", f"{REPO_ROOT}/docs/.hidden.md"),
+    ("test-author", READ_GREP_GLOB, "Read", f"{REPO_ROOT}/tests/config/..x.py"),
+]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "tools", "tool_name", "path"),
+    ORDINARY_NAME_CASES,
+    ids=[
+        f"{agent}-{tool}-{repo_relative_id(path)}" for agent, _, tool, path in ORDINARY_NAME_CASES
+    ],
+)
+def test_a_name_that_merely_contains_dots_is_ordinary(
+    agent_name: str,
+    tools: frozenset[str],
+    tool_name: str,
+    path: str,
+) -> None:
+    """Decision 18: only a component that is exactly `.` or `..` counts, so
+    `..notes.md`, `x..y.md`, `...`, `.hidden.md` and `..x.py` are ordinary names,
+    and each path gets the verdict the glob lists give it."""
+    result = run_configured(agent_name, tools, tool_name, path)
+    assert_allowed(result, f"{agent_name} {tool_name} of {path!r}")
+
+
+# Decision 18, brief T3 item 7: the message.
+
+MESSAGE_CASES: list[tuple[frozenset[str], str, str]] = [
+    (EDIT_WRITE, "Write", TESTS_TRAVERSAL_PATH),
+    (READ_GREP_GLOB, "Grep", "tests/../packages"),
+]
+
+
+@pytest.mark.parametrize(
+    ("tools", "tool_name", "path"),
+    MESSAGE_CASES,
+    ids=["Write-file_path", "Grep-path"],
+)
+def test_the_plain_form_denial_is_decision_18s_text_verbatim(
+    tools: frozenset[str],
+    tool_name: str,
+    path: str,
+) -> None:
+    """Decision 18 and assumption 44: the plain-form denial word for word, the
+    ADR's blockquote line breaks read as single spaces. It quotes no path and
+    carries no advice paragraph."""
+    result = run_configured("test-author", tools, tool_name, path)
+    reason = assert_plain_form_denied(result, f"test-author {tool_name} of {path!r}")
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert PLAIN_FORM_PHRASE in reason, reason
+    assert reason == PLAIN_FORM_MESSAGE, (
+        "the plain-form denial must be decision 18's text verbatim.\n"
+        f"expected: {PLAIN_FORM_MESSAGE!r}\nreason:   {reason!r}"
+    )
