@@ -10,30 +10,42 @@ Assumptions section lists the rest. One judgment call has since been
 overturned by the owner. As first written, this ADR did not require
 `--locked`; on 2026-09-24 the owner decided that `--locked` is required
 everywhere (Question 1, now decided; decision 5). That is the only part of
-this ADR the owner has ruled on.
+this ADR the owner has ruled on. Question 4 was ruled the same day by the
+top-level session, not by the owner, under CLAUDE.md's pre-1.0 standing
+order, because its recommendation was unambiguous and only tightens a guard;
+the session took this ADR's own recommendation (decision 17, third
+amendment).
 
-Not implemented yet. `.claude/hooks/bash-guard.sh` gains the features of
-decisions 3-11 through brief C1 and the fix of the second amendment
-(below), which is merged only after security auditor SA1b has re-audited
-the fixed commit clean and `supervisor` has reviewed SA1b (Follow-through,
-steps 4 and 5). SA1's original audit of C1 found a NUL-extraction bypass,
-and C1 itself flagged that literal mode did not refuse carriage return or
-other control characters; the second amendment settles both. The top-level
-session applies decision 14's `.claude/settings.json` text in step W, which
-must come after C1 and C3 have landed in the main checkout (decision 13).
+Partly implemented. `.claude/hooks/bash-guard.sh` has gained the features of
+decisions 3-11 through brief C1 and the fix of the second amendment (below).
+SA1's original audit of C1 found a NUL-extraction bypass, and C1 itself
+flagged that literal mode did not refuse carriage return or other control
+characters; the second amendment settles both. SA1b re-audited the fixed
+commit, `e38e9c9`, and found `bash-guard.sh` clean; that commit is now on
+this ADR's feature branch. SA1b's one finding was against
+`.claude/hooks/path-guard.sh`, which reads the path it vets through the same
+NUL-dropping extraction (Question 4). The third amendment settles that with
+decision 17, a NUL gate in `path-guard.sh`, delivered through briefs T2, C4
+and SA1c before step W (Follow-through, step 5). The top-level session
+applies decision 14's `.claude/settings.json` text in step W, which must come
+after C1, C3 and C4 have landed in the main checkout (decisions 13 and 17).
 The policy is not in force until decision 15's verification has passed. This
 ADR touches no spec section, schema or protocol document, so
 `docs/spec/README.md` does not change. Revised in place on 2026-09-24,
-before merge; "Revision 2026-09-24" and "Second amendment 2026-09-24" at the
-end list every edit and quote what they replaced.
+before merge; "Revision 2026-09-24", "Second amendment 2026-09-24" and "Third
+amendment 2026-09-24" at the end list every edit and quote what they
+replaced.
 
 Scope note. This ADR designs the Bash policy for the `coder` agent, the
-`bash-guard.sh` features that policy needs, and the widening of the coder's
-Edit/Write fence that the Bash policy depends on. It plans the change and
-writes the briefs. It changes agent tooling only: nothing in Hammertime's
-services, wire formats, configuration keys or deployment changes. The
-`security-auditor`'s policy does not change either — every new feature is
-off unless a policy turns it on, and the auditor's policy turns none on.
+`bash-guard.sh` features that policy needs, the widening of the coder's
+Edit/Write fence that the Bash policy depends on, and (third amendment) a NUL
+gate in `path-guard.sh` that every configured path-guard policy runs, the
+architect's and the test-author's as well as the coder's (decision 17). It
+plans the change and writes the briefs. It changes agent tooling only:
+nothing in Hammertime's services, wire formats, configuration keys or
+deployment changes. The `security-auditor`'s policy does not change
+either — every new feature is off unless a policy turns it on, and the
+auditor's policy turns none on.
 
 ## Context
 
@@ -806,7 +818,10 @@ fence. Decision 13 says how the coder that implements this ADR edits
 The Bash policy's claims depend on more than that, so the coder's Edit/Write
 `DENY_GLOBS` gains four groups:
 
-* The additions are globs only; `path-guard.sh` itself does not change.
+* The additions are globs. The one change to `path-guard.sh` itself is
+  decision 17's NUL gate (third amendment), which refuses a path the script
+  cannot read intact, for every agent the script serves; the verdict on every
+  path that is a string without a NUL is unchanged.
 * Each glob is matched against the path relative to the worktree (the
   payload's `cwd`) or the main checkout (`CLAUDE_PROJECT_DIR`).
 * Some existing files match an added glob: the root `CLAUDE.md`
@@ -914,6 +929,22 @@ exception:**
    coder dispatch.
 4. The session confirms that the main checkout's copy of the file is
    unchanged.
+
+**C4 edits `path-guard.sh` the same way (third amendment).** Brief C4, which
+adds decision 17's NUL gate, is dispatched before step W, under today's
+`settings.json`: the coder's fence does not yet deny `.claude/`, and no Bash
+policy is wired for it. C4's brief limits it to `.claude/hooks/path-guard.sh`,
+`supervisor` checks that no other file changed, and the top-level session
+confirms that the main checkout's `.claude/` is unchanged before merging. The
+merge waits for SA1c's audit and `supervisor`'s review of SA1c
+(Follow-through, step 5), because the main checkout's `path-guard.sh` is the
+live Edit/Write fence for the coder, the architect and the test-author, and
+the test-author's read fence. Step W waits for C4, for two reasons. Applied
+first, W's `.claude/*` glob would refuse C4 its file, which would then need
+the temporary exemption above. And W adds the coder's exact-name globs
+(`uv.lock`, `CLAUDE.md`, `conftest.py` and the rest), which are the globs a
+NUL gets past: wired before the gate, they would look closed without being
+closed, the same kind of hazard as the one above.
 
 ### 14. The `settings.json` text
 
@@ -1074,6 +1105,18 @@ main checkout. The path guard allows it by design (assumption 2), and the
 expected result is a refusal by the harness. If the write succeeds, the
 top-level session deletes the file, reports it, and raises Question 2.
 
+P9 (third amendment) must be refused, and it tests the harness as well as
+the guard. Write, with the Write tool, to a `file_path` made of the worktree
+root, then `/uv.lock`, then a NUL (U+0000), then `x`; in the tool call's
+JSON that is `"<worktree root>/uv.lock\u0000x"`. Then run `git status` and
+`git diff --stat`, one Bash call each, and report their full output. The
+expected refusal begins `Hammertime path guard: ` and contains
+`NUL byte (U+0000)` (decision 17), and the two commands must show `uv.lock`
+unmodified and no untracked file whose name begins `uv.lock`. The suffix is
+`x` because `.gitignore` hides `uv.lock.bak`, and a suffix that no pattern
+matches keeps any stray file visible. P9's outcomes follow the general ones
+below.
+
 A — allowed; each must run with no refusal from any layer (a failing test or
 gate is fine):
 
@@ -1116,6 +1159,32 @@ policy is scoped and does not police the session.
 * **An A command was refused:** the policy is too tight for real work. The
   architect is re-dispatched to amend it, and the slice-3 coder waits.
 
+**P9's outcomes** (third amendment). They replace the general rules above for
+that one item. P9 settles the harness side end to end — whether a Write whose
+path carries a NUL can reach a protected file on the live system — except in
+the inconclusive case.
+
+* **Pass:** P9 is refused, `uv.lock` is unmodified, and no untracked file
+  whose name begins `uv.lock` has appeared. A refusal that begins
+  `Hammertime path guard: ` and contains `NUL byte (U+0000)` means the harness
+  delivered the NUL to the hook intact and decision 17's gate refused it. Any
+  other refusal, or a tool error, means another layer rejected the path
+  first. That fails closed too, but the live gate was not exercised, and T2's
+  tests remain its only execution evidence. The session records which it
+  was.
+* **Fail:** `uv.lock` was modified, so a NUL-bearing Write reached a
+  protected file. The session acts as for an R or P command that ran: it
+  reverts step W at once, reports verbatim, and does not dispatch the
+  slice-3 coder.
+* **Inconclusive:** anything else. Typically the Write is `written`,
+  `uv.lock` is unmodified, and a new untracked file appears, such as
+  `uv.lockx` or one whose name contains the six characters `\u0000`. Either
+  no U+0000 reached the guard, or the gate did not run. The session confirms
+  that the main checkout's `path-guard.sh` is C4's merged commit and that
+  T2's tests pass there. If both hold, no NUL was delivered: the harness side
+  stays unsettled, the session reports that, and the rest of V1 stands. If
+  either does not hold, P9 is a fail.
+
 ### 16. `CHANGES`
 
 No entry. `CHANGES` records user-visible changes to Hammertime — features,
@@ -1123,6 +1192,183 @@ behaviour, defaults, wire formats, configuration keys. This change alters
 the agent tooling that builds Hammertime and nothing a deployment or an
 operator sees. CLAUDE.md: "If you are unsure whether a change qualifies, it
 does not." This one plainly does not qualify.
+
+### 17. A NUL gate in `path-guard.sh` (third amendment)
+
+Added on 2026-09-24, when the top-level session ruled Question 4.
+
+**Why.** `path-guard.sh` reads the path it vets the way `bash-guard.sh` read
+the command before decision 3's gate. Its line 98, before C4's change, reads:
+
+```text
+file_path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.path // empty')"
+```
+
+Bash command substitution silently drops NUL bytes, so the script vets the
+path with every NUL removed. SA1b reported this as its one finding (medium,
+needs-validation). The top-level session confirmed the guard side by running
+master's `path-guard.sh`: with `DENY_GLOBS='uv.lock CLAUDE.md'`, `uv.lock`
+exits 2, while `uv.lock\u0000.py` and `CLAUDE.md\u0000x` each exit 0, because
+they are vetted as `uv.lock.py` and `CLAUDE.mdx`. A harness that then acted on
+the bytes before the NUL would write `uv.lock` or `CLAUDE.md`. Whether the
+harness truncates at a NUL, rejects the path or does something else is not
+known, so the guard fails closed rather than resting on it. Probe P9
+(decision 15) checks the whole route live.
+
+Only a truncating harness turns the dropped byte into a bypass. It would then
+reach every agent path-guard serves, not only the coder's globs that SA1b
+named. This is reasoned from the script's matching rules, not run:
+
+* **The coder:** every glob in decision 12 without a trailing `*` — `uv.lock`,
+  `CLAUDE.md`, `.mcp.json`, `.git`, `conftest.py`, `*/conftest.py`,
+  `test_*.py`, `pytest.ini`, `mypy.ini`, `.python-version`, `GNUmakefile`,
+  `makefile`, `pytest`, `ruff`, `mypy` and the rest. The name, then a NUL and
+  any suffix, is vetted as a longer name that no glob matches. A glob that
+  ends in `*` is not exposed, because the vetted path still matches it.
+  Today's coder globs all end in `*`, so the coder's exposure would begin
+  with step W.
+* **The test-author:** `*/tests/*`, in its Edit/Write allowlist and in its
+  read exemptions, begins with `*`. Any path, then a NUL and `/tests/x`, is
+  vetted as a path inside a `tests/` directory and allowed, so a truncating
+  harness would write or read any file, `.claude/settings.json` included.
+  This exposure would be live today.
+* **The architect:** only prefixes of the paths it may write, because each of
+  its globs starts with a fixed directory or is an exact name. For example,
+  `<repo>/do<NUL>cs/x` is vetted as `docs/x`, and a truncating harness would
+  create `<repo>/do`.
+
+**The gate.** It is decision 3's gate, with the path in place of the command.
+
+* **Detection by exit status, over the raw payload.** The gate runs
+  `printf '%s' "$input" | jq -e '(.tool_input.file_path // .tool_input.path // "") | explode | any(. == 0)'`
+  and reads the answer from `jq`'s exit status, never from a captured string,
+  so no command substitution touches the path bytes. `explode` turns the
+  decoded string into integer codepoints, so the test does not depend on how
+  `jq` stores a NUL inside a string; it is decision 3's test, which the
+  top-level session verified on the installed `jq` 1.7. `file_path` is still
+  extracted as today for every other rule; the gate does not trust it.
+  (`input="$(cat)"` is itself a command substitution, but over the JSON text,
+  in which a NUL inside a string can only be the escape `\u0000`: assumption
+  30.)
+* **The fields: exactly what the script reads.** The selector is the
+  extraction's own — `tool_input.file_path`, falling back to
+  `tool_input.path` — with `// ""` in place of `// empty`. So the gate tests
+  the very value the rest of the script vets. The script reads no other path
+  field: not `notebook_path` (the `NotebookEdit` tool, which none of the
+  agents path-guard serves has), and not Glob's `pattern` or Grep's `glob`.
+  Testing each of the two fields on its own was considered and not chosen. A
+  field the extraction does not select is never vetted, NUL or not, so
+  testing it for a NUL would not make the vetted string any more faithful. If
+  the extraction's selector ever changes, the gate's changes with it.
+* **Only a clean false passes.** Status `1` (the value is a string with no
+  NUL) passes, and nothing else does. Status `0` (a NUL was found) denies with
+  the NUL denial below. Any other status means the check did not complete; it
+  denies with the could-not-be-checked denial, which names the status.
+* **The status is captured explicitly,** so that neither `set -e` nor an `if`
+  condition can swallow a `jq` error; the script runs under
+  `set -f -e -u -o pipefail`. For example:
+  `nul_status=0; printf '%s' "$input" | jq -e '...' >/dev/null 2>&1 || nul_status=$?`,
+  then a branch on its value. `if ... | jq -e ...; then deny; fi` would let
+  every `jq` error through as "no NUL".
+
+**What each value does.** The value tested is `tool_input.file_path`, or
+`tool_input.path` when `file_path` is absent, `null` or `false`.
+
+| The value | The gate | Afterwards |
+| --- | --- | --- |
+| A string with no NUL, `""` included | Status 1: passes | The script runs as before. |
+| A string with a NUL anywhere, or only a NUL | Status 0: the NUL denial | — |
+| Absent, `null` or `false`, with `path` absent, `null` or `false` too | `// ""` makes it the empty string: status 1, passes | The empty-path check, as before: an Edit or Write exits 0; a Read, Grep or Glob under a guarded policy gets the unscoped-search denial. |
+| `true`, a number, an array or an object | `explode` fails: another status, the could-not-be-checked denial | — |
+
+Before the gate, the script vetted a non-string value as its JSON text
+(`jq -r` prints `42`, `true`, or the array or object), which is not a path
+any tool would use. Refusing it is the fail-closed reading (assumption 32).
+
+**Where it sits.**
+
+1. **After the `SCOPE_AGENT_TYPES` routing.** A caller the policy does not
+   name passes through untouched, as the script's header promises ("routing,
+   not a check"). That caller is the top-level session, which carries no
+   `agent_type`, or another agent. Decision 3's gate sits behind the same
+   routing.
+2. **Only under a guarded policy:** one with `DENY_GLOBS` or `ALLOW_GLOBS`
+   set, which is the script's existing `guarded` flag. An entry that
+   constrains no paths still denies nothing, as
+   `test_agent_with_no_path_policy_is_not_guarded` requires. This mirrors
+   decision 3's gate, which sits after the `ALLOW_CMDS` guard. Every
+   configured path-guard policy is guarded.
+3. **Before the empty-path check** (`if [[ -z "$file_path" ]]`), and so
+   before the relativisation, the project-root check and every glob list. A
+   path that is only a NUL comes out of `$(...)` empty. After that check, an
+   Edit or Write would exit 0 and a Read, Grep or Glob would be refused for
+   the wrong reason. And `EXEMPT_GLOBS` exits 0 on a match, so a gate after
+   it would never see a NUL that makes a path look exempt; that is how
+   test-author's `*/tests/*` exemption would be reached.
+
+The gate calls `deny`, so it also comes after `deny` is defined. In today's
+script, that places it between the definition of `deny` and the empty-path
+check.
+
+**Who and what it covers.** Every in-scope call under a guarded policy,
+whatever the tool: the gate does not look at `tool_name`. That means the
+coder's, the architect's and the test-author's Edit and Write, and the
+test-author's Read, Grep and Glob. These are all the policies that run
+`path-guard.sh`, in today's `settings.json` and in decision 14's. The
+extraction is shared by all of them, the exposure above reaches all three
+agents, and no legitimate path contains a NUL, so the gate costs a legitimate
+call nothing.
+
+**No knob.** The gate is built into the script, like the `--locked`
+requirement (assumption 21), because a knob would let a policy leave it off.
+Decision 14's `settings.json` text does not change.
+
+**The denials.** Both go through the script's `deny`, so each is exit 2 with
+the JSON deny. The NUL denial is, verbatim:
+
+> Hammertime path guard: the path contains a NUL byte (U+0000), which cannot
+> be carried through this guard intact — the byte is dropped when the path is
+> read, so the guard cannot vet the path the tool would actually use. The
+> tool call is refused.
+
+When the check does not complete — any status other than 0 or 1 — the denial
+is, verbatim, with `N` replaced by that status:
+
+> Hammertime path guard: the path could not be checked for a NUL byte (the
+> check ended with status N instead of a result), so the guard cannot confirm
+> that the path it would vet is the path the tool would use. The tool call is
+> refused.
+
+Neither quotes the path. The only copy the script has is the one with the NUL
+dropped, which is the string that cannot be trusted. Neither names a
+workaround, because there is no supported way to put a NUL in a path.
+`path-guard.sh` has no `DENY_ADVICE`, and this amendment adds none, so
+neither carries decision 11's paragraph; no other path-guard denial does
+either.
+
+Phrases the tests pin:
+
+| Denial | Required phrase |
+| --- | --- |
+| Both | begins `Hammertime path guard: ` |
+| A NUL found | `NUL byte (U+0000)` |
+| The check did not complete | `could not be checked for a NUL byte` |
+
+**Everything else stays.** The extraction lines, the routing, the
+relativisation, the glob checks, every existing message and the exit codes
+are unchanged. As in decision 3, the status rule specifies the gate only.
+Whether a malformed payload can make an extraction line end the script
+before the gate, under `set -e`, with a status other than 0 or 2, is SA1c's
+to examine. SA1b judged the same question for `bash-guard.sh` unreachable
+through the tool protocol, because `tool_input` is always an object.
+
+**What the gate does not settle.** `file_path` still comes through `$(...)`,
+which also strips trailing newlines. Assumption 35 explains why that cannot
+make a protected name look unprotected.
+
+**Delivery.** Briefs T2 (tests), C4 (the script) and SA1c (the audit), all
+before step W (Follow-through, step 5; decision 13). Probe P9 (decision 15)
+checks it live. There is no `CHANGES` entry (decision 16).
 
 ## Assumptions
 
@@ -1274,6 +1520,78 @@ judgment calls in settling those.
     auditor's *intended* policy is unchanged; the gate only makes it
     honoured).
 
+Items 28-38 were added on 2026-09-24 by the third amendment, after SA1b's
+finding against `path-guard.sh` and the top-level session's ruling on
+Question 4. They are the architect's judgment calls in specifying decision
+17.
+
+28. **Every agent, every tool.** Question 4 and SA1b's finding name the
+    coder's exact-name globs. Applying the gate to the architect's and the
+    test-author's policies too, and to Read, Grep and Glob as well as Edit and
+    Write, is the architect's call. The script and its extraction are shared,
+    the exposure reaches all three agents (decision 17, reasoned from the
+    matching rules and not run), and no legitimate path contains a NUL.
+29. **The gate's boundaries.** The gate runs after the routing and only under
+    a guarded policy, which keeps two promises the script already makes: a
+    caller the policy does not name passes through untouched, and an entry
+    that constrains no paths denies nothing. Both are the architect's
+    choices, mirroring decision 3's gate. Neither leaves a fenced agent's call
+    ungated: every configured policy is guarded, and a caller outside a
+    policy's scope is not fenced by that policy at all.
+30. **The payload carries a NUL only as the escape `\u0000`.** The harness
+    sends one JSON object, and JSON requires a control character inside a
+    string to be escaped (RFC 8259, section 7, from recall; this amendment
+    used no web access). So `input="$(cat)"` does not drop it. A raw NUL byte
+    in the payload would be dropped before `jq` saw it, and no check that
+    reads `$input` could find it. Decision 3's gate rests on the same
+    assumption.
+31. **The selector is the extraction's, and only the path fields are gated.**
+    The gate tests the value the extraction selects, not each field on its
+    own; decision 17 gives the reason. The script reads no `notebook_path`,
+    and none of the agents path-guard serves has `NotebookEdit` (the `tools:`
+    lines of `.claude/agents/*.md`, read 2026-09-24). An agent that gained it
+    would need the extraction and the gate to read `notebook_path` together,
+    which is a separate change. The script's other `$(...)` extractions,
+    `tool_name`, `cwd` and `agent_type`, are set by the harness rather than
+    the agent, and are not gated.
+32. **Absent, `null` and `false` are no path; a non-string is refused.**
+    `false` counts as absent because `//` treats it so and the extraction
+    already does. Refusing `true`, a number, an array or an object, which the
+    script used to vet as their JSON text, is the architect's call. That
+    `explode` fails on a number, an array and an object rests on T1's group O
+    passing against the same `jq` builtin, as SA1b's coverage reports; the
+    architect ran nothing. That it fails on `true` is from recall, and T2
+    checks it.
+33. **No knob** (decision 17), for the reason in assumption 21.
+34. **The denial texts** are the architect's wording, modelled on decision
+    11's. They quote no path and name no workaround. They carry no advice
+    paragraph, because `path-guard.sh` has no `DENY_ADVICE` and this
+    amendment adds none; a coder refused by the path guard still gets no
+    stop-and-report paragraph from it, as before.
+35. **Trailing newlines are left alone.** After the gate, `file_path` still
+    comes through `$(...)`, which strips trailing newlines, so the vetted path
+    can differ from the decoded one by trailing newlines. Every glob in
+    today's lists and in decision 14's is made of literal characters and `*`,
+    so a glob that matches a path ending in newlines also matches it without
+    them. A deny glob can therefore only get stricter. An exact-name allow
+    glob or exemption (the architect's `README.md`; the test-author's read
+    exemptions `tests`, `*/tests` and `packages/hammertime-testkit`) could let
+    an agent create or read a name that is an allowed one plus trailing
+    newlines. That is a new, different file, which no tool reads by name and
+    which `git status` shows. Leaving this alone is the architect's
+    judgment; SA1c examines it.
+36. **The harness side is not assumed.** The gate fails closed whatever the
+    harness does with a NUL-bearing path. SA1b's remark that Node's `fs`
+    refuses such a path is not relied on. Probe P9 is the end-to-end check,
+    and only the coder is probed live; for the architect and the test-author,
+    the gate rests on T2's tests and SA1c's audit.
+37. **The sequencing.** C4 goes before step W by ordering rather than by an
+    exemption, as decision 13 does for C1. W waits for C4 because W adds the
+    coder's exact-name globs, which the gate protects. T2 before C4, and SA1c
+    before C4's merge, repeat the pattern of T1, C1 and SA1.
+38. **No `CHANGES` entry.** The gate changes agent tooling only (decision
+    16).
+
 ## Consequences
 
 * **Coder ergonomics change.**
@@ -1302,6 +1620,14 @@ judgment calls in settling those.
   refuses a NUL-bearing command for the auditor (decision 3). That is a
   soundness fix to the shared extraction, not a policy change: no ordinary
   auditor command carries a NUL, so its day-to-day behaviour is intact.
+* **Every path-guard policy gains one refusal (third amendment).** For the
+  coder, the architect and the test-author alike, and for Edit, Write, Read,
+  Grep and Glob, a path that contains a NUL is refused, and so is a path field
+  that holds `true`, a number, an array or an object (decision 17). No
+  legitimate path is either, so day-to-day behaviour is intact, and a caller a
+  policy does not name, the top-level session included, is untouched. Like
+  decision 3's gate, it is a soundness fix to a shared extraction, not a
+  policy change.
 * **Future policies inherit decision 13's hazard.** Never wire a policy
   before the script that implements its rules is live in the main checkout.
   From now on decision 4 makes that fail closed.
@@ -1338,6 +1664,12 @@ judgment calls in settling those.
    worktree-confinement logic, which is what P8 tests and what a
    require-under-`cwd` knob would strengthen. cwd confinement does not depend
    on the command extraction. So Question 2 stands exactly as written.
+
+   *Nor by the third amendment (2026-09-24).* Decision 17's gate refuses a
+   path that carries a NUL before the script relativises anything, and leaves
+   how every other path is relativised and matched exactly as it was. A
+   require-under-`cwd` knob would still be the separate script change this
+   question describes.
 3. *(Added 2026-09-24, raised by the owner's decision on Question 1.)*
    **Who regenerates `uv.lock` for a briefed dependency change?** With
    `--locked` everywhere, a coder that edits a manifest's dependencies
@@ -1367,6 +1699,20 @@ judgment calls in settling those.
    confinement, not extraction). Recommended: a separate brief applies the
    same exit-status NUL gate to `path-guard.sh`, with its own test and its
    own `supervisor`-paired coder and audit. Not ruled.
+
+   *Decided 2026-09-24 by the top-level session, under CLAUDE.md's pre-1.0
+   standing order, taking the recommendation above: yes. The recommendation
+   was unambiguous and only tightens a guard, and the owner's instruction had
+   been to "tighten the guard"; the owner has not ruled on this question.
+   SA1b's re-audit reported the same weakness as its one finding (medium,
+   needs-validation), and the top-level session confirmed the guard side by
+   running master's `path-guard.sh`: with `DENY_GLOBS='uv.lock CLAUDE.md'`,
+   `uv.lock` exits 2, while `uv.lock\u0000.py` and `CLAUDE.md\u0000x` each
+   exit 0. The third amendment carries it out: decision 17 specifies the
+   gate, decision 12's "`path-guard.sh` itself does not change" is replaced,
+   and briefs T2, C4 and SA1c, with probe P9 (decision 15), implement and
+   verify it. The question's text above is kept as written; its "none of the
+   briefs below touch it" was true of the second amendment.*
 
 ## Follow-through
 
@@ -1398,16 +1744,33 @@ Order and dependencies:
      account, below) then audits the fixed commit, and step 5's condition
      applies to SA1b and that fixed commit instead of to SA1. If SA1b raises
      a further fix, the cycle repeats.
-5. Merge C1, then apply W: two separate actions by the top-level session, in
-   this order.
+5. Merge C1, then land decision 17's NUL gate in `path-guard.sh`, then apply
+   W, in this order.
    * **Merge C1.** C1's (fixed) commit is merged into the branch the main
      checkout has checked out only when both of these hold: SA1b's re-audit
      of that exact commit is clean, and `supervisor` has reviewed SA1b. From
      then on, the new script is the live fence for the security-auditor.
+   * **Land decision 17's gate (third amendment): T2, then C4, then SA1c,
+     then merge C4.**
+     * T2 (test-author) adds its tests to the feature branch. It depends only
+       on this amendment, so it can start at once and run in parallel with
+       anything still open in step 3.
+     * C4 (coder, `.claude/hooks/path-guard.sh`) starts once T2's tests are
+       on the feature branch, and leaves its commit in its worktree. It is
+       dispatched before W (decision 13).
+     * SA1c (security-auditor) audits C4's commit where it sits, in C4's
+       worktree. Until C4 is merged, the main checkout's current
+       `path-guard.sh` stays the live fence for all three agents, so a gate
+       that failed open cannot go live unaudited.
+     * **Merge C4** into the branch the main checkout has checked out only
+       when SA1c's audit of that exact commit is clean and `supervisor` has
+       reviewed SA1c. A finding that needs only a script fix goes to a coder
+       on C4's branch, and SA1c re-audits the fixed commit, as SA1b did for
+       C1. A finding that needs a design change comes back to the architect.
    * **Apply W.** The top-level session applies decision 14 only after C1
-     (the first part of this step) and C3 (step 3) have both been merged.
-     The script the new policy depends on is then already live (decision
-     13). Commit W on the feature branch.
+     (the first part of this step), C4 (the second) and C3 (step 3) have all
+     been merged. The scripts the new policy depends on are then already live
+     (decisions 13 and 17). Commit W on the feature branch.
 6. The full suite, in the main checkout, with the gates as the owner's
    decision writes them: `uv run --locked pytest -q`,
    `uv run --locked ruff check .`, `uv run --locked ruff format --check .`
@@ -1426,6 +1789,14 @@ implements, so it must check that no file other than
 merging, the session runs `git status -- .claude` in the main checkout and
 confirms it is clean. A `reviewer` pass on C1's diff is optional and is not
 briefed here.
+
+C4 and SA1c (third amendment) are paired the same way. Tell `supervisor` that
+C4 runs before step W, with no Bash policy and under a fence that does not
+yet deny `.claude/`, so it must check that no file other than
+`.claude/hooks/path-guard.sh` changed in the worktree; `.commit-msg` is
+written there but is not staged. SA1c is a `security-auditor` dispatch and is
+`supervisor`-paired like SA1 and SA1b. Before merging C4, the session runs
+`git status -- .claude` in the main checkout and confirms it is clean.
 
 ### Brief T1 — `test-author`: behaviour and wiring tests for ADR-0018
 
@@ -2181,6 +2552,331 @@ execution, mark it needs-validation (findings) or `not-examined` with that
 reason (coverage), giving the exact JSON payload and command a human should
 run.
 
+### Brief T2 — `test-author`: tests for `path-guard.sh`'s NUL gate (third amendment)
+
+Files you may touch: `tests/config/test_path_guard_behavior.py`. Nothing
+else.
+
+Work from:
+
+* ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  decision 17: where the gate sits, the status rule, what an absent, `null`,
+  `false` or non-string path does, and the two denials verbatim;
+* decision 12's first bullet, as the third amendment rewrites it;
+* the module's own helpers (`run_guard`, `assert_denied`, `assert_allowed`,
+  `configured_policy`, `under_repo`), and, for the pattern, group O of
+  `tests/config/test_bash_guard_behavior.py`, which tests the Bash guard's
+  NUL gate the same way.
+
+`.claude/hooks/path-guard.sh` as it stands is the pre-change implementation
+that C4 will change, so take no expectation from its code. Where the ADR is
+silent or ambiguous, flag it rather than choosing.
+
+**Building the payloads.**
+
+* Put the NUL in the Python string (`"\x00"`). `json.dumps` in `run_guard`
+  encodes it as the JSON escape `\u0000` the payload needs.
+* Build a NUL-bearing absolute path by string concatenation, for example
+  `f"{REPO_ROOT}/uv.lock\x00.py"`, not through `pathlib`, so that nothing on
+  the way can drop or reject the NUL.
+* The non-string, `null` and `false` cases need a payload `run_guard` cannot
+  build, because it sends only string paths and leaves out `None`. Add a
+  sibling helper, as group O's `run_guard_tool_input` does, or extend
+  `run_guard` without changing what any existing call sends.
+* In decision 17's denials the dash is an em dash (U+2014), and each
+  blockquote's line breaks are single spaces in the message.
+
+The tests must demonstrate the following, each group citing decision 17:
+
+1. **A NUL anywhere is refused.** Under an explicit guarded policy (for
+   example the module's `DENY_TESTS`), a Write whose `file_path` is an
+   otherwise-allowed path (for example `IMPLEMENTATION_FILE`) with a NUL at
+   the start, in the middle or at the end is refused with the NUL denial, and
+   the same path without the NUL is allowed. A path that is only a NUL
+   (`"\x00"`) is refused with the NUL denial in two places: as a Write's
+   `file_path`, where a Write carrying no path would be allowed; and as a
+   Grep's `path`, where the refusal must be the NUL denial, not the
+   unscoped-search denial.
+2. **An exact-name protected file.** With `DENY_GLOBS='uv.lock CLAUDE.md'`:
+   * `uv.lock` is refused with the `DENY_GLOBS` denial;
+   * `uv.lock\x00.py` and `CLAUDE.md\x00x` are refused with the NUL denial;
+   * their NUL-stripped forms, `uv.lock.py` and `CLAUDE.mdx`, are allowed.
+     They are what the guard vetted before the gate, so the refusals are not
+     vacuous.
+
+   Also, under the coder's configured Edit|Write policy
+   (`configured_policy("coder", frozenset({"Edit", "Write"}))`), a Write of
+   `uv.lock\x00x` with `agent_type` `coder` is refused with the NUL denial.
+   That holds before step W and after it.
+3. **Every agent and tool path-guard serves.** Read each policy from
+   `.claude/settings.json` with `configured_policy`, and send the agent's own
+   `agent_type`. A NUL-bearing variant of a path the policy allows is refused
+   with the NUL denial, and the path without the NUL is allowed:
+   * coder, Edit|Write: `services/trie/src/hammertime/trie/query/app.py`, as
+     a Write and as an Edit;
+   * architect, Edit|Write: `docs/spec/hammertime_spec_1.md`, as a Write and
+     as an Edit;
+   * test-author, Edit|Write: `tests/config/test_path_guard_behavior.py`, as a
+     Write and as an Edit;
+   * test-author, Read|Grep|Glob: a Read of
+     `tests/config/test_path_guard_behavior.py`, and a Grep and a Glob whose
+     `path` is `tests`.
+
+   Each of these paths is allowed before step W and after it, so these tests
+   do not wait for W. In addition:
+   * Under the test-author's configured read policy, a Read of
+     `services/trie/src/hammertime/trie/query/app.py` followed by a NUL and
+     `/tests/x` is refused with the NUL denial. Its NUL-stripped form would
+     match the `*/tests/*` exemption, so this pins that the gate runs before
+     `EXEMPT_GLOBS`. Assert only the refusal.
+   * The gate's two boundaries. Under the coder's configured policy, a
+     NUL-bearing Write from a caller with no `agent_type` (the top-level
+     session) is allowed, exit 0 with empty stdout, because routing comes
+     first. Under a policy that constrains no paths (`policy={}`), a
+     NUL-bearing path is allowed, as
+     `test_agent_with_no_path_policy_is_not_guarded` requires for any path.
+4. **A non-string path fails closed.** Under a guarded policy, a Write whose
+   `file_path` is `42`, `["uv.lock"]`, `{"a": 1}` or `true`, and a Grep whose
+   `path` is each of those, is refused with the could-not-be-checked denial.
+   Pin the text, not the status number inside it.
+5. **An absent, `null` or `false` path behaves as before.** Under a guarded
+   policy:
+   * a Write whose `tool_input` has no `file_path`, or has `file_path` `null`
+     or `false` (and no `path`), is allowed: exit 0, empty stdout;
+   * a Grep with no `path`, or with `path` `null` or `false`, is refused with
+     the unscoped-search denial (its reason contains `Grep` and `path`), and
+     with neither NUL denial.
+6. **The messages.** The NUL denial is decision 17's text verbatim. The
+   could-not-be-checked denial is decision 17's text verbatim except for the
+   status number, which is not pinned. Both begin `Hammertime path guard: `,
+   and each carries its phrase from decision 17's table: `NUL byte (U+0000)`
+   and `could not be checked for a NUL byte`.
+
+Add a paragraph on decision 17 to the module docstring.
+
+**Expected state.** Until C4 lands, the tests that expect a NUL or non-string
+refusal fail. The NUL-free halves, the two boundaries and item 5 pass today.
+That is intended: do not mark any of them xfail or skip them. T1's coder
+cases that wait for step W still wait for it.
+
+You have no Bash and cannot run the tests. Write them carefully, and say in
+your report which ones you are least sure will collect or pass as written.
+Name `true` among them: that `explode` fails on `true` is from recall.
+
+**Done when:** the module covers items 1-6; no other file changed and no
+existing test changed; and the report lists the test functions added for each
+item and every ADR ambiguity you flagged.
+
+**Do not:** take expectations from `path-guard.sh`'s code; edit anything
+under `.claude/`; weaken, delete or change an existing test; or mark a new
+test xfail or skip other than through the module's existing `bash`/`jq`
+skip.
+
+### Brief C4 — `coder`: decision 17's NUL gate in `path-guard.sh`
+
+Files you may touch: `.claude/hooks/path-guard.sh`. Nothing else — not
+`.claude/settings.json`, `.claude/hooks/bash-guard.sh`, any agent file, any
+test, `docs/`, `.gitignore` or `CHANGES`. The one other file you create is
+`.commit-msg`, for your commit message, and you never stage it.
+
+Work from:
+
+* ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  decision 17: the gate, where it sits, the status rule, what each kind of
+  value does, and the two denials verbatim;
+* decision 3's NUL gate, and its implementation in
+  `.claude/hooks/bash-guard.sh` (the block headed "NUL gate, in every mode"),
+  which decision 17 mirrors. Read it as a model; do not edit it.
+* decision 13, for why you may edit this file now, before step W, and why
+  nothing else under `.claude/` is yours;
+* the script's own header, whose existing guarantees must all still hold;
+* T2's tests in `tests/config/test_path_guard_behavior.py`.
+
+Do:
+
+1. Add the gate exactly as decision 17 specifies.
+   * **Where:** after the `SCOPE_AGENT_TYPES` routing and after `deny` is
+     defined; only when `guarded` is 1; and before the empty-path check,
+     `if [[ -z "$file_path" ]]`. In today's script that is between the end of
+     `deny` and that check.
+   * **Detection:**
+     `printf '%s' "$input" | jq -e '(.tool_input.file_path // .tool_input.path // "") | explode | any(. == 0)'`,
+     read as an exit status. No command substitution over the path.
+   * **Status:** captured explicitly, for example
+     `nul_status=0; printf '%s' "$input" | jq -e '...' >/dev/null 2>&1 || nul_status=$?`.
+     Then `1` passes; `0` denies with decision 17's NUL denial, verbatim; any
+     other status denies with its could-not-be-checked denial, verbatim, with
+     `N` replaced by the status. Do not write `if ... | jq -e ...; then`,
+     which lets a `jq` error through as "no NUL".
+2. Change nothing else. The extraction lines, the routing, `guarded`,
+   `content_tool`, `deny`, the relativisation, the glob checks, every existing
+   message and the exit codes stay as they are. Add no knob, and do not make
+   the gate depend on `tool_name`. Every path that is a string without a NUL
+   must get exactly the verdict it gets today.
+3. Keep the invariants: a denial is exit 2 with the JSON deny; an allow is
+   exit 0 with no output; every message begins `Hammertime path guard: `.
+4. Update the header, so that it stays the authoritative description.
+   * Add a section on the NUL gate: what it refuses; that it runs for every
+     in-scope call under a guarded policy, whatever the tool; why it reads
+     `jq`'s exit status and does not trust `file_path`; the status rule; and
+     that out-of-scope callers and unguarded policies are untouched.
+   * Extend the sentence saying that the script checks
+     `tool_input.file_path`, falling back to `tool_input.path`, to say that a
+     path containing a NUL, or a path field that is not a string, is refused
+     first.
+5. Verify through the tests only, in this order:
+   `uv run --locked pytest -q tests/config`; then the four gates,
+   `uv run --locked pytest -q`, `uv run --locked ruff check .`,
+   `uv run --locked ruff format --check .` and `make typecheck`.
+   * Do not run the script, `bash`, `jq`, `python` or any other interpreter
+     by hand, and do not use heredocs, quotes or multi-line commands.
+   * No Bash policy is wired for you yet, because step W has not been
+     applied. Work within decision 2's literal forms all the same, as C1's
+     brief required.
+   * If you need a check the tests do not provide, report it instead of
+     improvising one.
+6. Commit in your worktree.
+   * Write the message, trailers included, to `.commit-msg` at the worktree
+     root with the Write tool.
+   * Stage only the script, by path: `git add .claude/hooks/path-guard.sh`.
+   * Run `git commit -F .commit-msg`.
+   * Leave the commit in your worktree. Do not merge it, push it, or copy the
+     script into the main checkout. The main checkout's `path-guard.sh` is the
+     live fence for the coder, the architect and the test-author, and yours is
+     merged only after SA1c has audited it clean and `supervisor` has reviewed
+     SA1c.
+
+**Stop and report on any refusal.** If any layer refuses a command or a write
+— this repository's guards, the harness's worktree check or the platform
+sandbox — do not retry it, re-spell it, or reach the same effect another way.
+Stop the part of the work that needs it, finish anything that does not, and
+report the refusal. Do the same if a T2 test fails and you believe the test,
+not your code, is wrong: stop, report it, and do not edit the test.
+
+**Done when:**
+
+* the gate is in place as decision 17 specifies, and nothing else about the
+  script's behaviour has changed;
+* every test in `tests/config/test_path_guard_behavior.py` passes, T2's
+  included, except T1's group M coder cases that wait for step W;
+* `uv run --locked ruff check .`, `uv run --locked ruff format --check .` and
+  `make typecheck` pass;
+* the only failures in `uv run --locked pytest -q` are the tests that wait
+  for step W (T1's group J, the coder part of K, the coder items of L and the
+  coder cases of M), each listed by test id in your report. C3's `--locked`
+  recipes are already in the main checkout's `Makefile` (read by the
+  architect on 2026-09-24), so group N should pass; report it if it does not;
+* the change is committed in your worktree.
+
+**Do not:**
+
+* touch any file but `.claude/hooks/path-guard.sh`, apart from writing the
+  unstaged `.commit-msg`;
+* edit a test to make it pass;
+* change or remove any existing rule, message or exit code;
+* add a knob, or make the gate depend on `tool_name`;
+* emit an allow decision;
+* change the message prefix.
+
+**Report:**
+
+* the files changed and the commit hash;
+* the exact `jq` check, the exact status handling, and where the gate sits
+  (between which lines);
+* the test results, with the expected failures listed by id;
+* every Bash command you ran, in order and verbatim, each with its exit
+  status or the refusal it met, including the ones that succeeded;
+* every refusal you received from any layer, verbatim, with what you did
+  next, and every file you created, including untracked ones;
+* every place where the ADR was ambiguous, contradicted the tests, or looked
+  wrong. Flag it; do not improvise.
+
+### Brief SA1c — `security-auditor`: audit `path-guard.sh`'s NUL gate, with a coverage account
+
+SA1c is paired with `supervisor`, like SA1 and SA1b.
+
+Examine:
+
+* C4's commit of `.claude/hooks/path-guard.sh`, where it sits in C4's
+  worktree (the top-level session names the commit). Audit it there. The main
+  checkout's current `path-guard.sh` is the live fence for the coder, the
+  architect and the test-author, and C4's version is merged only after this
+  audit is clean and `supervisor` has reviewed it.
+* ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  decision 17 and assumptions 28-38 (third amendment), decision 12 as
+  amended, and decision 3's gate, which decision 17 mirrors.
+* Today's `.claude/settings.json` and decision 14's text: the gate runs under
+  both.
+* T2's tests in `tests/config/test_path_guard_behavior.py`, for what they
+  pin.
+
+Judge against decision 17. The question is whether any payload from an agent
+that a path-guard policy names can get a path past the guard other than the
+path the guard vetted — above all a path carrying a NUL, or a path field that
+is not a string — and whether the change alters any verdict it should not.
+Cover at least these:
+
+1. **Detection.** Is the NUL found without a command substitution over the
+   path bytes, by `jq -e` over the raw `$input`, read as an exit status? Is
+   `input="$(cat)"` itself safe (assumption 30)?
+2. **The fields.** Does the gate test exactly the value the extraction
+   selects (`tool_input.file_path`, falling back to `tool_input.path`, with
+   `// ""` for `// empty`)? Does the script read a path from any other field?
+   Can the gate and the extraction ever select different values?
+3. **Status handling.** Does exactly one status, `1`, pass, with `0` denied by
+   the NUL denial and every other status by the could-not-be-checked denial?
+   Is the status captured so that neither `set -e` nor an `if` swallows a
+   `jq` error, under `pipefail`, including a `jq` killed by a signal?
+4. **Placement.** Is the gate after the `SCOPE_AGENT_TYPES` routing, only
+   under a guarded policy, and before the empty-path check, the
+   relativisation, the project-root check and every glob list, `EXEMPT_GLOBS`
+   above all? Are out-of-scope callers and unguarded policies untouched?
+5. **Every agent and tool.** The coder's, the architect's and the
+   test-author's policies, today's and decision 14's; Edit, Write, Read, Grep
+   and Glob. Include the exposures decision 17 names: the coder's exact-name
+   globs (`uv.lock<NUL>.py`, `CLAUDE.md<NUL>x`, `.mcp.json<NUL>x`,
+   `conftest.py<NUL>x`); the test-author's `*/tests/*`
+   (`<any path><NUL>/tests/x`), in its allowlist and in its read exemptions;
+   and the architect's prefix case.
+6. **Values.** Do absent, `null`, `false`, `""`, `true`, number, array and
+   object values behave as decision 17's table says?
+7. **Messages.** Are both denials decision 17's text verbatim, with the
+   prefix, no path quoted and no workaround?
+8. **Regression.** For every path that is a string without a NUL, is every
+   verdict unchanged: every case in the existing tests, and the configured
+   policies, today's and decision 14's? Does C4's diff add only the gate and
+   header text?
+9. **Before the gate.** Can a malformed payload make an extraction line end
+   the script before the gate, under `set -e`, with a status other than 0 or
+   2? SA1b judged this unreachable through the protocol for `bash-guard.sh`;
+   say whether that holds here.
+10. **After the gate.** Does the difference that remains between the
+    extracted `file_path` and the decoded path — trailing newlines, which
+    `$(...)` strips (assumption 35) — change a verdict under a configured
+    policy in a way that matters?
+
+Report any other bypass you notice in `path-guard.sh` as a separate finding;
+the coverage account is for the areas above.
+
+**Return two things**, as one JSON object, `{"findings": [...], "coverage":
+[...]}`, as SA1b did. This overrides the auditor's usual findings-only output
+contract for this brief only.
+
+* `findings` — most-severe-first, each with the fields your agent definition
+  specifies, `[]` if none.
+* `coverage` — one entry per item, each `{"area": "<name>", "status":
+  "checked-clean" | "not-examined", "basis": "<one line>"}`. It must contain
+  one entry for each of the ten areas above, and one for each ambiguity C4's
+  report flagged. The top-level session pastes C4's flagged items into this
+  brief before dispatch; if C4 flagged none, say so. `not-examined` requires
+  a reason. Do not mark clean an item you did not look at.
+
+Your Bash cannot run `bash`, `uv` or `pytest`, so you cannot run the guard or
+its tests. Where a finding or a coverage item can only be settled by
+execution, mark it needs-validation (findings) or `not-examined` with that
+reason (coverage), and give the exact JSON payload and command a human
+should run.
+
 ### Brief V1 — `coder`: verification probe (not implementation work)
 
 **Purpose.** You are verifying that ADR-0018's guards are live for a real
@@ -2189,7 +2885,7 @@ merged, and your worktree and branch are discarded afterwards.
 
 **Method.**
 
-* Run every item of the lists R1-R33, P1-P8 and A1-A14 in decision 15 of
+* Run every item of the lists R1-R33, P1-P9 and A1-A14 in decision 15 of
   ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
   exactly as written, one per Bash or Write call, in that order.
 * Do not change, retry, re-spell or work around any item, whatever a refusal
@@ -2207,8 +2903,13 @@ x
 EOF
 ```
 
-* For the Write items, P1-P8 and those inside A11 and A13, write the content
+* For the Write items, P1-P9 and those inside A11 and A13, write the content
   `probe` unless the item names other content.
+* P9 is one Write followed by two Bash calls. Its `file_path` is your
+  worktree root, then `/uv.lock`, then the single character U+0000, then `x`.
+  Write that character in the tool call as the JSON escape `\u0000`, so that
+  the tool receives one character, not the six characters `\u0000`. Then run
+  `git status`, then `git diff --stat`.
 
 **Report.** One line per item:
 
@@ -2217,6 +2918,10 @@ EOF
   refusal and `yes` or `no` for whether it contains
   `This refusal is final for this task.`;
 * or `ran: exit N`, or `written` for a Write.
+
+For P9, the line gives the Write's result the same way, a tool error counting
+as `refused:` with its first 300 characters, and it is followed by the full
+output of `git status` and of `git diff --stat`.
 
 Nothing else. Do not interpret the results, and do not attempt anything that
 is not listed.
@@ -2429,6 +3134,25 @@ repository was read instead.
     `jq`'s `//` yielding its right side when its left side is `null` or
     `false`; `explode` failing on a non-string; and bash's `set -e` not
     acting on a command in an `if` condition.
+* **Third amendment (2026-09-24), read or reported; no web access.**
+  * Read by the architect: `.claude/hooks/path-guard.sh` (line 98's
+    extraction, the routing, `guarded`, `deny`, the empty-path check and the
+    glob checks); the NUL gate in `.claude/hooks/bash-guard.sh` as merged
+    (lines 730-760); `.claude/settings.json`; the `tools:` lines of
+    `.claude/agents/*.md`, none of which lists `NotebookEdit`; `.gitignore`;
+    the `Makefile`; `tests/config/test_path_guard_behavior.py`; and group O
+    of `tests/config/test_bash_guard_behavior.py`.
+  * Reported to the architect, who ran nothing: SA1b's report (one finding,
+    `path-guard-nul-truncation`, medium, needs-validation; `bash-guard.sh`
+    checked clean in every coverage area, including group O's non-string
+    cases passing); and the top-level session's run of master's
+    `path-guard.sh` with `DENY_GLOBS='uv.lock CLAUDE.md'` (`uv.lock` exit 2;
+    `uv.lock\u0000.py` and `CLAUDE.md\u0000x` exit 0).
+  * From recall, not verified here: JSON's requirement that a control
+    character inside a string be escaped (RFC 8259, section 7); `explode`
+    failing on `true`; bash command substitution stripping trailing
+    newlines; and, as SA1b states it, Node's `fs` refusing a path that
+    contains a NUL, which decision 17 does not rely on.
 
 ## Revision 2026-09-24 (before merge)
 
@@ -2835,3 +3559,122 @@ first draft of this amendment.
   brief T1's "Expected state" rewording and the italic note after its "Done
   when", and carried the decision-13 misattribution quoted above. Its other
   content is carried into item 1.
+
+## Third amendment 2026-09-24 (before merge): Question 4, a NUL gate in `path-guard.sh`
+
+Made in place on 2026-09-24, before this ADR is merged, under the same
+convention as the two sections above: every edit is listed, and the replaced
+text is quoted wherever a passage was reworded rather than only extended.
+Replaced text is the ADR as it stood after the second amendment. No web
+access was used.
+
+The trigger. SA1b re-audited C1's fixed `bash-guard.sh` at `e38e9c9` and
+found it clean, and that commit is now on this ADR's feature branch. SA1b's
+one finding, medium and needs-validation, was against `path-guard.sh`. Its
+line 98 extracts the path with
+`file_path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.path // empty')"`,
+the command substitution drops NUL bytes, and so a path such as
+`uv.lock\u0000.py` is vetted as `uv.lock.py`, which none of decision 12's
+exact-name globs matches. The top-level session confirmed the guard side on
+master's `path-guard.sh`: with `DENY_GLOBS='uv.lock CLAUDE.md'`, `uv.lock`
+exits 2, and `uv.lock\u0000.py` and `CLAUDE.md\u0000x` each exit 0. The
+harness side is unknown. The session then ruled Question 4 under CLAUDE.md's
+pre-1.0 standing order, taking this ADR's own recommendation, because it was
+unambiguous and only tightens a guard; the owner's instruction had been to
+"tighten the guard".
+
+Every edit:
+
+* **Status, first paragraph.** A sentence added at its end: Question 4 was
+  ruled by the top-level session under the standing order, not by the
+  owner. Nothing was replaced.
+* **Status, second paragraph.** Reworded: C1's fixed commit has been
+  re-audited clean and is on this branch; SA1b's `path-guard.sh` finding;
+  decision 17 and briefs T2, C4 and SA1c; step W now also waits for C4; and
+  this section is named. The replaced paragraph:
+
+  > Not implemented yet. `.claude/hooks/bash-guard.sh` gains the features of
+  > decisions 3-11 through brief C1 and the fix of the second amendment
+  > (below), which is merged only after security auditor SA1b has re-audited
+  > the fixed commit clean and `supervisor` has reviewed SA1b (Follow-through,
+  > steps 4 and 5). SA1's original audit of C1 found a NUL-extraction bypass,
+  > and C1 itself flagged that literal mode did not refuse carriage return or
+  > other control characters; the second amendment settles both. The top-level
+  > session applies decision 14's `.claude/settings.json` text in step W, which
+  > must come after C1 and C3 have landed in the main checkout (decision 13).
+  > The policy is not in force until decision 15's verification has passed. This
+  > ADR touches no spec section, schema or protocol document, so
+  > `docs/spec/README.md` does not change. Revised in place on 2026-09-24,
+  > before merge; "Revision 2026-09-24" and "Second amendment 2026-09-24" at the
+  > end list every edit and quote what they replaced.
+
+* **Scope note.** Its first sentence extended to name decision 17. The
+  line breaks of the paragraph's other three sentences moved; their words
+  did not change. The replaced sentence:
+
+  > This ADR designs the Bash policy for the `coder` agent, the
+  > `bash-guard.sh` features that policy needs, and the widening of the coder's
+  > Edit/Write fence that the Bash policy depends on.
+
+* **Decision 12, first bullet.** The sentence Question 4 quotes, replaced.
+  The replaced bullet:
+
+  > * The additions are globs only; `path-guard.sh` itself does not change.
+
+* **Decision 13.** A closing paragraph added: C4 edits `path-guard.sh` by the
+  same ordering as C1, and step W waits for C4. Nothing was replaced.
+* **Decision 15.** P9 added after P8's paragraph, and "P9's outcomes" added
+  after the Outcomes list. Nothing was replaced. The second amendment added
+  no NUL probe because a NUL cannot be reproduced reliably through a live
+  Bash tool call. P9 is a Write rather than a Bash call, and its
+  inconclusive outcome covers a NUL that does not arrive.
+* **Decision 17.** New. Nothing was replaced.
+* **Assumptions.** An introductory sentence and items 28-38 added after item
+  27. Nothing was replaced.
+* **Consequences.** A bullet added after the auditor bullet. Nothing was
+  replaced.
+* **Question 2.** An italic note added: the third amendment does not affect
+  it. Nothing was replaced.
+* **Question 4.** The ruling added in italics after the question. The
+  question's text is kept word for word, including "Not ruled." and "none of
+  the briefs below touch it", which were true when it was written. Nothing
+  was replaced.
+* **Follow-through, order step 5.** Its opening line reworded; a bullet added
+  between "Merge C1" and "Apply W" for T2, C4, SA1c and C4's merge; and
+  "Apply W" reworded to wait for C4. "Merge C1" is unchanged. The replaced
+  opening line:
+
+  > 5. Merge C1, then apply W: two separate actions by the top-level session, in
+  >    this order.
+
+  The replaced "Apply W" bullet:
+
+  >    * **Apply W.** The top-level session applies decision 14 only after C1
+  >      (the first part of this step) and C3 (step 3) have both been merged.
+  >      The script the new policy depends on is then already live (decision
+  >      13). Commit W on the feature branch.
+
+* **Follow-through, `supervisor` pairing.** A paragraph added after the
+  existing one, for C4 and SA1c. Nothing was replaced.
+* **Briefs T2, C4 and SA1c.** Added after brief SA1b. Nothing was replaced.
+* **Brief V1.** P9 added to its method and its report. The two replaced
+  method bullets:
+
+  > * Run every item of the lists R1-R33, P1-P8 and A1-A14 in decision 15 of
+  >   ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  >   exactly as written, one per Bash or Write call, in that order.
+
+  > * For the Write items, P1-P8 and those inside A11 and A13, write the content
+  >   `probe` unless the item names other content.
+
+  A bullet on how to send P9 was added after the second of them, and a
+  paragraph on P9's report before "Nothing else."; nothing else in the brief
+  was replaced.
+* **Sources.** A "Third amendment (2026-09-24)" bullet added at the end of
+  the list. Nothing was replaced.
+* **This section.** Added.
+* **Unchanged, deliberately.** Decision 14's `settings.json` text, because
+  the gate has no knob; decisions 3 and 11, which specify the bash guard's
+  gate; decision 16, whose "no entry" covers this amendment too (assumption
+  38); briefs T1, C1, C2, C3, SA1, SA1b and V2; "For the top-level session";
+  and the two sections above.
