@@ -28,7 +28,38 @@
 #
 # Reads the PreToolUse JSON payload on stdin (see
 # https://code.claude.com/docs/en/hooks) and checks tool_input.file_path,
-# falling back to tool_input.path (Grep/Glob).
+# falling back to tool_input.path (Grep/Glob). For an in-scope call under a
+# guarded policy, a path containing a NUL byte, or a path field that is not
+# a string, is refused first, before any other check (see NUL GATE below).
+#
+# NUL GATE (ADR-0018 decision 17, third amendment).
+#
+# The path is read into file_path through a command substitution, and
+# bash's command substitution silently drops NUL bytes. So `uv.lock`, a
+# NUL, then `.py` would be vetted as `uv.lock.py`, and a path, a NUL, then
+# `/tests/x` as a path inside a tests directory, while a harness that acted
+# on the bytes before the NUL would use a different path from the one
+# vetted. The gate therefore does not trust file_path: it asks jq, over the
+# raw payload, whether the DECODED path -- the very value the extraction
+# selects, tool_input.file_path falling back to tool_input.path -- contains
+# codepoint 0, and reads the answer from jq's exit status rather than from
+# any captured string.
+#
+# It runs for every in-scope call under a guarded policy (DENY_GLOBS or
+# ALLOW_GLOBS set), whatever the tool: it does not look at tool_name. It
+# sits after the SCOPE_AGENT_TYPES routing, so an out-of-scope caller
+# still passes through untouched, and it does not run under a policy that
+# constrains no paths, which still denies nothing. It sits before the
+# empty-path check and every glob list, EXEMPT_GLOBS included.
+#
+# Status rule: only status 1 (`jq -e` on a clean `false`: a string with no
+# NUL, the empty string included) passes. Status 0 (a NUL was found) is
+# refused with the NUL denial. Any other status means the check did not
+# complete -- for example the error `explode` raises on a path field that
+# is `true`, a number, an array or an object -- and is refused with the
+# could-not-be-checked denial, which names the status. An absent, null or
+# false path becomes the empty string through `// ""`, passes, and meets
+# the empty-path check as before. There is no knob to turn the gate off.
 #
 # WIRING -- read this before believing the guard is doing anything.
 #
@@ -150,6 +181,26 @@ deny() {
   }'
   exit 2
 }
+
+# NUL gate (ADR-0018 decision 17; see NUL GATE in the header). Only under a
+# guarded policy, and before the empty-path check: a path that is only a
+# NUL comes out of the extraction above empty, and EXEMPT_GLOBS below exits
+# 0 on a match, so a later gate would never see some NUL-bearing paths.
+# The status is captured with `|| nul_status=$?` so that neither `set -e`
+# nor an `if` condition can turn a jq error into "no NUL".
+if (( guarded )); then
+  nul_status=0
+  printf '%s' "$input" | jq -e '(.tool_input.file_path // .tool_input.path // "") | explode | any(. == 0)' >/dev/null 2>&1 || nul_status=$?
+  case "$nul_status" in
+    1) ;;
+    0)
+      deny "Hammertime path guard: the path contains a NUL byte (U+0000), which cannot be carried through this guard intact — the byte is dropped when the path is read, so the guard cannot vet the path the tool would actually use. The tool call is refused."
+      ;;
+    *)
+      deny "Hammertime path guard: the path could not be checked for a NUL byte (the check ended with status ${nul_status} instead of a result), so the guard cannot confirm that the path it would vet is the path the tool would use. The tool call is refused."
+      ;;
+  esac
+fi
 
 # No path at all. For a guarded agent this is an unscoped Grep/Glob over
 # the whole project, which can return guarded content; deny it and say how
