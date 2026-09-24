@@ -35,6 +35,43 @@
 #                        this exists because the hook has to be
 #                        installed session-wide.
 #
+# ADR-0018 (docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md)
+# adds five more. Every one is off unless a policy sets it, and with all
+# five unset every rule and message below behaves as it did before them.
+#
+#   LITERAL_ONLY         - `1` turns on literal mode (see LITERAL MODE
+#                          below): one lexical check, run before every
+#                          other check, that refuses anything bash would
+#                          rewrite. Empty or unset is off. Any other value
+#                          is a configuration error that refuses every
+#                          command. The uv and make rules, git
+#                          add/commit/merge and ruff's write mode run only
+#                          in literal mode; a policy that reaches one of
+#                          them without it gets a configuration error.
+#   DENY_ADVICE          - unset, empty or `needs-validation` keeps every
+#                          message exactly as it was. `stop-and-report`
+#                          appends ADR-0018 decision 11's paragraph
+#                          ("This refusal is final for this task. ...")
+#                          after one space to EVERY denial, configuration
+#                          errors and shared rules included, and rewords
+#                          the two auditor-specific messages (a command not
+#                          on ALLOW_CMDS, a git subcommand not on
+#                          ALLOW_GIT_SUBCMDS) without their
+#                          needs-validation sentences. Any other non-empty
+#                          value behaves as `stop-and-report`.
+#   ALLOW_UV_RUN_TARGETS - targets `uv run` may launch. Every entry must
+#                          also be on this script's own UV_RUN_KNOWN_TARGETS
+#                          (`pytest ruff`), the targets it has rules for;
+#                          any other entry is a configuration error.
+#   ALLOW_MAKE_TARGETS   - the make targets allowed, one per command.
+#   WRITE_DENY_GLOBS     - glob list (`[[ str == pattern ]]` semantics, as
+#                          in path-guard.sh) of paths `ruff format` may not
+#                          rewrite in write mode. It is meant to equal the
+#                          agent's Edit/Write DENY_GLOBS, so that a write
+#                          launched from Bash respects the same fence as a
+#                          Write. Empty or unset refuses write mode
+#                          altogether.
+#
 # Reads the PreToolUse JSON payload on stdin (see
 # https://code.claude.com/docs/en/hooks) and inspects tool_input.command.
 # Any tool other than Bash passes through.
@@ -104,6 +141,20 @@
 #   silent success on a command that should be refused as evidence the
 #   fence is missing rather than as a pass.
 #
+#   A POLICY MUST NEVER BE WIRED BEFORE THE SCRIPT THAT IMPLEMENTS IT
+#   (ADR-0018 decision 13). A policy can depend on features of this
+#   script -- the coder's depends on literal mode and the uv, make and
+#   git add/commit/merge rules. Hook scripts are read from the main
+#   checkout, at ${CLAUDE_PROJECT_DIR}/.claude/hooks/bash-guard.sh, so
+#   the script that implements a policy must be the file there before
+#   the policy goes into settings.json. A script that predates those
+#   rules has no uv or make rule at all: wired to it, the coder's
+#   policy would admit `uv run python -c ...` while looking closed. The
+#   known-command check (see Caveat) makes a FUTURE policy fail closed
+#   when it is wired early, by refusing any command this script has no
+#   model for, but it cannot protect a transition to a script that does
+#   not have that check yet.
+#
 # What it enforces beyond the name allowlist: the whole command is
 # rejected if it contains redirection, backgrounding, process
 # substitution, a backtick, any `$` (shell expansion of any kind), a
@@ -124,6 +175,60 @@
 # be a literal path, with no glob character and no leading `~`, because
 # it is the only path this guard vets by value and bash would otherwise
 # expand it into a different path after approval.
+#
+# LITERAL MODE (LITERAL_ONLY='1', ADR-0018 decision 3). One lexical check
+# runs before every other check and refuses a command that contains,
+# anywhere: a newline, `$`, a backtick, `\`, `'`, `"`, `{`, `}`, `[`, `]`,
+# `(`, `)`, `*`, `?`, `<`, `>`, `#`; an `&` that is not part of `&&`; or
+# a word that begins with `~` or contains `=~` or `:~`. For that last
+# test words are split on blanks and on `|`, `;` and `&`, because bash
+# starts a new word after a separator whether or not a blank follows.
+# What is left can only be words of ordinary characters separated by
+# blanks and by `|`, `;`, `&&` and `||`. On such a string bash removes no
+# quotes, performs no brace, tilde, parameter, command, arithmetic or
+# process expansion, has no expansion result to word-split, globs nothing
+# (extended globs need `(`), and recognises no comment, redirection or
+# grouping. So the words split out below are exactly the argv each tool
+# receives, and each segment is exactly one simple command; a reserved
+# word at the start of a segment is simply not on ALLOW_CMDS. `HEAD~1`,
+# `--tb=short`, `a:b` and `x@y` remain available. The denial says `must
+# be literal` and names the supported forms: the Grep and Glob tools,
+# `git commit -F .commit-msg`, `-k WORD`, and that stderr is captured.
+#
+# Literal mode is what the ADR-0018 rules stand on, and they run only in
+# it:
+#
+#   * uv (decision 5): only `uv run`, nothing between `uv` and `run`;
+#     between `run` and the target only `--locked` and `--offline`,
+#     matched exactly (both valueless, so the first word without a dash
+#     IS the target); the target on ALLOW_UV_RUN_TARGETS and on
+#     UV_RUN_KNOWN_TARGETS; the shadow check (below); the target's own
+#     rule; and LAST, `--locked` required among uv's options. Last,
+#     because that denial corrects a form instead of refusing a
+#     capability, so it is only ever given to a command that is allowed
+#     as soon as `--locked` is added, and it names that command.
+#   * Shadowing (decisions 5 and 8): every uv and make command is refused
+#     while the payload's cwd holds an entry of any type named pytest,
+#     ruff, mypy, GNUmakefile or makefile, and when the payload carries
+#     no cwd. uv runs a same-named directory with __main__.py, or a
+#     zipapp, in place of the tool, and make reads GNUmakefile and
+#     makefile before Makefile. This is defence in depth behind the
+#     Edit/Write fence, which refuses to create those names: a check
+#     against the live filesystem has a window when a Write and a Bash
+#     call are issued together.
+#   * pytest (decision 6) and ruff (decision 7): exact-match option
+#     allowlists, and EVERY word checked -- none skipped as an option's
+#     value -- so the guard never models which options take values. A
+#     pytest operand must be a relative directory or a test_*.py /
+#     *_test.py file (with or without ::node ids), because pytest imports
+#     any .py and doctests any .txt/.rst named on its command line.
+#     `ruff format` without `--check`/`--diff` is write mode: explicit
+#     .py/.pyi files only, none matching WRITE_DENY_GLOBS.
+#   * make (decision 8): exactly `make TARGET`, TARGET on
+#     ALLOW_MAKE_TARGETS, then the shadow check.
+#   * git add, commit and merge (decision 9): an option allowlist each,
+#     over every word after the subcommand; `merge` requires --ff-only.
+#     Every existing git rule still applies first.
 #
 # BASH EXPANSIONS -- the layer underneath every option rule in this file.
 # Everything below reasons about how a TOOL parses its arguments. That is
@@ -199,6 +304,14 @@
 #          which to create such a file -- which is what the rest of this
 #          file is for. Treat the filesystem check as evidence from one
 #          point in time; the argument, not the check, is the bound.
+#
+#          FOR A LITERAL POLICY THIS BOUND IS REPLACED, NOT RELIED ON.
+#          Its argument fails for an agent that CAN write: a coder could
+#          create a file named `--pre=sh` and run `rg x *`, and bash would
+#          hand rg `--pre=sh`. Under LITERAL_ONLY='1' no `*`, `?`, `[` or
+#          `]` reaches bash at all, so no glob expands and the filesystem
+#          plays no part. Any policy fencing an agent with Edit or Write
+#          must be literal for this reason alone.
 #      (b) It must not inject a SECOND COMMAND. Expansion results are not
 #          re-scanned as shell syntax: files named `a;b` and `c|d` are
 #          passed as single arguments, not as separators (verified).
@@ -216,7 +329,10 @@
 #      MODELLED rather than rejected: normalize_token deletes `'`, `"`
 #      and `\` so the rules compare what the tool will actually receive.
 #      See TOKEN NORMALIZATION next, and the two text divergences under
-#      POSITIONAL RULES where the model and bash still differ.
+#      POSITIONAL RULES where the model and bash still differ. Under
+#      LITERAL_ONLY='1' it is REJECTED instead: no quote or backslash
+#      survives the literal check, so there is nothing to remove, and a
+#      leading tilde (row 2) is rejected too.
 #
 # Not expansions, but the same class of after-the-fact rewriting, for
 # completeness: alias and history expansion are both off in the
@@ -299,6 +415,21 @@
 # guarded binary's parser; only "deny because a bad token is present"
 # keeps it here.
 #
+# Outside literal mode that rule is absolute. Inside it there are exactly
+# two present-flag rules, both from ADR-0018: `ruff format` is read-only
+# when `--check` or `--diff` is present (decision 7), and `git merge` is
+# allowed only when `--ff-only` is present (decision 9). They are sound
+# there, and only there, because all three of these hold, and the sed
+# failure above broke the second:
+#
+#   * literal mode makes the word the guard sees the word the tool gets;
+#   * `--` is refused by both rules, so the flag cannot be demoted to an
+#     operand;
+#   * every option either rule allows is valueless, so nothing can
+#     consume the flag as its value.
+#
+# Drop any one of those and the rule must go with it.
+#
 # POSITIONAL RULES: three rules do still depend on WHICH token is an
 # operand rather than an option -- sed's script, git's subcommand and
 # node's script path. Such a rule is sound only when every option that
@@ -330,6 +461,13 @@
 # would disambiguate it. node needs no allowlist because it already
 # denies every option-shaped token before the script path, which is the
 # same property by a stricter route.
+#
+# The ADR-0018 rules need no position argument of this kind. uv's target
+# is the first word without a dash because every uv option allowed
+# before it is valueless; pytest, ruff and git add/commit/merge check
+# every word, whether or not the tool will read it as some option's
+# value; and make takes exactly one word. Their option allowlists are
+# exact-match, so no abbreviation is resolved by guesswork there either.
 #
 # "Treats as an option" is deliberately not the same as "starts with a
 # dash", because the tools do not agree that it is either. A bare `-` is
@@ -405,21 +543,68 @@
 # script's text, and `sed -n '"1p"' FILE` being allowed is a recorded
 # consequence of divergence 2, not a shape to rely on.
 #
+# FOR A LITERAL POLICY NEITHER DIVERGENCE CAN OCCUR, and that replaces
+# the bound above rather than leaning on it. Divergence 1 needs a word
+# joined across a blank, which takes a quote or a backslash; divergence 2
+# needs a quote or backslash that bash keeps. LITERAL_ONLY='1' refuses
+# all three characters, so normalize_token is a no-op and the token every
+# rule reasons about is, character for character, the token the tool
+# gets. That is not merely tidier: the ADR-0018 rules RELAX or VET on
+# what they see ("read-only because --check is present", "this pytest
+# operand is a test file"), and for such a rule a quote-blind divergence
+# would fail OPEN -- in `ruff format x\ --check .` the guard would see
+# `--check` while ruff got the one operand `x --check` and wrote files.
+# That is why those rules exist only in literal mode.
+#
 # Caveat (documented, not a bug): this guard inspects the command STRING.
 # It is default-deny and it blocks the obvious and the moderately clever,
 # but a command-string guard is not a kernel sandbox and must not be
 # described as one. Its guarantee is also only as strong as the binaries
 # on the allowlist: every allowed command must itself be incapable of
-# writing files or executing arbitrary code. Adding something like `awk`,
-# `python3`, `perl`, `xargs`, `env`, `tee` or any shell to ALLOW_CMDS
-# voids the guarantee entirely, because that one entry can then do
-# everything the rest of this script exists to prevent. Two known limits
-# are not fixable at the token level: `git` executes programs named by its
-# on-disk configuration (core.pager, core.editor, diff.external, textconv
-# filters) even with `-c` blocked on the command line, so it is only as
-# safe as the config in the repository it runs in; and the guard vouches
-# for WHICH script `node` runs, never for what that script does. Keep the
-# Bash tool off any agent whose boundary must be a hard one.
+# writing files or executing arbitrary code, or be fenced by a rule here.
+#
+# KNOWN COMMANDS (ADR-0018 decision 4). The script carries the list of
+# commands it knows how to vet: KNOWN_RULE_CMDS (`find git node rg sed
+# sort file uv make`, each with a rule) and KNOWN_READONLY_CMDS (`ls cat
+# head tail wc stat grep jq diff cmp pwd`, read-only by construction). A
+# command on a policy's ALLOW_CMDS that is on neither is refused with a
+# configuration error, whatever its arguments. So adding `awk`,
+# `python3`, `perl`, `xargs`, `env`, `tee` or any shell to ALLOW_CMDS no
+# longer voids the guarantee silently -- it gets that command refused.
+# What voids the guarantee now is adding a name to one of those two lists
+# (or a target to UV_RUN_KNOWN_TARGETS) without the rules that make it
+# safe: one such entry can do everything the rest of this script exists
+# to prevent.
+#
+# Two known limits are not fixable at the token level: `git` executes
+# programs named by its on-disk configuration (core.pager, core.editor,
+# diff.external, textconv filters) even with `-c` blocked on the command
+# line, so it is only as safe as the config in the repository it runs in;
+# and the guard vouches for WHICH script `node` runs, never for what that
+# script does. Keep the Bash tool off any agent whose boundary must be a
+# hard one.
+#
+# FOR AN AGENT THAT WRITES CODE THIS IS A TRIPWIRE, NOT A BOUNDARY
+# (ADR-0018 decision 1). No Bash policy can stop such an agent from
+# running arbitrary code, and a policy that lets it run the gates does
+# not try. pytest imports the test modules, the conftest files and the
+# implementation they import; mypy loads the plugins its configuration
+# names; make runs whatever the Makefile recipe says; uv installs what
+# pyproject.toml and uv.lock describe. The agent writes that
+# implementation and may edit that configuration, so it can put code in
+# one of those files and run a gate, and nothing in `uv run --locked
+# pytest -q` shows what that will execute. What such a policy does
+# instead: it refuses every route that needs no file edit first
+# (interpreters, heredocs, installs, network clients, options that write
+# files or load code, launchers pointed at anything but the named tools,
+# commands this script has no model for); together with the Edit/Write
+# fence it makes the remaining routes leave evidence in `git diff` or
+# `git status`; and in stop-and-report mode every refusal says that
+# reaching the same effect another way is circumvention. It does not see
+# what a gate executes, it does not preserve evidence (an edit, a gate run
+# and a revert leave nothing in the files), it does not confine Edit or
+# Write to the worktree, and it does not restrict reading. Only an
+# OS-enforced sandbox would be a boundary.
 
 set -f -e -u -o pipefail
 
@@ -429,8 +614,26 @@ command_str="$(printf '%s' "$input" | jq -r '.tool_input.command // empty')"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
 agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
 
+# DENY_ADVICE (ADR-0018 decision 11). Unset, empty or `needs-validation`
+# keeps every message exactly as it was. Any other value -- including a
+# misspelling -- means `stop-and-report`, failing towards the stricter
+# advice: every denial then ends with FINAL_PARAGRAPH after one space.
+stop_and_report=0
+case "${DENY_ADVICE:-}" in
+  "" | needs-validation) ;;
+  *) stop_and_report=1 ;;
+esac
+
+FINAL_PARAGRAPH="This refusal is final for this task. Do not retry the same effect another way: not with a different spelling, quoting or option order, not with another program or interpreter, and not by writing a script, test, config file or Makefile target and then running a command that picks it up. Each of those is circumventing this guard, whatever the intent, and must be reported as such. If this message names a supported form and that form does what you need, use exactly that form. Otherwise stop the part of your work that needs this, finish anything that does not, and put in your report: the command you ran, what you needed it for, and this refusal word for word. Whoever dispatched you decides what happens next."
+
+# Every refusal in this file goes through here, which is what makes the
+# paragraph reach every denial in stop-and-report mode, configuration
+# errors and the shared rules included.
 deny() {
   local reason="$1"
+  if (( stop_and_report )); then
+    reason="${reason} ${FINAL_PARAGRAPH}"
+  fi
   jq -n --arg reason "$reason" '{
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -470,10 +673,93 @@ if [[ -n "${SCOPE_AGENT_TYPES:-}" ]]; then
   fi
 fi
 
+# LITERAL_ONLY (ADR-0018 decision 3). Empty or unset is off, `1` is on,
+# and anything else is a configuration error that refuses every command:
+# a policy that meant to be literal and misspelt the value must not run
+# its literal-only rules without the lexical check they depend on. This
+# sits before the "no allowlist" exit below so that it fails closed even
+# for a policy that is otherwise incomplete.
+literal_mode=0
+case "${LITERAL_ONLY:-}" in
+  "") ;;
+  1) literal_mode=1 ;;
+  *)
+    deny "Hammertime bash guard: configuration error: LITERAL_ONLY is '${LITERAL_ONLY}', and the only valid values are empty and 1. Every command is refused until the policy in .claude/settings.json is corrected; this is not something the calling agent can fix."
+    ;;
+esac
+
 # No command allowlist means this agent is not guarded on Bash at all.
 [[ -n "${ALLOW_CMDS:-}" ]] || exit 0
 
 [[ -n "$command_str" ]] || exit 0
+
+# --- Literal mode (ADR-0018 decision 3) ----------------------------------
+# One lexical check, before every other check. What it leaves can only be
+# words of ordinary characters separated by blanks and by `|`, `;`, `&&`
+# and `||`. On such a string bash removes no quotes (there are none) and
+# performs no brace, tilde, parameter, command, arithmetic or process
+# expansion; there is no expansion result to word-split and nothing to
+# glob (extended globs need `(`); it recognises no comment, redirection or
+# grouping. So the words this guard splits out below are exactly the argv
+# each tool receives, and each segment is exactly one simple command.
+#
+# The tilde rule is applied to words split on blanks AND on the three
+# separator characters, because bash starts a new word after `;`, `|` and
+# `&&` whether or not a blank follows: `ls;~` hands `ls` nothing odd but
+# runs `~`, a word the plain whitespace split would have missed.
+LITERAL_FORBIDDEN_CHARS=('$' '`' '\' "'" '"' '{' '}' '[' ']' '(' ')' '*' '?' '<' '>' '#')
+LITERAL_FORBIDDEN_NAMES=(
+  "a dollar sign (\$)"
+  "a backtick (\`)"
+  "a backslash (\\)"
+  "a single quote (')"
+  "a double quote (\")"
+  "an opening brace ({)"
+  "a closing brace (})"
+  "an opening bracket ([)"
+  "a closing bracket (])"
+  "an opening parenthesis (()"
+  "a closing parenthesis ())"
+  "an asterisk (*)"
+  "a question mark (?)"
+  "a less-than sign (<)"
+  "a greater-than sign (>)"
+  "a hash sign (#)"
+)
+
+deny_literal() {
+  deny "Hammertime bash guard: the command contains $1. Commands for this agent must be literal: plain words separated by blanks and by |, ;, && or ||, with no quoting, escaping, expansion, glob, redirection, comment, grouping, backgrounding or second line, so that the words this guard checks are exactly the words each program receives. Supported forms: search with the Grep and Glob tools rather than a quoted pattern; write a commit message, trailers included, to .commit-msg with the Write tool and commit with git commit -F .commit-msg; select tests with -k WORD, a single word; and leave out 2>&1, because the Bash tool already captures stderr."
+}
+
+check_literal() {
+  local cmd="$1" idx word
+  local -a words=()
+  if [[ "$cmd" == *$'\n'* ]]; then
+    deny_literal "a newline"
+  fi
+  for (( idx = 0; idx < ${#LITERAL_FORBIDDEN_CHARS[@]}; idx++ )); do
+    if [[ "$cmd" == *"${LITERAL_FORBIDDEN_CHARS[idx]}"* ]]; then
+      deny_literal "${LITERAL_FORBIDDEN_NAMES[idx]}"
+    fi
+  done
+  if [[ "${cmd//&&/}" == *'&'* ]]; then
+    deny_literal "an '&' that is not part of '&&'"
+  fi
+  local split="${cmd//|/ }"
+  split="${split//;/ }"
+  split="${split//&/ }"
+  read -r -a words <<< "$split"
+  for word in ${words[@]+"${words[@]}"}; do
+    if [[ "$word" == '~'* || "$word" == *'=~'* || "$word" == *':~'* ]]; then
+      deny_literal "the word '${word}', which bash would tilde-expand"
+    fi
+  done
+  return 0
+}
+
+if (( literal_mode )); then
+  check_literal "$command_str"
+fi
 
 matches_any() {
   local value="$1"; shift
@@ -882,8 +1168,9 @@ check_find() {
 GIT_SAFE_GLOBAL_OPTS="--no-pager --bare --literal-pathspecs --icase-pathspecs --no-replace-objects --no-optional-locks -h"
 
 check_git() {
-  local token subcmd="" saw_ddash=0
+  local token subcmd="" saw_ddash=0 pos=0 subcmd_pos=0
   for token in "$@"; do
+    pos=$(( pos + 1 ))
     # --help launches a manual viewer, or with help.format=web the
     # program named by web.browser, wherever it appears in the command --
     # `git log --help` does it just as `git --help log` does.
@@ -919,14 +1206,99 @@ check_git() {
         continue
       fi
       subcmd="$token"
+      subcmd_pos=$pos
     fi
   done
   if [[ -z "$subcmd" ]]; then
     deny "Hammertime bash guard: this git command names no subcommand. Name an allowed read-only subcommand explicitly (ALLOW_GIT_SUBCMDS: ${ALLOW_GIT_SUBCMDS:-none})."
   fi
   if ! in_list "$subcmd" ${ALLOW_GIT_SUBCMDS:-}; then
+    if (( stop_and_report )); then
+      # ADR-0018 decisions 9 and 11: the auditor's wording, reworded
+      # without its read-only framing, naming the one sanctioned
+      # alternative there is (for `branch`).
+      deny "Hammertime bash guard: 'git ${subcmd}' is not an allowed git subcommand for this agent (ALLOW_GIT_SUBCMDS: ${ALLOW_GIT_SUBCMDS:-none}). To learn the current branch, use git rev-parse --abbrev-ref HEAD or git status; no other git subcommand has a supported substitute."
+    fi
     deny "Hammertime bash guard: 'git ${subcmd}' is not an allowed git subcommand for this agent, because it can mutate the repository, the index or the working tree. Use a read-only subcommand instead (ALLOW_GIT_SUBCMDS: ${ALLOW_GIT_SUBCMDS:-none})."
   fi
+  # The three writing subcommands (ADR-0018 decision 9). Each is an
+  # allowlist over EVERY word after the subcommand, none skipped as an
+  # option's value, and each is sound only in literal mode, where the word
+  # checked here is the word git receives.
+  case "$subcmd" in
+    add | commit | merge)
+      require_literal "git ${subcmd}"
+      shift "$subcmd_pos"
+      "check_git_${subcmd}" "$@"
+      ;;
+  esac
+  return 0
+}
+
+GIT_ADD_OPTS="-A --all -u --update -N --intent-to-add -v --verbose -n --dry-run"
+
+check_git_add() {
+  local token
+  for token in "$@"; do
+    [[ "$token" == -* ]] || continue
+    in_list "$token" $GIT_ADD_OPTS && continue
+    [[ "$token" =~ ^-[AuNvn]+$ ]] && continue
+    deny "Hammertime bash guard: 'git add ${token}' is not one of the git add options this agent may use. Only these are, matched exactly: ${GIT_ADD_OPTS}, or a cluster of the letters AuNvn. Anything else -- -f/--force, -p, -i, -e, --chmod, --pathspec-from-file, -- and the rest -- is refused. Stage files by naming their paths: git add PATH."
+  done
+  return 0
+}
+
+GIT_COMMIT_OPTS="-a --all -q --quiet -m -F"
+
+# A short cluster is read letter by letter as git reads it: zero or more
+# of `a` and `q`, then optionally one `m` or `F`, whose value is the rest
+# of the word or, if nothing is left, the next word. That next word is
+# still checked by this loop like any other (values are never skipped),
+# so a message word beginning with `-` is refused -- a documented
+# over-denial, and the reason `-m -n` cannot smuggle in --no-verify.
+git_commit_option_allowed() {
+  local token="$1" idx=1 ch
+  in_list "$token" $GIT_COMMIT_OPTS && return 0
+  [[ "$token" == --message=* || "$token" == --file=* ]] && return 0
+  [[ "$token" == --* ]] && return 1
+  (( ${#token} >= 2 )) || return 1
+  while (( idx < ${#token} )); do
+    ch="${token:idx:1}"
+    case "$ch" in
+      a | q) idx=$(( idx + 1 )) ;;
+      m | F) return 0 ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+check_git_commit() {
+  local token
+  for token in "$@"; do
+    [[ "$token" == -* ]] || continue
+    git_commit_option_allowed "$token" && continue
+    deny "Hammertime bash guard: 'git commit ${token}' is not one of the git commit options this agent may use. Only these are: -a/--all, -q/--quiet, -m, -F, --message=, --file=, and short clusters of a and q ending in m or F. Everything else -- -n/--no-verify, --amend, -e, -S/--gpg-sign, -C, -c, -p, --trailer, --author, -- and the rest -- is refused, and a message word beginning with '-' is refused too. Write the message, trailers included, to .commit-msg with the Write tool and commit with git commit -F .commit-msg."
+  done
+  return 0
+}
+
+check_git_merge() {
+  local token ff_only=0
+  for token in "$@"; do
+    [[ "$token" == -* ]] || continue
+    case "$token" in
+      --ff-only) ff_only=1 ;;
+      -q | --quiet) ;;
+      *)
+        deny "Hammertime bash guard: 'git merge ${token}' is not one of the git merge options this agent may use. Only --ff-only, -q and --quiet are, and --ff-only is required: git merge --ff-only REF."
+        ;;
+    esac
+  done
+  if (( ! ff_only )); then
+    deny "Hammertime bash guard: git merge is allowed for this agent only as a fast-forward: git merge --ff-only REF."
+  fi
+  return 0
 }
 
 # `--` handling: node treats `--` as the end of its own options and runs
@@ -1053,6 +1425,294 @@ check_file() {
   done
 }
 
+# --- ADR-0018 rules: uv, make, pytest, ruff ------------------------------
+# All of these are literal-mode rules (decision 3). They reason about the
+# exact words a tool receives, and they include present-flag and operand
+# rules that are sound only when those words are the words bash hands
+# over. A policy that reaches one without LITERAL_ONLY='1' gets a
+# configuration error instead of a verdict.
+
+# The rules below that match letters and digits spell the classes out
+# rather than using ranges, which some locales stretch beyond ASCII.
+ASCII_LETTERS="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+require_literal() {
+  if (( ! literal_mode )); then
+    deny "Hammertime bash guard: configuration error: this policy allows ${1}, whose rules in this script are sound only in literal mode, but LITERAL_ONLY is not '1'. Every use of ${1} is refused until the policy in .claude/settings.json sets LITERAL_ONLY='1'; this is not something the calling agent can fix."
+  fi
+  return 0
+}
+
+# uv classifies its target before looking it up on PATH: a bare target
+# naming a directory with __main__.py in the working directory runs as a
+# Python package, and a zipapp file of that name runs as that. make reads
+# GNUmakefile, then makefile, before Makefile. So an entry of any type
+# with one of these names in the payload's cwd would make an unchanged
+# gate command run something else (ADR-0018 decision 5 step 4, decision
+# 8). `mypy` is here because `make typecheck` runs it through uv. This is
+# defence in depth: the fence is the Edit/Write guard's refusal to create
+# these names (decision 12), since a check against the live filesystem
+# has a window when a Write and a Bash call are issued together.
+SHADOW_NAMES="pytest ruff mypy GNUmakefile makefile"
+
+check_shadowing() {
+  local base name
+  if [[ -z "$cwd" ]]; then
+    deny "Hammertime bash guard: this Bash call carries no working directory, so the guard cannot check it for files that would shadow ${1}. It is refused."
+  fi
+  base="${cwd%/}"
+  for name in $SHADOW_NAMES; do
+    if [[ -e "${base}/${name}" || -L "${base}/${name}" ]]; then
+      deny "Hammertime bash guard: the working directory contains an entry named '${name}'. With it present, ${1} could run that entry instead of the tracked tool or Makefile, so every uv and make command is refused while it exists. Report it; do not remove or rename it to get past this check."
+    fi
+  done
+  return 0
+}
+
+# uv (ADR-0018 decision 5). Only `uv run`, with nothing between `uv` and
+# `run`; between `run` and the target only the valueless `--locked` and
+# `--offline`, matched exactly, so the first word not beginning with `-`
+# is the target by construction; the target must be on both
+# ALLOW_UV_RUN_TARGETS and UV_RUN_KNOWN_TARGETS; then the shadow check;
+# then the target's own rule over the words after it; and LAST the
+# requirement that `--locked` was among uv's options. Last, because that
+# denial corrects a form rather than refusing a capability, so it must
+# only ever reach a command that is allowed once `--locked` is added.
+# `--locked` written after the target is the tool's word, not uv's, and
+# the tool's rule refuses it.
+UV_RUN_KNOWN_TARGETS="pytest ruff"
+
+check_uv() {
+  local -a words=("$@") opts=() rest=()
+  local n=$# idx=1 has_locked=0 target="" known
+
+  require_literal "uv"
+
+  for known in ${ALLOW_UV_RUN_TARGETS:-}; do
+    if ! in_list "$known" $UV_RUN_KNOWN_TARGETS; then
+      deny "Hammertime bash guard: configuration error: ALLOW_UV_RUN_TARGETS lists '${known}', but this script has rules only for these uv run targets: ${UV_RUN_KNOWN_TARGETS}. Every uv command is refused until the policy in .claude/settings.json is corrected; this is not something the calling agent can fix."
+    fi
+  done
+
+  if (( n == 0 )) || [[ "${words[0]}" != "run" ]]; then
+    deny "Hammertime bash guard: 'uv ${words[0]:-}' is refused. The only uv subcommand this agent may use is run, written directly after uv with no uv option before it, so installing, syncing, locking and uv's other subcommands are not available: uv run --locked TARGET, with TARGET from ALLOW_UV_RUN_TARGETS (${ALLOW_UV_RUN_TARGETS:-none})."
+  fi
+
+  while (( idx < n )); do
+    if [[ "${words[idx]}" == -* ]]; then
+      case "${words[idx]}" in
+        --locked) has_locked=1 ;;
+        --offline) ;;
+        *)
+          deny "Hammertime bash guard: 'uv run ${words[idx]}' is refused. Between run and the target, uv may be given only --locked and --offline, matched exactly; --locked is required. Options that choose another interpreter, script, project, index, cache or environment, or that skip the lockfile check (--frozen, --no-sync), are not available: uv run --locked TARGET."
+          ;;
+      esac
+      opts+=("${words[idx]}")
+      idx=$(( idx + 1 ))
+      continue
+    fi
+    target="${words[idx]}"
+    break
+  done
+
+  if [[ -z "$target" ]]; then
+    deny "Hammertime bash guard: this uv run command names no target. Name one from ALLOW_UV_RUN_TARGETS (${ALLOW_UV_RUN_TARGETS:-none}): uv run --locked pytest -q, for example."
+  fi
+
+  if ! in_list "$target" ${ALLOW_UV_RUN_TARGETS:-}; then
+    local hint=""
+    case "$target" in
+      mypy) hint=" Type-checking runs through make typecheck." ;;
+      python*) hint=" Tests run through uv run --locked pytest, and type-checking through make typecheck." ;;
+    esac
+    deny "Hammertime bash guard: 'uv run ${target}' is refused: uv run may only launch a target on ALLOW_UV_RUN_TARGETS (${ALLOW_UV_RUN_TARGETS:-none}). An interpreter, a script file, a URL, stdin and the project's own entry points are not available.${hint}"
+  fi
+
+  check_shadowing "uv run ${target}"
+
+  rest=(${words[@]+"${words[@]:idx+1}"})
+  case "$target" in
+    pytest) check_pytest ${rest[@]+"${rest[@]}"} ;;
+    ruff) check_ruff ${rest[@]+"${rest[@]}"} ;;
+  esac
+
+  if (( ! has_locked )); then
+    local corrected="uv run --locked"
+    (( ${#opts[@]} )) && corrected+=" ${opts[*]}"
+    corrected+=" ${target}"
+    (( ${#rest[@]} )) && corrected+=" ${rest[*]}"
+    deny "Hammertime bash guard: uv run must carry --locked, before the target, so that uv refuses to change uv.lock instead of re-locking and installing. Run exactly this instead: ${corrected}"
+  fi
+  return 0
+}
+
+# make (ADR-0018 decision 8). Exactly `make TARGET`, with TARGET on
+# ALLOW_MAKE_TARGETS: no options, no second target, no assignment. make
+# still runs whatever the tracked Makefile's recipe says; that route needs
+# a tracked edit, which is what decision 1 counts on.
+check_make() {
+  require_literal "make"
+  if (( $# != 1 )) || [[ "$1" == -* || "$1" == *=* ]] || ! in_list "$1" ${ALLOW_MAKE_TARGETS:-}; then
+    deny "Hammertime bash guard: 'make $*' is refused. make may be run only as make TARGET, with exactly one TARGET from ALLOW_MAKE_TARGETS (${ALLOW_MAKE_TARGETS:-none}), and with no option, second target or VAR=value assignment."
+  fi
+  check_shadowing "make ${1}"
+  return 0
+}
+
+# pytest (ADR-0018 decision 6), for the words after `uv run ... pytest`.
+# Every word is checked and none is skipped as some option's value: a
+# word beginning with `-` must be an allowed option wherever it stands,
+# and every other word must pass the operand rule even when pytest will
+# read it as a value (`-k WORD`, `--tb short`). So the guard never has to
+# model which options take values; a value vetted as an operand is either
+# harmless or refused, which fails closed.
+PYTEST_LONG_OPTS="--quiet --verbose --exitfirst --showlocals --last-failed --lf --failed-first --ff --new-first --nf --stepwise --sw --collect-only --co --no-header --no-summary --setup-show --strict-markers --runxfail --full-trace --benchmark-only --benchmark-skip --benchmark-disable --hypothesis-show-statistics --tb --maxfail --durations --hypothesis-seed"
+PYTEST_TB_STYLES="auto long short line native no"
+
+is_digits() {
+  [[ -n "$1" && "$1" != *[!0123456789]* ]]
+}
+
+pytest_option_allowed() {
+  local token="$1"
+  in_list "$token" $PYTEST_LONG_OPTS && return 0
+  case "$token" in
+    --tb=*)
+      in_list "${token#--tb=}" $PYTEST_TB_STYLES
+      return
+      ;;
+    --maxfail=* | --durations=* | --hypothesis-seed=*)
+      is_digits "${token#*=}"
+      return
+      ;;
+    -k | -m) return 0 ;;
+    -r?*)
+      [[ "${token#-r}" != *[!${ASCII_LETTERS}]* ]]
+      return
+      ;;
+    --*) return 1 ;;
+    -?*)
+      [[ "${token#-}" != *[!qvxsl]* ]]
+      return
+      ;;
+  esac
+  return 1
+}
+
+pytest_operand_allowed() {
+  local word="$1" pre path base
+  [[ "$word" == @* || "$word" == /* || "$word" == '~'* ]] && return 1
+  pre="${word%%::*}"
+  [[ "/${pre}/" == */../* ]] && return 1
+  path="${pre#./}"
+  while [[ "$path" == */ ]]; do
+    path="${path%/}"
+  done
+  [[ -z "$path" || "$path" == "." ]] && return 0
+  base="${path##*/}"
+  [[ "$base" != *.* ]] && return 0
+  [[ "$base" == test_*.py || "$base" == *_test.py ]] && return 0
+  return 1
+}
+
+check_pytest() {
+  local token
+  for token in "$@"; do
+    if [[ "$token" == -* ]]; then
+      if ! pytest_option_allowed "$token"; then
+        deny "Hammertime bash guard: 'pytest ${token}' is not one of the pytest options this agent may use. Allowed, matched exactly: ${PYTEST_LONG_OPTS}; --tb=STYLE; --maxfail=N, --durations=N, --hypothesis-seed=N; -k WORD; -m WORD; -r followed by letters; and clusters of the letters qvxsl. Options that load code, write or delete files, send output elsewhere or go interactive are refused, as are -- and an attached -kWORD."
+      fi
+      continue
+    fi
+    if ! pytest_operand_allowed "$token"; then
+      deny "Hammertime bash guard: '${token}' is not something pytest may be given here. Every word that is not an option, option values included, must be a relative directory or a test file (test_*.py or *_test.py, optionally with ::node ids), with no leading /, ~ or @ and no .. component. pytest imports any .py file named on its command line and runs a .txt or .rst named there as a doctest, whatever its name. Select tests with -k WORD, a single word, or by naming the test file."
+    fi
+  done
+  return 0
+}
+
+# ruff (ADR-0018 decision 7), for the words after `uv run ... ruff`.
+RUFF_CHECK_OPTS="-q --quiet --no-fix --diff --statistics --show-fixes"
+RUFF_FORMAT_OPTS="--check --diff -q --quiet"
+
+ruff_read_operand_allowed() {
+  local word="$1"
+  [[ "$word" == @* || "$word" == /* || "$word" == '~'* ]] && return 1
+  [[ "/${word}/" == */../* ]] && return 1
+  return 0
+}
+
+deny_ruff_operand() {
+  deny "Hammertime bash guard: '${1}' is not a path ruff may be given here. ruff's operands must be relative paths with no leading /, ~ or @ and no .. component."
+}
+
+deny_ruff_write() {
+  deny "Hammertime bash guard: ${1} Without --check or --diff, ruff format rewrites files, so it takes only the Python files you changed, named one by one: uv run --locked ruff format path/to/module.py [more .py or .pyi files]. '.' and directories are refused because they would also rewrite test files, which are test-author's to change: report a misformatted test file rather than formatting it."
+}
+
+check_ruff() {
+  local sub token read_only=0 glob rel
+  local -a operands=()
+  if (( $# == 0 )) || [[ "$1" != "check" && "$1" != "format" ]]; then
+    deny "Hammertime bash guard: 'ruff ${1:-}' is refused. ruff may be run only as ruff check or ruff format, with the subcommand first and no global option before it: uv run --locked ruff check . and uv run --locked ruff format --check ."
+  fi
+  sub="$1"
+  shift
+  for token in "$@"; do
+    if [[ "$token" == -* ]]; then
+      if [[ "$sub" == "check" ]]; then
+        in_list "$token" $RUFF_CHECK_OPTS && continue
+        if [[ "$token" == "--fix" ]]; then
+          deny "Hammertime bash guard: 'ruff check --fix' rewrites files and is not available to this agent. Fix lint findings with the Edit tool."
+        fi
+        deny "Hammertime bash guard: 'ruff check ${token}' is not one of the ruff check options this agent may use. Only these are, matched exactly: ${RUFF_CHECK_OPTS}."
+      fi
+      if in_list "$token" $RUFF_FORMAT_OPTS; then
+        [[ "$token" == "--check" || "$token" == "--diff" ]] && read_only=1
+        continue
+      fi
+      deny "Hammertime bash guard: 'ruff format ${token}' is not one of the ruff format options this agent may use. Only these are, matched exactly: ${RUFF_FORMAT_OPTS}."
+    fi
+    ruff_read_operand_allowed "$token" || deny_ruff_operand "$token"
+    operands+=("$token")
+  done
+
+  [[ "$sub" == "check" ]] && return 0
+  (( read_only )) && return 0
+
+  # Write mode. `--check`/`--diff` is a present-flag rule, and it is sound
+  # here only because literal mode makes the word checked the word ruff
+  # gets, `--` is refused so `--check` cannot be demoted to an operand,
+  # and every allowed option is valueless so none can consume it.
+  if [[ -z "${WRITE_DENY_GLOBS:-}" ]]; then
+    deny_ruff_write "ruff format in write mode is not available under this policy, because it sets no WRITE_DENY_GLOBS to fence what it may rewrite."
+  fi
+  if (( ${#operands[@]} == 0 )); then
+    deny_ruff_write "ruff format was given no file to format."
+  fi
+  for token in "${operands[@]}"; do
+    if [[ "$token" != *.py && "$token" != *.pyi ]]; then
+      deny_ruff_write "'${token}' is not a .py or .pyi file."
+    fi
+    rel="${token#./}"
+    for glob in $WRITE_DENY_GLOBS; do
+      if [[ "$rel" == $glob ]]; then
+        deny "Hammertime bash guard: '${token}' matches '${glob}' in WRITE_DENY_GLOBS, the same fence the Edit and Write tools apply, so ruff format may not rewrite it. If it needs formatting, report it."
+      fi
+    done
+  done
+  return 0
+}
+
+# The commands this script knows how to vet (ADR-0018 decision 4). The
+# first list carries a rule each; the second is read-only by construction
+# and needs none. A command on a policy's ALLOW_CMDS that is on neither is
+# a configuration error. Add a name here only together with the rules
+# that make it safe -- a name on this list with no rule behind it is
+# admitted with any arguments.
+KNOWN_RULE_CMDS="find git node rg sed sort file uv make"
+KNOWN_READONLY_CMDS="ls cat head tail wc stat grep jq diff cmp pwd"
+
 # --- Validate every segment ---------------------------------------------
 
 saw_segment=0
@@ -1078,7 +1738,26 @@ while IFS= read -r segment; do
   fi
 
   if ! in_list "$cmd0" $ALLOW_CMDS; then
+    if (( stop_and_report )); then
+      # ADR-0018 decisions 4 and 11: the auditor's wording without its
+      # needs-validation sentences, plus the two required hints.
+      not_allowed="Hammertime bash guard: '${cmd0}' is not an allowed command for this agent (ALLOW_CMDS: ${ALLOW_CMDS})."
+      case "$cmd0" in
+        cd) not_allowed+=" There is no cd: run every command from the worktree root and name paths relative to it." ;;
+        python*) not_allowed+=" Tests run through uv run --locked pytest, and type-checking through make typecheck." ;;
+      esac
+      deny "$not_allowed"
+    fi
     deny "Hammertime bash guard: '${cmd0}' is not an allowed command for this agent. This agent gets read-only inspection tools only (ALLOW_CMDS: ${ALLOW_CMDS}); running the repository's own code, its test suite, a package manager or a network client would execute target-controlled code, and that needs an OS-enforced sandbox this environment does not provide. Report the finding as needs-validation, naming the exact command a human should run to confirm it, instead of running it here."
+  fi
+
+  # ADR-0018 decision 4: a command the policy allows but this script has
+  # no model for is refused, whatever its arguments, instead of being
+  # admitted unvetted. This is what makes a policy that lists python3,
+  # awk or a shell fail closed, and a future policy wired before the
+  # script learns its rules.
+  if ! in_list "$cmd0" $KNOWN_RULE_CMDS $KNOWN_READONLY_CMDS; then
+    deny "Hammertime bash guard: configuration error: '${cmd0}' is on this policy's ALLOW_CMDS, but this script has no rules for it and cannot vet what it would run, so it is refused whatever its arguments. Commands this script knows: ${KNOWN_RULE_CMDS} ${KNOWN_READONLY_CMDS}. This is not something the calling agent can fix."
   fi
 
   case "$cmd0" in
@@ -1089,6 +1768,8 @@ while IFS= read -r segment; do
     node) check_node ${args[@]+"${args[@]}"} ;;
     rg) check_rg ${args[@]+"${args[@]}"} ;;
     file) check_file ${args[@]+"${args[@]}"} ;;
+    uv) check_uv ${args[@]+"${args[@]}"} ;;
+    make) check_make ${args[@]+"${args[@]}"} ;;
   esac
 done <<< "$segments"
 
