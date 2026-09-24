@@ -13,16 +13,19 @@ everywhere (Question 1, now decided; decision 5). That is the only part of
 this ADR the owner has ruled on.
 
 Not implemented yet. `.claude/hooks/bash-guard.sh` gains the features of
-decisions 3-11 through brief C1, which is merged only after security
-auditor SA1 has found it clean and `supervisor` has reviewed SA1
-(Follow-through, steps 4 and 5). The top-level session
-applies decision 14's `.claude/settings.json` text in step W, which must
-come after C1 and C3 have landed in the main checkout (decision 13). The
-policy is not in force until decision 15's verification has passed. This
+decisions 3-11 through brief C1 and the fix of the second amendment
+(below), which is merged only after security auditor SA1b has re-audited
+the fixed commit clean and `supervisor` has reviewed SA1b (Follow-through,
+steps 4 and 5). SA1's original audit of C1 found a NUL-extraction bypass,
+and C1 itself flagged that literal mode did not refuse carriage return or
+other control characters; the second amendment settles both. The top-level
+session applies decision 14's `.claude/settings.json` text in step W, which
+must come after C1 and C3 have landed in the main checkout (decision 13).
+The policy is not in force until decision 15's verification has passed. This
 ADR touches no spec section, schema or protocol document, so
 `docs/spec/README.md` does not change. Revised in place on 2026-09-24,
-before merge; "Revision 2026-09-24" at the end lists every edit and quotes
-what it replaced.
+before merge; "Revision 2026-09-24" and "Second amendment 2026-09-24" at the
+end list every edit and quote what they replaced.
 
 Scope note. This ADR designs the Bash policy for the `coder` agent, the
 `bash-guard.sh` features that policy needs, and the widening of the coder's
@@ -201,7 +204,90 @@ this guard, with a message saying what the refusal means:
 | Service smoke runs, `docker`, `docker compose` | Decision 10 |
 | Deleting or renaming files (`rm`, `git rm`, `git mv`) | Decision 10 |
 
-### 3. Literal mode (`LITERAL_ONLY='1'`)
+### 3. Literal mode (`LITERAL_ONLY='1'`), a NUL gate, and control characters
+
+**A NUL gate, in every mode (second amendment, 2026-09-24).** Before the
+literal check, before the empty-command `exit 0`, and independent of
+`LITERAL_ONLY`, the guard refuses any command whose `tool_input.command`
+decodes to a value containing a NUL (U+0000). This closes a bypass SA1
+found. The guard reads the command with
+`command_str="$(printf %s "$input" | jq -r .tool_input.command)"`, and bash
+command substitution silently drops NUL bytes (bash prints "warning:
+command substitution: ignored null byte in input" to stderr, which nothing
+reads). So a coder command `uv run --locked ruff format<NUL> --check .` is
+vetted as the read-only `uv run --locked ruff format --check .` and approved
+as read-only, while a harness that then hands the shell only the bytes
+before the NUL runs `uv run --locked ruff format` in write mode;
+`git merge<NUL> --ff-only ...` is the same shape. The guard side is
+verified; whether the harness truncates at a NUL is not, so the guard fails
+closed rather than resting on the harness.
+
+The detection must not itself pass the command bytes through a command
+substitution, or it inherits the same NUL-stripping. The guard therefore
+asks `jq` whether the decoded command contains a NUL codepoint and reads the
+answer as `jq`'s exit status, not as a captured string — for example
+`jq -e '(.tool_input.command // "") | explode | any(. == 0)'`, which turns
+the string into integer codepoints, so it does not depend on how `jq` stores
+a NUL inside a string. `command_str` is still extracted as today for every
+other rule; the NUL gate is a separate check that does not trust
+`command_str` to be faithful. A byte-for-byte length comparison
+(`utf8bytelength` against `${#command_str}`) was considered and not chosen:
+`$(...)` also strips trailing newlines and `${#command_str}` counts
+characters, not bytes, under a multibyte locale, so a length check carries
+confounds this one does not.
+
+**Only a clean false passes the gate; every other status denies.** `jq -e`
+exits 1 when its last output is `false` or `null`, exits 0 when it is any
+other value, and exits with some other status when `jq` fails. The gate acts
+on the exact status:
+
+* **1** — a clean false: the command is a string with no NUL. The gate
+  passes, and nothing else does.
+* **0** — a NUL was found. The guard denies with the NUL message of
+  decision 11.
+* **Any other status** — the check did not complete. The guard denies with
+  the could-not-be-checked message of decision 11, which names the status.
+  A command that is not a string is the case the payload can produce: a
+  number, an array or an object reaches `explode`, which accepts only a
+  string, so `jq` fails with a runtime error. (That `explode` fails on a
+  non-string is from recall of `jq`; brief T1's non-string cases check it.)
+
+The status must be captured so that neither `set -e` nor an `if` condition
+swallows an error. The script runs under `set -f -e -u -o pipefail`, and
+`set -e` does not act on a command in an `if` condition, so the obvious
+`if ... | jq -e ...; then deny; fi` treats every `jq` error as "no NUL" and
+lets the command through to the rest of the guard. Capture the status
+explicitly instead — for example
+`nul_status=0; printf '%s' "$input" | jq -e '...' >/dev/null 2>&1 || nul_status=$?`
+— and branch on its value: `1` passes, `0` denies with the NUL message, and
+anything else denies with the could-not-be-checked message.
+
+**What `// ""` makes of a missing command.** `jq`'s `//` yields its right
+side when its left side is `null` or `false`. So an absent, `null` or `false`
+command becomes the empty string: `explode` gives `[]`, `any` gives `false`,
+and `jq -e` exits 1. The gate passes. The guard then reaches the
+empty-command check and exits 0, exactly as it did before the gate existed:
+there is no command text to vet.
+
+This status rule specifies the gate only. The extraction lines above it
+(`tool_name`, `command_str`, `cwd`, `agent_type`) still run under `set -e`
+as before. Whether a malformed payload can make one of them end the script
+before the gate, with a status other than 0 or 2, is examined by SA1b
+(area 10).
+
+**This gate runs in every mode, including the security-auditor's non-literal
+policy,** because the weak extraction is shared by every policy and is not a
+property of literal mode. It is the one refusal this amendment adds to the
+auditor. The auditor's *intended* policy is unchanged — default-deny, vetting
+the real command — and the gate only makes the implementation honor it; the
+regression tests, which use ordinary commands, are unaffected.
+
+**Verified by the top-level session (2026-09-24).** The session ran the
+recommended test on the installed `jq` 1.7. It exits 0 (true) for a decoded
+NUL and for a command that is only a NUL, and 1 (false) for a clean command.
+The architect did not run it. Brief T1's group O checks the same through the
+script. The session's run did not cover the error path; T1's non-string
+cases do.
 
 A new knob. When `LITERAL_ONLY` is `1`, one lexical check runs before every
 other check. It refuses a command that contains any of these, anywhere:
@@ -211,7 +297,15 @@ other check. It refuses a command that contains any of these, anywhere:
 * `<`, `>`, `#`;
 * an `&` that is not part of `&&`;
 * a whitespace-separated word that begins with `~`, or contains `=~` or
-  `:~`.
+  `:~`;
+* any C0 control character other than tab and newline — that is `0x01`-`0x08`,
+  `0x0B`, `0x0C`, `0x0D` and `0x0E`-`0x1F` — and DEL (`0x7F`). NUL (`0x00`) is
+  already refused in every mode by the NUL gate above; the newline (`0x0A`)
+  is refused by the first bullet; tab (`0x09`) stays allowed, because it is
+  one of bash's blanks and this guard splits words on it exactly as bash
+  does. The detection must not rest on a locale-dependent range (a `[[ =~ ]]`
+  bracket range collates differently under a non-C locale); enumerate the
+  bytes, or match under `LC_ALL=C` (second amendment; C1's fix, brief T1).
 
 What is left can only be words of ordinary characters, separated by blanks
 and by the four separators `|`, `;`, `&&`, `||`. On such a string bash does
@@ -244,11 +338,27 @@ Consequences, each deliberate:
   replaces a parametrised node id (`test_x[ipv4]`). `2>&1` is unnecessary,
   because the Bash tool already captures stderr. Searching with quoted
   patterns moves to the Grep and Glob tools.
+* **Control characters are invariant-hygiene, not a demonstrated exec
+  path.** They mostly fail closed already: an exact-match rule rejects a
+  token that carries a stray control byte (`pytest\r` is not `pytest`), and
+  the two present-flag relaxations do not fire on a flag that carries one
+  (`--check\r` is not `--check`, so `ruff format` stays in write mode and is
+  refused). Refusing them outright makes decision 3's "ordinary characters"
+  claim literally true, and keeps the transcript that decision 1's tripwire
+  relies on faithful — a carriage return can make a logged command line
+  render as something other than what ran. This is unlike the NUL gate,
+  which closes a real guard/harness divergence (the guard vets bytes the
+  harness may not run), not a hygiene gap. Control characters are refused
+  only in literal mode; the auditor's non-literal, deny-only policy has no
+  relaxation rule for one to subvert, so it is left byte-for-byte unchanged.
 
 The literal-mode denial names the offending character and contains the
 phrase `must be literal`. It also names the sanctioned forms: the Grep and
 Glob tools, `git commit -F .commit-msg`, `-k WORD`, and the fact that stderr
-is already captured.
+is already captured. A control character is named as "a control character
+other than tab (for example a carriage return)" and refused through this
+same denial, so it too contains `must be literal`. The NUL gate above is
+separate, runs in every mode, and has its own message (decision 11).
 
 ### 4. The command allowlist, and commands the script knows
 
@@ -629,6 +739,34 @@ the `ALLOW_CMDS` denial becomes the text of decision 4, and the
 git-subcommand denial the text of decision 9. The brace, `node` and legacy
 lexical messages are unreachable for a literal-mode policy with no `node`.
 
+**The NUL gate and control characters (second amendment).** The NUL denial
+is, verbatim:
+
+> Hammertime bash guard: the command contains a NUL byte (U+0000), which
+> cannot be carried through this guard intact — the byte is dropped when the
+> command is read, so the guard cannot vet the command that would actually
+> run. The command is refused.
+
+When the NUL check itself does not complete — any status other than 0 or 1
+(decision 3) — the denial is, verbatim, with `N` replaced by that status:
+
+> Hammertime bash guard: the command could not be checked for a NUL byte
+> (the check ended with status N instead of a result), so the guard cannot
+> confirm that the command it would vet is the command that would run. The
+> command is refused.
+
+Neither message names a workaround: there is no supported way to include a
+NUL, and nothing the calling agent sends is meant to make the check fail.
+Both run through the shared `deny`, so in the coder's `stop-and-report` mode
+each ends, after one space, with the paragraph above (`This refusal is final
+for this task. ...`), and under the auditor's unset `DENY_ADVICE` neither
+does — the same base text serves both, because the gate applies in every
+mode. A control character in literal mode is refused through the
+literal-mode denial (decision 3): its message contains `must be literal` and
+names the sanctioned forms as every other literal refusal does, and it names
+the offending byte as "a control character other than tab (for example a
+carriage return)".
+
 **Design rule for every new message.** It says what was refused and why, and
 it either names the supported form (decisions 3-9 list them) or names none.
 It never suggests a workaround. Every message still begins
@@ -640,7 +778,9 @@ Phrases the tests pin, so the implementation must contain them:
 | Denial | Required phrase |
 | --- | --- |
 | Configuration errors | `configuration error` |
-| Literal mode | `must be literal`, and `git commit -F` |
+| NUL gate, a NUL found | `NUL byte (U+0000)` |
+| NUL gate, the check did not complete | `could not be checked for a NUL byte` |
+| Literal mode (a forbidden character or a control character) | `must be literal`, and `git commit -F` |
 | uv target | `ALLOW_UV_RUN_TARGETS` |
 | `uv run` without `--locked` | `must carry --locked` |
 | make | `ALLOW_MAKE_TARGETS` |
@@ -1097,6 +1237,43 @@ calls in carrying out the owner's decision on Question 1.
     configuration keys, wire formats or deployment. CLAUDE.md: "If you are
     unsure whether a change qualifies, it does not."
 
+Items 24-27 were added on 2026-09-24 by the second amendment, after SA1's
+NUL finding and C1's control-character flag. They are the architect's
+judgment calls in settling those.
+
+24. **The NUL detection method** is a `jq` codepoint test read as an exit
+    status (decision 3), not a byte-for-byte length comparison. Which `jq`
+    incantation is precise enough is C1's to implement and T1's to pin; the
+    ADR fixes the requirement (no `$(...)` capture of the command bytes;
+    only exit status 1 passes, 0 and every other status deny) and recommends
+    the form. That the recommended form surfaces a decoded NUL was verified
+    by the top-level session on the installed `jq` 1.7 (decision 3), not by
+    the architect. That `explode` fails on a non-string command, which the
+    error path relies on for those payloads, is from recall and is checked
+    by T1's non-string cases. Which denial text the error case carries, and
+    that an absent or `null` command passes the gate as the empty string,
+    are the architect's calls.
+25. **The refused control set** is `0x01`-`0x08`, `0x0B`, `0x0C`, `0x0D`,
+    `0x0E`-`0x1F` and `0x7F`, with tab (`0x09`) and newline (`0x0A`) handled
+    separately and NUL (`0x00`) by the every-mode gate. Excepting tab (it is
+    a bash blank the guard already splits on) and including DEL are the
+    architect's calls, not stated requirements.
+26. **The control-character refusal is literal-mode-only, and is
+    hygiene/transcript-integrity rather than a demonstrated exec bypass.**
+    Decision 3 shows control characters fail closed for the exact-match and
+    present-flag rules; the refusal is kept anyway to make decision 3's
+    invariant true and the transcript faithful. The NUL gate, by contrast,
+    closes a real divergence and so runs in every mode.
+27. **The NUL gate's placement** is after the `ALLOW_CMDS` guard (so an
+    unguarded agent is unaffected), before the empty-command `exit 0` (so a
+    command that is only a NUL, which `$(...)` would render empty and let
+    through, is refused), and before the literal branch (so it covers both
+    the coder and the auditor). It is the only new refusal the auditor gains;
+    that this is acceptable under the ADR's "the auditor's policy does not
+    change" scope note is a judgment call, argued in decision 3 (the
+    auditor's *intended* policy is unchanged; the gate only makes it
+    honoured).
+
 ## Consequences
 
 * **Coder ergonomics change.**
@@ -1119,9 +1296,12 @@ calls in carrying out the owner's decision on Question 1.
   decision 6's licence review governs the change as before.
 * **Coders report misformatted test files rather than fixing them.** That is
   already CLAUDE.md's rule; the guard now enforces it for ruff.
-* **The auditor's behaviour does not change.** Its script gains a
-  known-command check that the auditor passes, and nothing else it can
-  reach.
+* **The auditor's behaviour does not change,** with one exception. Its
+  script gains a known-command check that the auditor passes, and nothing
+  else it can reach — except the second amendment's NUL gate, which now also
+  refuses a NUL-bearing command for the auditor (decision 3). That is a
+  soundness fix to the shared extraction, not a policy change: no ordinary
+  auditor command carries a NUL, so its day-to-day behaviour is intact.
 * **Future policies inherit decision 13's hazard.** Never wire a policy
   before the script that implements its rules is live in the main checkout.
   From now on decision 4 makes that fail closed.
@@ -1151,6 +1331,13 @@ calls in carrying out the owner's decision on Question 1.
    checkout,** should `path-guard.sh` gain a require-under-`cwd` knob, which
    denies any Edit or Write outside the payload's `cwd`? That would be a
    script change with its own brief.
+
+   *Not affected by the second amendment (2026-09-24).* The NUL gate and the
+   control-character rule change `bash-guard.sh`'s handling of a Bash command
+   string; they touch neither the harness nor `path-guard.sh`'s
+   worktree-confinement logic, which is what P8 tests and what a
+   require-under-`cwd` knob would strengthen. cwd confinement does not depend
+   on the command extraction. So Question 2 stands exactly as written.
 3. *(Added 2026-09-24, raised by the owner's decision on Question 1.)*
    **Who regenerates `uv.lock` for a briefed dependency change?** With
    `--locked` everywhere, a coder that edits a manifest's dependencies
@@ -1166,6 +1353,20 @@ calls in carrying out the owner's decision on Question 1.
    there.
 
    Not ruled.
+4. *(Added 2026-09-24 by the second amendment, a consequence of SA1's NUL
+   finding.)* **Should `path-guard.sh` get the same NUL gate?** It extracts
+   the Edit/Write/Read path with the identical
+   `file_path="$(printf %s "$input" | jq -r '.tool_input.file_path // ...')"`
+   pattern, so a NUL in a path is dropped the same way, and its glob checks
+   then vet a different string from the one the harness would act on. This
+   amendment does not fix it: the task scoped the fix to `bash-guard.sh`,
+   decision 12 makes the coder's fence change globs only ("`path-guard.sh`
+   itself does not change"), and none of the briefs below touch it. It is
+   recorded here so
+   the finding is not lost, distinct from Question 2 (which is about
+   confinement, not extraction). Recommended: a separate brief applies the
+   same exit-status NUL gate to `path-guard.sh`, with its own test and its
+   own `supervisor`-paired coder and audit. Not ruled.
 
 ## Follow-through
 
@@ -1190,14 +1391,19 @@ Order and dependencies:
      before it is audited.
    * A finding that needs a design change goes to the architect.
    * A finding that needs only a script fix goes to a coder working on C1's
-     branch. SA1 then audits the fixed commit, and step 5's condition
-     applies to that commit instead.
+     branch. SA1 found two such items: the NUL-extraction bypass (SA1's
+     finding) and control characters in literal mode (C1's own flag). Both
+     are settled by the second amendment and implemented by **brief C1 fix**
+     (below) on C1's branch. **SA1b** (a full re-audit with a coverage
+     account, below) then audits the fixed commit, and step 5's condition
+     applies to SA1b and that fixed commit instead of to SA1. If SA1b raises
+     a further fix, the cycle repeats.
 5. Merge C1, then apply W: two separate actions by the top-level session, in
    this order.
-   * **Merge C1.** C1's commit is merged into the branch the main checkout
-     has checked out only when both of these hold: SA1's audit of that exact
-     commit is clean, and `supervisor` has reviewed SA1. From then on, the
-     new script is the live fence for the security-auditor.
+   * **Merge C1.** C1's (fixed) commit is merged into the branch the main
+     checkout has checked out only when both of these hold: SA1b's re-audit
+     of that exact commit is clean, and `supervisor` has reviewed SA1b. From
+     then on, the new script is the live fence for the security-auditor.
    * **Apply W.** The top-level session applies decision 14 only after C1
      (the first part of this step) and C3 (step 3) have both been merged.
      The script the new policy depends on is then already live (decision
@@ -1212,12 +1418,14 @@ Order and dependencies:
    CLAUDE.md and `coder.md` carry the `--locked` gates ("For the top-level
    session", items 1 and 4).
 
-The top-level session pairs every dispatch with `supervisor`. For C1, tell
-`supervisor` that C1 runs without the Bash policy it implements, so it must
-check that no file other than `.claude/hooks/bash-guard.sh` changed in the
-worktree. Before merging, the session runs `git status -- .claude` in the
-main checkout and confirms it is clean. A `reviewer` pass on C1's diff is
-optional and is not briefed here.
+The top-level session pairs every dispatch with `supervisor`. For C1 and its
+fix, tell `supervisor` that the coder runs without the Bash policy it
+implements, so it must check that no file other than
+`.claude/hooks/bash-guard.sh` changed in the worktree. SA1b is a
+`security-auditor` dispatch and is `supervisor`-paired like SA1. Before
+merging, the session runs `git status -- .claude` in the main checkout and
+confirms it is clean. A `reviewer` pass on C1's diff is optional and is not
+briefed here.
 
 ### Brief T1 — `test-author`: behaviour and wiring tests for ADR-0018
 
@@ -1513,19 +1721,85 @@ N. **The `Makefile`** (decision 8, and the owner's decision in decision 5),
    * The test must find at least one such line, so that it cannot pass
      vacuously.
 
-**Expected state.** Until C1 lands, most of `test_bash_guard_behavior.py`
-fails. Until step W, groups J and K, L's coder items and M's new coder cases
-fail. Until C3 lands, group N fails. That is intended: do not mark them
-xfail or skip them.
+O. **The NUL gate and control characters** (decision 3, second amendment),
+   in `test_bash_guard_behavior.py`. For the NUL and control-character cases,
+   put the byte in the Python command string; `json.dumps` in the existing
+   `run_guard` harness encodes it as the JSON escape the payload needs. The
+   non-string and missing-command cases below need a payload `run_guard`
+   cannot build as it stands, because it always sends
+   `{"command": <str>}`: extend it, or add a sibling helper, as this brief
+   already allows.
+   * **NUL, coder policy.** A command whose `tool_input.command` contains a
+     NUL is refused, with a reason beginning `Hammertime bash guard: `,
+     containing `NUL byte (U+0000)`, and — because the coder is
+     `stop-and-report` — ending with the final paragraph. Cover a NUL at the
+     start, in the middle, and at the end, and a command that is only a NUL
+     (`"\x00"`), which must be refused rather than allowed as empty.
+   * **The NUL gate does real work.** `"uv run --locked ruff format\x00 --check ."`
+     is refused, even though the same command with the NUL removed
+     (`uv run --locked ruff format --check .`) is allowed; and
+     `"git merge\x00 --ff-only HEAD"` is refused. If the NUL check were
+     absent these would be allowed, so a passing test here is not vacuous.
+   * **The NUL gate runs in every mode.** The same NUL-bearing command under
+     the **auditor** policy is also refused, with a reason containing
+     `NUL byte (U+0000)` and *not* containing `This refusal is final for
+     this task.` (the auditor sets no `DENY_ADVICE`). This is the test that
+     pins "the extraction is shared".
+   * **Control characters, coder (literal) policy.** Each of CR (`\r`,
+     `0x0D`), VT (`0x0B`), FF (`0x0C`), ESC (`0x1B`), BEL (`0x07`) and DEL
+     (`0x7F`), placed inside an otherwise-allowed command such as
+     `"ls a<C>b"`, is refused with a reason containing `must be literal`.
+   * **Tab is allowed.** `"ls\tservices"` (a tab between two allowed words)
+     is allowed under the coder policy: tab is a permitted blank.
+   * **Control characters are literal-mode-only.** Under the **auditor**
+     (non-literal) policy, a command carrying a CR is *not* refused with a
+     `must be literal` reason — the auditor runs no literal check. (It may
+     still be refused for another reason, e.g. an unknown command name; the
+     assertion is only that no denial there contains `must be literal`.)
+   * **A command that is not a string fails closed.** A `tool_input.command`
+     that is a number (e.g. `42`), an array (e.g. `["ls"]`) or an object
+     (e.g. `{"a": 1}`) is refused, under both the coder and the auditor
+     policy, with a reason beginning `Hammertime bash guard: ` and
+     containing `could not be checked for a NUL byte`. Pin the phrase, not
+     the status number inside the message.
+   * **A missing command passes the gate as the empty string.** A payload
+     whose `tool_input` has no `command`, and one whose `command` is `null`,
+     is allowed (exit 0, empty stdout) under the coder policy: `// ""`
+     makes either the empty string, the check exits 1, and the guard then
+     exits 0 at the empty-command check, as before the gate existed.
+   * **A `jq` failure through the payload.** The only `jq` failure a payload
+     can produce at the gate is the runtime error `explode` raises on a
+     non-string command, which the non-string cases above already exercise;
+     write no separate case. A payload that is not JSON, or whose
+     `tool_input` is not an object, fails, if at all, at the extraction
+     lines above the gate, not at the gate: do not write it as a gate test.
+     SA1b examines that path.
+   * The recommended check was verified by the top-level session on the
+     installed `jq` 1.7 (exit 0 for a decoded NUL and for a NUL-only
+     command, exit 1 for a clean one), so the NUL tests are expected to pass
+     once C1's fix lands. The non-string cases rest on `explode` failing on a
+     non-string, which is from recall; if you doubt it, name those cases as
+     the ones you are least sure of. Do not skip or xfail any of them.
+
+**Expected state.** Until C1's fix lands, most of `test_bash_guard_behavior.py`
+fails, group O included. Until step W, groups J and K, L's coder items and
+M's new coder cases fail. Until C3 lands, group N fails. That is intended: do
+not mark them xfail or skip them.
 
 Cite ADR-0018 and the decision number in each module's docstring and in
 each test group. You have no Bash and cannot run the tests. Write them
 carefully, and say in your report which ones you are least sure will
 collect or pass as written.
 
-**Done when:** the four files cover A-N; no other file changed; and the
+**Done when:** the four files cover A-O; no other file changed; and the
 report lists the test functions added per group and every ADR ambiguity you
 flagged.
+
+*Second-amendment note (2026-09-24).* Group O is the only group added by the
+second amendment. If T1 has already landed group A-N before this note
+reaches you, add group O to `test_bash_guard_behavior.py` as a follow-up on
+the same branch and change nothing else; that follow-up alone satisfies the
+"cover A-O" bar.
 
 **Do not:** take expectations from `bash-guard.sh`'s code; edit anything
 under `.claude/`; weaken or delete an existing test; or mark a new test
@@ -1604,11 +1878,68 @@ Do:
    Write tool, stage only `.claude/hooks/bash-guard.sh` by path, and run
    `git commit -F .commit-msg`.
 
+**Fix (second amendment, 2026-09-24 — dispatched on C1's branch after SA1).**
+SA1 found a NUL-extraction bypass, and C1 flagged that literal mode did not
+refuse control characters. On C1's existing branch, and touching only
+`.claude/hooks/bash-guard.sh`, add both, per the amended decision 3:
+
+7. **The NUL gate, in every mode.** Refuse any command whose
+   `tool_input.command` decodes to a value containing a NUL (U+0000). Detect
+   it without a command substitution over the command bytes — read the
+   answer from `jq`'s exit status, e.g.
+   `jq -e '(.tool_input.command // "") | explode | any(. == 0)'` — because
+   `command_str="$(... jq -r ...)"` silently drops the NUL and would defeat a
+   string check. Place the gate after the `ALLOW_CMDS` guard, before the
+   empty-command `exit 0`, and before the literal-mode branch, so it covers
+   both the coder and the auditor. `command_str` stays as it is for every
+   other rule.
+   * **Act on the exact status (decision 3).** Exit status `1` — a clean
+     false — is the only one that passes. `0` means a NUL was found: deny
+     with decision 11's NUL message, verbatim. Any other status means the
+     check did not complete — including the `jq` runtime error a number,
+     array or object command causes in `explode`: deny with decision 11's
+     could-not-be-checked message, verbatim, with `N` replaced by the
+     status.
+   * **Do not let `set -e` or an `if` swallow the status.** The script runs
+     under `set -f -e -u -o pipefail`, and `set -e` does not act inside an
+     `if` condition, so `if ... | jq -e ...; then deny; fi` lets every `jq`
+     error through as "no NUL". Capture the status explicitly, e.g.
+     `nul_status=0; printf '%s' "$input" | jq -e '...' >/dev/null 2>&1 || nul_status=$?`,
+     then branch on its value.
+   * Both denials go through the shared `deny`, so the final paragraph is
+     added in `stop-and-report` and not under the auditor.
+8. **Control characters in literal mode.** In `check_literal`, refuse any C0
+   control character except tab (`0x09`) and newline (`0x0A`, already
+   refused) — that is `0x01`-`0x08`, `0x0B`, `0x0C`, `0x0D`, `0x0E`-`0x1F` —
+   and DEL (`0x7F`). Do not use a locale-dependent `[[ =~ ]]` range;
+   enumerate the bytes or match under `LC_ALL=C`. Refuse through the same
+   `deny_literal` path as the other literal refusals, naming "a control
+   character other than tab (for example a carriage return)", so the message
+   still contains `must be literal`.
+9. **Header.** Extend the header for the NUL gate (every mode, why the
+   exit-status detection, that it does not trust `command_str`) and the
+   control-character refusal (literal mode; that it is mostly fail-closed
+   already and kept for the invariant and the transcript).
+10. **Verify** through the T1 tests, group O included:
+    `uv run --locked pytest -q tests/config`. The top-level session has
+    verified on the installed `jq` 1.7 that the recommended check exits 0
+    for a decoded NUL and for a NUL-only command and 1 for a clean one.
+    **Report the exact `jq` check and the exact status handling you
+    used.** If a group O test still fails — a NUL case, or a non-string case
+    (whose error path rests on `explode` failing on a non-string, from
+    recall) — stop, report it, and do not improvise another method; the
+    architect will revise decision 3.
+11. Amend or extend the commit on C1's branch as in item 6 (message to
+    `.commit-msg`, stage only `.claude/hooks/bash-guard.sh`,
+    `git commit -F .commit-msg`).
+
 **Done when:**
 
-* the script implements decisions 3-11;
+* the script implements decisions 3-11, including the second amendment's NUL
+  gate and control-character refusal;
 * every test in `tests/config/test_bash_guard_behavior.py` that does not
-  read `.claude/settings.json` passes;
+  read `.claude/settings.json` passes, group O included (subject to item 10's
+  `jq` caveat, which you report rather than work around);
 * `uv run --locked ruff check .`, `uv run --locked ruff format --check .`
   and `make typecheck` pass;
 * the only failures left are these, and each is listed by test id in your
@@ -1771,6 +2102,84 @@ Your Bash cannot run `bash`, `uv` or `pytest`, so you cannot run the guard.
 Where a finding can only be settled by execution, report it as
 needs-validation, with the exact JSON payload and command a human should
 run. Output the JSON of your agent definition.
+
+### Brief SA1b — `security-auditor`: full re-audit of the fixed guard, with a coverage account
+
+This supersedes SA1. SA1 found a NUL-extraction bypass and C1 flagged
+control characters; brief C1 fix added the second amendment's NUL gate and
+control-character refusal. Re-audit the **whole** fixed `bash-guard.sh` — not
+only the fix diff — at the commit the top-level session names on C1's branch.
+A fix can regress what SA1 cleared, so every area is examined again against
+the current file.
+
+Examine:
+
+* the fixed `.claude/hooks/bash-guard.sh` in C1's worktree (the session names
+  the commit);
+* ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  decisions 1-14, **as amended by the second amendment** — decision 3's NUL
+  gate and control-character refusal, decision 11's two NUL-gate messages
+  and phrase table, and assumptions 24-27;
+* the `settings.json` text of decision 14, including the coder's `DENY_GLOBS`
+  (decision 12) as `.claude/hooks/path-guard.sh` interprets them.
+
+Judge against ADR-0018, for the same four bypass classes (a)-(d) as SA1.
+Cover **at least** SA1's nine numbered areas (its items 1-9), re-checked
+against the fixed file, **plus** a tenth:
+
+10. **The NUL gate and control characters** (decision 3, second amendment).
+    * Is the NUL detected without a command substitution over the command
+      bytes, so that `$(...)` NUL-stripping cannot defeat it? Does it run in
+      every mode (coder and auditor), after the `ALLOW_CMDS` guard and before
+      the empty-command exit and the literal branch?
+    * **Status handling.** Does exactly one status — `1`, a clean false —
+      pass the gate, with `0` denied by the NUL message and every other
+      status denied by the could-not-be-checked message? Is the status
+      captured so that neither `set -e` nor an `if` condition swallows a
+      `jq` error? (An `if ... | jq -e ...; then deny; fi` form lets every
+      `jq` error through as "no NUL".) Do a non-string command (number,
+      array, object) and an absent or `null` one behave as decision 3 says?
+    * The recommended check was verified by the top-level session on the
+      installed `jq` 1.7 (exit 0 for a decoded NUL and for a NUL-only
+      command, exit 1 for a clean one). Confirm that the script uses that
+      check, or one you can show to be equivalent; you need not re-derive
+      `jq`'s behaviour for it. That `explode` fails on a non-string is from
+      recall: if you cannot settle it by reading, mark it needs-validation
+      with the exact payload and command a human runs.
+    * Decision 3's status rule covers the gate only. Can a malformed payload
+      end the script before the gate — an extraction line (`tool_name`,
+      `command_str`, `cwd`, `agent_type`) failing under `set -e` — with a
+      status other than 0 or 2?
+    * Are the control characters of assumption 25 refused in literal mode,
+      by a detection that is not locale-dependent, with tab and newline
+      correctly excepted?
+    * Does the coder's git-merge/ruff/gate handling still hold now that the
+      fix has moved code around it?
+
+**Return two things**, as one JSON object, `{"findings": [...], "coverage":
+[...]}`. This overrides the auditor's usual findings-only output contract for
+this brief only.
+
+* `findings` — exactly as SA1: most-severe-first, each with the fields your
+  agent definition specifies, `[]` if none.
+* `coverage` — an explicit account, one entry per item, each
+  `{"area": "<name>", "status": "checked-clean" | "not-examined", "basis":
+  "<one line>"}`. It must contain:
+  * one entry for each of SA1's nine areas and area 10 above (ten in all);
+  * one entry for each of **C1's six flagged ambiguities**. The top-level
+    session pastes C1's six items (from C1's report) into this brief before
+    dispatch; cover each by its number. If fewer or more than six were
+    flagged, cover exactly what C1 reported and say so.
+  * `checked-clean` means you examined it against the fixed file and found no
+    bypass; `not-examined` requires a reason (out of reach without execution,
+    out of scope, superseded, etc.). Do not mark an item clean you did not
+    actually look at.
+
+Your Bash cannot run `bash`, `uv`, `pytest` or `jq` against the guard, so you
+cannot run it. Where a finding or a coverage item can only be settled by
+execution, mark it needs-validation (findings) or `not-examined` with that
+reason (coverage), giving the exact JSON payload and command a human should
+run.
 
 ### Brief V1 — `coder`: verification probe (not implementation work)
 
@@ -1993,6 +2402,19 @@ repository was read instead.
   headers of `.claude/hooks/bash-guard.sh` and `.claude/hooks/path-guard.sh`.
   Also `.claude/settings.json`, `tests/config/`, CLAUDE.md, `Makefile`,
   `pyproject.toml` and `ruff.toml`.
+* **Second amendment (2026-09-24), read or reported; no web access.**
+  * Read by the architect: C1's rewritten script,
+    `.claude/worktrees/agent-afa851310c23bc944/.claude/hooks/bash-guard.sh`,
+    line 613 (`command_str` extracted through `$(... jq -r ...)`), and
+    `.claude/hooks/path-guard.sh` line 98 (`file_path` extracted the same
+    way; Question 4).
+  * Run by the top-level session and reported to the architect, who did
+    not run either: the rewritten script vets
+    `uv run --locked ruff format<NUL> --check .` as read-only and approves
+    it, bash printing "warning: command substitution: ignored null byte in
+    input"; and on the installed `jq` 1.7,
+    `explode | any(. == 0)` exits 0 for a decoded NUL and for a NUL-only
+    command and 1 for a clean command (decision 3).
 * **From recall, not verified here:**
   * GNU make's default makefile names and their order;
   * CPython's `site` importing `sitecustomize` after `.pth` processing;
@@ -2001,7 +2423,12 @@ repository was read instead.
   * rg's `--pre` running a command per searched file;
   * uv's `--locked` asserting that `uv.lock` will not change, and exiting
     with an error instead of re-locking (decision 5; the 2026-09-24
-    revision used no web access).
+    revision used no web access);
+  * (second amendment) `jq -e` exiting 1 when its last output is `false`
+    or `null`, 0 for any other value, and another status on an error;
+    `jq`'s `//` yielding its right side when its left side is `null` or
+    `false`; `explode` failing on a non-string; and bash's `set -e` not
+    acting on a command in an `if` condition.
 
 ## Revision 2026-09-24 (before merge)
 
@@ -2104,3 +2531,307 @@ everywhere.**
   * "For the top-level session" changes the `coder.md` text and gains item
     4, CLAUDE.md's gates.
 * **Sources.** One recall bullet is added.
+
+## Second amendment 2026-09-24 (before merge): SA1's NUL finding and control characters
+
+Made in place on 2026-09-24, before C1 is merged, so it follows the same
+before-merge convention as the revision above: every edit is listed, and the
+replaced text is quoted wherever a passage was reworded rather than only
+extended. The trigger: SA1's audit of C1's commit `dc0a367` (unmerged, in
+worktree `.claude/worktrees/agent-afa851310c23bc944`) found that the guard
+extracts the command with
+`command_str="$(printf %s "$input" | jq -r .tool_input.command)"`, that bash
+command substitution silently drops NUL bytes, and so that
+`uv run --locked ruff format<NUL> --check .` is vetted as read-only while a
+harness truncating at the NUL would run it in write mode; `git merge<NUL>
+--ff-only ...` is the same. The top-level session confirmed the guard side by
+running the rewritten script; whether the harness truncates at a NUL is
+unverified, so the guard is made to fail closed. C1's coder had separately
+flagged that decision 3 did not refuse carriage return or other control
+characters.
+
+**1. SA1's NUL finding and C1's control-character flag.** The amendment as
+first drafted. Replaced text is the ADR as it stood before this amendment.
+
+* **Status.** Reworded to say the merge hinges on SA1b (a re-audit of the
+  fixed commit) rather than SA1, to name the NUL finding and the
+  control-character flag, and to point to this section. The replaced
+  paragraph:
+
+  > Not implemented yet. `.claude/hooks/bash-guard.sh` gains the features of
+  > decisions 3-11 through brief C1, which is merged only after security
+  > auditor SA1 has found it clean and `supervisor` has reviewed SA1
+  > (Follow-through, steps 4 and 5). The top-level session
+  > applies decision 14's `.claude/settings.json` text in step W, which must
+  > come after C1 and C3 have landed in the main checkout (decision 13). The
+  > policy is not in force until decision 15's verification has passed. This
+  > ADR touches no spec section, schema or protocol document, so
+  > `docs/spec/README.md` does not change. Revised in place on 2026-09-24,
+  > before merge; "Revision 2026-09-24" at the end lists every edit and quotes
+  > what it replaced.
+
+* **Decision 3, heading.** Now "Literal mode (`LITERAL_ONLY='1'`), a NUL
+  gate, and control characters". It replaced:
+
+  > ### 3. Literal mode (`LITERAL_ONLY='1'`)
+
+* **Decision 3, the NUL gate.** Added before "A new knob.": the bypass, the
+  requirement that detection not pass the command through a `$(...)`, the
+  recommended `jq` codepoint test read as an exit status, why a length
+  comparison was rejected, that the gate runs in every mode (auditor
+  included), and the `jq` dependence routed to T1, C1's fix and SA1b. Nothing
+  was replaced. (Item 2 below rewrote parts of it.)
+* **Decision 3, the forbidden list.** The tilde bullet now ends with a
+  semicolon instead of a full stop, and a new bullet for control characters
+  follows it (`0x01`-`0x08`, `0x0B`, `0x0C`, `0x0D`, `0x0E`-`0x1F`, `0x7F`;
+  tab and newline excepted; no locale-dependent range). The replaced bullet:
+
+  > * a whitespace-separated word that begins with `~`, or contains `=~` or
+  >   `:~`.
+
+* **Decision 3, Consequences.** Added a bullet, "Control characters are
+  invariant-hygiene, not a demonstrated exec path", after "Ergonomics".
+  Nothing was replaced.
+* **Decision 3, the denial paragraph.** Extended with two sentences, on the
+  control-character wording and on the NUL message living in decision 11.
+  Its two existing sentences are unchanged.
+* **Decision 11, the NUL message.** Added a paragraph after "Two current
+  messages carry auditor-specific sentences": the NUL denial, verbatim, how
+  it runs through the shared `deny` (the final paragraph for the coder, none
+  for the auditor), and that a control character reuses the literal denial.
+  Nothing was replaced. (Item 2 below extended it.)
+* **Decision 11, the phrase table.** Added a NUL row (split in item 2), and
+  reworded the literal-mode row to name control characters. The replaced
+  row:
+
+  > | Literal mode | `must be literal`, and `git commit -F` |
+
+* **Assumptions.** Added the introductory sentence and items 24-27. Nothing
+  was replaced. (Item 2 below reworded 24.)
+* **Consequences, the auditor bullet.** Reworded to record the NUL gate as
+  the one new auditor refusal, framed as a soundness fix. The replaced
+  bullet:
+
+  > * **The auditor's behaviour does not change.** Its script gains a
+  >   known-command check that the auditor passes, and nothing else it can
+  >   reach.
+
+* **Questions.** Added an italic note under Question 2 that cwd confinement
+  is not affected, and added Question 4 (`path-guard.sh` extracts
+  `file_path` the same way and has the analogous NUL weakness; left unfixed,
+  because the task scoped the fix to `bash-guard.sh` and decision 12 makes
+  the coder's fence change globs only, and recorded so it is not lost).
+  Nothing was replaced. (Item 2 below corrects Question 4's attribution.)
+* **Follow-through, order step 4.** Its last bullet reworded to name brief
+  C1 fix and SA1b. The replaced bullet:
+
+  >    * A finding that needs only a script fix goes to a coder working on C1's
+  >      branch. SA1 then audits the fixed commit, and step 5's condition
+  >      applies to that commit instead.
+
+* **Follow-through, order step 5.** The merge condition is now SA1b clean
+  and `supervisor`-reviewed. The replaced bullet:
+
+  >    * **Merge C1.** C1's commit is merged into the branch the main checkout
+  >      has checked out only when both of these hold: SA1's audit of that exact
+  >      commit is clean, and `supervisor` has reviewed SA1. From then on, the
+  >      new script is the live fence for the security-auditor.
+
+* **Follow-through, the `supervisor`-pairing paragraph.** Reworded to cover
+  C1's fix and SA1b. The replaced paragraph:
+
+  > The top-level session pairs every dispatch with `supervisor`. For C1, tell
+  > `supervisor` that C1 runs without the Bash policy it implements, so it must
+  > check that no file other than `.claude/hooks/bash-guard.sh` changed in the
+  > worktree. Before merging, the session runs `git status -- .claude` in the
+  > main checkout and confirms it is clean. A `reviewer` pass on C1's diff is
+  > optional and is not briefed here.
+
+* **Brief T1, group O.** Added after group N. Nothing was replaced. (Item 2
+  below extended it.)
+* **Brief T1, "Expected state".** Reworded: C1's fix is what group O waits
+  for. The replaced paragraph:
+
+  > **Expected state.** Until C1 lands, most of `test_bash_guard_behavior.py`
+  > fails. Until step W, groups J and K, L's coder items and M's new coder cases
+  > fail. Until C3 lands, group N fails. That is intended: do not mark them
+  > xfail or skip them.
+
+* **Brief T1, "Done when".** "A-N" became "A-O". The replaced paragraph:
+
+  > **Done when:** the four files cover A-N; no other file changed; and the
+  > report lists the test functions added per group and every ADR ambiguity you
+  > flagged.
+
+* **Brief T1, the italic "Second-amendment note (2026-09-24)".** Added after
+  "Done when": if groups A-N have already landed, group O is added as a
+  follow-up on the same branch. Nothing was replaced.
+* **Brief C1, the fix.** Added "Fix (second amendment, 2026-09-24 —
+  dispatched on C1's branch after SA1)", items 7-11, after item 6. Nothing
+  was replaced. (Item 2 below rewrote items 7 and 10.)
+* **Brief C1, "Done when".** Its first two bullets reworded to include the
+  second amendment and group O. The replaced bullets:
+
+  > * the script implements decisions 3-11;
+  > * every test in `tests/config/test_bash_guard_behavior.py` that does not
+  >   read `.claude/settings.json` passes;
+
+* **Brief SA1b.** Added after brief SA1. Nothing was replaced. (Item 2 below
+  rewrote its area 10.)
+* **This section.** Added.
+* **Unchanged, deliberately.** Briefs SA1, C2, C3, V1 and V2, and "For the
+  top-level session". Decision 15 is not extended: no R/P probe is added for
+  a NUL or a control character, because a NUL cannot be reproduced reliably
+  through a live Bash tool call, and T1's group O plus SA1b's re-audit cover
+  the gate and the refusal. No `CHANGES` entry: this changes agent tooling
+  only, like the rest of ADR-0018 (decision 16).
+
+**2. `supervisor`'s review of this amendment (2026-09-24).** `supervisor`
+found three problems in the first draft: the NUL gate's fail-closed
+behaviour was stated but not specified; this section did not list every
+edit or quote what each replaced; and Question 4 attributed a sentence of
+decision 12 to decision 13. The top-level session also reported that it had
+run the recommended check on the installed `jq` 1.7. Replaced text is the
+first draft of this amendment.
+
+* **Decision 3, the NUL gate.** The detection sentence no longer carries the
+  status; four paragraphs were added after the length-comparison sentence —
+  "Only a clean false passes the gate; every other status denies" (status 1
+  passes, 0 denies with the NUL message, any other status denies with the
+  could-not-be-checked message, a non-string command being the case a
+  payload can produce), the capture rule (`set -e` does not act in an `if`
+  condition, so capture the status explicitly), "What `// ""` makes of a
+  missing command", and the statement that the rule covers the gate only.
+  The dependency sentences at the end of the every-mode paragraph were
+  replaced by a separate "Verified by the top-level session (2026-09-24)"
+  paragraph. The replaced sentence:
+
+  > The guard therefore asks `jq` whether the decoded command contains a NUL
+  > codepoint and reads the answer as `jq`'s exit status, not as a captured
+  > string — for example
+  > `jq -e '(.tool_input.command // "") | explode | any(. == 0)'`, which turns
+  > the string into integer codepoints (so it does not depend on how `jq`
+  > stores a NUL inside a string) and exits 0 when one of them is 0.
+
+  The replaced dependency sentences:
+
+  > One dependency is left explicit because the architect could not run it:
+  > the host `jq` must actually surface a decoded NUL through the codepoint
+  > test (a `jq` that truncated a string at the first NUL on decode would make
+  > the recommended form fail open). Brief T1 pins it with a test that feeds a
+  > NUL and expects a deny; brief C1's fix reports the exact incantation and
+  > whether the installed `jq` detects it; brief SA1b marks it
+  > needs-validation with the command a human runs if it cannot be settled by
+  > reading. If the installed `jq` mishandles a decoded NUL, the method changes
+  > and the architect is re-dispatched.
+
+* **Decision 11.** Added the could-not-be-checked denial, verbatim, and
+  reworded the sentence after the NUL denial to cover both messages. The
+  replaced sentence:
+
+  > It names no workaround, because there is no supported way to include a
+  > NUL. It runs through the shared `deny`, so in the coder's
+  > `stop-and-report` mode it ends, after one space, with the paragraph above
+  > (`This refusal is final for this task. ...`), and under the auditor's
+  > unset `DENY_ADVICE` it does not — the same base text serves both, because
+  > the gate applies in every mode.
+
+  The NUL phrase-table row became two rows, "NUL gate, a NUL found" and "NUL
+  gate, the check did not complete" (`could not be checked for a NUL byte`).
+  The replaced row:
+
+  > | NUL gate | `NUL byte (U+0000)` |
+
+* **Assumption 24.** Reworded to state the status rule, the session's
+  verification, the recall behind the non-string case, and the architect's
+  calls. The replaced item:
+
+  > 24. **The NUL detection method** is a `jq` codepoint test read as an exit
+  >     status (decision 3), not a byte-for-byte length comparison. Which `jq`
+  >     incantation is precise enough is C1's to implement and T1's to pin; the
+  >     ADR fixes the requirement (no `$(...)` capture of the command bytes, and
+  >     fail closed) and recommends the form. It rests on the host `jq`
+  >     surfacing a decoded NUL — an execution-dependent fact the architect could
+  >     not check, called out in decision 3 and routed to T1, C1's fix and SA1b.
+
+* **Question 4.** Attribution corrected; the question stays open. The
+  replaced words:
+
+  > decision 13 freezes `path-guard.sh` ("`path-guard.sh` itself does not
+  > change")
+
+  They now read: decision 12 makes the coder's fence change globs only
+  ("`path-guard.sh` itself does not change"). The first draft of this
+  section repeated the error ("left unfixed here (out of scope; decision 13
+  freezes `path-guard.sh`)"); item 1 above now gives the correct attribution.
+* **Brief T1, group O.** Its introduction reworded, because the new cases
+  need a payload `run_guard` cannot build; three bullets added (a command
+  that is not a string fails closed; a missing command passes the gate as
+  the empty string; the only `jq` failure a payload can produce at the gate
+  is the non-string case, so no separate case); and its last bullet
+  reworded for the session's verification. The replaced introduction:
+
+  > O. **The NUL gate and control characters** (decision 3, second amendment),
+  >    in `test_bash_guard_behavior.py`. Inject a NUL or a control byte by
+  >    putting it in the Python command string; `json.dumps` in the existing
+  >    `run_guard` harness encodes it as the JSON escape the payload needs, so
+  >    no change to the harness is required.
+
+  The replaced last bullet:
+
+  >    * If you cannot be sure the installed `jq` surfaces a decoded NUL — the
+  >      one execution-dependent point of decision 3 — say so in your report and
+  >      mark the affected NUL tests as the ones you are least sure will pass.
+  >      Do not skip or xfail them.
+
+* **Brief C1 fix, item 7.** Two bullets added: act on the exact status, and
+  do not let `set -e` or an `if` swallow it. Its closing sentences reworded
+  to cover both denials. The replaced sentences:
+
+  > Deny with decision 11's NUL message, verbatim; it goes through the shared
+  > `deny`, so the final paragraph is added in `stop-and-report` and not under
+  > the auditor. `command_str` stays as it is for every other rule.
+
+* **Brief C1 fix, item 10.** Reworded for the session's verification and to
+  ask for the status handling used. The replaced item:
+
+  > 10. **Verify** through the T1 tests, group O included:
+  >     `uv run --locked pytest -q tests/config`. **Report the exact `jq`
+  >     detection you used and whether the installed `jq` actually flags a
+  >     decoded NUL** (feed a `\u0000` payload through the group O tests). If it
+  >     does not — if the recommended `explode` form fails to detect the NUL —
+  >     stop, report it, and do not improvise another method; the architect will
+  >     revise decision 3.
+
+* **Brief SA1b, "Examine".** "decision 11's NUL message" became "decision
+  11's two NUL-gate messages", because decision 11 now has the
+  could-not-be-checked message too. The replaced words:
+
+  > decision 11's NUL message and phrase table
+
+* **Brief SA1b, area 10.** The first bullet loses "Does it fail closed?" and
+  gains the `ALLOW_CMDS` placement; a status-handling bullet is added; the
+  `jq` bullet is reworded for the session's verification; and a bullet is
+  added on whether an extraction line can end the script before the gate.
+  The replaced bullets:
+
+  >     * Is the NUL detected without a command substitution over the command
+  >       bytes, so that `$(...)` NUL-stripping cannot defeat it? Does it fail
+  >       closed? Does it run in every mode (coder and auditor), before the
+  >       empty-command exit and the literal branch?
+  >     * Does the recommended `jq` codepoint test actually surface a decoded
+  >       NUL under the installed `jq`? You cannot run `jq`, so if you cannot
+  >       settle it by reading, report it needs-validation with the exact
+  >       payload and command a human runs — this is the one execution-dependent
+  >       point of the fix.
+
+* **Sources.** Added a "Second amendment (2026-09-24)" bullet (what the
+  architect read; what the top-level session ran and reported) and a recall
+  entry (`jq -e`'s statuses, `//`, `explode` on a non-string, and `set -e`
+  in an `if` condition). The recall list's previous last entry now ends with
+  a semicolon; it ended "revision used no web access)." with a full stop.
+* **This section.** Restructured into items 1 and 2, with the replaced text
+  quoted. The first draft listed item 1's edits without quotes, omitted
+  brief T1's "Expected state" rewording and the italic note after its "Done
+  when", and carried the decision-13 misattribution quoted above. Its other
+  content is carried into item 1.
