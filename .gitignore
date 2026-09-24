@@ -18,3 +18,5 @@ snapshots/
 *.snap
 .DS_Store
 .claude/worktrees/
+# Commit message drafts written by agents for git commit -F (ADR-0018 decision 9)
+/.commit-msg
