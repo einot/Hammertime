@@ -27,7 +27,9 @@ Groups, each citing the decision it encodes:
 * H -- git for the coder (decision 9);
 * I -- denial advice, `DENY_ADVICE` (decision 11);
 * J -- the incident (decision 1's table), against the configured coder policy;
-* K -- the policies as configured in `.claude/settings.json` (decision 14).
+* K -- the policies as configured in `.claude/settings.json` (decision 14);
+* O -- the NUL gate and literal-mode control characters (decisions 2, 3 and 11,
+  second amendment of 2026-09-24).
 
 Groups J and K read `.claude/settings.json`, so the coder half of them fails
 until the top-level session applies decision 14 (step W). Everything else
@@ -36,6 +38,7 @@ fails until brief C1 lands. That is intended; nothing here is xfailed.
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1209,3 +1212,264 @@ def test_configured_auditor_policy_refuses_uv_as_needs_validation() -> None:
     reason = assert_denied(run_configured("security-auditor", "uv run pytest -q"), "uv (auditor)")
     assert_phrase(reason, "needs-validation", "uv run pytest -q (configured auditor)")
     assert FINAL_SENTENCE not in reason, reason
+
+
+# --- O. the NUL gate and control characters (decisions 3 and 11) ---------
+#
+# ADR-0018's second amendment (2026-09-24). Decision 3 adds a NUL gate that runs
+# in every mode, before the literal check and before the empty-command exit, and
+# makes literal mode refuse every C0 control character other than tab and
+# newline, and DEL. Decision 11 gives both NUL-gate messages verbatim. A NUL or a
+# control byte is put in the Python command string; `json.dumps` in `run_guard`
+# encodes it as the JSON escape the payload needs. The non-string and missing
+# command cases need a payload `run_guard` cannot build, so they go through
+# `run_guard_tool_input`.
+
+# Decision 11's NUL denial, verbatim, with the ADR's blockquote line breaks joined
+# by single spaces. U+2014 is the em dash in the ADR's text.
+NUL_MESSAGE = (
+    "Hammertime bash guard: the command contains a NUL byte (U+0000), which "
+    "cannot be carried through this guard intact — the byte is dropped when the "
+    "command is read, so the guard cannot vet the command that would actually "
+    "run. The command is refused."
+)
+
+# Decision 11's could-not-be-checked denial, verbatim except for the status N,
+# which the brief says not to pin.
+NOT_CHECKED_HEAD = (
+    "Hammertime bash guard: the command could not be checked for a NUL byte "
+    "(the check ended with status "
+)
+NOT_CHECKED_TAIL = (
+    " instead of a result), so the guard cannot confirm that the command it "
+    "would vet is the command that would run. The command is refused."
+)
+NOT_CHECKED_PATTERN = re.compile(rf"{re.escape(NOT_CHECKED_HEAD)}\d+{re.escape(NOT_CHECKED_TAIL)}")
+
+NUL_GATE_POLICIES: dict[str, dict[str, str]] = {
+    "coder": CODER_POLICY,
+    "security-auditor": AUDITOR_POLICY,
+}
+
+
+def run_guard_tool_input(
+    tool_input: Mapping[str, Any],
+    *,
+    policy: Mapping[str, str],
+    cwd: str | Path,
+    agent_type: str,
+) -> subprocess.CompletedProcess[str]:
+    """Like `run_guard`, but with the whole `tool_input` given (brief T1, group O).
+
+    `run_guard` always sends `{"command": <str>}`. This sends whatever JSON
+    `tool_input` holds: a command that is not a string, or no command at all.
+    """
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+
+    payload: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": dict(tool_input),
+        "cwd": str(cwd),
+        "agent_type": agent_type,
+    }
+
+    env = dict(os.environ)
+    for name in POLICY_VARS:
+        env.pop(name, None)
+    env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
+    env.update(policy)
+
+    return subprocess.run(
+        [BASH or "bash", str(GUARD)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+
+NUL_POSITIONS = [
+    ("start", "\x00git status"),
+    ("middle", "git\x00 status"),
+    ("end", "git status\x00"),
+    ("only-a-nul", "\x00"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [command for _, command in NUL_POSITIONS],
+    ids=[case_id for case_id, _ in NUL_POSITIONS],
+)
+def test_a_nul_anywhere_is_refused_under_the_coder_policy(tmp_path: Path, command: str) -> None:
+    """Decisions 3 and 11: a NUL anywhere, even a command that is only a NUL, is
+    refused rather than read as the command with the NUL dropped (or as empty)."""
+    reason = assert_denied(coder(command, tmp_path), repr(command))
+    assert_phrase(reason, "NUL byte (U+0000)", repr(command))
+    assert reason.endswith(f" {FINAL_PARAGRAPH}"), (
+        f"the coder is stop-and-report, so the NUL denial of {command!r} must end with "
+        f"decision 11's paragraph after one space.\nreason: {reason!r}"
+    )
+
+
+@pytest.mark.parametrize("agent", ["coder", "security-auditor"])
+def test_the_nul_denial_is_decision_11s_text_verbatim(tmp_path: Path, agent: str) -> None:
+    """Decision 11: one base text in every mode, with the final paragraph added
+    only under stop-and-report (the coder), never under the auditor."""
+    command = "git status\x00"
+    result = run_guard(command, policy=NUL_GATE_POLICIES[agent], cwd=tmp_path, agent_type=agent)
+    reason = assert_denied(result, f"{command!r} from {agent}")
+    expected = f"{NUL_MESSAGE} {FINAL_PARAGRAPH}" if agent == "coder" else NUL_MESSAGE
+    assert reason == expected, (
+        f"the NUL denial for {agent} must be decision 11's text verbatim.\n"
+        f"expected: {expected!r}\nreason:   {reason!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "without_nul"),
+    [
+        ("uv run --locked ruff format\x00 --check .", "uv run --locked ruff format --check ."),
+        ("git merge\x00 --ff-only HEAD", "git merge --ff-only HEAD"),
+    ],
+    ids=["ruff-format-check", "git-merge-ff-only"],
+)
+def test_the_nul_gate_refuses_a_command_allowed_without_the_nul(
+    tmp_path: Path, command: str, without_nul: str
+) -> None:
+    """Decision 3: the guard reads the command with the NUL dropped, so without
+    the gate these would be vetted, and allowed, as `without_nul`. The allowed
+    half keeps the refusal from passing vacuously."""
+    assert_allowed(coder(without_nul, tmp_path), without_nul)
+    reason = assert_denied(coder(command, tmp_path), repr(command))
+    assert_phrase(reason, "NUL byte (U+0000)", repr(command))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [command for _, command in NUL_POSITIONS],
+    ids=[case_id for case_id, _ in NUL_POSITIONS],
+)
+def test_the_nul_gate_runs_under_the_non_literal_auditor_policy(
+    tmp_path: Path, command: str
+) -> None:
+    """Decision 3: the gate runs in every mode, because the extraction is shared.
+    The auditor sets no DENY_ADVICE, so no final paragraph (decision 11)."""
+    reason = assert_denied(auditor(command, tmp_path), f"{command!r} (auditor)")
+    assert_phrase(reason, "NUL byte (U+0000)", f"{command!r} under the auditor's policy")
+    assert FINAL_SENTENCE not in reason, reason
+
+
+# Decision 3: every C0 control character except tab (0x09) and newline (0x0A),
+# which are dealt with separately, and DEL.
+CONTROL_CODES = [*range(0x01, 0x09), *range(0x0B, 0x20), 0x7F]
+
+
+@pytest.mark.parametrize("code", CONTROL_CODES, ids=[f"0x{code:02x}" for code in CONTROL_CODES])
+def test_literal_mode_refuses_a_control_character(tmp_path: Path, code: int) -> None:
+    """Decisions 3 and 11: a control character in an otherwise-allowed command is
+    refused through the literal-mode denial. CR, VT, FF, ESC, BEL and DEL (brief
+    T1) are among the cases."""
+    command = f"ls a{chr(code)}b"
+    reason = assert_denied(coder(command, tmp_path), repr(command))
+    assert_phrase(reason, "must be literal", repr(command))
+    assert_phrase(reason, "git commit -F", repr(command))
+    if code != 0x7F:
+        # Decisions 3 and 11 name a C0 byte this way. Whether DEL is named the
+        # same way is not stated, so it is not pinned for DEL.
+        assert_phrase(reason, "a control character other than tab", repr(command))
+    assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+
+
+def test_literal_mode_refuses_a_trailing_carriage_return(tmp_path: Path) -> None:
+    """Decision 3: `git status\\r` is refused outright, not vetted as `git status`."""
+    command = "git status\r"
+    reason = assert_denied(coder(command, tmp_path), repr(command))
+    assert_phrase(reason, "must be literal", repr(command))
+
+
+@pytest.mark.parametrize("command", ["ls\tservices", "git\tstatus"])
+def test_literal_mode_allows_a_tab_as_a_blank(tmp_path: Path, command: str) -> None:
+    """Decision 3: tab stays allowed; it is one of bash's blanks."""
+    assert_allowed(coder(command, tmp_path), repr(command))
+
+
+def test_control_characters_are_not_a_literal_refusal_under_the_auditor(tmp_path: Path) -> None:
+    """Decision 3: control characters are refused only in literal mode. The
+    auditor may still refuse the command for another reason, but never as
+    `must be literal`."""
+    command = "ls a\rb"
+    result = auditor(command, tmp_path)
+    if result.returncode == 0:
+        assert_allowed(result, f"{command!r} (auditor)")
+        return
+    reason = assert_denied(result, f"{command!r} (auditor)")
+    assert "must be literal" not in reason, (
+        f"the auditor's policy runs no literal check, so {command!r} must not be "
+        f"refused as non-literal.\nreason: {reason!r}"
+    )
+
+
+NON_STRING_COMMANDS: list[tuple[str, Any]] = [
+    ("number", 42),
+    ("array", ["ls"]),
+    ("object", {"a": 1}),
+]
+
+
+@pytest.mark.parametrize("agent", ["coder", "security-auditor"])
+@pytest.mark.parametrize(
+    "value",
+    [value for _, value in NON_STRING_COMMANDS],
+    ids=[case_id for case_id, _ in NON_STRING_COMMANDS],
+)
+def test_a_command_that_is_not_a_string_fails_closed(
+    tmp_path: Path, agent: str, value: Any
+) -> None:
+    """Decision 3: only a clean false passes the gate. A non-string command makes
+    the check fail, and decision 11's could-not-be-checked denial follows."""
+    result = run_guard_tool_input(
+        {"command": value}, policy=NUL_GATE_POLICIES[agent], cwd=tmp_path, agent_type=agent
+    )
+    what = f"a command of {value!r} from {agent}"
+    reason = assert_denied(result, what)
+    assert_phrase(reason, "could not be checked for a NUL byte", what)
+    if agent == "coder":
+        assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+    else:
+        assert FINAL_SENTENCE not in reason, reason
+
+
+@pytest.mark.parametrize("agent", ["coder", "security-auditor"])
+def test_the_not_checked_denial_is_decision_11s_text(tmp_path: Path, agent: str) -> None:
+    """Decision 11: the could-not-be-checked text verbatim, with any status N,
+    and the final paragraph only for the coder."""
+    result = run_guard_tool_input(
+        {"command": 42}, policy=NUL_GATE_POLICIES[agent], cwd=tmp_path, agent_type=agent
+    )
+    reason = assert_denied(result, f"a command of 42 from {agent}")
+    body = reason
+    if agent == "coder":
+        assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+        body = reason.removesuffix(f" {FINAL_PARAGRAPH}")
+    assert NOT_CHECKED_PATTERN.fullmatch(body), (
+        f"the could-not-be-checked denial for {agent} must be decision 11's text "
+        f"verbatim, with N a status number.\nreason: {reason!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [{}, {"command": None}],
+    ids=["absent", "null"],
+)
+def test_a_missing_command_passes_the_gate_as_empty(
+    tmp_path: Path, tool_input: dict[str, Any]
+) -> None:
+    """Decision 3: `// ""` makes an absent or null command the empty string, the
+    check exits 1, and the guard exits 0 at the empty-command check."""
+    result = run_guard_tool_input(tool_input, policy=CODER_POLICY, cwd=tmp_path, agent_type="coder")
+    assert_allowed(result, f"tool_input {tool_input!r} under the coder policy")
