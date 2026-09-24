@@ -99,7 +99,12 @@ carries a dated note); amended a twelfth time 2026-09-23 (see "Amendment
 12" — by ADR-0017 Amendment 2: the trie's `PrefixStatsChanged` publisher is
 decision 4's fourth producer, and uses the `hammertime.prefix-stats.v1`
 stream and the bus's producer as they already are; nothing in the bus, the
-streams or provisioning changes; decision 4 carries a dated note).
+streams or provisioning changes; decision 4 carries a dated note); amended a
+thirteenth time 2026-09-24 (see "Amendment 13" — by ADR-0017 Amendment 3:
+`MessageBus` gains `last_value(topic)`, the value of the message at a
+topic's last offset, which the trie reads at `start()` to learn how far
+its stats reached the log; decision 3 gains dated additions, and Amendment
+12's assumption 144 a dated note; no stream configuration changes).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
@@ -551,6 +556,7 @@ class MessageBus(Protocol):         # moved here from hammertime.aggregator.work
     def consumer(self, group_id: str) -> Consumer: ...
     async def end_offset(self, topic: str) -> int: ...   # amended 2026-09-21: the log end, see decision 9
     async def first_offset(self, topic: str) -> int: ... # added 2026-09-23 (Amendment 10): the first retained offset, see below
+    async def last_value(self, topic: str) -> bytes | None: ...  # added 2026-09-24 (Amendment 13): the value at the last offset, see below
 
 def static_partitions(topic: str, partitions: Iterable[int]) -> frozenset[int]: ...   # unchanged (ADR-0011 A3)
 ```
@@ -587,6 +593,17 @@ before they use the connection. An unregistered topic is therefore a
 `KeyError` whether or not the bus has started, and `RuntimeError("NatsBus
 is not started")` is raised only for a registered topic before `start()`.
 `InMemoryBus` raises neither.*
+
+*`MessageBus.last_value(topic)` (added 2026-09-24, Amendment 13) is the
+value of the message the log holds at offset `end_offset(topic) - 1`, and
+`None` when it holds none there: nothing was appended, or the last message
+aged out, was purged, or was deleted on its own. It raises what
+`end_offset` raises, in the same order. `NatsBus.last_value` reads
+`stream_info(...).state`. With no message it returns `None`; otherwise it
+reads the message at `state.last_seq` with `get_msg(<stream name>,
+seq=state.last_seq)`, and returns `None` on `NotFoundError`.
+`InMemoryBus.last_value` is the value of the topic's last record. It checks
+no subject and no key. Amendment 13 has the rest.*
 
 **`Producer.publish(topic, key, value, *, message_id=None)`** appends
 `value` to partition `partition_for(key, TOPICS[topic].partitions)` of
@@ -739,6 +756,7 @@ class NatsBus:                                   # satisfies MessageBus
     def consumer(self, group_id: str) -> Consumer   # a new NatsConsumer over the shared connection
     async def end_offset(self, topic: str) -> int   # stream_info(...).state.last_seq + 1 (amended 2026-09-21)
     async def first_offset(self, topic: str) -> int # first_offset_of(stream_info(...).state) (added 2026-09-23, Amendment 10)
+    async def last_value(self, topic: str) -> bytes | None  # get_msg at state.last_seq; None when there is none (added 2026-09-24, Amendment 13)
 
 def first_offset_of(state: api.StreamState) -> int:   # added 2026-09-23, Amendment 10; not re-exported from hammertime.bus
     """`state.first_seq` when the stream holds a message; `state.last_seq + 1` when it holds none."""
@@ -950,6 +968,9 @@ way on both (amended 2026-09-21, ruling C3; decision 9 defines it).
 *`InMemoryBus.first_offset(topic)` is `0` for every topic (added
 2026-09-23, Amendment 10). The memory log never discards, so its first
 index is `0`, and an empty log's `end_offset` is `0` as well.*
+*`InMemoryBus.last_value(topic)` is the value of the topic's last record,
+and `None` for an empty log; a publish dropped as a duplicate does not
+change it (added 2026-09-24, Amendment 13).*
 
 ### 4. Publishing: every event carries `Nats-Msg-Id = event_id`; ordering is by awaited acknowledgement
 
@@ -5348,6 +5369,15 @@ continues the ADR's list):
      the prefix-stats stream has no byte cap. It stays a deployment
      decision, as assumption 6 has it, and the snapshot epic bounds what a
      start re-publishes.
+
+     *Revisited 2026-09-24 (Amendment 13; ADR-0017 Amendment 3 rulings 1
+     and 6): the reason this assumption adds no longer holds. A start
+     re-publishes only from the last `sequence` the prefix-stats stream
+     holds, so it no longer appends the stats of the whole retained log
+     again, and the snapshot epic is not what bounds it. What remains is
+     the general question of a byte cap on the streams. It is put to the
+     repository owner again and is not ruled. Until it is answered,
+     assumption 6 stands.*
 145. **No CHANGES entry.** Only documents change.
 
 Read on 2026-09-23 for this amendment. No web source was consulted.
@@ -5355,3 +5385,116 @@ Repository facts: `packages/hammertime-bus/src/hammertime/bus/topics.py`
 (`PREFIX_STATS`: 4 partitions, one day, `_prefix_key`), `nats.py`
 (`NatsProducer.publish` and `flush`, `NatsBus.start()`), `memory.py`
 (`MemoryProducer`).
+
+## Amendment 13 (2026-09-24) — `MessageBus.last_value`: the value at a topic's last offset (ADR-0017 Amendment 3)
+
+Why: ADR-0017 Amendment 3 ruling 1 has the trie read, at `start()`, the
+last message of `hammertime.prefix-stats.v1`, to learn how far its stats
+reached the log before it last stopped. It then re-publishes only from
+there, so that a start no longer appends the stats of the whole retained
+log again. Only the bus can read that message. This amendment adds the
+read to decision 3's interface, and records what it means for Amendment
+12's assumption 144. Nothing else changes: no stream configuration, no
+provisioning, and no other method.
+
+**Ruling.** `MessageBus` gains one method:
+
+```python
+async def last_value(self, topic: str) -> bytes | None: ...
+```
+
+* **What it returns.** The value of the message the log holds at offset
+  `end_offset(topic) - 1`: the message appended last, while the log still
+  holds it. `None` when the log holds no message there: nothing was ever
+  appended, the last message aged out or was purged, or it was deleted on
+  its own. An empty value is `b""`, not `None`.
+* **What it raises.** What `end_offset` raises, in the same order
+  (Amendment 11): `KeyError` for an unregistered topic on `NatsBus`,
+  whether or not the bus has started, and `RuntimeError("NatsBus is not
+  started")` for a registered topic before `start()`. `InMemoryBus` raises
+  neither. Any other error from the broker propagates, except the one
+  named below.
+* **`NatsBus.last_value`** reads `stream_info(<stream name>).state`, as
+  `end_offset` does. When `state.messages` is `0` it returns `None` and
+  sends no second request. Otherwise it reads the message at
+  `state.last_seq` with the JetStream context's `get_msg(<stream name>,
+  seq=state.last_seq)`, in its default form: the `STREAM.MSG.GET` API
+  request. The direct form is not available, because decision 2 sets
+  `allow_direct` to false. A `nats.js.errors.NotFoundError` from that read,
+  meaning no message at that sequence, returns `None`. The result is the
+  message's data, or `b""` when it carries none.
+* **`InMemoryBus.last_value`** is the value of the last record in the
+  topic's log. It is `None` for an empty log, and for a topic never
+  published to, registered or not. A publish the bus drops as a duplicate
+  does not change it.
+* **What it does not do.** It does not check the message's subject or key,
+  as a consumer does under decision 5's rule for a message malformed at the
+  transport. It returns the value only, and its caller judges it.
+* **`async`** on both implementations, like the offset reads. It is on the
+  protocol, and not only on the two classes, for Amendment 10's reason: the
+  trie types its bus by the interface.
+
+**Assumption 144.** Its reason for a byte cap, that every trie start
+appends the stats of the whole retained log again, no longer holds, and
+the snapshot epic is not what bounds a start any more. A dated note says
+so. The byte cap itself is put to the repository owner again (ADR-0017
+Amendment 3 ruling 6) and is not ruled here. Until it is answered,
+decision 2 and assumption 6 stand.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended a thirteenth time 2026-09-24"
+  clause.
+* **Decision 3.**
+  * The interface block gains the `last_value` line, with a dated comment.
+  * An italic dated paragraph follows the Amendment 11 paragraph ("Which
+    error, when both apply").
+  * The `NatsBus` block gains a `last_value` line, with a dated comment.
+  * An italic dated sentence follows the `hammertime.bus.memory`
+    paragraph's Amendment 10 sentence.
+
+  No text of decision 3 is replaced.
+* **Amendment 12, assumption 144.** A dated italic note under it. Its text
+  is unchanged.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+146. **The value, not a `ConsumedMessage`.** The one caller needs only the
+     value. A `ConsumedMessage` would need a partition, which a malformed
+     subject does not give, and so a rule for that case.
+147. **The message at the last offset, and `None` when it is missing.**
+     "The last message the log still holds" would have to look behind a
+     hole at the end. `get_msg` can ask by `last_by_subj`, but whether the
+     server accepts the stream's wildcard subject there was not checked.
+     The caller answers `None` with a full re-publish, which is safe.
+148. **`NotFoundError` means no message.** nats-py raises it for an API
+     error whose code is 404 (`nats/js/errors.py`,
+     `APIError.from_error`). That the server answers a missing sequence
+     with 404 was not checked against the server. If it answers otherwise,
+     the read raises, and the trie's start fails loudly rather than
+     silently. The integration job (#52) is where to see it.
+149. **Two requests, not one.** `stream_info`, then `get_msg`. A message
+     that ages out between them gives `None`. One appended between them is
+     not returned: the value is the last message as `stream_info` saw it.
+     The trie reads it before it publishes anything, so no message of its
+     own arrives in between.
+150. **No `CHANGES` entry.** The method is internal to the repository.
+
+Read on 2026-09-24 for this amendment. No web source was consulted.
+
+* nats-py 2.16.0 as installed, in `.venv/lib/python3.12/site-packages/nats/`:
+  `js/manager.py` (`get_msg(stream_name, seq=None, subject=None,
+  direct=False, next=False)`; its default form sends
+  `$JS.API.STREAM.MSG.GET.<stream>` through `_api_request`, which raises
+  `APIError.from_error` on an error response; `get_last_msg` asks by
+  `last_by_subj`), `js/errors.py` (`APIError.from_error` raises
+  `NotFoundError` for code 404), `js/api.py` (`RawStreamMsg.data:
+  Optional[bytes]`; `StreamState.messages` and `last_seq`) and
+  `js/client.py` (`class JetStreamContext(JetStreamManager)`).
+* Repository facts: `packages/hammertime-bus/src/hammertime/bus/nats.py`
+  (`NatsBus.end_offset` and `first_offset`, `stream_config_for`'s
+  `allow_direct=False`), `memory.py` (`InMemoryBus._append` drops a
+  duplicate id without appending) and `tests/test_streams.py`
+  (`TestNatsBusOffsetReads` reaches the offset reads through a stub
+  context, which `last_value` can use the same way).
