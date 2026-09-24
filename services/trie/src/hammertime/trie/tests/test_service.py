@@ -55,6 +55,24 @@ Choices of this file's own:
   and the injected bus is an `InMemoryBus` wrapper with a counting
   `close()`. Whether `stop()` alone, with no `run()`, closes the transport
   is not stated, and is not asserted.
+
+Slice 2, from ADR-0017 Amendment 2 (rulings 4-7, with decision 13 as noted
+there) and section 47.2 and 47.4:
+
+* `startup_fields()` gains `min_prefix_lengths`, each served family's name
+  mapped to its floor (ruling 7) -- the one change to an existing assertion,
+  `STARTUP_FIELD_NAMES`;
+* `build_service` passes `min_prefix_lengths={IPV4: settings.min_prefix_length,
+  IPV6: settings.min_prefix_length_ipv6}` to the worker (decision 13 as
+  noted), seen as 9 records per APPLIED event at `min_prefix_length=24`;
+* readiness waits for the replay's publishes, and a publish failure keeps the
+  service unready or ends `run()` (rulings 4 and 5);
+* the shutdown order: every producer `flush()` comes before the transport's
+  `close()` (ruling 6, section 47.4).
+
+Producer doubles reach the worker through a bus double's `producer()`
+(Amendment 2, "Test seams"); the hot-ip log is the double's inner
+`InMemoryBus`.
 """
 
 import asyncio
@@ -62,7 +80,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import httpx
 import pytest
@@ -74,7 +92,7 @@ from hammertime.bus.interface import (
     Producer,
 )
 from hammertime.bus.memory import InMemoryBus
-from hammertime.bus.topics import HOT_IP
+from hammertime.bus.topics import HOT_IP, PREFIX_STATS
 from hammertime.core.addressing.address import Address, AddressFamily
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.errors import ConfigurationError, InvariantViolation
@@ -84,12 +102,15 @@ from hammertime.core.events.models import HotIpAdded
 from hammertime.core.runtime import Service
 from hammertime.trie.config import TrieSettings
 from hammertime.trie.metrics import TrieMetrics
+from hammertime.trie.publisher import PrefixStatsPublishError
 from hammertime.trie.service import SERVICE_NAME, TrieService, build_service
 from hammertime.trie.state import TrieState
 from hammertime.trie.worker import TrieWorker
 
 IPV4 = AddressFamily.IPV4
+IPV6 = AddressFamily.IPV6
 TOPIC = HOT_IP.name
+STATS_TOPIC = PREFIX_STATS.name
 AN_HOUR = 3600.0
 
 T0 = datetime.fromtimestamp(1_800_000_000, tz=UTC)
@@ -129,6 +150,9 @@ STARTUP_FIELD_NAMES = {
     "config_version",
     "bind",
     "families",
+    # ADR-0017 Amendment 2 ruling 7: "`startup_fields()` gains
+    # `min_prefix_lengths`".
+    "min_prefix_lengths",
 }
 
 
@@ -137,7 +161,12 @@ def _write(path: Path, **overrides: Any) -> Path:
     return path
 
 
-def _settings(path: Path, *, bus_brokers: str = "nats://localhost:4222") -> TrieSettings:
+def _settings(
+    path: Path, *, bus_brokers: str = "nats://localhost:4222", **extra: Any
+) -> TrieSettings:
+    """`extra` passes further `TrieSettings` fields, such as `families` or the
+    slice-2 `min_prefix_length` and `min_prefix_length_ipv6`."""
+
     return TrieSettings(
         host="127.0.0.1",
         port=0,
@@ -145,6 +174,7 @@ def _settings(path: Path, *, bus_brokers: str = "nats://localhost:4222") -> Trie
         bus_kind="memory",
         bus_brokers=bus_brokers,
         config_poll_interval_s=AN_HOUR,
+        **extra,
     )
 
 
@@ -522,6 +552,25 @@ class TestStartupFields:
         assert fields["bind"] == "127.0.0.1:0"
         assert fields["families"] == ["ipv4"]
         assert fields["bus_kind"] == "memory"
+        # Ruling 7: "each served family's name mapped to its floor, for
+        # example `{"ipv4": 8}`".
+        assert fields["min_prefix_lengths"] == {"ipv4": 8}
+
+    def test_min_prefix_lengths_names_every_served_family(
+        self, config_path: Path, bus: InMemoryBus
+    ) -> None:
+        settings = _settings(
+            config_path,
+            families=frozenset({IPV4, IPV6}),
+            min_prefix_length=24,
+            min_prefix_length_ipv6=64,
+        )
+        service = build_service(settings, bus=bus)
+
+        fields = service.startup_fields()
+
+        assert set(fields) == STARTUP_FIELD_NAMES
+        assert fields["min_prefix_lengths"] == {"ipv4": 24, "ipv6": 64}
 
     def test_the_brokers_userinfo_never_appears(self, config_path: Path, bus: InMemoryBus) -> None:
         settings = _settings(config_path, bus_brokers="nats://user:s3cret@nats:4222")
@@ -714,3 +763,226 @@ class TestWhoClosesTheBus:
         await task
 
         assert bus.closed == 0
+
+
+# ==========================================================================
+# Slice 2: ADR-0017 Amendment 2 -- the publisher's wiring into the service.
+# ==========================================================================
+
+
+class _StatsProducer:
+    """A producer double (Amendment 2, "Test seams"). A publish whose key
+    `hold(key)` accepts waits until `release` is set; then, if `fail` is set,
+    it raises it. `flush()` appends `"flush"` to `trace` if one is given."""
+
+    def __init__(
+        self,
+        *,
+        hold: Callable[[object], bool] | None = None,
+        fail: BaseException | None = None,
+        trace: list[str] | None = None,
+    ) -> None:
+        self.calls = 0
+        self.release = asyncio.Event()
+        self.in_flight = 0
+        self.flushes = 0
+        self._hold = hold if hold is not None else (lambda key: False)
+        self._fail = fail
+        self._trace = trace
+
+    async def publish(
+        self, topic: object, key: object, value: object, *, message_id: object = None
+    ) -> None:
+        self.calls += 1
+        if self._hold(key):
+            self.in_flight += 1
+            try:
+                await self.release.wait()
+            finally:
+                self.in_flight -= 1
+        if self._fail is not None:
+            raise self._fail
+
+    async def flush(self) -> None:
+        self.flushes += 1
+        if self._trace is not None:
+            self._trace.append("flush")
+
+
+class _ProducerBus:
+    """An `InMemoryBus` (`inner`, which holds the hot-ip log) whose
+    `producer()` returns the given double."""
+
+    def __init__(self, producer: _StatsProducer) -> None:
+        self.inner = InMemoryBus()
+        self.stats_producer = producer
+
+    def producer(self) -> Producer:
+        return cast(Producer, self.stats_producer)
+
+    def consumer(self, group_id: str) -> Consumer:
+        return self.inner.consumer(group_id)
+
+    async def end_offset(self, topic: str) -> int:
+        return await self.inner.end_offset(topic)
+
+    async def first_offset(self, topic: str) -> int:
+        return await self.inner.first_offset(topic)
+
+
+class _TracingTransport(_FakeTransport):
+    """A `_FakeTransport` whose `close()` also appends `"close"` to `trace`."""
+
+    def __init__(self, trace: list[str]) -> None:
+        super().__init__()
+        self._trace = trace
+
+    async def close(self) -> None:
+        self._trace.append("close")
+        await super().close()
+
+
+class _PublishFailed(Exception):
+    """Raised by `_StatsProducer.publish` when a test sets it."""
+
+
+def _published(service: TrieService, family: str = "ipv4") -> int | float:
+    return service.metrics.get("prefix_stats_published", family=family)
+
+
+class TestBuildServicePassesTheFloors:
+    """Decision 13 as noted by Amendment 2 ruling 6: "`build_service` passes
+    `min_prefix_lengths={IPV4: settings.min_prefix_length, IPV6:
+    settings.min_prefix_length_ipv6}` to the worker". At an IPv4 floor of 24,
+    an APPLIED event publishes `/24` to `/32`: 9 records."""
+
+    async def test_an_event_replayed_in_start(self, config_path: Path, bus: InMemoryBus) -> None:
+        await _publish(bus, _envelope(IP_A, 0))
+        service = build_service(_settings(config_path, min_prefix_length=24), bus=bus)
+
+        await service.start()
+        try:
+            assert service.ready is True
+            assert await bus.end_offset(STATS_TOPIC) == 9
+            assert _published(service) == 9
+        finally:
+            await service.stop()
+
+    async def test_an_event_consumed_in_run(self, config_path: Path, bus: InMemoryBus) -> None:
+        service = build_service(_settings(config_path, min_prefix_length=24), bus=bus)
+        await service.start()
+        task = asyncio.create_task(asyncio.wait_for(service.run(), timeout=10.0))
+        try:
+            await _publish(bus, _envelope(IP_A, 0))
+            await _yield_until(lambda: _published(service) == 9)
+
+            assert await bus.end_offset(STATS_TOPIC) == 9
+        finally:
+            await service.stop()
+        await task
+
+
+class TestReadinessWaitsForThePublishes:
+    """Ruling 4: "`TrieService` marks itself ready only after `start()`
+    returns ... A ready trie has therefore had every stat of every
+    state-changing record it replayed acknowledged by the log." Section
+    47.2: `/readyz` answers 503 until the service is ready."""
+
+    async def test_not_ready_until_the_held_publishes_are_released(self, config_path: Path) -> None:
+        producer = _StatsProducer(hold=lambda key: True)
+        bus = _ProducerBus(producer)
+        await _publish(bus.inner, _envelope(IP_A, 0))
+        service = build_service(_settings(config_path), bus=bus)
+
+        async with _client(service) as client:
+            task = asyncio.create_task(service.start())
+            try:
+                try:
+                    await _yield_until(lambda: producer.in_flight == 25)
+
+                    assert service.ready is False
+                    readyz = await client.get("/readyz")
+                    assert readyz.status_code == 503
+                    assert readyz.content != b'{"status":"ready"}'
+                    assert not task.done()
+                finally:
+                    producer.release.set()
+                await asyncio.wait_for(task, timeout=10.0)
+
+                assert service.ready is True
+                readyz = await client.get("/readyz")
+                assert readyz.status_code == 200
+                assert readyz.content == b'{"status":"ready"}'
+            finally:
+                await service.stop()
+
+
+class TestAPublishFailure:
+    """Ruling 5: `PrefixStatsPublishError` goes "out of `handle()`, then out of
+    `start()` (`start_failed`, exit 1, never ready) or `run()` (`run_exited`,
+    exit 1)"; "`/readyz` never answers 200"."""
+
+    async def test_start_raises_and_the_service_stays_unready(self, config_path: Path) -> None:
+        producer = _StatsProducer(fail=_PublishFailed("refused"))
+        bus = _ProducerBus(producer)
+        await _publish(bus.inner, _envelope(IP_A, 0))
+        service = build_service(_settings(config_path), bus=bus)
+
+        try:
+            with pytest.raises(PrefixStatsPublishError):
+                await asyncio.wait_for(service.start(), timeout=10.0)
+
+            assert service.ready is False
+            async with _client(service) as client:
+                readyz = await client.get("/readyz")
+            assert readyz.status_code == 503
+        finally:
+            await service.stop()
+
+    async def test_a_failure_during_run_ends_run(self, config_path: Path) -> None:
+        producer = _StatsProducer(fail=_PublishFailed("refused"))
+        bus = _ProducerBus(producer)
+        service = build_service(_settings(config_path), bus=bus)
+        await service.start()
+        assert service.ready is True
+
+        try:
+            task = asyncio.create_task(asyncio.wait_for(service.run(), timeout=10.0))
+            await _publish(bus.inner, _envelope(IP_A, 0))
+
+            with pytest.raises(PrefixStatsPublishError):
+                await task
+        finally:
+            await service.stop()
+
+
+class TestShutdownOrder:
+    """Ruling 6, "The shutdown order": `worker.stop()` "sets the flag, takes
+    the lock once the message in hand and its publishes are done, and
+    flushes"; then "`run()`'s teardown gathers its tasks and closes the
+    transport it built, the bus, last". Section 47.4: flush before close."""
+
+    async def test_every_flush_comes_before_the_transports_close(self, config_path: Path) -> None:
+        trace: list[str] = []
+        producer = _StatsProducer(trace=trace)
+        bus = _ProducerBus(producer)
+        transport = _TracingTransport(trace)
+        service = TrieService(
+            _settings(config_path),
+            _worker_on(bus),
+            DETECTION_CONFIG,
+            transport=transport,  # type: ignore[arg-type]
+        )
+
+        await service.start()
+        task = asyncio.create_task(asyncio.wait_for(service.run(), timeout=10.0))
+        await _publish(bus.inner, _envelope(IP_A, 0))
+        await _yield_until(lambda: _published(service) == 25)
+
+        await service.stop()
+        await task
+
+        assert "close" in trace
+        flushes = [index for index, entry in enumerate(trace) if entry == "flush"]
+        assert flushes
+        assert max(flushes) < trace.index("close")

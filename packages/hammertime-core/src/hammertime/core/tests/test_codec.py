@@ -67,6 +67,16 @@ at the very end: a `HotIpAdded` or `HotIpRemoved` payload without
 `window_count` is a `CodecError` that is not an attributes rejection, and
 `schemas/hot_ip_event.v1.json` lists `window_count` in `required`. The
 message is not pinned.
+
+ADR-0017 Amendment 2 ruling 9 (with ADR-0016 Amendment 1) is tested in the
+final section: `PrefixStatsChanged.hot_ratio` is optional (`None` writes no
+key, an absent key reads `None`), a present value must be a JSON number that
+is not a boolean, finite, and inside `schemas/prefix_stats_event.v1.json`'s
+inclusive `minimum` and `maximum` (read from the schema file, ADR-0016
+assumption 10), and is carried as `float(value)`. A refusal is a
+`CodecError` whose check never names the value. `hot_ratio` is a number, not
+one of the eight integer fields, so `_PAYLOAD_INTEGER_FIELDS` and
+`_BOUNDED_FIELDS` do not list it (ADR-0016 assumption 14).
 """
 
 import json
@@ -1234,3 +1244,317 @@ def test_the_hot_ip_schema_requires_window_count() -> None:
 
     assert "window_count" in schema["required"]
     assert set(schema["properties"]["type"]["enum"]) == set(HOT_IP_EVENT_TYPES)
+
+
+# ==========================================================================
+# ADR-0017 Amendment 2 ruling 9 (ADR-0016 Amendment 1): `hot_ratio` on
+# `PrefixStatsChanged`. "`None` writes no key. Otherwise the value must be an
+# `int` or a `float` and not a `bool`; a `float` must be finite; the value must
+# be `>= 0` and `<= 1`. The wire carries `float(value)`." On decode "An absent
+# key is `None`. A present one must be a JSON number ... finite ... and `>= 0`
+# and `<= 1`. It is stored as `float(value)`. Anything else, `null` included,
+# is a `CodecError`." The bounds are read from the schema file, never restated
+# (ADR-0016 assumption 10). `hot_ratio` is not one of the eight integer
+# fields, and is added to neither list above (ADR-0016 assumption 14).
+# ==========================================================================
+
+_HOT_RATIO_PATH: tuple[str | int, ...] = ("payload", "hot_ratio")
+
+# Used only to locate the schema property through `_schema_property`; it is
+# deliberately not in `_BOUNDED_FIELDS`.
+_HOT_RATIO = _Bound(
+    "PrefixStatsChanged",
+    _HOT_RATIO_PATH,
+    "payload",
+    "hot_ratio",
+    "prefix_stats_event.v1.json",
+    ("properties", "hot_ratio"),
+)
+
+
+def _hot_ratio_bounds() -> tuple[int | float, int | float]:
+    """`(minimum, maximum)` of `hot_ratio` as the schema file states them."""
+
+    prop = _schema_property(_HOT_RATIO)
+    assert "minimum" in prop and "maximum" in prop, prop
+    minimum = prop["minimum"]
+    maximum = prop["maximum"]
+    for bound in (minimum, maximum):
+        assert type(bound) is int or type(bound) is float, prop
+    return minimum, maximum
+
+
+def _ratio_envelope(hot_ratio: Any) -> EventEnvelope[Any]:
+    """A valid `PrefixStatsChanged` envelope whose payload carries `hot_ratio`.
+
+    The payload's `hot_count` 156 over `capacity` 256 is 0.609375; ruling 9
+    leaves `hot_ratio == hot_count / capacity` unchecked (ADR-0016 assumption
+    11), and no test here depends on it either way."""
+
+    payload = PrefixStatsChanged(**_PAYLOAD_FIELDS["PrefixStatsChanged"], hot_ratio=hot_ratio)
+    return EventEnvelope(event_type="PrefixStatsChanged", payload=payload, **_ENVELOPE_FIELDS)
+
+
+def _ratio_wire() -> bytes:
+    """Encoded bytes whose payload carries `hot_ratio` 0.5, for editing."""
+
+    data = encode(_ratio_envelope(0.5))
+    assert _wire_value(data, _HOT_RATIO_PATH) == 0.5
+    return data
+
+
+class TestHotRatioAbsent:
+    """Ruling 9: "`PrefixStatsChanged` gains `hot_ratio: float | None = None`
+    as its last field, so every existing construction stays valid"; "`None`
+    writes no key"; "An absent key is `None`"."""
+
+    def test_a_payload_built_without_it_has_none_writes_no_key_and_round_trips(self) -> None:
+        payload = PrefixStatsChanged(**_PAYLOAD_FIELDS["PrefixStatsChanged"])
+        assert payload.hot_ratio is None
+        envelope = EventEnvelope(
+            event_type="PrefixStatsChanged", payload=payload, **_ENVELOPE_FIELDS
+        )
+
+        data = encode(envelope)
+
+        assert "hot_ratio" not in json.loads(data)["payload"]
+        decoded: Any = decode(data)
+        assert decoded == envelope
+        assert decoded.payload.hot_ratio is None
+
+    def test_a_wire_payload_without_the_key_decodes_to_none(self) -> None:
+        data = _without_payload_key(_ratio_wire(), "hot_ratio")
+
+        decoded: Any = decode(data)
+
+        assert decoded.payload.hot_ratio is None
+
+
+_IN_RANGE_RATIOS: list[Any] = [
+    pytest.param(0.0, id="0.0"),
+    pytest.param(1.0, id="1.0"),
+    pytest.param(0.609375, id="0.609375"),
+    pytest.param(2**-24, id="2-to-the-minus-24"),
+    pytest.param(2**-128, id="2-to-the-minus-128"),
+    pytest.param(0, id="int-0"),
+    pytest.param(1, id="int-1"),
+]
+
+
+class TestHotRatioInRange:
+    @pytest.mark.parametrize("value", _IN_RANGE_RATIOS)
+    def test_it_encodes_as_a_float_and_round_trips(self, value: Any) -> None:
+        """Ruling 9: "The wire carries `float(value)`" and decode stores
+        `float(value)`; assumption 56: an `int` is accepted and written as a
+        `float`, one wire form. `2**-128` is the trie's smallest non-zero
+        ratio, a normal double."""
+
+        envelope = _ratio_envelope(value)
+
+        data = encode(envelope)
+
+        written = _wire_value(data, _HOT_RATIO_PATH)
+        assert type(written) is float
+        assert written == float(value)
+        decoded: Any = decode(data)
+        assert type(decoded.payload.hot_ratio) is float
+        assert decoded.payload.hot_ratio == float(value)
+        assert decoded == envelope
+
+    @pytest.mark.parametrize("wire", [pytest.param(0, id="0"), pytest.param(1, id="1")])
+    def test_a_json_integer_on_the_wire_decodes_to_a_float(self, wire: int) -> None:
+        """Ruling 9: "A present one must be a JSON number: an `int` that is not
+        a `bool`, or a `float` ... It is stored as `float(value)`." """
+
+        tampered = _tamper_field(_ratio_wire(), _HOT_RATIO_PATH, wire)
+        assert type(_wire_value(tampered, _HOT_RATIO_PATH)) is int
+
+        decoded: Any = decode(tampered)
+
+        assert type(decoded.payload.hot_ratio) is float
+        assert decoded.payload.hot_ratio == float(wire)
+
+
+def _ratio_bound_cases() -> list[Any]:
+    minimum, maximum = _hot_ratio_bounds()
+    return [
+        pytest.param(minimum, id="minimum"),
+        pytest.param(maximum, id="maximum"),
+    ]
+
+
+def _ratio_out_of_range_cases() -> list[Any]:
+    """Just outside each bound, then far outside. `10**400` is a JSON integer
+    too large for a float: ruling 9's order refuses it by the range "before
+    anything converts it to a float"."""
+
+    minimum, maximum = _hot_ratio_bounds()
+    return [
+        pytest.param(minimum - 1e-9, id="minimum-minus-1e-9"),
+        pytest.param(maximum + 1e-9, id="maximum-plus-1e-9"),
+        pytest.param(-1, id="minus-1"),
+        pytest.param(2, id="2"),
+        pytest.param(1e300, id="1e300"),
+        pytest.param(10**400, id="10-to-the-400"),
+    ]
+
+
+def _assert_ratio_out_of_range(value: int | float) -> None:
+    """Guard: the case really is outside the schema's bounds. Python compares
+    an `int` with a `float` exactly, so `10**400` is not converted here."""
+
+    minimum, maximum = _hot_ratio_bounds()
+    assert value < minimum or value > maximum, (value, minimum, maximum)
+
+
+class TestHotRatioBounds:
+    """Ruling 9: "The bounds are the schema's: `minimum` 0 and `maximum` 1,
+    both inclusive (JSON Schema Validation 2020-12 §6.2.2 and §6.2.4, as
+    ADR-0016 read them). ... the tests read them from the schema file"."""
+
+    @pytest.mark.parametrize("value", _ratio_bound_cases())
+    def test_decode_accepts_each_bound(self, value: int | float) -> None:
+        tampered = _tamper_field(_ratio_wire(), _HOT_RATIO_PATH, value)
+
+        decoded: Any = decode(tampered)
+
+        assert type(decoded.payload.hot_ratio) is float
+        assert decoded.payload.hot_ratio == float(value)
+
+    @pytest.mark.parametrize("value", _ratio_bound_cases())
+    def test_encode_accepts_each_bound_and_round_trips(self, value: int | float) -> None:
+        envelope = _ratio_envelope(value)
+
+        data = encode(envelope)
+
+        assert _wire_value(data, _HOT_RATIO_PATH) == float(value)
+        assert decode(data) == envelope
+
+    @pytest.mark.parametrize("value", _ratio_out_of_range_cases())
+    def test_decode_refuses_a_value_outside_the_bounds(self, value: int | float) -> None:
+        """Bytes built by editing encoded JSON; a `CodecError`, never an
+        `OverflowError` or anything else."""
+
+        _assert_ratio_out_of_range(value)
+        tampered = _tamper_field(_ratio_wire(), _HOT_RATIO_PATH, value)
+
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    @pytest.mark.parametrize("value", _ratio_out_of_range_cases())
+    def test_encode_refuses_a_value_outside_the_bounds(self, value: int | float) -> None:
+        """The value is set through the model constructor."""
+
+        _assert_ratio_out_of_range(value)
+
+        with pytest.raises(CodecError):
+            encode(_ratio_envelope(value))
+
+
+class TestHotRatioRefusals:
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param(None, id="null"),
+            pytest.param("0.5", id="string"),
+            pytest.param(True, id="true"),
+            pytest.param(False, id="false"),
+            pytest.param([], id="array"),
+            pytest.param({}, id="object"),
+            pytest.param(float("nan"), id="NaN"),
+            pytest.param(float("inf"), id="Infinity"),
+            pytest.param(float("-inf"), id="minus-Infinity"),
+        ],
+    )
+    def test_decode_refuses_a_present_value_that_is_not_a_finite_json_number(
+        self, bad: object
+    ) -> None:
+        """Ruling 9: "Anything else, `null` included, is a `CodecError`";
+        "`json.loads` reads `NaN`, `Infinity` and `-Infinity`", and they are
+        refused as not finite; `true` is a type error. `pytest.raises` lets
+        any other exception type fail the test."""
+
+        tampered = _tamper_field(_ratio_wire(), _HOT_RATIO_PATH, bad)
+
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param(True, id="True"),
+            pytest.param(False, id="False"),
+            pytest.param("0.5", id="str"),
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="inf"),
+            pytest.param(float("-inf"), id="minus-inf"),
+        ],
+    )
+    def test_encode_refuses_a_bool_a_str_or_a_non_finite_float(self, bad: object) -> None:
+        """Ruling 9: "the value must be an `int` or a `float` and not a
+        `bool`; a `float` must be finite ... Anything else is a
+        `CodecError`"."""
+
+        with pytest.raises(CodecError):
+            encode(_ratio_envelope(bad))
+
+
+# Ruling 9: "The check's own text names the field and the rule it broke, never
+# the value." Each value carries a digit run ("987654321" or "98765") that no
+# field name, rule or bound can contain by chance. The 400-digit integer is
+# under CPython's default integer-string limit, so `json` handles it.
+_RATIO_LEAK_CASES: list[Any] = [
+    pytest.param(987654321, "987654321", id="int-above"),
+    pytest.param(-987654321, "987654321", id="int-below"),
+    pytest.param(98765.4321, "98765", id="float-above"),
+    pytest.param(-98765.4321, "98765", id="float-below"),
+    pytest.param(int("98765" * 80), "98765", id="400-digit-int"),
+]
+
+
+class TestHotRatioErrorsDoNotNameTheValue:
+    @pytest.mark.parametrize(("value", "digits"), _RATIO_LEAK_CASES)
+    def test_encode(self, value: int | float, digits: str) -> None:
+        """Ruling 9: "On encode the `CodecError`'s own text names no value." """
+
+        _assert_ratio_out_of_range(value)
+
+        with pytest.raises(CodecError) as excinfo:
+            encode(_ratio_envelope(value))
+
+        message = str(excinfo.value)
+        assert digits not in message, f"the refused value appears in {message[:200]!r}"
+
+    @pytest.mark.parametrize(("value", "digits"), _RATIO_LEAK_CASES)
+    def test_decode(self, value: int | float, digits: str) -> None:
+        """Ruling 9: "On decode the check runs where the payload's integer
+        checks run, so a refusal is a `CodecError` whose `__cause__` is the check's own
+        error. The wrapper's text embeds the payload, which is ADR-0015
+        Amendment 3's open item, unchanged." So only the cause's text is
+        asserted on (ADR-0016 assumption 11)."""
+
+        _assert_ratio_out_of_range(value)
+        tampered = _tamper_field(_ratio_wire(), _HOT_RATIO_PATH, value)
+        assert digits.encode() in tampered
+
+        with pytest.raises(CodecError) as excinfo:
+            decode(tampered)
+
+        cause = excinfo.value.__cause__
+        assert cause is not None
+        message = str(cause)
+        assert digits not in message, f"the refused value appears in {message[:200]!r}"
+
+
+def test_the_schema_keeps_hot_ratio_an_optional_number_between_0_and_1() -> None:
+    """Ruling 9, "The schema": "`hot_ratio` stays optional, and no type, bound
+    or `required` entry changes"; assumption 57."""
+
+    path = _schemas_dir() / "prefix_stats_event.v1.json"
+    schema: Any = json.loads(path.read_text(encoding="utf-8"))
+    prop = schema["properties"]["hot_ratio"]
+
+    assert "hot_ratio" not in schema["required"]
+    assert prop["type"] == "number"
+    assert prop["minimum"] == 0
+    assert prop["maximum"] == 1
