@@ -10,7 +10,11 @@ for a trie that keeps no consumer position; both noted in place); amended
 two numbers are one; an event that leaves the hot set unchanged publishes
 no stats; every `PrefixStatsChanged` carries its prefix as `subject`;
 Amendment 1's readiness test also reads the log's first retained offset;
-each noted in place)
+each noted in place); amended again 2026-09-23 (see "Amendment 3" at the
+end — by ADR-0017 Amendment 2: decision 3's reporting range is per address
+family, and IPv6 reports `/104` through `/128` by default under a key of
+its own, `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6`; decision 3 and the
+assumption on the minimum length each carry a dated note)
 
 Scope note: this ADR pins down the interfaces the cross-service tests of
 issue #26 (`docs/spec/integration-scenarios.md`) observe the pipeline through,
@@ -131,6 +135,14 @@ committed, so a crash cannot commit an update whose stats were never emitted.
 >    `event_id`, and the log's `Nats-Msg-Id` deduplication (ADR-0013
 >    decision 4) would keep one of them.
 
+> Amended 2026-09-23 (ADR-0017 Amendment 2; Amendment 3): the range above
+> is per address family. For IPv4 it is as written, `[L, 32]`, with `L`
+> from `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH`, default 8. For IPv6 it is
+> `[L, 128]`, with `L` from `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6`,
+> default 104. A `/104` holds as many addresses as an IPv4 `/8`, 2^24, so
+> the capacity argument below gives IPv6 the same floor, and an IPv6
+> transition publishes 25 messages as well.
+
 Twenty-five messages per transition is acceptable for the same reason
 ADR-0005 gave for not scoring continuously: hysteresis makes transitions rare
 relative to observations, and `PrefixStatsChanged` is keyed by prefix so the
@@ -203,6 +215,11 @@ It is never used to spread the delta. This is what
   comes from the capacity argument in decision 3, not from the spec. IPv6's
   default is left undefined because v1 is IPv4-only (§43); the setting must
   become per-family when §35 is implemented.
+
+  > Settled 2026-09-23 (ADR-0017 Amendment 2; Amendment 3): IPv6's default
+  > is `/104`, and the setting is per family.
+  > `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` stays IPv4's, and
+  > `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6` is IPv6's.
 * **One trie-wide `sequence` shared by the stats of one hot-IP event.** The
   schema requires a `sequence`; per-prefix counters would give the detector no
   way to tell which stats belong together. Chosen for groupability; a future
@@ -411,3 +428,32 @@ Assumptions made by this amendment (push back individually):
   looks.
 * **No CHANGES entry.** No trie build that publishes stats has shipped.
   The implementing change of ADR-0017's slice 2 records the publisher.
+
+## Amendment 3 (2026-09-23) — the reporting range is per family; IPv6 reports `/104` to `/128` (ADR-0017 Amendment 2)
+
+Why: decision 3 fixed the reporting range as `[min_prefix_length,
+bit_length]` and gave IPv4's default. The assumption "Minimum reported
+prefix length 8 (IPv4), a trie setting" left IPv6's default undefined, and
+added that "the setting must become per-family when §35 is implemented".
+ADR-0017 implemented §35 in its first slice, and its Amendment 2 designs
+the publisher. Ruling 1 there settles IPv6's range and the per-family
+setting. This amendment records that in the two places.
+
+Decisions 1, 2, 4, 5 and 6 are unchanged, and so is decision 3's text.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended again 2026-09-23" clause.
+* **Decision 3.** A dated blockquote after its 2026-09-23 one: the range
+  is per family, and IPv6's floor is `/104`.
+* **Assumptions, "Minimum reported prefix length 8 (IPv4), a trie
+  setting."** A dated blockquote under the bullet. The bullet's text is
+  unchanged.
+
+Assumptions made by this amendment (push back individually):
+
+* **Pointer notes, not rewritten decisions.** The ruling, its reasons and
+  its alternatives are ADR-0017 Amendment 2's: ruling 1 and assumptions 41
+  to 43. The notes stop this ADR from leaving open what is now settled.
+* **No CHANGES entry from this amendment.** ADR-0017 Amendment 2 ruling 11
+  gives the implementing change's lines.

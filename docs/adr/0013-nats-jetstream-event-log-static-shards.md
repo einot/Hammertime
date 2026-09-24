@@ -95,7 +95,11 @@ flagged during the trie epic's slice 1 and listed in ADR-0017 Amendment
 1: when both of their errors apply, an unregistered topic on a `NatsBus`
 that has not started, `end_offset` and `first_offset` raise `KeyError`,
 the order the shipped code and the bus tests already follow; decision 3
-carries a dated note).
+carries a dated note); amended a twelfth time 2026-09-23 (see "Amendment
+12" — by ADR-0017 Amendment 2: the trie's `PrefixStatsChanged` publisher is
+decision 4's fourth producer, and uses the `hammertime.prefix-stats.v1`
+stream and the bus's producer as they already are; nothing in the bus, the
+streams or provisioning changes; decision 4 carries a dated note).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
@@ -961,6 +965,12 @@ aggregator's reconciliation divert (`worker._divert`: the diverted
 observation's own `event_id`, which it has because the message was decoded
 before it was classified — a diverted message is byte-identical to the
 consumed one, so its `event_id` is the same one ingest published under).
+
+*Added 2026-09-23 (Amendment 12): the trie's `PrefixStatsChanged`
+publisher (ADR-0017 Amendment 2) is a fourth producer. It passes each
+envelope's `event_id` as `message_id`. The envelope's `subject` is the
+prefix, so the stats of one hot-ip event carry distinct ids (ADR-0017
+decision 14 item 3).*
 
 Effect, and what it closes: the stream drops a second copy of any record
 whose `event_id` it has seen in the last 120 s. That is the transport
@@ -5291,3 +5301,57 @@ Repository facts: `packages/hammertime-bus/src/hammertime/bus/nats.py`
 `NatsProducer.publish`); `memory.py` (`InMemoryBus.end_offset` reads a
 `defaultdict`, and `first_offset` returns `0`, so neither raises);
 `tests/test_streams.py` (`TestNatsBusOffsetReads` and its ASSUMPTION 6).
+
+## Amendment 12 (2026-09-23) — the trie's publisher is decision 4's fourth producer; nothing in the bus changes (ADR-0017 Amendment 2)
+
+Why: ADR-0017 Amendment 2 designs the trie's `PrefixStatsChanged`
+publisher, slice 2 of epic #10. It is the first producer to
+`hammertime.prefix-stats.v1`. Its dispatch asked what that topic and its
+producer already provide under this ADR, and what is new. This amendment
+records the answer where decision 4 lists the producers. No decision here
+changes.
+
+What exists, and is used as it is:
+
+* decision 1: the topic `hammertime.prefix-stats.v1`, its stream
+  `hammertime-prefix-stats-v1` and subjects `hammertime.prefix-stats.v1.*`,
+  4 partitions; a message is keyed by its prefix text (`topics.py`'s
+  `_prefix_key`);
+* decision 2: the stream is provisioned with every registered topic —
+  limits retention, `max_age` one day, `max_bytes` unbounded, discard old,
+  file storage, `duplicate_window` 120 s — and `NatsBus.start()` checks
+  that it exists;
+* decisions 3 and 4: `Producer.publish` with `message_id`, an awaited
+  acknowledgement, the `Nats-Msg-Id` and `Hammertime-Key` headers, and a
+  duplicate returned normally; `flush()` returning at once on both buses;
+  `MemoryProducer`'s deduplication for the bus's life.
+
+What is new: nothing in `hammertime.bus`, `hammertime-provision`, the
+stream configuration or the compose file. Decision 4's list of producers
+gains the trie.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended a twelfth time 2026-09-23" clause.
+* **Decision 4.** A dated italic paragraph after its first paragraph. That
+  paragraph's text is unchanged.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+143. **A pointer, no ruling.** The publisher's design is ADR-0017's. This
+     ADR records only that decision 4's list is incomplete without it.
+144. **No byte cap now.** Consequences' "Not done here" already names a
+     byte cap on streams. ADR-0017 Amendment 2 ruling 4 adds a reason for
+     one: every trie start appends again the stats of each state-changing
+     record whose first publish is older than the duplicate window, and
+     the prefix-stats stream has no byte cap. It stays a deployment
+     decision, as assumption 6 has it, and the snapshot epic bounds what a
+     start re-publishes.
+145. **No CHANGES entry.** Only documents change.
+
+Read on 2026-09-23 for this amendment. No web source was consulted.
+Repository facts: `packages/hammertime-bus/src/hammertime/bus/topics.py`
+(`PREFIX_STATS`: 4 partitions, one day, `_prefix_key`), `nats.py`
+(`NatsProducer.publish` and `flush`, `NatsBus.start()`), `memory.py`
+(`MemoryProducer`).

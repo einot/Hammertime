@@ -12,6 +12,11 @@ a short amendment section listing its notes:
 
 No schema file changes.
 
+Amended 2026-09-23 (see "Amendment 1" at the end): ADR-0017 Amendment 2
+has the codec read `prefix_stats_event.v1.json`'s `hot_ratio` and hold it
+to that schema's bounds. Decision 1's "Not changed" list named it as a
+property the codec does not read, and carries a dated note.
+
 Scope note: this ADR settles what issue #112's fix is implemented against.
 It covers two modules:
 
@@ -151,6 +156,16 @@ none is added and none is left out:
   * properties the codec does not read, such as `hot_ip_event.v1.json`'s
     `shard` and `prefix_stats_event.v1.json`'s `hot_ratio`. They stay
     unchecked because they are ignored, as ADR-0015 assumption 64 rules;
+
+    > Amended 2026-09-23 (ADR-0017 Amendment 2 ruling 9; Amendment 1):
+    > `hot_ratio` is read now, and checked. The codec writes it when it is
+    > set and reads it when it is present. On encode and on decode it
+    > refuses, as a `CodecError`, a value that is not a JSON number, one
+    > that is not finite, and one outside the schema's inclusive `minimum`
+    > 0 and `maximum` 1, checked in that order. The check's text names the
+    > field, never the value. It is a number, not an integer, so the table
+    > above and decision 2's eight fields do not change. `shard` stays
+    > unread.
   * `observations`' `maxItems`, which is already enforced, and its
     `minItems`, which is not (assumption 9).
 * **Messages.** The range check's own text names the field and the bound
@@ -496,3 +511,33 @@ Nothing was removed anywhere. Each edit is an insertion:
   * ADR-0015's note in Amendment 3 ruling 3, and its Amendment 4, said the
     envelope's three integer fields get no bounds. `schema_version` is pinned
     to 1, as decision 1 says. A dated correction follows each.
+
+## Amendment 1 (2026-09-23) — `hot_ratio` is read and bounded (ADR-0017 Amendment 2)
+
+Why: decision 1's "Not changed" list named `prefix_stats_event.v1.json`'s
+`hot_ratio` as a property the codec does not read, and so does not check.
+ADR-0017 decision 14 item 5 has `PrefixStatsChanged` carry it. ADR-0017
+Amendment 2 ruling 9 has the codec write and read it within the schema's
+bounds, in this ADR's style: the schema's inclusive bounds, on decode and
+on encode; a `CodecError` whose check names no value; and bounds the tests
+read from the schema file (assumption 10). This amendment records that
+where the list stood. Nothing decided here changes.
+
+Every edit outside this section:
+
+* **Status paragraph.** A paragraph after "No schema file changes." names
+  this amendment.
+* **Decision 1, "Not changed", the bullet on properties the codec does not
+  read.** A dated blockquote under it. The bullet's text is unchanged.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+13. **A pointer, with the rule stated.** The rule is ADR-0017's. It is
+    repeated in the note because this ADR's table is where a reader of the
+    codec's bounds looks first.
+14. **The eight integer fields stay eight.** `hot_ratio` is a JSON number,
+    with its own rule. The integer rules of decisions 1 and 2, and the
+    tests that pin exactly eight fields, do not change.
+15. **No CHANGES entry from this amendment.** ADR-0017 Amendment 2 ruling
+    11 says why the codec's change gets none.
