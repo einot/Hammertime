@@ -3,7 +3,7 @@
 Spec: section 19, section 32, section 46.2; ADR-0015 decision 5,
 Amendment 2 (ruling A) and Amendment 3 (ruling 3, assumptions 64-67); ADR-0011
 decision 3 step 1; ADR-0016 decisions 1 and 2, and Amendment 1; ADR-0017
-Amendment 2 ruling 9
+Amendment 2 ruling 9 and Amendment 3 ruling 2
 
 The wire format is JSON. Every message is an `EventEnvelope` (see
 `envelope.py`) with a `payload` object whose field names match the relevant
@@ -71,6 +71,17 @@ into the event it returns, so the bytes on the wire are the bytes that were
 checked (ADR-0015 Amendment 2 ruling A). An `InvalidAttributesError` becomes a
 `CodecError` chained `from` it, so `CodecError.__cause__` identifies every
 attributes rejection (ADR-0015 assumption 32).
+
+Every timestamp field -- the envelope's `timestamp`,
+`RequestObservation.window_start`, the `timestamp` of `HotIpAdded` and
+`HotIpRemoved`, and `PrefixStatsChanged.timestamp` -- is decoded to UTC: a
+value with an offset is converted, a value with none is read as UTC. A value
+whose UTC equivalent falls outside the years 1 to 9999 is a `CodecError`
+naming the field, not the value. Encode writes every timestamp in UTC with
+`Z`, and a value whose conversion to UTC overflows is likewise a
+`CodecError`, never an `OverflowError`; after the decode rule no decoded
+value can cause it (ADR-0017 Amendment 3 ruling 2). So a timestamp the codec
+decodes can always be encoded again.
 """
 
 import json
@@ -266,20 +277,39 @@ def _integer_field(value: object, field: str) -> int:
     return value
 
 
-def _format_timestamp(value: datetime) -> str:
-    """RFC3339/ISO-8601 UTC, `Z`-suffixed, matching the spec's examples."""
-    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-    return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")
+def _to_utc(value: datetime, *, field: str) -> datetime:
+    """`value` in UTC: converted when it has an offset, read as UTC when it has none.
+
+    A conversion whose result falls outside the years 1 to 9999 overflows;
+    that is a `CodecError` naming the field and not the value (ADR-0017
+    Amendment 3 ruling 2).
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    try:
+        return value.astimezone(UTC)
+    except OverflowError as exc:
+        raise CodecError(f"{field} is outside the years 1 to 9999 in UTC") from exc
+
+
+def _format_timestamp(value: datetime, *, field: str) -> str:
+    """RFC3339/ISO-8601 UTC, `Z`-suffixed, matching the spec's examples.
+
+    A value whose conversion to UTC overflows is a `CodecError`, never an
+    `OverflowError` (ADR-0017 Amendment 3 ruling 2).
+    """
+    return _to_utc(value, field=field).isoformat().replace("+00:00", "Z")
 
 
 def _parse_timestamp(value: Any, *, field: str) -> datetime:
+    """Parse an ISO-8601 date-time and return it in UTC (ADR-0017 Amendment 3 ruling 2)."""
     if not isinstance(value, str):
         raise CodecError(f"{field} must be a string, got {type(value).__name__}")
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise CodecError(f"{field} is not a valid date-time: {value!r}") from exc
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return _to_utc(parsed, field=field)
 
 
 def _require(data: dict[str, Any], key: str) -> Any:
@@ -293,7 +323,7 @@ def _encode_request_observation(payload: RequestObservation) -> dict[str, Any]:
     return {
         "agent_id": payload.agent_id,
         "sequence": _bounded_integer_field(payload.sequence, "sequence", _OBSERVATION_SEQUENCE),
-        "window_start": _format_timestamp(payload.window_start),
+        "window_start": _format_timestamp(payload.window_start, field="window_start"),
         "window_seconds": _bounded_integer_field(
             payload.window_seconds, "window_seconds", _OBSERVATION_WINDOW_SECONDS
         ),
@@ -365,7 +395,7 @@ def _encode_hot_ip_event(event_type: str, payload: HotIpAdded | HotIpRemoved) ->
         "type": event_type,
         "ip": str(payload.ip),
         "family": payload.ip.family.value,
-        "timestamp": _format_timestamp(payload.timestamp),
+        "timestamp": _format_timestamp(payload.timestamp, field="timestamp"),
         "sequence": _bounded_integer_field(payload.sequence, "sequence", _HOT_IP_SEQUENCE),
         "window_count": _bounded_integer_field(
             payload.window_count, "window_count", _HOT_IP_WINDOW_COUNT
@@ -456,7 +486,7 @@ def _encode_prefix_stats_changed(payload: PrefixStatsChanged) -> dict[str, Any]:
         # a Python int (arbitrary precision); only the wire form is a string.
         "capacity": _encode_capacity(payload.capacity),
         "sequence": _bounded_integer_field(payload.sequence, "sequence", _PREFIX_STATS_SEQUENCE),
-        "timestamp": _format_timestamp(payload.timestamp),
+        "timestamp": _format_timestamp(payload.timestamp, field="timestamp"),
     }
     if payload.hot_ratio is not None:
         document["hot_ratio"] = _bounded_ratio_field(
@@ -526,7 +556,7 @@ def encode(envelope: EventEnvelope[EventPayload]) -> bytes:
         "sequence": _integer_field(envelope.sequence, "sequence"),
         "event_type": envelope.event_type,
         "config_version": _integer_field(envelope.config_version, "config_version"),
-        "timestamp": _format_timestamp(envelope.timestamp),
+        "timestamp": _format_timestamp(envelope.timestamp, field="timestamp"),
         "payload": _encode_payload(envelope.event_type, envelope.payload),
     }
     if envelope.subject is not None:

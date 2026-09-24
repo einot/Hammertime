@@ -1,7 +1,7 @@
 """Emit PrefixStatsChanged so classification stays outside trie maintenance.
 
 Spec: section 3, section 14, section 19, section 22, section 35; ADR-0010
-decision 3; ADR-0017 decision 14 and Amendment 2
+decision 3; ADR-0017 decision 14, Amendment 2 and Amendment 3 ruling 3
 
 For each hot-ip event that changes the hot set, the trie publishes one
 `PrefixStatsChanged` per ancestor prefix of the event's address, from the
@@ -15,11 +15,16 @@ The work is two calls (ruling 3, "Why two calls"):
   describe the state between this event and the next, whatever is written
   afterwards (an R2 reader, decision 9).
 * `publish()` starts every message's publish before it awaits any of them, and
-  returns only once each has returned or raised, so no publish outlives it.
-  Publishes that returned are counted as `prefix_stats_published`. If any
-  raised an `Exception`, it raises one `PrefixStatsPublishError`, carrying
-  only the event's `sequence` and the counts, from the first failed message's
-  exception (ruling 2, ruling 5). It never retries.
+  completes only once each has returned or raised, so no publish outlives it,
+  whether it returns, raises, or is itself cancelled (Amendment 3 ruling 3:
+  when cancelled it cancels the publishes in flight, waits for each, then
+  raises `CancelledError`). Each publish that returned is counted as
+  `prefix_stats_published` as it returns, so the count is exact in every
+  ending. If any raised an `Exception`, it raises one
+  `PrefixStatsPublishError`, carrying only the event's `sequence` and the
+  counts, from the first failed message's exception in message order (ruling
+  2, ruling 5); a non-`Exception` `BaseException` is re-raised as it is. It
+  never retries.
 
 Each message is keyed by the prefix text and carries it as the envelope's
 subject, so the stats of one event carry distinct `event_id`s (decision 14
@@ -175,29 +180,29 @@ class PrefixStatsPublisher:
         return PreparedStats(family=trie.family, sequence=sequence, messages=tuple(messages))
 
     async def publish(self, prepared: PreparedStats) -> None:
-        """Publish every message at once; return once each has returned or raised.
+        """Publish every message at once; complete only once each has returned or raised.
 
-        Counts each publish that returned. A non-`Exception` `BaseException`
-        from a publish, such as a cancellation, is re-raised as it is;
-        otherwise any failure is one `PrefixStatsPublishError` from the first
-        failed message's exception.
+        Holds in all four endings (Amendment 3 ruling 3): it returns; it
+        raises `PrefixStatsPublishError`; it re-raises, as it is, a
+        non-`Exception` `BaseException` a publish raised; or it is itself
+        cancelled, in which case it cancels the publishes still in flight,
+        waits for each, and raises `CancelledError` even if some publish
+        raised an `Exception`. Once it has completed, `prefix_stats_published`
+        has grown by exactly the number of publishes that returned. Any
+        `Exception` otherwise becomes one `PrefixStatsPublishError` from the
+        first failed message's exception in message order.
         """
         # `gather` schedules every publish before this awaits any of them, and
         # with `return_exceptions=True` it completes only once each has
         # returned or raised -- also when this call is itself cancelled, in
-        # which case it cancels them and still waits for them.
+        # which case it cancels them, still waits for them, and then raises
+        # `CancelledError`. Its results are dropped on cancellation, so each
+        # publish counts itself as it returns (`_publish_one`).
         results = await asyncio.gather(
-            *(
-                self._producer.publish(
-                    PREFIX_STATS.name, message.key, message.value, message_id=message.message_id
-                )
-                for message in prepared.messages
-            ),
+            *(self._publish_one(message, prepared.family) for message in prepared.messages),
             return_exceptions=True,
         )
         failures = [result for result in results if isinstance(result, BaseException)]
-        for _ in range(len(results) - len(failures)):
-            self._metrics.increment("prefix_stats_published", family=prepared.family)
         for failure in failures:
             if not isinstance(failure, Exception):
                 raise failure
@@ -207,6 +212,17 @@ class PrefixStatsPublisher:
                 attempted=len(prepared.messages),
                 failed=len(failures),
             ) from failures[0]
+
+    async def _publish_one(self, message: StatsMessage, family: AddressFamily) -> None:
+        """Publish one message and count it the moment its publish returns.
+
+        There is no `await` between the publish returning and the increment,
+        so a cancellation cannot fall between them (Amendment 3 ruling 3).
+        """
+        await self._producer.publish(
+            PREFIX_STATS.name, message.key, message.value, message_id=message.message_id
+        )
+        self._metrics.increment("prefix_stats_published", family=family)
 
     async def flush(self) -> None:
         """Await the producer's `flush()`."""
