@@ -204,7 +204,9 @@ descendant (§31: the most specific qualifying prefixes).
 > HOT qualifies. For the 156 HOT addresses of spec §42, `10.20.30.1` to
 > `10.20.30.156`, the list holds 21 prefixes, from eight `/28`s to
 > `10.20.28.0/22`, and `minimal=true` keeps the eight `/28`s,
-> `10.20.30.16/28` to `10.20.30.128/28`.
+> `10.20.30.16/28` to `10.20.30.128/28`. That §42's minimal answer is these
+> `/28`s, and not `10.20.30.0/24`, is the repository owner's decision of
+> 2026-09-24 (ADR-0017 Amendment 5 ruling 2).
 
 ## Detector — port 8082 (§22, §31, ADR-0010)
 

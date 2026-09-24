@@ -244,10 +244,18 @@ and that a rejected or non-increasing document has no effect.
    `state == "HOT_PREFIX"` (32 >= 16 and 32/256 = 0.125 >= 0.10),
    `config_version == 2`. Hot-ip log: exactly 32 `HotIpAdded`, every one
    with `config_version == 2`, `window_count == 600`, `weight == 1200`
-   (`(1000*600 + 250) // 500`). `wait_until(detections()` lists
-   `10.20.30.0/24` with `state == "HOT_PREFIX"`, `hot_count == 32`,
-   `config_version == 2`)`; `detections(minimal=True)` lists exactly that
-   one prefix; `10.20.0.0/16` is absent from both (32/65536).
+   (`(1000*600 + 250) // 500`). Then `wait_until` the full `detections()`
+   list is exactly, in order (length descending, address ascending):
+   `10.20.30.16/28 (16/16)`, `10.20.30.0/27 (31/32)`,
+   `10.20.30.0/26 (32/64)`, `10.20.30.0/25 (32/128)`,
+   `10.20.30.0/24 (32/256)`, each with `state == "HOT_PREFIX"`; the
+   `10.20.30.0/24` item has `config_version == 2`.
+   `detections(minimal=True)` is exactly `[10.20.30.16/28]`, the one `/28`
+   the 32 addresses fill (`.16` to `.31`). `10.20.30.0/23` (32/512) and
+   `10.20.0.0/16` (32/65536) are absent from both. (Corrected 2026-09-24,
+   ADR-0017 Amendment 5 ruling 3: the step expected `10.20.30.0/24` alone
+   in both lists, but under `minimum_hot_ips` 16 a `/28` whose sixteen
+   addresses are all HOT qualifies.)
 3. `publish_config(v3)` = v1 thresholds under `config_version: 3`
    (`hot_threshold: 1000, cold_threshold: 800`).
    `wait_until(prefix("10.20.30.0/24")["hot_ips"] == 0)`; hot-ip log has
@@ -298,7 +306,10 @@ stop leaves a newer snapshot.
    (ADR-0017 decision 8);
    `ip("10.20.30.156") == ip_before` (HOT, `weight == 1200`);
    `ip("10.20.30.1")["state"] == "COLD"` with no `attributes`;
-   `hot_prefixes(minimal=True)["prefixes"]` is exactly `[10.20.30.0/24]`.
+   `hot_prefixes(minimal=True)["prefixes"]` is exactly
+   `[10.20.30.112/28, 10.20.30.128/28]`, the two `/28`s whose sixteen
+   addresses are all among the HOT `.101` to `.156` (corrected 2026-09-24,
+   ADR-0017 Amendment 5 ruling 3: was `[10.20.30.0/24]`).
 8. Consumption resumes at the right place: `post(3, [("10.20.30.1", 1200)])`;
    `wait_until(prefix(...)["hot_ips"] == 57)` — not 58 or more (no
    double-application of the 56 replayed adds) and not stuck at 56.
@@ -321,19 +332,38 @@ specific; decay below threshold clears it without a rescan.
    `wait_until(prefix("10.20.30.0/24")["hot_ips"] == 156)`; assert
    `hot_ratio == 0.609375`, `state == "HOT_PREFIX"`;
    `prefix("10.20.0.0/16")` -> `hot_ips == 156`, `state == "NORMAL"`.
-   `wait_until(detections(minimal=True)["detections"]` is exactly
-   `[10.20.30.0/24]`)`; `198.51.100.0/24` absent.
+   `wait_until` `detections(minimal=True)["detections"]` is exactly the
+   eight `/28`s `10.20.30.16/28`, `10.20.30.32/28`, `10.20.30.48/28`,
+   `10.20.30.64/28`, `10.20.30.80/28`, `10.20.30.96/28`, `10.20.30.112/28`
+   and `10.20.30.128/28`, each 16 of 16 (`10.20.30.0/28` holds 15 HOT
+   addresses and `10.20.30.144/28` 13); `198.51.100.0/24` absent.
+   (Corrected 2026-09-24, ADR-0017 Amendment 5 ruling 3: was
+   `[10.20.30.0/24]`. §42's minimal answer is the eight `/28`s, the
+   repository owner's decision of that day.)
 3. **Nested ancestors and the minimal set (§31).**
    `post(3, [(f"10.20.31.{i}", 1200) for i in 1..156])`;
    `wait_until(prefix("10.20.31.0/24")["hot_ips"] == 156)`.
-   Then `wait_until` the full `detections()` list is exactly, in order
-   (length descending, address ascending):
-   `10.20.30.0/24 (156/256)`, `10.20.31.0/24 (156/256)`,
-   `10.20.30.0/23 (312/512)`, `10.20.28.0/22 (312/1024)`,
-   `10.20.24.0/21 (312/2048 = 0.15234375)`; `10.20.16.0/20` is absent
-   (312/4096 < 0.10). `detections(minimal=True)` is exactly the two /24s.
-   `hot_prefixes(minimal=True)` on the trie agrees with the detector's
-   minimal list (same predicate, ADR-0010 decision 1).
+   Then `wait_until` the full `detections()` list is exactly these 41
+   prefixes, in order (length descending, address ascending):
+   * the sixteen `/28`s, each (16/16): `10.20.30.16/28`, `10.20.30.32/28`
+     and so on in steps of 16 to `10.20.30.128/28`, then `10.20.31.16/28`
+     to `10.20.31.128/28` likewise;
+   * ten `/27`s: `10.20.30.0/27 (31/32)`, `10.20.30.32/27 (32/32)`,
+     `10.20.30.64/27 (32/32)`, `10.20.30.96/27 (32/32)`,
+     `10.20.30.128/27 (29/32)`, then the same five in `10.20.31.0/24`;
+   * six `/26`s: `10.20.30.0/26 (63/64)`, `10.20.30.64/26 (64/64)`,
+     `10.20.30.128/26 (29/64)`, then the same three in `10.20.31.0/24`;
+   * four `/25`s: `10.20.30.0/25 (127/128)`, `10.20.30.128/25 (29/128)`,
+     then the same two in `10.20.31.0/24`;
+   * `10.20.30.0/24 (156/256)`, `10.20.31.0/24 (156/256)`;
+   * `10.20.30.0/23 (312/512)`, `10.20.28.0/22 (312/1024)`,
+     `10.20.24.0/21 (312/2048 = 0.15234375)`.
+
+   `10.20.16.0/20` is absent (312/4096 < 0.10). `detections(minimal=True)`
+   is exactly the sixteen `/28`s. `hot_prefixes(minimal=True)` on the trie
+   agrees with the detector's minimal list (same predicate, ADR-0010
+   decision 1). (Corrected 2026-09-24, ADR-0017 Amendment 5 ruling 3: the
+   list began at the two `/24`s, and the minimal list was those two.)
 4. **Hysteresis (§7) and decay (§42).** `advance(200)` (nothing expires:
    200 < 300). Then, at `window_start = clock.now()`:
    `post(4, [(f"10.20.30.{i}", 1200) for i in 1..15] + [("198.51.100.7", 900)])`.

@@ -104,7 +104,14 @@ thirteenth time 2026-09-24 (see "Amendment 13" — by ADR-0017 Amendment 3:
 `MessageBus` gains `last_value(topic)`, the value of the message at a
 topic's last offset, which the trie reads at `start()` to learn how far
 its stats reached the log; decision 3 gains dated additions, and Amendment
-12's assumption 144 a dated note; no stream configuration changes).
+12's assumption 144 a dated note; no stream configuration changes); amended
+a fourteenth time 2026-09-24 (see "Amendment 14" — by ADR-0017 Amendment 5,
+recording the repository owner's decision of that day: the reference
+compose file publishes the trie's, the detector's and the aggregator's
+ports, 8081 to 8083, and Prometheus's 9090 on `127.0.0.1` only, as
+decision 11 already publishes 4222, 8222 and 6379; ingest's 8080 stays on
+every interface; decision 11, assumption 13 and Amendment 4's ruling S1
+carry dated notes).
 Epic #95's first reason for the swap — that Kafka's cold start
 threatens ADR-0009's 60 s startup deadline — was measured on 2026-09-21 and
 does not hold (see Context, prerequisite 5); the epic's own text says the
@@ -1795,6 +1802,18 @@ here as the contract):
   no longer an instant reacquire but the same-member classification that
   makes a recreated container wait in-process for its predecessor's
   leases instead of exiting 1 (decision 7, as amended).*
+* *The services' own ports (amended 2026-09-24, Amendment 14; ADR-0017
+  Amendment 5 ruling 1, recording the repository owner's decision of that
+  day): `trie`, `detector` and `aggregator` publish theirs on the loopback
+  interface only, `127.0.0.1:8081:8081`, `127.0.0.1:8082:8082` and
+  `127.0.0.1:8083:8083`, and `prometheus` publishes `127.0.0.1:9090:9090`,
+  each under a comment in the form the `nats` and `valkey` services carry.
+  The binds inside the containers stay `0.0.0.0`: Prometheus scrapes its
+  targets over the compose network, and the healthchecks run inside the
+  containers. `ingest` keeps `8080:8080` on every interface, because agents
+  must reach it and §36 authenticates them. Loopback narrows who can reach
+  these ports and authenticates nothing; assumption 13's boundary is
+  unchanged.*
 * `broker` (Kafka) is removed; `deploy/docker-compose.redpanda.yml` is
   deleted; the `KAFKA_*` block and `CLUSTER_ID` go with them.
 * `Makefile` `up` becomes `docker compose -f deploy/docker-compose.yml up
@@ -1971,6 +1990,10 @@ not make. Push back on them individually.
     the store here (a follow-up, Consequences), and the services' own
     ports (8080-8083, 9090) are unchanged and are the owner's to reconsider
     (open question in the Amendment 4 report).*
+    *Decided 2026-09-24 by the repository owner (Amendment 14; ADR-0017
+    Amendment 5 ruling 1): 8081, 8082, 8083 and 9090 are published on
+    `127.0.0.1` only, and 8080 stays on every interface. The boundary this
+    assumption draws around the bus and the store is unchanged.*
 14. **Connection options: fail-fast connect, unbounded reconnect, by
     switching the client's options after the initial connect.**
     *(Rewritten 2026-09-21, Amendment 1.)* So that `connect_with_retry`
@@ -3217,6 +3240,9 @@ auditor's `member_id` note.
   `authorization` and Valkey `requirepass` plumbed through the services
   (Consequences), `deny_delete`/`deny_purge` on the streams (assumption
   76), and the services' own ports (open question).
+  *Decided 2026-09-24 by the repository owner (Amendment 14): 8081, 8082,
+  8083 and 9090 are published on `127.0.0.1` only; ingest's 8080 stays on
+  every interface.*
 * **S2 (`bus_endpoints` residual plus the chained `ValueError` in
   `start_failed`) — real, fixed here on both paths.** The first path is
   R8's. The second — nats-py's `errors.Error` chaining the `ValueError`
@@ -5498,3 +5524,60 @@ Read on 2026-09-24 for this amendment. No web source was consulted.
   duplicate id without appending) and `tests/test_streams.py`
   (`TestNatsBusOffsetReads` reaches the offset reads through a stub
   context, which `last_value` can use the same way).
+
+## Amendment 14 (2026-09-24) — the services' own ports on loopback: the owner's decision (ADR-0017 Amendment 5)
+
+Why: Amendment 4 ruling S1 published the bus's and the store's ports on
+`127.0.0.1` only, and left "the services' own ports" open; assumption 13
+left "8080-8083, 9090" with the repository owner. ADR-0017 Amendment 4
+raised the question again for the trie's `8081`, which from slice 3 of
+epic #10 serves an unauthenticated read API that discloses the hot set.
+The owner decided on 2026-09-24:
+
+* `8081`, `8082`, `8083` and `9090` are published on `127.0.0.1` only, as
+  decision 11 publishes `4222`, `8222` and `6379`;
+* the binds inside the containers stay `0.0.0.0`;
+* ingest's `8080` stays on every interface: agents must reach it, and §36
+  authenticates them.
+
+ADR-0017 Amendment 5 ruling 1 records the decision, what it leaves, and the
+implementing change. This amendment writes the four mappings into decision
+11, the reference deployment's contract, and closes the open question
+where this ADR states it. Nothing in the bus, the streams or provisioning
+changes.
+
+Every edit outside this section:
+
+* **Status line.** Gained the "amended a fourteenth time 2026-09-24"
+  clause.
+* **Decision 11.** A dated italic bullet after the bullet on `ingest`,
+  `aggregator`, `trie` and `detector`. No text of decision 11 is replaced.
+* **Assumption 13.** A dated italic sentence at its end. Its text is
+  unchanged.
+* **Amendment 4, ruling S1.** A dated italic sentence after "and the
+  services' own ports (open question)." Its text is unchanged.
+
+Assumptions made by this amendment (push back individually; numbering
+continues the ADR's list):
+
+151. **A contract line and pointers, and no ruling of this ADR's own.** The
+     decision is the owner's. Its reasons, what it leaves open and the
+     implementing change are ADR-0017 Amendment 5's (ruling 1; assumptions
+     113 to 119). Decision 11 is where the reference deployment's mappings
+     are written, so it gains the four, as Amendment 9 recorded the owner's
+     decision of 2026-09-23 where decision 9 had left the question.
+152. **Assumption 13's boundary is unchanged.** Loopback narrows who can
+     reach the four ports; it authenticates nothing. The bus and the store
+     stay inside the trust boundary exactly as assumption 13 draws it, and
+     its obligation on a deployment that exposes them is unchanged.
+     Amendment 6 ruling 2(d)'s aside on the aggregator's fixed host port
+     reads the same for `127.0.0.1:8083:8083`, a host port on one address.
+     That is from recall, as the aside itself is, and it is still not
+     relied on (assumption 110).
+153. **No `CHANGES` entry from this amendment.** ADR-0017 Amendment 5
+     ruling 1 gives the implementing change's line.
+
+Read on 2026-09-24 for this amendment. No web source was consulted.
+Repository facts: `deploy/docker-compose.yml` (the five `ports` lines, and
+the `nats` and `valkey` comments) and `deploy/prometheus.yml` (targets
+`ingest:8080`, `trie:8081` and `detector:8082`).

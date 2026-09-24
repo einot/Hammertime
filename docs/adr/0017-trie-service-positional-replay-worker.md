@@ -50,6 +50,16 @@ and `prefix_queries` counts by route and result. The port's exposure is left
 with the owner and is not ruled. Decisions 1, 2, 9, 10, 12, 13 and 15, the
 Test seams and Consequences carry dated notes. ADR-0010 (Amendment 5) and
 ADR-0015 carry notes, and so does `docs/protocol/read-api-v1.md`.
+Amended a fifth time 2026-09-24 (see "Amendment 5" at the end), recording
+the repository owner's answers to Amendment 4's two questions. The
+reference compose file publishes the trie's port, and the detector's, the
+aggregator's and Prometheus's, on `127.0.0.1` only; ingest's stays public.
+The minimal set keeps its definition, so §42's minimal answer is eight
+`/28`s. Four steps of `docs/spec/integration-scenarios.md` are corrected,
+and a correction of `deploy/k8s/README.md` is specified for the
+implementing change. Consequences and Amendment 4 carry dated notes.
+ADR-0013 (Amendment 14) and ADR-0010 carry notes, and so does
+`docs/protocol/read-api-v1.md`.
 
 Scope note. This ADR settles what epic #10 ("Trie worker, publisher &
 read-side query API") is built against. It splits the epic into slices
@@ -1654,6 +1664,10 @@ Assumptions 26-32 were added by the revision of 2026-09-23 (see
 
   > Noted 2026-09-24 (Amendment 4 ruling 11): slice 3's implementing change
   > adds four lines, none `BREAKING`.
+
+  > Noted 2026-09-24 (Amendment 5 ruling 1): the change that publishes the
+  > trie's, the detector's and the aggregator's ports and Prometheus's on
+  > `127.0.0.1` adds one line, not `BREAKING`.
 * **Security posture.**
   * The trie trusts `hammertime.hot-ip.v1`, which is inside the boundary
     ADR-0013 assumption 13 states.
@@ -1674,6 +1688,11 @@ Assumptions 26-32 were added by the revision of 2026-09-23 (see
   > `GET /prefixes/hot` delays the writer by one walk each time. The port's
   > exposure is still the owner's question, raised again with this ADR's
   > Amendment 4 and not ruled there.
+
+  > Decided 2026-09-24 by the repository owner (Amendment 5 ruling 1): the
+  > reference compose file publishes 8081, and with it 8082, 8083 and 9090,
+  > on `127.0.0.1` only. The bind inside each container stays `0.0.0.0`,
+  > and ingest's 8080 stays on every interface.
 
 ## Sources
 
@@ -3891,6 +3910,12 @@ designed here.
   Until the owner answers, ADR-0013 decision 11 and this ADR's decision 11
   stand.
 
+  > Decided 2026-09-24 by the repository owner (Amendment 5 ruling 1): the
+  > first answer, for `8081`, `8082`, `8083` and `9090`. The binds inside
+  > the containers and this ADR's decision 11 are unchanged, and so is the
+  > rest of this ruling: no authentication, no rate limit, no memo and no
+  > lock.
+
 ### Ruling 8. `create_app`, and the service's wiring
 
 ```python
@@ -3969,6 +3994,11 @@ server's own limit on the request line.
   the owner's open question (ruling 7), and its residuals are recorded
   there, not re-found.
 
+  > Noted 2026-09-24 (Amendment 5 ruling 1): the exposure question is
+  > decided: loopback only. Ruling 7's residuals now reach only what runs on
+  > the host, and Amendment 5 names the one left for the audit to assess,
+  > DNS rebinding (its assumption 118).
+
 ### Ruling 11. `CHANGES`
 
 The implementing change adds four lines at the top, in this order. None is
@@ -4026,6 +4056,10 @@ renders nothing until the telemetry epic; `evaluate_prefix_state` and
 | Does the read API need prefix metadata? | ADR-0015 assumption 7; decision 15 item 4 | ruling 6: no |
 | What do the read routes answer before the trie is ready? | §47.2; `read-api-v1.md` | ruling 3 |
 | Should the trie's port be reachable beyond its host? | ADR-0013 assumption 13; Consequences | not ruled: with the owner (ruling 7) |
+
+> Noted 2026-09-24 (Amendment 5): the last row is decided. The owner chose
+> loopback publishing for `8081`, `8082`, `8083` and `9090` (Amendment 5
+> ruling 1).
 
 ### Edits
 
@@ -4202,6 +4236,10 @@ list.
      Each would be a mechanism sized for a threat whose size the exposure
      question decides, and that question is the owner's. A deployment that
      exposes the port has standard means to put in front of it.
+
+     > Noted 2026-09-24 (Amendment 5 ruling 1): the owner has answered the
+     > exposure question with loopback publishing, and none of the four is
+     > added.
 103. **No record from the read routes, and uvicorn's access record left as
      it is.** Turning the access record off for the trie alone would set it
      apart from ingest's and the aggregator's servers, which run uvicorn
@@ -4248,6 +4286,10 @@ list.
      §4 step 2, §5 step 7 and §6 steps 2 and 3 expect lists that assume no
      prefix below `/24` qualifies. Those scenarios are #52's, and are
      reported with this amendment's hand-off rather than edited here.
+
+     > Decided 2026-09-24 by the repository owner (Amendment 5 ruling 2):
+     > the definition stands, and §42's minimal answer is the eight `/28`s.
+     > The scenarios named here are corrected (Amendment 5 ruling 3).
 112. **`docs/spec/README.md` gains entries** in the five rows whose mapping
      this amendment extends, as each amendment of this ADR has done, and
      loses none.
@@ -4295,3 +4337,352 @@ Read on 2026-09-24 for this amendment. No web source was consulted.
   `deploy/docker-compose.yml` and `deploy/prometheus.yml`;
   `schemas/detection_config.v1.json` (`minimum_hot_ips` has `minimum` 1);
   `docs/spec/integration-scenarios.md`.
+
+## Amendment 5 (2026-09-24) — the owner's answers to Amendment 4's two questions: the services' ports on loopback, the minimal set unchanged; four scenarios and a Kubernetes note corrected
+
+Why: Amendment 4 raised two questions for the repository owner and ruled
+neither:
+
+* whether the trie's port, `8081`, stays published on every interface of
+  the host that runs the reference stack (ruling 7). ADR-0013 had left the
+  same question open for all the services' own ports;
+* whether §42's candidate should be read otherwise than as a member of the
+  minimal set, which for §42's example under the default document holds
+  eight `/28`s and not `10.20.30.0/24` (assumption 111).
+
+The top-level session relayed the owner's answers to this design on
+2026-09-24:
+
+* publish `8081` on `127.0.0.1` only, and for the same reason `8082`,
+  `8083` and `9090`. The bind inside each container stays `0.0.0.0`, and
+  ingest's `8080` stays public;
+* keep the current definition: §42's minimal answer is the eight `/28`s.
+
+Rulings 1 and 2 record the two answers. Rulings 3 and 4 correct two texts
+the same dispatch named. Four scenarios expected lists that the definition
+does not give, and ruling 2 makes that definition final. A sentence of
+`deploy/k8s/README.md` describes a trie topology that decision 5 rules out.
+No other ruling of Amendment 4 changes: the port stays shared,
+unauthenticated and not rate limited, and `?minimal=true` keeps the meaning
+Amendment 4 ruling 2 gave it.
+
+### Ruling 1. The reference compose file publishes `8081`, `8082`, `8083` and `9090` on `127.0.0.1` only
+
+| Service | `ports` before | `ports` after the implementing change |
+| --- | --- | --- |
+| `trie` | `["8081:8081"]` | `["127.0.0.1:8081:8081"]` |
+| `detector` | `["8082:8082"]` | `["127.0.0.1:8082:8082"]` |
+| `aggregator` | `["8083:8083"]` | `["127.0.0.1:8083:8083"]` |
+| `prometheus` | `["9090:9090"]` | `["127.0.0.1:9090:9090"]` |
+| `ingest` | `["8080:8080"]` | unchanged |
+
+* **What stays.**
+  * The bind inside each container, and every setting.
+    `HAMMERTIME_TRIE_QUERY_BIND` keeps its default, `0.0.0.0:8081`
+    (decision 11), and no other service's bind or default changes
+    (assumption 115). Prometheus scrapes `ingest:8080`, `trie:8081` and
+    `detector:8082` over the compose network (`deploy/prometheus.yml`), and
+    each healthcheck calls `127.0.0.1` inside its own container. Neither
+    goes through a host mapping.
+  * `ingest`'s `8080:8080`, on every interface: agents must reach it, and
+    §36 authenticates them.
+  * The rest of Amendment 4 ruling 7: no authentication, no rate limit, no
+    memo and no lock.
+* **What changes.** A client on another host no longer reaches the four
+  ports of the reference stack. A client on the host still does, through
+  `127.0.0.1` (assumption 114). A deployment that wants one of them
+  reachable from elsewhere changes its mapping and puts an authenticating
+  proxy in front of it, as `read-api-v1.md` already asks of the trie's.
+* **What it does not do.** Loopback narrows who can reach a port. It
+  authenticates nothing, and every process on the host can still read the
+  hot set. One path from off the host is left: a web page open in a
+  browser on the host, through DNS rebinding (assumption 118). The security
+  audit of slice 3 assesses it (Amendment 4 ruling 10, as noted).
+* **Scope.** The reference compose file, and nothing under `deploy/k8s/`
+  (assumption 119).
+* **The implementing change** is brief E of this amendment's hand-off:
+  * in `deploy/docker-compose.yml`, the four `ports` lines of the table,
+    each under a comment in the form the `nats` and `valkey` services
+    carry;
+  * in `.env.example`, a comment above `HAMMERTIME_TRIE_QUERY_BIND` saying
+    what the port discloses and how the compose file publishes it
+    (assumption 116);
+  * in `CHANGES`, one line at the top, not `BREAKING` (assumption 117):
+
+        Reference compose file publishes the trie (8081), detector (8082) and aggregator (8083) ports and Prometheus (9090) on 127.0.0.1 only, as it already does for NATS and Valkey; ingest's 8080 stays reachable on every interface
+
+  No test reads either file. The full suite checks the change, and so does
+  `docker compose -f deploy/docker-compose.yml config --quiet` where Docker
+  is available.
+
+### Ruling 2. The minimal set keeps its definition; §42's minimal answer is eight `/28`s
+
+* `?minimal=true` keeps `read-api-v1.md`'s definition on both read APIs: a
+  listed prefix stays only when no listed prefix lies inside it (§31).
+  Amendment 4 ruling 2 stands as written.
+* For §42's example under the default document, the 156 HOT addresses
+  `10.20.30.1` to `10.20.30.156`, the minimal answer is the eight `/28`s
+  `10.20.30.16/28` to `10.20.30.128/28`, 16 HOT addresses each.
+  `10.20.30.0/24` is in the full answer, and not in the minimal one.
+* ADR-0010 decision 2's reading stands: §42's "BOT_NETWORK_CANDIDATE" is a
+  member of the minimal set, and `bot_network_candidates` counts that set.
+  For §42's example it counts eight.
+* §42's text is not edited (assumption 120).
+
+### Ruling 3. Four scenarios are corrected
+
+`docs/spec/integration-scenarios.md` §4 step 2, §5 step 7 and §6 steps 2
+and 3 expected lists in which no prefix below `/24` qualifies. Under the
+configuration they run with (§2.1: `minimum_hot_ips` 16,
+`minimum_hot_ratio` 0.10), a `/28` whose sixteen addresses are all HOT
+qualifies. Each step now expects what ruling 2's definition gives, and ends
+with a dated parenthetical (assumption 123):
+
+| Step | HOT addresses | Full list | Minimal list |
+| --- | --- | --- | --- |
+| §4 step 2, detector | `10.20.30.1` to `.32` | `10.20.30.16/28` (16/16), `10.20.30.0/27` (31/32), `10.20.30.0/26` (32/64), `10.20.30.0/25` (32/128), `10.20.30.0/24` (32/256) | `10.20.30.16/28` |
+| §5 step 7, trie | `10.20.30.101` to `.156` | not asserted | `10.20.30.112/28`, `10.20.30.128/28` |
+| §6 step 2, detector | `10.20.30.1` to `.156`, and `198.51.100.7` | not asserted | the eight `/28`s `10.20.30.16/28` to `10.20.30.128/28` |
+| §6 step 3, detector and trie | as in step 2, and `10.20.31.1` to `.156` | 41 prefixes: sixteen `/28`s, ten `/27`s, six `/26`s, four `/25`s, the two `/24`s, `10.20.30.0/23`, `10.20.28.0/22` and `10.20.24.0/21` | the sixteen `/28`s |
+
+A pair such as (16/16) is `hot_count`/`capacity`, as §6 step 3 already
+writes it. The lists are computed by hand (assumption 125).
+
+**A step that reads the detector waits for a whole list.** The detector
+hears the stats of one hot-ip event over the prefix-stats topic's four
+partitions, keyed by prefix, so it may list `10.20.30.0/24` before it lists
+`10.20.30.16/28`. A step therefore waits until the whole list it asserts
+has the expected value, and never for one prefix in it. In each corrected
+step HOT addresses are only added, so the wait ends only when the list has
+its final value (assumption 124).
+
+### Ruling 4. `deploy/k8s/README.md`: the trie's one replica holds every family
+
+The file says "`trie` is a StatefulSet with a single replica per address
+family". Decision 5 gives a deployment one trie process, which holds every
+family `HAMMERTIME_TRIE_FAMILIES` names, and rules out processes split by
+family. The bullet's two lines become three:
+
+    * `trie` is a StatefulSet with a single replica, which holds every address
+      family in `HAMMERTIME_TRIE_FAMILIES` (ADR-0017 decision 5), and a
+      PersistentVolume for snapshots (§28: single-writer ownership, §33: snapshots).
+
+Nothing else in the file changes, and the edit gets no `CHANGES` line. This
+design does not make the edit, because the file lies outside `docs/` and
+`schemas/`, the only places it may write. Brief E carries it (assumption
+126).
+
+### Questions this amendment closes
+
+| Question | Left open by | Ruled in |
+| --- | --- | --- |
+| Should the trie's port be reachable beyond its host? | Amendment 4 ruling 7; ADR-0013 assumption 13 and Amendment 4 ruling S1 | ruling 1: no, and neither should `8082`, `8083` or `9090`; the owner's decision |
+| Should §42's candidate be read otherwise than as a member of the minimal set? | Amendment 4 assumption 111; ADR-0010 decision 2's first 2026-09-24 note | ruling 2: no; the owner's decision |
+
+### Edits
+
+**In this ADR.** Each is a dated note; no text is replaced.
+
+* **Status.** A paragraph on this amendment, after Amendment 4's.
+* **Consequences.** A note under the `CHANGES` bullet and one under the
+  "Security posture" bullet, each after its Amendment 4 note.
+* **Amendment 4.** A note at the end of ruling 7; one after ruling 10's
+  bullet "What the audit checks"; one after the table under "Questions
+  this amendment closes"; one under each of assumptions 102 and 111.
+* **This section.**
+
+**In other documents.**
+
+* **`docs/adr/0013-nats-jetstream-event-log-static-shards.md`** (Amendment
+  14): a status clause, after the "amended a thirteenth time" clause; a
+  dated italic bullet in decision 11, after the bullet on `ingest`,
+  `aggregator`, `trie` and `detector`; a dated italic sentence at the end
+  of assumption 13, and one after Amendment 4 ruling S1's "and the
+  services' own ports (open question)."; an "Amendment 14" section. No text
+  is replaced.
+* **`docs/adr/0010-read-apis-and-shared-prefix-predicate.md`**: three
+  dated notes: after decision 2's 2026-09-24 note; in that ADR's own
+  Amendment 5, after the paragraph that begins "Designing it also showed";
+  and under that amendment's assumption "The note on decision 2 records a
+  consequence, not a ruling." No status clause and no amendment section
+  (assumption 122).
+* **`docs/protocol/read-api-v1.md`**: the 2026-09-24 note after the
+  paragraph of `GET /prefixes/hot[?minimal=true]` gains a last sentence
+  (assumption 121). The text before it is unchanged.
+* **`docs/spec/integration-scenarios.md`** (ruling 3). Four passages are
+  replaced, and each replacement ends with a dated parenthetical. The
+  replaced text:
+  * §4 step 2, from "`wait_until(detections()` lists" to the end of the
+    step:
+
+        `wait_until(detections()` lists
+        `10.20.30.0/24` with `state == "HOT_PREFIX"`, `hot_count == 32`,
+        `config_version == 2`)`; `detections(minimal=True)` lists exactly that
+        one prefix; `10.20.0.0/16` is absent from both (32/65536).
+
+  * §5 step 7, its last line:
+
+        `hot_prefixes(minimal=True)["prefixes"]` is exactly `[10.20.30.0/24]`.
+
+  * §6 step 2, its last sentence:
+
+        `wait_until(detections(minimal=True)["detections"]` is exactly
+        `[10.20.30.0/24]`)`; `198.51.100.0/24` absent.
+
+  * §6 step 3, from "Then `wait_until`" to the end of the step:
+
+        Then `wait_until` the full `detections()` list is exactly, in order
+        (length descending, address ascending):
+        `10.20.30.0/24 (156/256)`, `10.20.31.0/24 (156/256)`,
+        `10.20.30.0/23 (312/512)`, `10.20.28.0/22 (312/1024)`,
+        `10.20.24.0/21 (312/2048 = 0.15234375)`; `10.20.16.0/20` is absent
+        (312/4096 < 0.10). `detections(minimal=True)` is exactly the two /24s.
+        `hot_prefixes(minimal=True)` on the trie agrees with the detector's
+        minimal list (same predicate, ADR-0010 decision 1).
+
+* **`docs/spec/README.md`** (assumption 127). Two rows gain entries; none
+  loses one.
+  * §13, 14, 31: its ADR-0017 entry was "`docs/adr/0017` (Amendment 4
+    rulings 2 and 5)", and gains "Amendment 5 ruling 2: the minimal set's
+    granularity, the owner's decision".
+  * §43: was "`deploy/docker-compose.yml`, `docs/adr/0012` (Amendment 2),
+    `docs/adr/0013` (decisions 11, 12)". Its ADR-0013 entry gains
+    "Amendment 14: the services' own ports", and the row gains
+    "`docs/adr/0017` (Amendment 5 ruling 1: `8081` to `8083` and `9090` on
+    `127.0.0.1`)".
+
+**Specified here, made by the implementing change:**
+`deploy/docker-compose.yml`, `.env.example` and `CHANGES` (ruling 1), and
+`deploy/k8s/README.md` (ruling 4).
+
+No section of `docs/spec/hammertime_spec_1.md` changes, and no schema.
+
+### Assumptions
+
+Each is a judgment call that the owner's answers, the spec and the earlier
+ADRs do not make. Push back on them individually; numbering continues the
+ADR's list.
+
+113. **The answers are taken as the top-level session relayed them.** This
+     design did not see the owner's own words. It records them as relayed:
+     `8081` published on `127.0.0.1`, "and for the same reason 8082, 8083
+     and 9090", with the container binds unchanged and ingest's `8080`
+     public; and the current definition kept, with §42's minimal answer the
+     eight `/28`s.
+114. **The mapping is `127.0.0.1:<port>:<port>`: IPv4 loopback only.** It is
+     the form the `nats` and `valkey` services already use (ADR-0013
+     decision 11). IPv6's `::1` is not published as well. A client that
+     tries only `::1` for `localhost` is refused, and one that tries every
+     address `localhost` resolves to reaches `127.0.0.1`. A deployment that
+     needs `::1` adds a mapping of its own.
+115. **Nothing in the services' settings changes.** The owner's answer keeps
+     the container binds. This assumption adds that no default moves
+     either: `HAMMERTIME_TRIE_QUERY_BIND` stays `0.0.0.0:8081`, and so does
+     `.env.example`'s value. A default of `127.0.0.1` inside the container
+     would cut Prometheus's scrape over the compose network, and would be a
+     changed default of a configuration key.
+116. **The comments.** Each of the four `ports` lines gets a comment in the
+     form the `nats` and `valkey` services carry: "Loopback only, no auth",
+     a citation, and what exposing the port takes. `.env.example` gets its
+     comment in the trie's block, because `8081` is the only one of the
+     four ports with a key in that file. Brief E gives the texts; their
+     wording is not part of this contract.
+117. **The `CHANGES` line is not `BREAKING`.** `CLAUDE.md` prefixes a line
+     `BREAKING` "when a running deployment needs action to keep working",
+     and names a changed event-log schema, a renamed or removed config key,
+     a changed agent protocol, and a snapshot format older builds cannot
+     load. None of those changes. After the change the stack runs as
+     before: the services reach one another over the compose network,
+     Prometheus scrapes as before, the healthchecks run inside the
+     containers, and agents reach ingest's `8080`. What stops working is
+     access to `8081`, `8082`, `8083` and `9090` from another host, such as
+     a Grafana elsewhere querying `9090`. That is a client of the
+     deployment, not the deployment, and neither read API has shipped.
+     Line 10 of `CHANGES`, "Reference compose file sets container_name on
+     the aggregator, so docker compose up --scale aggregator=N is refused",
+     also narrowed what the reference file allows, and is not `BREAKING`.
+     If the owner counts remote access to those ports as part of a
+     deployment working, the line takes the prefix, and nothing else
+     changes.
+118. **DNS rebinding is the residual left for the audit.** With the ports on
+     loopback, the path left from off the host is a web page open in a
+     browser on the host. A page whose own name is rebound to `127.0.0.1`
+     can read the read routes' JSON as a same-origin response, unless the
+     server refuses a `Host` header it does not expect. That is recalled
+     from how the attack is generally described, and was not re-read.
+     Whether uvicorn or FastAPI refuses an unexpected `Host` by default was
+     not checked either. Starlette's `TrustedHostMiddleware` is the usual
+     remedy, and it is not designed here. The audit judges whether the
+     residual needs it.
+119. **The compose file only.** The owner's answer names the reference
+     compose file. `deploy/k8s/` holds a README and no manifest, so nothing
+     there publishes a host port. A Kubernetes Service is reachable only
+     inside the cluster unless it is given another type; that is recalled,
+     and was not re-read.
+120. **§42 is not edited.** The owner kept the definition, and §42's
+     "10.20.30.0/24 = BOT_NETWORK_CANDIDATE" stays descriptive, as ADR-0010's
+     assumption "`BOT_NETWORK` unused in v1" reads it. The `/24` is
+     `HOT_PREFIX`, and it contains the candidates. A pointer note at §42
+     naming the minimal answer would spare a reader the trip through
+     ADR-0010 and this ADR. It is not made here, since the dispatch asked
+     for no spec edit, and it is recommended in the hand-off.
+121. **`read-api-v1.md`'s note gains a sentence, not a second note.** The
+     note is Amendment 4's, written the same day. The sentence names the
+     owner's decision and its date, so it reads as a dated addition, and a
+     nested note would add a layer and no history.
+122. **ADR-0010 gains pointer notes, and ADR-0013 an amendment.** No
+     decision of ADR-0010 changes: the owner kept decision 2's reading. Its
+     notes therefore follow assumption 110's rule, with no status clause
+     and no amendment section. ADR-0013's decision 11 is the contract for
+     the reference deployment's mappings, and gains four. ADR-0013
+     therefore gains Amendment 14, as it gained Amendment 9 for the owner's
+     decision of 2026-09-23.
+123. **The scenarios are corrected in place, each with a dated
+     parenthetical.** `integration-scenarios.md` is test-author's hand-off,
+     and test-author works from it: it must state the expected lists, not
+     carry a note that they are wrong. §7 already carries a dated
+     parenthetical of this kind ("reworded 2026-09-21, ADR-0013 Amendment
+     3"). The replaced passages are quoted under "Edits", so the history is
+     kept here.
+124. **A detector step waits for the whole list.** The prefix-stats topic
+     has four partitions and is keyed by prefix (ADR-0013 decision 1;
+     ADR-0010 decision 3), and the order in which the detector reads them
+     is the detector epic's. A scenario therefore assumes no order between
+     the stats of two prefixes. In each corrected step HOT addresses are
+     only added, so a prefix that qualifies stays qualified until the step
+     ends. A full list reaches its expected value only once it is complete.
+     A minimal list reaches it once every expected member is listed, since
+     every other prefix the step can list contains one of them, and it
+     keeps that value for the rest of the step. A wait on the whole list is
+     therefore safe, and a wait on one prefix is not.
+125. **The corrected lists are computed by hand.** Each follows from the
+     step's addresses, §2.1's configuration and §3's formulas, with exact
+     fractions, and each count was checked against the prefix's address
+     range. Nothing was run: the detector is not implemented, and the
+     trie's read API was not merged when this amendment was written.
+126. **`deploy/k8s/README.md` is specified here, not edited, and rides with
+     ruling 1's change.** The dispatch asked this design to correct the
+     sentence. The file is outside `docs/` and `schemas/`, the only places
+     this design may write, so ruling 4 gives the text and brief E carries
+     the edit. It rides with ruling 1's change because both edit `deploy/`.
+     Nothing else ties them, and the session may dispatch it on its own.
+127. **`docs/spec/README.md` gains entries in two rows,** §13, 14, 31 for
+     ruling 2 and §43 for ruling 1, and loses none, as assumption 112 did.
+
+### Sources
+
+Read on 2026-09-24 for this amendment. No web source was consulted.
+
+* Repository files: `deploy/docker-compose.yml` (the five `ports` lines,
+  the `nats` and `valkey` comments, the healthchecks on `127.0.0.1`);
+  `deploy/prometheus.yml` (targets `ingest:8080`, `trie:8081` and
+  `detector:8082`); `deploy/k8s/README.md` (lines 16 and 17);
+  `.env.example` (the trie's block); `CHANGES` (line 10);
+  `docs/spec/integration-scenarios.md` (§2.1, and §4 to §7);
+  `docs/spec/hammertime_spec_1.md` (§42); ADR-0013 (decision 11,
+  assumption 13, Amendment 4 ruling S1, Amendment 6 ruling 2(d)); ADR-0010
+  (decisions 2 and 3, Amendment 5); `docs/protocol/read-api-v1.md`.
+* Recalled, and not re-read: how DNS rebinding works (assumption 118); that
+  a Kubernetes Service is reachable only inside the cluster by default
+  (assumption 119); how a client tries the addresses `localhost` resolves
+  to (assumption 114).

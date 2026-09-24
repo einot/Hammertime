@@ -125,6 +125,12 @@ classification_changes  count of NORMAL <-> HOT_PREFIX edges observed
 > and from §13. Whether §42 should be read otherwise is raised for the
 > repository owner with ADR-0017 Amendment 4, and is not ruled here.
 
+> Decided 2026-09-24 by the repository owner (ADR-0017 Amendment 5 ruling
+> 2): this decision's reading stands. §42's minimal answer is the eight
+> `/28`s, and `bot_network_candidates` counts eight for that example. §42's
+> wording stays descriptive, as the assumption "`BOT_NETWORK` unused in v1"
+> reads it.
+
 ### 3. The trie emits `PrefixStatsChanged` for every ancestor from a minimum length down to the host route
 
 On each applied `HotIpAdded`/`HotIpRemoved`, after the single-writer update
@@ -572,6 +578,10 @@ Designing it also showed what decision 2's reading of §42 yields under the
 default document. That is raised for the repository owner, and is not ruled
 here.
 
+> Noted 2026-09-24 (ADR-0017 Amendment 5 ruling 2): the owner decided the
+> same day that the reading stands. Decision 2's second 2026-09-24 note
+> records it.
+
 Decisions 3 and 6 are unchanged, and so is the text of every decision.
 
 Every edit outside this section:
@@ -603,5 +613,8 @@ Assumptions made by this amendment (push back individually):
 * **The note on decision 2 records a consequence, not a ruling.** The
   numbers follow from §13 and the reading decision 2 already made. Whether
   that reading should change is the owner's question.
+
+  > Noted 2026-09-24 (ADR-0017 Amendment 5 ruling 2): the owner has kept
+  > that reading, so the numbers are now the decided answer.
 * **No CHANGES entry from this amendment.** ADR-0017 Amendment 4 ruling 11
   gives the implementing change's lines.
