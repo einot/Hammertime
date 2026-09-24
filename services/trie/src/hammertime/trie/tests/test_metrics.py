@@ -33,6 +33,12 @@ exercised: decision 12 constrains label names, not values.
 Slice 2 adds one counter, `prefix_stats_published`, label `family` (ADR-0017
 Amendment 2 ruling 7, and decision 12 as noted there), under decision 12's
 rules: it is in `EVERY_SERIES`, and `TestPrefixStatsPublished` covers it.
+
+Slice 3 adds one counter, `prefix_queries`, labels `route` (`prefix`, `ip`,
+`prefixes_hot`) and `result` (`ok`, `invalid`, `family_not_served`,
+`not_ready`) (ADR-0017 Amendment 4 ruling 9, and decision 12 as noted there),
+under decision 12's rules: it is in `EVERY_SERIES`, and `TestPrefixQueries`
+covers it. What the read routes count is `test_query.py`'s.
 """
 
 from datetime import UTC, datetime
@@ -100,6 +106,12 @@ EVERY_SERIES = [
     pytest.param("event_sequence", {}, id="event_sequence"),
     pytest.param("trie_recovery_seconds", {}, id="trie_recovery_seconds"),
     pytest.param("prefix_stats_published", {"family": "ipv4"}, id="prefix_stats_published"),
+    pytest.param("prefix_queries", {"route": "prefix", "result": "ok"}, id="prefix_queries"),
+    pytest.param(
+        "prefix_queries",
+        {"route": "prefixes_hot", "result": "not_ready"},
+        id="prefix_queries-hot-not-ready",
+    ),
 ]
 
 
@@ -321,6 +333,73 @@ class TestPrefixStatsPublished:
 
         with pytest.raises(ValueError):
             metrics.set("prefix_stats_published", 1.0, family="ipv4")
+
+
+PREFIX_QUERY_ROUTES = ("prefix", "ip", "prefixes_hot")
+PREFIX_QUERY_RESULTS = ("ok", "invalid", "family_not_served", "not_ready")
+
+
+class TestPrefixQueries:
+    """ADR-0017 Amendment 4 ruling 9: "`prefix_queries` | counter | `route`
+    (`prefix`, `ip`, `prefixes_hot`), `result` (`ok`, `invalid`,
+    `family_not_served`, `not_ready`)", under decision 12's rules: the label
+    names are exactly the series' own, and `set` is for gauges only."""
+
+    def test_it_increments_and_reads_back_per_route_and_result(self) -> None:
+        metrics, _ = _bound()
+
+        metrics.increment("prefix_queries", route="prefix", result="ok")
+        metrics.increment("prefix_queries", route="prefix", result="ok")
+        metrics.increment("prefix_queries", route="ip", result="family_not_served")
+        metrics.increment("prefix_queries", route="prefixes_hot", result="not_ready")
+
+        expected = {
+            ("prefix", "ok"): 2,
+            ("ip", "family_not_served"): 1,
+            ("prefixes_hot", "not_ready"): 1,
+        }
+        for route in PREFIX_QUERY_ROUTES:
+            for result in PREFIX_QUERY_RESULTS:
+                got = metrics.get("prefix_queries", route=route, result=result)
+                assert got == expected.get((route, result), 0), (route, result)
+
+    @pytest.mark.parametrize(
+        "labels",
+        [
+            pytest.param({}, id="none-given"),
+            pytest.param({"route": "prefix"}, id="route-alone"),
+            pytest.param({"result": "ok"}, id="result-alone"),
+            pytest.param({"route": "prefix", "result": "ok", "family": "ipv4"}, id="extra"),
+        ],
+    )
+    def test_increment_with_the_wrong_label_names_is_refused(
+        self, labels: dict[str, object]
+    ) -> None:
+        metrics, _ = _bound()
+
+        with pytest.raises(ValueError):
+            metrics.increment("prefix_queries", **labels)
+
+    @pytest.mark.parametrize(
+        "labels",
+        [
+            pytest.param({}, id="none-given"),
+            pytest.param({"route": "prefix"}, id="route-alone"),
+            pytest.param({"result": "ok"}, id="result-alone"),
+            pytest.param({"route": "prefix", "result": "ok", "family": "ipv4"}, id="extra"),
+        ],
+    )
+    def test_get_with_the_wrong_label_names_is_refused(self, labels: dict[str, object]) -> None:
+        metrics, _ = _bound()
+
+        with pytest.raises(ValueError):
+            metrics.get("prefix_queries", **labels)
+
+    def test_set_is_refused(self) -> None:
+        metrics, _ = _bound()
+
+        with pytest.raises(ValueError):
+            metrics.set("prefix_queries", 1.0, route="prefix", result="ok")
 
 
 class TestSeriesDerivedFromTheState:
