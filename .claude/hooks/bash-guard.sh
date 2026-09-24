@@ -179,8 +179,10 @@
 # LITERAL MODE (LITERAL_ONLY='1', ADR-0018 decision 3). One lexical check
 # runs before every other check and refuses a command that contains,
 # anywhere: a newline, `$`, a backtick, `\`, `'`, `"`, `{`, `}`, `[`, `]`,
-# `(`, `)`, `*`, `?`, `<`, `>`, `#`; an `&` that is not part of `&&`; or
-# a word that begins with `~` or contains `=~` or `:~`. For that last
+# `(`, `)`, `*`, `?`, `<`, `>`, `#`; an `&` that is not part of `&&`;
+# any C0 control character other than tab and newline (0x01-0x08, 0x0B,
+# 0x0C, 0x0D, 0x0E-0x1F) and DEL (0x7F); or a word that begins with `~`
+# or contains `=~` or `:~`. For that last
 # test words are split on blanks and on `|`, `;` and `&`, because bash
 # starts a new word after a separator whether or not a blank follows.
 # What is left can only be words of ordinary characters separated by
@@ -194,6 +196,40 @@
 # `--tb=short`, `a:b` and `x@y` remain available. The denial says `must
 # be literal` and names the supported forms: the Grep and Glob tools,
 # `git commit -F .commit-msg`, `-k WORD`, and that stderr is captured.
+#
+# The control-character refusal (second amendment) is invariant hygiene
+# rather than a closed exec path. Such bytes mostly fail closed already:
+# an exact-match rule rejects a token carrying one (`pytest\r` is not
+# `pytest`), and neither present-flag rule fires on a flag carrying one
+# (`--check\r` is not `--check`, so ruff format stays in write mode and
+# is refused). Refusing them outright makes "words of ordinary
+# characters" literally true, and keeps the transcript that the tripwire
+# relies on faithful: a carriage return can make a logged command line
+# render as something other than what ran. Tab stays allowed because it
+# is one of bash's blanks and this guard splits on it exactly as bash
+# does. The bytes are enumerated, not matched with a locale-dependent
+# range. The refusal is the ordinary literal-mode denial, naming "a
+# control character other than tab". It applies only in literal mode:
+# the auditor's deny-only policy has no relaxation for one to subvert.
+#
+# NUL GATE, IN EVERY MODE (ADR-0018 decision 3, second amendment). Before
+# the empty-command exit and before literal mode, independent of
+# LITERAL_ONLY, a command whose decoded tool_input.command contains a NUL
+# (U+0000) is refused. The reason is the extraction every policy shares:
+# command_str comes from a command substitution, which silently drops NUL
+# bytes, so the string every other rule vets may not be the command the
+# harness runs -- `uv run --locked ruff format<NUL> --check .` would be
+# vetted as read-only. The gate therefore does NOT trust command_str. It
+# runs `jq -e '(.tool_input.command // "") | explode | any(. == 0)'` over
+# the raw payload and reads jq's EXIT STATUS, because any captured string
+# would pass through the same NUL-stripping. Status 1 (a clean false) is
+# the only pass; 0 denies as a NUL; any other status -- a jq error, such
+# as `explode` on a command that is a number, array or object -- denies
+# as "could not be checked". The status is captured explicitly, because
+# `set -e` does not act inside an `if` condition and would otherwise let
+# every jq error through as "no NUL". An absent or null command becomes
+# the empty string, passes, and exits 0 at the empty-command check as
+# before. This is the one refusal the amendment adds to the auditor.
 #
 # Literal mode is what the ADR-0018 rules stand on, and they run only in
 # it:
@@ -691,6 +727,38 @@ esac
 # No command allowlist means this agent is not guarded on Bash at all.
 [[ -n "${ALLOW_CMDS:-}" ]] || exit 0
 
+# --- NUL gate, in every mode (ADR-0018 decision 3, second amendment) ----
+# command_str above came through a command substitution, and bash's
+# command substitution silently drops NUL bytes. So a command such as
+# `uv run --locked ruff format<NUL> --check .` would be vetted here as the
+# read-only `... --check .`, while a harness that hands the shell only the
+# bytes before the NUL would run `ruff format` in write mode. This gate
+# therefore does not trust command_str: it asks jq, over the raw payload,
+# whether the DECODED command contains codepoint 0, and reads the answer
+# from jq's exit status rather than from any captured string. `explode`
+# turns the string into integer codepoints, so the test does not depend
+# on how jq stores a NUL inside a string.
+#
+# Only status 1 (`jq -e` on a clean `false`) passes. Status 0 means a NUL
+# was found. Any other status means the check did not complete -- for
+# example the runtime error `explode` raises on a command that is a
+# number, array or object -- and that fails closed too. The status is
+# captured with `|| nul_status=$?` so that neither `set -e` nor an `if`
+# condition can turn a jq error into "no NUL". `// ""` makes an absent,
+# null or false command the empty string, which passes here and then
+# exits 0 at the empty-command check below, as it always did.
+nul_status=0
+printf '%s' "$input" | jq -e '(.tool_input.command // "") | explode | any(. == 0)' >/dev/null 2>&1 || nul_status=$?
+case "$nul_status" in
+  1) ;;
+  0)
+    deny "Hammertime bash guard: the command contains a NUL byte (U+0000), which cannot be carried through this guard intact — the byte is dropped when the command is read, so the guard cannot vet the command that would actually run. The command is refused."
+    ;;
+  *)
+    deny "Hammertime bash guard: the command could not be checked for a NUL byte (the check ended with status ${nul_status} instead of a result), so the guard cannot confirm that the command it would vet is the command that would run. The command is refused."
+    ;;
+esac
+
 [[ -n "$command_str" ]] || exit 0
 
 # --- Literal mode (ADR-0018 decision 3) ----------------------------------
@@ -727,6 +795,20 @@ LITERAL_FORBIDDEN_NAMES=(
   "a hash sign (#)"
 )
 
+# Every C0 control character except tab (a blank, split on exactly as
+# bash splits on it) and newline (refused on its own above), plus DEL.
+# NUL cannot appear here: the NUL gate has already refused it in every
+# mode, and a bash string cannot hold one. The bytes are enumerated one
+# by one rather than written as a bracket range, whose meaning depends on
+# the locale's collation.
+LITERAL_CONTROL_CHARS=(
+  $'\x01' $'\x02' $'\x03' $'\x04' $'\x05' $'\x06' $'\x07' $'\x08'
+  $'\x0b' $'\x0c' $'\x0d' $'\x0e' $'\x0f'
+  $'\x10' $'\x11' $'\x12' $'\x13' $'\x14' $'\x15' $'\x16' $'\x17'
+  $'\x18' $'\x19' $'\x1a' $'\x1b' $'\x1c' $'\x1d' $'\x1e' $'\x1f'
+  $'\x7f'
+)
+
 deny_literal() {
   deny "Hammertime bash guard: the command contains $1. Commands for this agent must be literal: plain words separated by blanks and by |, ;, && or ||, with no quoting, escaping, expansion, glob, redirection, comment, grouping, backgrounding or second line, so that the words this guard checks are exactly the words each program receives. Supported forms: search with the Grep and Glob tools rather than a quoted pattern; write a commit message, trailers included, to .commit-msg with the Write tool and commit with git commit -F .commit-msg; select tests with -k WORD, a single word; and leave out 2>&1, because the Bash tool already captures stderr."
 }
@@ -740,6 +822,11 @@ check_literal() {
   for (( idx = 0; idx < ${#LITERAL_FORBIDDEN_CHARS[@]}; idx++ )); do
     if [[ "$cmd" == *"${LITERAL_FORBIDDEN_CHARS[idx]}"* ]]; then
       deny_literal "${LITERAL_FORBIDDEN_NAMES[idx]}"
+    fi
+  done
+  for (( idx = 0; idx < ${#LITERAL_CONTROL_CHARS[@]}; idx++ )); do
+    if [[ "$cmd" == *"${LITERAL_CONTROL_CHARS[idx]}"* ]]; then
+      deny_literal "a control character other than tab (for example a carriage return)"
     fi
   done
   if [[ "${cmd//&&/}" == *'&'* ]]; then
