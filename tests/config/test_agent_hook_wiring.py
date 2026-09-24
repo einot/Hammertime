@@ -32,6 +32,14 @@ Every invariant below is derived by globbing `.claude/agents/*.md` and reading
 `.claude/settings.json`, so a newly added agent that can write or execute fails
 these tests without anyone having to remember to update them.
 
+ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+adds the coder's Bash policy. The last section of this module pins it: decision
+14's exact knob values, decision 3's rule that a policy fencing a writing agent
+or enabling a write-capable rule is literal, decision 4's refusal to list generic
+interpreters and writers, and decision 12's Edit/Write globs, which decision 7
+requires to equal the Bash policy's `WRITE_DENY_GLOBS`. Those coder items fail
+until the top-level session applies decision 14 (step W).
+
 See also `.claude/hooks/path-guard.sh` and `.claude/hooks/bash-guard.sh`, whose
 own headers record the probes of the frontmatter wiring, and
 `tests/config/test_path_guard_behavior.py`, which exercises the guard script
@@ -442,6 +450,8 @@ EXPECTED_POLICIES = [
     ("test-author", frozenset({"Read", "Grep", "Glob"}), "DENY_GLOBS", "path-guard.sh"),
     ("test-author", frozenset({"Read", "Grep", "Glob"}), "EXEMPT_GLOBS", "path-guard.sh"),
     ("security-auditor", frozenset({"Bash"}), "ALLOW_CMDS", "bash-guard.sh"),
+    # ADR-0018 decision 14: the coder's Bash policy.
+    ("coder", frozenset({"Bash"}), "ALLOW_CMDS", "bash-guard.sh"),
 ]
 
 
@@ -480,3 +490,240 @@ def test_expected_policy_is_present(
         f"matching {sorted(tools)}, running {script_name} and setting a non-empty "
         f"{variable}; found none.\npolicies present: {present}"
     )
+
+
+# --- ADR-0018: bash-guard.sh policies and the coder's fences -------------
+
+BASH_GUARD = "bash-guard.sh"
+PATH_GUARD = "path-guard.sh"
+
+# Decision 14's coder Bash policy, knob by knob. Compared as sets of words.
+ADR_0018_CODER_BASH_POLICY = {
+    "ALLOW_CMDS": "ls cat head tail wc stat find grep rg jq diff cmp pwd git uv make",
+    "ALLOW_GIT_SUBCMDS": "status diff log show rev-parse ls-files add commit merge",
+    "ALLOW_UV_RUN_TARGETS": "pytest ruff",
+    "ALLOW_MAKE_TARGETS": "typecheck",
+    "DENY_ADVICE": "stop-and-report",
+    "LITERAL_ONLY": "1",
+}
+
+# Decision 12's glob list: the coder's Edit/Write DENY_GLOBS after step W.
+ADR_0018_DECISION_12_GLOBS = frozenset(
+    [
+        "tests/*",
+        "*/tests/*",
+        "docs/spec/*",
+        "docs/adr/*",
+        "docs/protocol/*",
+        "schemas/*",
+        ".claude/*",
+        "CLAUDE.md",
+        "*/CLAUDE.md",
+        "CLAUDE.local.md",
+        "*/CLAUDE.local.md",
+        ".mcp.json",
+        "/*",
+        "../*",
+        "*/../*",
+        ".git",
+        ".git/*",
+        "*/.git",
+        "*/.git/*",
+        ".venv/*",
+        "*/.venv/*",
+        "__pycache__/*",
+        "*/__pycache__/*",
+        "conftest.py",
+        "*/conftest.py",
+        "test_*.py",
+        "*/test_*.py",
+        "*_test.py",
+        "test*.txt",
+        "*/test*.txt",
+        "pytest.toml",
+        "*/pytest.toml",
+        ".pytest.toml",
+        "*/.pytest.toml",
+        "pytest.ini",
+        "*/pytest.ini",
+        ".pytest.ini",
+        "*/.pytest.ini",
+        "tox.ini",
+        "*/tox.ini",
+        "setup.cfg",
+        "*/setup.cfg",
+        "mypy.ini",
+        "*/mypy.ini",
+        ".mypy.ini",
+        "*/.mypy.ini",
+        ".ruff.toml",
+        "*/.ruff.toml",
+        "*/ruff.toml",
+        "uv.toml",
+        "*/uv.toml",
+        ".python-version",
+        "*/.python-version",
+        "sitecustomize.py",
+        "*/sitecustomize.py",
+        "usercustomize.py",
+        "*/usercustomize.py",
+        "pytest",
+        "pytest/*",
+        "ruff",
+        "ruff/*",
+        "mypy",
+        "mypy/*",
+        "GNUmakefile",
+        "makefile",
+        "uv.lock",
+    ]
+)
+
+# Commands that no bash-guard.sh policy may list: interpreters, launchers,
+# network clients, container tooling and file writers (brief T1, group L).
+FORBIDDEN_BASH_COMMANDS = frozenset(
+    [
+        "python",
+        "python3",
+        "pip",
+        "pip3",
+        "uvx",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "env",
+        "xargs",
+        "awk",
+        "perl",
+        "ruby",
+        "curl",
+        "wget",
+        "nc",
+        "ssh",
+        "scp",
+        "rsync",
+        "docker",
+        "npm",
+        "npx",
+        "tee",
+        "cp",
+        "mv",
+        "rm",
+        "chmod",
+        "ln",
+        "dd",
+        "cd",
+        "timeout",
+    ]
+)
+
+# Settings that turn on a rule only literal mode may run (decision 3).
+LITERAL_ONLY_COMMANDS = frozenset({"uv", "make"})
+LITERAL_ONLY_GIT_SUBCMDS = frozenset({"add", "commit", "merge"})
+
+
+def bash_guard_policies() -> list[HookCommand]:
+    return [command for command in HOOK_COMMANDS if Path(command.script).name == BASH_GUARD]
+
+
+def words(command: HookCommand, variable: str) -> frozenset[str]:
+    return frozenset(command.env.get(variable, "").split())
+
+
+def coder_policy(tool: str, script_name: str) -> HookCommand:
+    matching = [
+        command
+        for command in HOOK_COMMANDS
+        if "coder" in command.scoped_agents
+        and tool in command.matched_tools
+        and Path(command.script).name == script_name
+    ]
+    assert len(matching) == 1, (
+        f"expected exactly one PreToolUse policy in {SETTINGS_PATH} scoped to 'coder', "
+        f"matching {tool} and running {script_name} (ADR-0018 decision 14); found "
+        f"{len(matching)}"
+    )
+    return matching[0]
+
+
+def test_bash_guard_policies_are_found() -> None:
+    """The bash-guard invariants below must not pass vacuously."""
+    assert bash_guard_policies(), f"no PreToolUse policy in {SETTINGS_PATH} runs {BASH_GUARD}"
+
+
+def test_bash_policy_for_an_agent_that_writes_is_literal() -> None:
+    """ADR-0018 decision 3: a Bash policy fencing an agent with Edit or Write
+    must set LITERAL_ONLY='1'. Without it, a written file named like an option
+    reaches a tool through a glob (Context item 2)."""
+    writers = {agent.name for agent in AGENTS if {"Edit", "Write"} & set(agent.tools)}
+    offenders = [
+        f"{sorted(command.scoped_agents)}: {command.command}"
+        for command in bash_guard_policies()
+        if command.scoped_agents & writers and command.env.get("LITERAL_ONLY") != "1"
+    ]
+    assert not offenders, (
+        "these bash-guard.sh policies fence an agent that can Edit or Write but do not "
+        f"set LITERAL_ONLY='1' (ADR-0018 decision 3): {offenders}"
+    )
+
+
+def test_bash_policy_enabling_a_literal_only_rule_is_literal() -> None:
+    """ADR-0018 decision 3: every uv and make rule, and git add/commit/merge,
+    run only in literal mode."""
+    offenders = [
+        command.command
+        for command in bash_guard_policies()
+        if (
+            words(command, "ALLOW_CMDS") & LITERAL_ONLY_COMMANDS
+            or words(command, "ALLOW_GIT_SUBCMDS") & LITERAL_ONLY_GIT_SUBCMDS
+        )
+        and command.env.get("LITERAL_ONLY") != "1"
+    ]
+    assert not offenders, (
+        "these bash-guard.sh policies allow uv, make, or git add/commit/merge without "
+        f"LITERAL_ONLY='1' (ADR-0018 decision 3): {offenders}"
+    )
+
+
+def test_no_bash_policy_allows_an_interpreter_or_a_writer() -> None:
+    """ADR-0018 decision 4: listing any of these voids the guard."""
+    offenders = {
+        command.command: sorted(words(command, "ALLOW_CMDS") & FORBIDDEN_BASH_COMMANDS)
+        for command in bash_guard_policies()
+        if words(command, "ALLOW_CMDS") & FORBIDDEN_BASH_COMMANDS
+    }
+    assert not offenders, f"bash-guard.sh policies list forbidden commands: {offenders}"
+
+
+@pytest.mark.parametrize("variable", sorted(ADR_0018_CODER_BASH_POLICY))
+def test_coder_bash_policy_has_the_adr_0018_values(variable: str) -> None:
+    command = coder_policy("Bash", BASH_GUARD)
+    expected = frozenset(ADR_0018_CODER_BASH_POLICY[variable].split())
+    assert words(command, variable) == expected, (
+        f"the coder's Bash policy sets {variable}={command.env.get(variable)!r}; ADR-0018 "
+        f"decision 14 says {ADR_0018_CODER_BASH_POLICY[variable]!r}"
+    )
+
+
+def test_coder_write_deny_globs_equal_its_edit_write_deny_globs() -> None:
+    """ADR-0018 decision 7: a write launched from Bash respects the same fence
+    as a Write, so the two copies of the list must be equal."""
+    bash = words(coder_policy("Bash", BASH_GUARD), "WRITE_DENY_GLOBS")
+    edit_write = words(coder_policy("Write", PATH_GUARD), "DENY_GLOBS")
+    assert bash, "the coder's Bash policy sets no WRITE_DENY_GLOBS"
+    assert bash == edit_write, (
+        "the coder's Bash WRITE_DENY_GLOBS and Edit|Write DENY_GLOBS differ.\n"
+        f"only in WRITE_DENY_GLOBS: {sorted(bash - edit_write)}\n"
+        f"only in DENY_GLOBS: {sorted(edit_write - bash)}"
+    )
+
+
+def test_coder_edit_write_deny_globs_cover_decision_12() -> None:
+    command = coder_policy("Write", PATH_GUARD)
+    assert {"Edit", "Write"} <= command.matched_tools, command.matcher
+    missing = ADR_0018_DECISION_12_GLOBS - words(command, "DENY_GLOBS")
+    assert not missing, (
+        f"the coder's Edit|Write DENY_GLOBS lacks ADR-0018 decision 12's {sorted(missing)}"
+    )
+    assert ".claude/*" in words(command, "DENY_GLOBS")

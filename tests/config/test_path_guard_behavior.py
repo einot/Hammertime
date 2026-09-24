@@ -26,6 +26,13 @@ The contract (see the script's own header, and issue #102):
 The last group of tests runs the policies as they are actually configured in
 `.claude/settings.json`, so a typo in a glob list fails here even though the
 wiring tests see a perfectly well-formed entry.
+
+ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+decision 12 widens the coder's Edit/Write fence: agent configuration and
+governance, git's internals, ignored executed state (`.venv/`, `__pycache__/`),
+files that tools find by name, and `uv.lock`. The coder cases added to
+`WRITE_CASES` and the worktree cases below encode it; they fail until the
+top-level session applies decision 14 (step W).
 """
 
 import json
@@ -436,6 +443,56 @@ WRITE_CASES = [
     ("test-author", TESTKIT_FILE, True),
     ("test-author", IMPLEMENTATION_FILE, False),
     ("test-author", SPEC_FILE, False),
+    # ADR-0018 decision 12 (a): agent configuration and governance.
+    ("coder", ".claude/settings.json", False),
+    ("coder", ".claude/hooks/bash-guard.sh", False),
+    ("coder", ".claude/agents/coder.md", False),
+    ("coder", "CLAUDE.md", False),
+    ("coder", "services/trie/CLAUDE.md", False),
+    ("coder", ".mcp.json", False),
+    # Decision 12 (b): git's internals and executed state git does not show.
+    ("coder", ".git/config", False),
+    ("coder", ".venv/lib/python3.12/site-packages/x.pth", False),
+    ("coder", "services/trie/src/hammertime/trie/__pycache__/x.cpython-312.pyc", False),
+    # Decision 12 (c): pytest collection and conftest loading.
+    ("coder", "packages/hammertime-core/conftest.py", False),
+    ("coder", "packages/hammertime-core/src/hammertime/core/test_scratch.py", False),
+    ("coder", "packages/hammertime-core/src/hammertime/core/scratch_test.py", False),
+    ("coder", "test_notes.txt", False),
+    ("coder", "services/trie/test_notes.txt", False),
+    # Decision 12 (c): tool configuration found by name.
+    ("coder", "pytest.ini", False),
+    ("coder", "pytest.toml", False),
+    ("coder", ".pytest.ini", False),
+    ("coder", "services/trie/tox.ini", False),
+    ("coder", "services/trie/setup.cfg", False),
+    ("coder", "mypy.ini", False),
+    ("coder", ".mypy.ini", False),
+    ("coder", "services/trie/ruff.toml", False),
+    ("coder", "uv.toml", False),
+    ("coder", ".python-version", False),
+    ("coder", "packages/hammertime-core/src/sitecustomize.py", False),
+    # Decision 12 (c): entries that shadow a tool or the Makefile.
+    ("coder", "pytest/__main__.py", False),
+    ("coder", "ruff/__main__.py", False),
+    ("coder", "mypy/__main__.py", False),
+    ("coder", "GNUmakefile", False),
+    ("coder", "makefile", False),
+    # Decision 12 (d), and (b)'s `/*` for a path outside both checkouts, passed
+    # as given (joining an absolute path onto REPO_ROOT leaves it unchanged).
+    ("coder", "uv.lock", False),
+    ("coder", "/tmp/x.txt", False),
+    # Decision 12: what the coder legitimately edits stays writable.
+    ("coder", "Makefile", True),
+    ("coder", "pyproject.toml", True),
+    ("coder", "packages/hammertime-core/pyproject.toml", True),
+    ("coder", "ruff.toml", True),
+    ("coder", ".commit-msg", True),
+    ("coder", "deploy/docker-compose.yml", True),
+    ("coder", "README.md", True),
+    ("coder", "CHANGES", True),
+    ("coder", ".github/workflows/ci.yml", True),
+    ("coder", "services/trie/src/hammertime/trie/query/app.py", True),
 ]
 
 
@@ -458,6 +515,46 @@ def test_configured_write_policy(agent_name: str, path: str, allowed: bool) -> N
         assert_allowed(result, f"{agent_name} writing {path}")
     else:
         assert_denied(result, f"{agent_name} writing {path}")
+
+
+# ADR-0018 decision 12, from inside a worktree: `cwd` is the coder's worktree and
+# CLAUDE_PROJECT_DIR the main checkout. `{worktree}` and `{repo}` are filled in
+# with tmp_path and REPO_ROOT.
+WORKTREE_WRITE_CASES = [
+    ("{worktree}/.claude/settings.json", False),
+    ("{repo}/.claude/settings.json", False),
+    ("{repo}/.claude/worktrees/other/services/x.py", False),
+    ("{worktree}/../x.txt", False),
+    ("{worktree}/services/x.py", True),
+]
+
+
+@pytest.mark.parametrize(
+    ("template", "allowed"),
+    WORKTREE_WRITE_CASES,
+    ids=[f"{'allow' if ok else 'deny'}-{template}" for template, ok in WORKTREE_WRITE_CASES],
+)
+def test_configured_coder_write_policy_from_a_worktree(
+    tmp_path: Path, template: str, allowed: bool
+) -> None:
+    """The coder's fence holds for its own worktree, the main checkout's
+    `.claude/`, other agents' worktrees, and a traversal the Write tool did not
+    normalise (`../*`)."""
+    path = template.format(worktree=tmp_path, repo=REPO_ROOT)
+    policy, script = configured_policy("coder", frozenset({"Edit", "Write"}))
+    result = run_guard(
+        "Write",
+        policy=policy,
+        file_path=path,
+        agent_type="coder",
+        cwd=str(tmp_path),
+        project_dir=str(REPO_ROOT),
+        script=script,
+    )
+    if allowed:
+        assert_allowed(result, f"coder writing {path} from a worktree")
+    else:
+        assert_denied(result, f"coder writing {path} from a worktree")
 
 
 READ_CASES = [
