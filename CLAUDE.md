@@ -163,8 +163,15 @@ session may finish and merge PRs itself — resolving merge conflicts
 (including regenerating lockfiles with the repo's own tooling, never by
 hand), pushing the resolution, and merging — without delegating that work.
 This does not extend to designing the change being merged, only to landing
-it. Before merging, the full suite must pass (`uv run pytest -q`, `ruff
-check`, `ruff format --check`, `make typecheck`). A bare `mypy` names no
+it. It also covers regenerating `uv.lock` with `uv lock` when landing a
+dependency change a brief asked for: coder cannot run `uv lock` or edit
+`uv.lock` under ADR-0018, and every `uv run --locked` fails until the
+lockfile matches (owner's decision, 2026-09-24). ADR-0012 decision 6's
+licence review still applies to the dependency itself. Before merging, the
+full suite must pass (`uv run --locked pytest -q`, `uv run --locked ruff
+check .`, `uv run --locked ruff format --check .`, `make typecheck`).
+`--locked` is required everywhere, so an unapproved dependency change fails
+loudly instead of re-locking (owner's decision, 2026-09-24). A bare `mypy` names no
 targets and exits 2 without checking anything; `make typecheck` runs it
 over `packages services tools`. There is no longer a standing
 exception to that bar — the `integration` CI gap that used to be one is now
