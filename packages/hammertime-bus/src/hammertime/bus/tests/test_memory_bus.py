@@ -92,6 +92,13 @@ non-empty log, and it is also an empty log's `end_offset`" (and the dated
 sentence in the `hammertime.bus.memory` paragraph; Amendment 10 assumption
 136: "no purge or retention is added to the memory bus").
 
+Amendment 13 (2026-09-24; ADR-0017 Amendment 3 ruling 1) added
+`last_value` to the `MessageBus` protocol, pinned in `TestLastValue`:
+"`InMemoryBus.last_value` is the value of the last record in the topic's
+log. It is `None` for an empty log, and for a topic never published to,
+registered or not. A publish the bus drops as a duplicate does not change
+it."
+
 Amendment 3 (2026-09-21) ruling (a) appended one more sentence to the `ack`
 paragraph, pinned in `TestAckPrecedence` as well: "Closed is checked first
 and is absorbing ...: an instance whose `close()` ran before it ever
@@ -1292,6 +1299,113 @@ class TestFirstOffset:
         bus: MessageBus = InMemoryBus()
 
         assert await bus.first_offset(TOPIC) == 0
+
+
+class TestLastValue:
+    """Decision 3 as amended by Amendment 13 (ADR-0017 Amendment 3 ruling 1):
+    "`MessageBus.last_value(topic)` ... is the value of the message the log
+    holds at offset `end_offset(topic) - 1`, and `None` when it holds none
+    there". "`InMemoryBus.last_value` is the value of the last record in the
+    topic's log. It is `None` for an empty log, and for a topic never
+    published to, registered or not. A publish the bus drops as a duplicate
+    does not change it." "An empty value is `b""`, not `None`." It "returns
+    the value only, and its caller judges it"; it is a read, and moves no
+    position."""
+
+    def test_last_value_is_on_the_message_bus_protocol(self) -> None:
+        # Amendment 13: "It is on the protocol, and not only on the two
+        # classes"; `InMemoryBus` still satisfies the widened protocol.
+        assert hasattr(MessageBus, "last_value")
+        assert isinstance(InMemoryBus(), MessageBus)
+
+    async def test_it_is_awaitable(self) -> None:
+        # Amendment 13: "`async` on both implementations".
+        bus = InMemoryBus()
+
+        pending = bus.last_value(TOPIC)
+
+        assert inspect.isawaitable(pending)
+        assert await pending is None
+
+    async def test_it_is_none_for_a_registered_topic_never_published_to(self) -> None:
+        # "`None` ... for a topic never published to, registered or not":
+        # `hammertime.prefix-stats.v1` is a registered topic (ADR-0017
+        # Amendment 2 ruling 8).
+        bus: MessageBus = InMemoryBus()
+
+        assert await bus.last_value("hammertime.prefix-stats.v1") is None
+
+    async def test_it_is_none_for_an_unregistered_topic_never_published_to(self) -> None:
+        # "registered or not": `InMemoryBus` raises no `KeyError`.
+        bus = InMemoryBus()
+
+        assert await bus.last_value("test.never-published.v1") is None
+
+    async def test_it_is_the_last_appended_value(self) -> None:
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        assert await bus.last_value(TOPIC) == b"third"
+
+        await bus.producer().publish(TOPIC, key="k4", value=b"fourth", message_id="id-4")
+
+        assert await bus.last_value(TOPIC) == b"fourth"
+
+    async def test_a_publish_to_another_topic_does_not_change_it(self) -> None:
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        await bus.producer().publish(OTHER_TOPIC, key="k", value=b"elsewhere", message_id="o-1")
+
+        assert await bus.last_value(TOPIC) == b"third"
+        assert await bus.last_value(OTHER_TOPIC) == b"elsewhere"
+
+    async def test_a_publish_dropped_as_a_duplicate_does_not_change_it(self) -> None:
+        # "A publish the bus drops as a duplicate does not change it" -- even
+        # when the duplicate carries a different body (dedup is by id).
+        bus = InMemoryBus()
+        producer = bus.producer()
+        await producer.publish(TOPIC, key="k1", value=b"first", message_id="event-1")
+        await producer.publish(TOPIC, key="k2", value=b"second", message_id="event-2")
+
+        await producer.publish(TOPIC, key="k1", value=b"replaced?", message_id="event-1")
+
+        assert await bus.last_value(TOPIC) == b"second"
+        assert await bus.end_offset(TOPIC) == 2
+
+    async def test_an_empty_value_is_empty_bytes_not_none(self) -> None:
+        # "An empty value is `b""`, not `None`."
+        bus = InMemoryBus()
+        await bus.producer().publish(TOPIC, key="k1", value=b"", message_id="empty-1")
+
+        value = await bus.last_value(TOPIC)
+
+        assert value is not None
+        assert value == b""
+
+    async def test_reading_it_moves_nothing(self) -> None:
+        # A read of the value only: a positional consumer from 0 afterwards is
+        # still handed every record, and the log's bounds are unchanged.
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        await bus.last_value(TOPIC)
+        await bus.last_value(TOPIC)
+
+        consumer = bus.consumer("replayer")
+        replayed = await _take(await consumer.subscribe(TOPIC, start_offset=0), 3)
+        assert [message.value for message in replayed] == [b"first", b"second", b"third"]
+        assert await bus.end_offset(TOPIC) == 3
+        assert await bus.first_offset(TOPIC) == 0
+
+    async def test_reading_it_does_not_disturb_a_durable_group(self) -> None:
+        bus = InMemoryBus()
+        await _publish_three(bus)
+
+        await bus.last_value(TOPIC)
+
+        durable = await _read_group(bus, GROUP, TOPIC, 3)
+        assert [message.value for message in durable] == [b"first", b"second", b"third"]
 
 
 class TestTheInterfaceAfterAdr0013:

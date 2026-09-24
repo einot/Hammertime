@@ -250,6 +250,9 @@ class MessageBus(Protocol):
     the interface rather than as `InMemoryBus | NatsBus`. `first_offset`
     joins it so that a positional reader can tell whether the log still
     holds anything below the end it read (ADR-0013 Amendment 10).
+    `last_value` joins it so that the trie can read the last message of the
+    prefix-stats log at `start()` (ADR-0013 Amendment 13, ADR-0017
+    Amendment 3 ruling 1).
     """
 
     def producer(self) -> Producer: ...
@@ -293,5 +296,27 @@ class MessageBus(Protocol):
         may exceed it. `0` for every topic on `InMemoryBus`, which never
         discards. `async` on every implementation (ADR-0013 decision 3,
         Amendment 10).
+        """
+        ...
+
+    async def last_value(self, topic: str) -> bytes | None:
+        """The value of the message the log holds at `end_offset(topic) - 1`.
+
+        That is the message appended last, while the log still holds it.
+        `None` when the log holds no message there: nothing was ever
+        appended, the last message aged out or was purged, or it was deleted
+        on its own. An empty value is `b""`, not `None`.
+
+        It raises what `end_offset` raises, in the same order: `KeyError`
+        for an unregistered topic on `NatsBus`, whether or not the bus has
+        started, and `RuntimeError("NatsBus is not started")` for a
+        registered topic before `start()`. `InMemoryBus` raises neither. Any
+        other error from the broker propagates, except that
+        `NatsBus.last_value` answers a `nats.js.errors.NotFoundError` from
+        its read of the message itself with `None`.
+
+        It does not check the message's subject or key; it returns the value
+        only, and its caller judges it. It moves no read position. `async` on
+        every implementation (ADR-0013 decision 3, Amendment 13).
         """
         ...

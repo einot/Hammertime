@@ -1,7 +1,7 @@
 """Service settings: query bind, bus wiring, detection config path, address families served.
 
-Spec: section 33, section 35, section 47; ADR-0017 decision 11, ADR-0009
-decision 2.
+Spec: section 33, section 35, section 47; ADR-0017 decision 11 and Amendment 2
+ruling 1, ADR-0009 decision 2.
 
 `load_settings(env)` follows ADR-0009 decision 2's pattern: `env=None` means
 `os.environ`, a bad value is a `ValueError` naming the variable (so
@@ -13,10 +13,16 @@ values is reported is deliberately not pinned.
 trie and one attribute record map each (section 35's separate roots). The
 default is `ipv4`, section 43's first item.
 
-Not read in slice 1: `HAMMERTIME_STORE_KIND` and `HAMMERTIME_REDIS_URL` (the
-trie has no store), `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` (slice 2), and
-`HAMMERTIME_TRIE_SNAPSHOT_DIR` / `HAMMERTIME_TRIE_SNAPSHOT_INTERVAL_S` (the
-snapshot epic adds them together with the code that reads them).
+`HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` (default 8, 0 to 32) and
+`HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6` (default 104, 0 to 128) are the
+shortest IPv4 and IPv6 prefixes reported in `PrefixStatsChanged` (ADR-0017
+Amendment 2 ruling 1). Each is read with `int()` and checked against its
+range, both ends included, whatever `HAMMERTIME_TRIE_FAMILIES` holds; the
+value for a family the process does not serve is not used.
+
+Not read: `HAMMERTIME_STORE_KIND` and `HAMMERTIME_REDIS_URL` (the trie has no
+store), and `HAMMERTIME_TRIE_SNAPSHOT_DIR` / `HAMMERTIME_TRIE_SNAPSHOT_INTERVAL_S`
+(the snapshot epic adds them together with the code that reads them).
 """
 
 import os
@@ -33,6 +39,8 @@ _DEFAULT_BUS_KIND = "nats"
 _DEFAULT_BUS_BROKERS = "nats://localhost:4222"
 _DEFAULT_FAMILIES = "ipv4"
 _DEFAULT_CONFIG_POLL_INTERVAL_S = 1.0
+_DEFAULT_MIN_PREFIX_LENGTH = 8
+_DEFAULT_MIN_PREFIX_LENGTH_IPV6 = 104
 
 _BIND_KEY = "HAMMERTIME_TRIE_QUERY_BIND"
 _CONFIG_PATH_KEY = "HAMMERTIME_CONFIG_PATH"
@@ -40,6 +48,8 @@ _BUS_KIND_KEY = "HAMMERTIME_BUS_KIND"
 _BUS_BROKERS_KEY = "HAMMERTIME_BUS_BROKERS"
 _FAMILIES_KEY = "HAMMERTIME_TRIE_FAMILIES"
 _CONFIG_POLL_INTERVAL_KEY = "HAMMERTIME_CONFIG_POLL_INTERVAL_S"
+_MIN_PREFIX_LENGTH_KEY = "HAMMERTIME_TRIE_MIN_PREFIX_LENGTH"
+_MIN_PREFIX_LENGTH_IPV6_KEY = "HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6"
 
 _ALLOWED_BUS_KINDS = frozenset({"nats", "memory"})
 _FAMILY_NAMES: Mapping[str, AddressFamily] = {family.value: family for family in AddressFamily}
@@ -65,6 +75,12 @@ class TrieSettings:
     #: HAMMERTIME_CONFIG_POLL_INTERVAL_S: how often the detection config
     #: document is re-read (ADR-0009 decision 6, spec section 47.3).
     config_poll_interval_s: float = _DEFAULT_CONFIG_POLL_INTERVAL_S
+    #: HAMMERTIME_TRIE_MIN_PREFIX_LENGTH: the shortest IPv4 prefix reported in
+    #: PrefixStatsChanged, 0 to 32 (ADR-0017 Amendment 2 ruling 1).
+    min_prefix_length: int = _DEFAULT_MIN_PREFIX_LENGTH
+    #: HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6: the shortest IPv6 prefix
+    #: reported in PrefixStatsChanged, 0 to 128.
+    min_prefix_length_ipv6: int = _DEFAULT_MIN_PREFIX_LENGTH_IPV6
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> TrieSettings:
@@ -89,6 +105,16 @@ def load_settings(env: Mapping[str, str] | None = None) -> TrieSettings:
         config_poll_interval_s=_parse_positive_number(
             _CONFIG_POLL_INTERVAL_KEY,
             source.get(_CONFIG_POLL_INTERVAL_KEY, str(_DEFAULT_CONFIG_POLL_INTERVAL_S)),
+        ),
+        min_prefix_length=_parse_int_in_range(
+            _MIN_PREFIX_LENGTH_KEY,
+            source.get(_MIN_PREFIX_LENGTH_KEY, str(_DEFAULT_MIN_PREFIX_LENGTH)),
+            maximum=AddressFamily.IPV4.bit_length,
+        ),
+        min_prefix_length_ipv6=_parse_int_in_range(
+            _MIN_PREFIX_LENGTH_IPV6_KEY,
+            source.get(_MIN_PREFIX_LENGTH_IPV6_KEY, str(_DEFAULT_MIN_PREFIX_LENGTH_IPV6)),
+            maximum=AddressFamily.IPV6.bit_length,
         ),
     )
 
@@ -143,6 +169,17 @@ def _parse_positive_number(name: str, value: str) -> float:
         raise ValueError(f"{name} must be a number, got {value!r}") from exc
     if not parsed > 0:
         raise ValueError(f"{name} must be a positive number, got {parsed}")
+    return parsed
+
+
+def _parse_int_in_range(name: str, value: str, *, maximum: int, minimum: int = 0) -> int:
+    """`int(value)`, then `minimum <= parsed <= maximum`, else a `ValueError` naming `name`."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be from {minimum} to {maximum}, got {parsed}")
     return parsed
 
 

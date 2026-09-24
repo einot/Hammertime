@@ -125,6 +125,14 @@ name. ASSUMPTIONS for this class:
    topic before `start()`." This is the order decision 3 already gave
    `NatsConsumer.subscribe()` ("raised with the other argument checks before
    the broker is contacted", Amendment 1 C5.6).
+
+`NatsBus.last_value` without a server (`TestNatsBusLastValue`) is written from
+ADR-0013 Amendment 13 and decision 3's dated paragraph of 2026-09-24, and
+reached, as ADR-0017 Amendment 3's Test seams says, "like the offset reads,
+through a stub JetStream context whose `stream_info` and `get_msg` answer what
+the test chooses". The stub is installed on `_js` (ASSUMPTION 5). Whether the
+stream name reaches `get_msg` positionally or as `stream_name=` is not pinned,
+and the stub accepts both.
 """
 
 import copy
@@ -979,3 +987,205 @@ class TestNatsBusOffsetReads:
         await _read(_bus_with(js), method, spec.name)
 
         assert js.names == [spec.stream_name]
+
+
+# --------------------------------------------------------------------------
+# NatsBus.last_value: stream_info(...).state, then get_msg at state.last_seq
+# --------------------------------------------------------------------------
+
+
+class _Msg:
+    """What `get_msg` answers: an object with `data: bytes | None`, as nats-py's
+    `RawStreamMsg.data: Optional[bytes]` (ADR-0013 Amendment 13, Sources)."""
+
+    def __init__(self, data: bytes | None) -> None:
+        self.data = data
+
+
+class _BrokerBoom(Exception):
+    """An error from the broker that is not `NotFoundError`: it must propagate."""
+
+
+class _LastValueJetStream:
+    """A stub JetStream context for `NatsBus.last_value`: `stream_info(name)` answers one
+    `StreamState` (or raises `info_error`), and `get_msg(...)` answers `_Msg(data)` (or
+    raises `get_error`), recording every call with its arguments.
+
+    `get_msg` accepts the stream name positionally or as `stream_name=`, since
+    Amendment 13 does not pin which, and records every keyword it receives so a
+    test can check that the default form was used."""
+
+    def __init__(
+        self,
+        state: api.StreamState,
+        *,
+        data: bytes | None = b"payload",
+        get_error: BaseException | None = None,
+        info_error: BaseException | None = None,
+    ) -> None:
+        self.state = state
+        self.data = data
+        self.get_error = get_error
+        self.info_error = info_error
+        self.names: list[str] = []
+        self.get_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def stream_info(self, name: str | None = None, **params: Any) -> _StateInfo:
+        resolved = name if name is not None else params["name"]
+        self.names.append(resolved)
+        if self.info_error is not None:
+            raise self.info_error
+        return _StateInfo(self.state)
+
+    async def get_msg(self, stream_name: str | None = None, *args: Any, **params: Any) -> _Msg:
+        # nats-py: `get_msg(stream_name, seq=None, subject=None, direct=False,
+        # next=False)`. A positional `seq` after the name is folded into the
+        # keywords so the assertions read one shape.
+        if args:
+            params = {"seq": args[0], **params}
+        resolved = stream_name if stream_name is not None else params.pop("stream_name")
+        self.get_calls.append((resolved, dict(params)))
+        if self.get_error is not None:
+            raise self.get_error
+        return _Msg(self.data)
+
+
+def _bus_with_last(js: _LastValueJetStream) -> NatsBus:
+    """An unstarted `NatsBus` with the stub installed on `_js` (ASSUMPTION 5)."""
+
+    bus = NatsBus(_SERVERS)
+    cast(Any, bus)._js = js
+    return bus
+
+
+class TestNatsBusLastValue:
+    """ADR-0013 decision 3 as amended by Amendment 13 (ADR-0017 Amendment 3 ruling
+    1). "`MessageBus.last_value(topic)` ... is the value of the message the log
+    holds at offset `end_offset(topic) - 1`, and `None` when it holds none
+    there." "It raises what `end_offset` raises, in the same order": `KeyError`
+    for an unregistered topic "whether or not the bus has started", and
+    `RuntimeError("NatsBus is not started")` for a registered topic before
+    `start()`. "`NatsBus.last_value` reads `stream_info(<stream name>).state`, as
+    `end_offset` does. When `state.messages` is `0` it returns `None` and sends
+    no second request. Otherwise it reads the message at `state.last_seq` with
+    the JetStream context's `get_msg(<stream name>, seq=state.last_seq)`, in its
+    default form ... The direct form is not available ... A
+    `nats.js.errors.NotFoundError` from that read ... returns `None`. The result
+    is the message's data, or `b""` when it carries none." "Any other error from
+    the broker propagates, except the one named below." ADR-0017 decision 7, as
+    amended 2026-09-24: an exception from `bus.last_value` propagates out of
+    `start()`. Reached through a stub context, as ADR-0017 Amendment 3's Test
+    seams says ("like the offset reads")."""
+
+    async def test_an_unregistered_topic_is_a_key_error_before_start(self) -> None:
+        bus = NatsBus(_SERVERS)
+
+        with pytest.raises(KeyError):
+            await bus.last_value(_UNREGISTERED_TOPIC)
+
+    async def test_an_unregistered_topic_is_a_key_error_with_a_jetstream_context(self) -> None:
+        js = _LastValueJetStream(_state(messages=3, first_seq=1, last_seq=3))
+
+        with pytest.raises(KeyError):
+            await _bus_with_last(js).last_value(_UNREGISTERED_TOPIC)
+
+        assert js.names == []
+        assert js.get_calls == []
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    async def test_a_registered_topic_before_start_is_a_runtime_error(
+        self, spec: TopicSpec
+    ) -> None:
+        bus = NatsBus(_SERVERS)
+
+        with pytest.raises(RuntimeError):
+            await bus.last_value(spec.name)
+
+    @pytest.mark.parametrize(
+        ("first_seq", "last_seq"),
+        [
+            pytest.param(0, 0, id="never-written"),
+            pytest.param(21, 20, id="emptied"),
+        ],
+    )
+    async def test_no_message_is_none_and_no_second_request(
+        self, first_seq: int, last_seq: int
+    ) -> None:
+        # "When `state.messages` is `0` it returns `None` and sends no second
+        # request."
+        js = _LastValueJetStream(_state(messages=0, first_seq=first_seq, last_seq=last_seq))
+
+        result = await _bus_with_last(js).last_value(PREFIX_STATS.name)
+
+        assert result is None
+        assert js.names == [PREFIX_STATS.stream_name]
+        assert js.get_calls == []
+
+    @pytest.mark.parametrize("spec", list(all_topics()), ids=[s.name for s in all_topics()])
+    async def test_it_reads_the_message_at_last_seq_in_the_default_form(
+        self, spec: TopicSpec
+    ) -> None:
+        # "`get_msg(<stream name>, seq=state.last_seq)`, in its default form:
+        # the `STREAM.MSG.GET` API request. The direct form is not available":
+        # no truthy `direct`, no `subject`, no `next`.
+        js = _LastValueJetStream(_state(messages=5, first_seq=16, last_seq=20), data=b"last")
+
+        result = await _bus_with_last(js).last_value(spec.name)
+
+        assert result == b"last"
+        assert js.names == [spec.stream_name]
+        assert len(js.get_calls) == 1
+        stream_name, params = js.get_calls[0]
+        assert stream_name == spec.stream_name
+        assert params.get("seq") == 20
+        assert not params.get("direct")
+        assert params.get("subject") is None
+        assert not params.get("next")
+
+    async def test_a_not_found_error_from_get_msg_is_none(self) -> None:
+        # "A `nats.js.errors.NotFoundError` from that read, meaning no message
+        # at that sequence, returns `None`" (assumption 148): the last
+        # message was deleted on its own.
+        js = _LastValueJetStream(
+            _state(messages=4, first_seq=16, last_seq=20),
+            get_error=nats.js.errors.NotFoundError(),
+        )
+
+        assert await _bus_with_last(js).last_value(PREFIX_STATS.name) is None
+        assert len(js.get_calls) == 1
+
+    async def test_a_message_with_no_data_is_empty_bytes(self) -> None:
+        # "The result is the message's data, or `b""` when it carries none."
+        js = _LastValueJetStream(_state(messages=1, first_seq=7, last_seq=7), data=None)
+
+        result = await _bus_with_last(js).last_value(PREFIX_STATS.name)
+
+        assert result is not None
+        assert result == b""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(_BrokerBoom("broker says no"), id="other-exception"),
+            pytest.param(TimeoutError(), id="timeout"),
+        ],
+    )
+    async def test_any_other_error_from_get_msg_propagates(self, error: Exception) -> None:
+        # "Any other error from the broker propagates, except the one named".
+        js = _LastValueJetStream(_state(messages=5, first_seq=16, last_seq=20), get_error=error)
+
+        with pytest.raises(type(error)):
+            await _bus_with_last(js).last_value(PREFIX_STATS.name)
+
+    async def test_a_not_found_error_from_stream_info_propagates(self) -> None:
+        # The exception is `NotFoundError` from `get_msg` only; a missing
+        # stream at `stream_info` is not "no message at that sequence".
+        js = _LastValueJetStream(
+            _state(messages=5, first_seq=16, last_seq=20),
+            info_error=nats.js.errors.NotFoundError(),
+        )
+
+        with pytest.raises(nats.js.errors.NotFoundError):
+            await _bus_with_last(js).last_value(PREFIX_STATS.name)
+
+        assert js.get_calls == []

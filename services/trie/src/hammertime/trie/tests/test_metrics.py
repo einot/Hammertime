@@ -29,6 +29,10 @@ counter incremented before `bind_state` is visible after it.
 
 Label *values* outside the documented sets (e.g. `result="bogus"`) are not
 exercised: decision 12 constrains label names, not values.
+
+Slice 2 adds one counter, `prefix_stats_published`, label `family` (ADR-0017
+Amendment 2 ruling 7, and decision 12 as noted there), under decision 12's
+rules: it is in `EVERY_SERIES`, and `TestPrefixStatsPublished` covers it.
 """
 
 from datetime import UTC, datetime
@@ -95,6 +99,7 @@ EVERY_SERIES = [
     pytest.param("ip_attribute_bytes", {"family": "ipv4"}, id="ip_attribute_bytes"),
     pytest.param("event_sequence", {}, id="event_sequence"),
     pytest.param("trie_recovery_seconds", {}, id="trie_recovery_seconds"),
+    pytest.param("prefix_stats_published", {"family": "ipv4"}, id="prefix_stats_published"),
 ]
 
 
@@ -263,6 +268,59 @@ class TestGauge:
         metrics.set("trie_recovery_seconds", 0.5)
 
         assert metrics.get("trie_recovery_seconds") == 0.5
+
+
+class TestPrefixStatsPublished:
+    """ADR-0017 Amendment 2 ruling 7: "`prefix_stats_published` | counter |
+    `family`", under decision 12's rules: the label names are exactly the
+    series' own, and `set` is for gauges only."""
+
+    def test_it_increments_and_reads_back_per_family(self) -> None:
+        metrics, _ = _bound(frozenset({IPV4, IPV6}))
+
+        for _ in range(25):
+            metrics.increment("prefix_stats_published", family="ipv4")
+        metrics.increment("prefix_stats_published", family=IPV6)
+
+        assert metrics.get("prefix_stats_published", family="ipv4") == 25
+        assert metrics.get("prefix_stats_published", family=IPV4) == 25
+        assert metrics.get("prefix_stats_published", family="ipv6") == 1
+
+    @pytest.mark.parametrize(
+        "labels",
+        [
+            pytest.param({}, id="none-given"),
+            pytest.param({"reason": "malformed"}, id="wrong"),
+            pytest.param({"family": "ipv4", "shard": "0"}, id="extra"),
+        ],
+    )
+    def test_increment_with_the_wrong_label_names_is_refused(
+        self, labels: dict[str, object]
+    ) -> None:
+        metrics, _ = _bound()
+
+        with pytest.raises(ValueError):
+            metrics.increment("prefix_stats_published", **labels)
+
+    @pytest.mark.parametrize(
+        "labels",
+        [
+            pytest.param({}, id="none-given"),
+            pytest.param({"reason": "malformed"}, id="wrong"),
+            pytest.param({"family": "ipv4", "shard": "0"}, id="extra"),
+        ],
+    )
+    def test_get_with_the_wrong_label_names_is_refused(self, labels: dict[str, object]) -> None:
+        metrics, _ = _bound()
+
+        with pytest.raises(ValueError):
+            metrics.get("prefix_stats_published", **labels)
+
+    def test_set_is_refused(self) -> None:
+        metrics, _ = _bound()
+
+        with pytest.raises(ValueError):
+            metrics.set("prefix_stats_published", 1.0, family="ipv4")
 
 
 class TestSeriesDerivedFromTheState:

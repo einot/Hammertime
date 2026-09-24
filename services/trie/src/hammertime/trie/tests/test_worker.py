@@ -64,7 +64,59 @@ decision 6: `apply_hot_ip_added` / `apply_hot_ip_removed`). What is pinned:
 * R1 of decision 9: a concurrent reader sees `len(records) ==
   hot_ip_count == event_sequence` at every resume while bursts of distinct
   adds are consumed from offset 0, and it resumes at least once strictly
-  between 0 and the last event (`TestReadersSeeWholeEvents`).
+  between 0 and the last event (`TestReadersSeeWholeEvents`); since slice 2
+  it also checks that the prefix-stats topic ends with 25 records per event.
+
+Slice 2, from ADR-0017 Amendment 2 rulings 3-7 with its "Test seams" (and
+decisions 6, 7, 9, 12, 13 and 14 as noted there), is tested in the classes
+after `TestMetricsMatchTheOutcomes`:
+
+* an APPLIED add or remove publishes one `PrefixStatsChanged` per ancestor
+  from the family's floor to the host route, 25 at the defaults, carrying
+  `sequence == offset + 1 == event_sequence`, the configuration in force, the
+  hot-ip payload's `timestamp`, `subject == key`, and the trie's counts after
+  the event (steps 5a and 5b); UNCHANGED and every skipped outcome publish
+  nothing (decision 14 item 1);
+* the publish runs under the worker's lock, after the event is applied, with
+  every publish in flight at once; `apply_config()` and `stop()` wait for it
+  (ruling 3);
+* a failing publish raises `PrefixStatsPublishError` out of `handle()` and
+  `start()`, with the event applied, and logs `prefix_stats_publish_failed`
+  once at ERROR with fixed tokens and numbers only (rulings 5 and 7);
+* startup replay publishes, `replay_complete` carries
+  `prefix_stats_published`, readiness waits for the publishes, and a second
+  worker on the same memory bus appends nothing (ruling 4, "Test seams");
+* `stop()` flushes after the lock, on every call, before `start()` too, and a
+  flush that raises propagates (ruling 6);
+* `prefix_stats_published{family}` (ruling 7).
+
+ADR-0017 Amendment 3 (2026-09-24), with the dated notes it adds to decisions
+4, 6, 7 and 12 and to Amendment 2 rulings 4, 5 and 7, is tested at the end:
+
+* ruling 1: `start()` reads `last_value(hammertime.prefix-stats.v1)` after
+  `first_offset` and before subscribing (step 2a); `republish_from` is `None`
+  before it, `0` for no last message and for each of the four refusals
+  (`codec`, `payload_type`, `agent_id`, `ahead_of_log`, each logged once as
+  `prefix_stats_last_ignored` at WARNING with `reason` and `replay_target`
+  and nothing of the message), and the envelope's `sequence` otherwise; an
+  event below it is applied and `APPLIED` but publishes nothing;
+  `replay_complete` carries `republish_from`; a last message that trips
+  several refusals is logged with the first row's reason; a failed start is
+  continued by the next; an exception from `last_value` propagates, before
+  step 3 has passed anything; a live event, and
+  `handle()` before `start()`, publish;
+* ruling 2: a hot-ip record whose payload `timestamp` is out of range in UTC
+  is `MALFORMED` [`codec`], and the replay goes on past it.
+
+Every bus double implements `last_value` ("Test seams"); `None` models a
+prefix-stats log with no usable last message.
+
+What was published is read back on the memory bus by a second consumer
+subscribed positionally to `hammertime.prefix-stats.v1` from `0` ("Test
+seams"). Producer doubles are reached through a bus double's `producer()`,
+which the worker calls once, in its constructor (ruling 3, assumption 61).
+Within one event the order in which the messages reach the log is not pinned
+(ruling 2), so they are compared as sets keyed by prefix.
 
 Choices of this file's own:
 
@@ -102,13 +154,15 @@ Choices of this file's own:
 """
 
 import asyncio
+import ipaddress
+import itertools
 import json
 import logging
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import hammertime.trie.worker as trie_worker
 import pytest
@@ -120,11 +174,12 @@ from hammertime.bus.interface import (
     Producer,
 )
 from hammertime.bus.memory import InMemoryBus
-from hammertime.bus.topics import HOT_IP
+from hammertime.bus.topics import HOT_IP, PREFIX_STATS
 from hammertime.core.addressing.address import Address, AddressFamily
+from hammertime.core.addressing.prefix import Prefix
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.errors import InvalidAttributesError, InvariantViolation
-from hammertime.core.events.codec import encode
+from hammertime.core.events.codec import decode, encode
 from hammertime.core.events.envelope import EventEnvelope
 from hammertime.core.events.models import (
     HotIpAdded,
@@ -135,6 +190,8 @@ from hammertime.core.events.models import (
 )
 from hammertime.trie.metadata.ip_attributes import apply_hot_ip_added
 from hammertime.trie.metrics import TrieMetrics
+from hammertime.trie.publisher import AGENT_ID as TRIE_AGENT_ID
+from hammertime.trie.publisher import PrefixStatsPublishError
 from hammertime.trie.state import TrieState
 from hammertime.trie.structure.invariants import check_attribute_records, check_trie
 from hammertime.trie.worker import CONSUMER_GROUP, HotIpOutcome, TrieWorker
@@ -399,8 +456,9 @@ class _SpyConsumer:
 
 
 class _SpyBus:
-    """An `InMemoryBus` whose `consumer`, `end_offset`, `first_offset` and
-    `subscribe` calls are recorded, in the order they are made."""
+    """An `InMemoryBus` whose `consumer`, `end_offset`, `first_offset`,
+    `last_value` and `subscribe` calls are recorded, in the order they are
+    made."""
 
     def __init__(self) -> None:
         self.inner = InMemoryBus()
@@ -420,6 +478,12 @@ class _SpyBus:
     async def first_offset(self, topic: str) -> int:
         self.calls.append(("first_offset", topic))
         return await self.inner.first_offset(topic)
+
+    async def last_value(self, topic: str) -> bytes | None:
+        # ADR-0017 Amendment 3 "Test seams": every bus double handed to a
+        # worker implements `last_value(topic)`.
+        self.calls.append(("last_value", topic))
+        return await self.inner.last_value(topic)
 
 
 def _subscriptions(calls: list[tuple[str, object]]) -> list[object]:
@@ -502,13 +566,26 @@ class _ScriptedBus:
     amended by Amendment 10), so a test that does not name it models a log
     that never discards. A JetStream log that holds nothing to replay, or
     whose head has aged out, names it (ADR-0017 Test seams, "The log's
-    bounds")."""
+    bounds").
 
-    def __init__(self, stream: _ScriptedStream, *, end: int, first: int = 0) -> None:
+    `last` is what `last_value` answers for every topic, `None` by default:
+    "A double that returns `None` models a prefix-stats log with no usable
+    last message. It keeps Amendment 2's behaviour: the replay publishes
+    everything" (ADR-0017 Amendment 3, "Test seams")."""
+
+    def __init__(
+        self,
+        stream: _ScriptedStream,
+        *,
+        end: int,
+        first: int = 0,
+        last: bytes | None = None,
+    ) -> None:
         self.stream = stream
         self.calls: list[tuple[str, object]] = []
         self._end = end
         self._first = first
+        self._last = last
         self._consumer = _ScriptedConsumer(stream, self.calls)
 
     def producer(self) -> Producer:
@@ -525,6 +602,10 @@ class _ScriptedBus:
     async def first_offset(self, topic: str) -> int:
         self.calls.append(("first_offset", topic))
         return self._first
+
+    async def last_value(self, topic: str) -> bytes | None:
+        self.calls.append(("last_value", topic))
+        return self._last
 
 
 class _FirstOffsetFailed(Exception):
@@ -674,10 +755,14 @@ class TestStartRules:
         try:
             # Decision 4 step 2: "It reads `end = await bus.end_offset(HOT_IP.name)`,
             # then `first = await bus.first_offset(HOT_IP.name)`: both *before*
-            # subscribing, and in that order"; step 4 subscribes (decision 3).
+            # subscribing, and in that order"; step 2a, as amended 2026-09-24
+            # (Amendment 3 ruling 1): "`last = await
+            # bus.last_value(PREFIX_STATS.name)`. This runs after decision 4's
+            # step 2 ... and before step 3"; step 4 subscribes (decision 3).
             assert bus.calls[1:] == [
                 ("end_offset", TOPIC),
                 ("first_offset", TOPIC),
+                ("last_value", "hammertime.prefix-stats.v1"),
                 ("subscribe", _positional(0)),
             ]
             assert worker.replay_target == 3
@@ -1968,6 +2053,9 @@ class TestReadersSeeWholeEvents:
         assert {50, 100, 150} <= between
         assert state.event_sequence == k
         assert len(fs.records) == fs.trie.hot_ip_count == k
+        # ADR-0017 Amendment 2 ruling 3: every event here is APPLIED, and each
+        # publishes 25 records before the next is handled.
+        assert await bus.end_offset(PREFIX_STATS.name) == 25 * k
 
 
 class TestApplyConfig:
@@ -2025,5 +2113,1425 @@ class TestMetricsMatchTheOutcomes:
             assert _skipped(worker, "malformed") == 1
             assert _skipped(worker, "family_not_served") == 1
             assert metrics.get("hot_ip_count", family="ipv6") == 0
+        finally:
+            await worker.stop()
+
+
+# ==========================================================================
+# Slice 2: ADR-0017 Amendment 2 rulings 3-7 -- the worker publishes
+# `PrefixStatsChanged` for every APPLIED event, under its lock.
+# ==========================================================================
+
+STATS_TOPIC = PREFIX_STATS.name
+
+
+class _StatsProducer:
+    """A producer double (Amendment 2, "Test seams": it "records every call,
+    holds each publish until the test releases it, raises for a chosen key,
+    or counts `flush()` calls").
+
+    A publish whose key `hold(key)` accepts waits until `release` is set;
+    then, if its key is in `fail`, it raises that exception. `flush()` counts
+    its calls, appends `"flush"` to `trace` if one is given, and raises
+    `flush_error` if one is set."""
+
+    def __init__(
+        self,
+        *,
+        hold: Callable[[object], bool] | None = None,
+        fail: Mapping[object, BaseException] | None = None,
+        trace: list[str] | None = None,
+    ) -> None:
+        self.calls: list[tuple[object, object, object, object]] = []
+        self.release = asyncio.Event()
+        self.in_flight = 0
+        self.flushes = 0
+        self.flush_error: BaseException | None = None
+        self._hold = hold if hold is not None else (lambda key: False)
+        self._fail = dict(fail) if fail is not None else {}
+        self._trace = trace
+
+    async def publish(
+        self, topic: object, key: object, value: object, *, message_id: object = None
+    ) -> None:
+        self.calls.append((topic, key, value, message_id))
+        if self._hold(key):
+            self.in_flight += 1
+            try:
+                await self.release.wait()
+            finally:
+                self.in_flight -= 1
+        error = self._fail.get(key)
+        if error is not None:
+            raise error
+
+    async def flush(self) -> None:
+        self.flushes += 1
+        if self._trace is not None:
+            self._trace.append("flush")
+        if self.flush_error is not None:
+            raise self.flush_error
+
+
+class _ProducerBus:
+    """An `InMemoryBus` (`inner`, which holds the hot-ip log) whose
+    `producer()` returns the given double and counts its calls."""
+
+    def __init__(self, producer: _StatsProducer) -> None:
+        self.inner = InMemoryBus()
+        self.stats_producer = producer
+        self.producer_calls = 0
+
+    def producer(self) -> Producer:
+        self.producer_calls += 1
+        return cast(Producer, self.stats_producer)
+
+    def consumer(self, group_id: str) -> Consumer:
+        return self.inner.consumer(group_id)
+
+    async def end_offset(self, topic: str) -> int:
+        return await self.inner.end_offset(topic)
+
+    async def first_offset(self, topic: str) -> int:
+        return await self.inner.first_offset(topic)
+
+    async def last_value(self, topic: str) -> bytes | None:
+        # The stats go to the double, so `inner`'s prefix-stats log stays
+        # empty and this is `None`: the replay publishes everything.
+        return await self.inner.last_value(topic)
+
+
+class _ScriptedBusWithProducer(_ScriptedBus):
+    """A `_ScriptedBus` whose `producer()` returns the given double."""
+
+    def __init__(
+        self,
+        stream: _ScriptedStream,
+        *,
+        end: int,
+        producer: _StatsProducer,
+        first: int = 0,
+        last: bytes | None = None,
+    ) -> None:
+        super().__init__(stream, end=end, first=first, last=last)
+        self._stats_producer = producer
+
+    def producer(self) -> Producer:
+        return cast(Producer, self._stats_producer)
+
+
+class _PublishFailed(Exception):
+    """Raised by `_StatsProducer.publish` for a chosen key; no other code raises it."""
+
+
+class _FlushFailed(Exception):
+    """Raised by `_StatsProducer.flush` when a test sets it."""
+
+
+def _stats_worker(
+    bus: MessageBus,
+    *,
+    families: frozenset[AddressFamily] = ONLY_V4,
+    config: DetectionConfig | None = None,
+    lengths: Mapping[AddressFamily, int] | None = None,
+) -> TrieWorker:
+    """A worker on `bus`; `lengths`, when given, is `min_prefix_lengths`."""
+
+    state = TrieState(families=families, config=config if config is not None else _config())
+    if lengths is None:
+        return TrieWorker(bus=bus, state=state, metrics=TrieMetrics())
+    return TrieWorker(bus=bus, state=state, metrics=TrieMetrics(), min_prefix_lengths=lengths)
+
+
+def _ancestor_text(ip: Address, length: int) -> str:
+    """The canonical CIDR text of `ip`'s ancestor at `length` (`ipaddress`)."""
+
+    return str(ipaddress.ip_network(f"{ip}/{length}", strict=False))
+
+
+_READERS = itertools.count()
+
+
+async def _stats_records(bus: InMemoryBus) -> list[ConsumedMessage]:
+    """Every record on the prefix-stats topic, read by a fresh consumer
+    subscribed positionally from `0` ("Test seams")."""
+
+    n = await bus.end_offset(STATS_TOPIC)
+    if n == 0:
+        return []
+    consumer = bus.consumer(f"prefix-stats-reader-{next(_READERS)}")
+    stream = await consumer.subscribe(STATS_TOPIC, start_offset=0)
+    records: list[ConsumedMessage] = []
+
+    async def take() -> None:
+        async for message in stream:
+            records.append(message)
+            if len(records) == n:
+                return
+
+    await asyncio.wait_for(take(), timeout=10.0)
+    await consumer.close()
+    return records
+
+
+def _key_text(record: ConsumedMessage) -> str:
+    key: object = record.key
+    if isinstance(key, bytes):
+        return key.decode("utf-8")
+    assert isinstance(key, str), key
+    return key
+
+
+def _stats_envelope(record: ConsumedMessage) -> Any:
+    envelope: Any = decode(record.value)
+    assert isinstance(envelope.payload, PrefixStatsChanged)
+    return envelope
+
+
+def _of_sequence(records: Iterable[ConsumedMessage], sequence: int) -> list[ConsumedMessage]:
+    return [record for record in records if _stats_envelope(record).sequence == sequence]
+
+
+def _assert_stats(
+    records: list[ConsumedMessage],
+    worker: TrieWorker,
+    ip: Address,
+    *,
+    sequence: int,
+    config_version: int,
+    timestamp: datetime,
+    floor: int,
+) -> dict[str, Any]:
+    """Ruling 3 step 5a with ruling 2's envelope: one record per ancestor of
+    `ip` from `floor` to the host route, keyed by its prefix text, whose counts
+    are the trie's now. Returns the payloads by prefix text."""
+
+    trie = worker.state.of(ip.family).trie
+    bits = ip.family.bit_length
+    assert len(records) == bits - floor + 1
+    payloads: dict[str, Any] = {}
+    for record in records:
+        envelope = _stats_envelope(record)
+        key = _key_text(record)
+        payload = envelope.payload
+        assert envelope.subject == key == payload.prefix
+        assert envelope.agent_id == "trie-primary"
+        assert envelope.event_type == "PrefixStatsChanged"
+        assert envelope.sequence == sequence
+        assert payload.sequence == sequence
+        assert envelope.config_version == config_version
+        assert envelope.timestamp == timestamp
+        assert payload.timestamp == timestamp
+        payloads[key] = payload
+    assert set(payloads) == {_ancestor_text(ip, length) for length in range(floor, bits + 1)}
+    for text, payload in payloads.items():
+        length = int(text.rsplit("/", 1)[1])
+        capacity = 2 ** (bits - length)
+        hot_count = trie.hot_count(Prefix.parse(text))
+        assert payload.hot_count == hot_count, text
+        assert payload.capacity == capacity, text
+        assert payload.hot_ratio == hot_count / capacity, text
+    return payloads
+
+
+def _stats_published(worker: TrieWorker, family: str = "ipv4") -> int | float:
+    return worker.metrics.get("prefix_stats_published", family=family)
+
+
+async def _spin(steps: int = 200) -> None:
+    """Further yields, after which a task that should still be waiting is
+    checked not done."""
+
+    for _ in range(steps):
+        await asyncio.sleep(0)
+
+
+class TestAnAppliedEventPublishesItsStats:
+    """Ruling 3, steps 5a and 5b: `prepared = publisher.prepare(fs.trie,
+    payload.ip, sequence=state.event_sequence,
+    config_version=state.config.config_version, timestamp=payload.timestamp)`,
+    then `await publisher.publish(prepared)`; "`state.event_sequence` is
+    `message.offset + 1` at that point". Decision 14 items 2-4."""
+
+    async def test_an_applied_add(self) -> None:
+        bus = InMemoryBus()
+        worker = _worker(bus=bus, config=_config(3))
+        assert await worker.handle(_msg(_envelope(IP_B, 0), 3)) is HotIpOutcome.APPLIED
+        envelope = _envelope(IP_A, 1)
+        assert envelope.config_version == 1
+
+        outcome = await worker.handle(_msg(envelope, 4))
+
+        assert outcome is HotIpOutcome.APPLIED
+        assert worker.state.event_sequence == 5
+        records = await _stats_records(bus)
+        assert len(records) == 50
+        assert len(_of_sequence(records, 4)) == 25
+        payloads = _assert_stats(
+            _of_sequence(records, 5),
+            worker,
+            IP_A,
+            sequence=5,
+            config_version=worker.state.config.config_version,
+            timestamp=envelope.payload.timestamp,
+            floor=8,
+        )
+        assert worker.state.config.config_version == 3
+        # Non-vacuous: both addresses count at the /24, only IP_A at the /32.
+        assert payloads[_ancestor_text(IP_A, 24)].hot_count == 2
+        assert payloads[_ancestor_text(IP_A, 32)].hot_count == 1
+
+    async def test_an_applied_remove_publishes_the_counts_after_it(self) -> None:
+        bus = InMemoryBus()
+        worker = _worker(bus=bus)
+        assert await worker.handle(_msg(_envelope(IP_A, 0), 0)) is HotIpOutcome.APPLIED
+        assert await worker.handle(_msg(_envelope(IP_B, 1), 1)) is HotIpOutcome.APPLIED
+        removal = _envelope(IP_A, 2, removed=True)
+
+        outcome = await worker.handle(_msg(removal, 2))
+
+        assert outcome is HotIpOutcome.APPLIED
+        records = await _stats_records(bus)
+        assert len(records) == 75
+        payloads = _assert_stats(
+            _of_sequence(records, 3),
+            worker,
+            IP_A,
+            sequence=3,
+            config_version=1,
+            timestamp=removal.payload.timestamp,
+            floor=8,
+        )
+        # Zero where IP_A was the only address (10.20.30.0/31 holds .0 and .1).
+        for length in (31, 32):
+            payload = payloads[_ancestor_text(IP_A, length)]
+            assert payload.hot_count == 0
+            assert payload.hot_ratio == 0.0
+        assert payloads[_ancestor_text(IP_A, 30)].hot_count == 1
+        assert payloads[_ancestor_text(IP_A, 24)].hot_count == 1
+
+
+_NOTHING_PUBLISHED = [
+    pytest.param(
+        lambda: _msg(_envelope(IP_A, 1), 1), HotIpOutcome.UNCHANGED, False, id="unchanged-add"
+    ),
+    pytest.param(
+        lambda: _msg(_envelope(IP_C, 1, removed=True), 1),
+        HotIpOutcome.UNCHANGED,
+        False,
+        id="unchanged-remove",
+    ),
+    pytest.param(
+        lambda: _message(b"not json", 1, str(IP_A).encode()),
+        HotIpOutcome.MALFORMED,
+        False,
+        id="malformed",
+    ),
+    pytest.param(
+        lambda: _msg(_envelope(IP_V6, 1), 1),
+        HotIpOutcome.FAMILY_NOT_SERVED,
+        False,
+        id="family-not-served",
+    ),
+    pytest.param(
+        lambda: _msg(_envelope(IP_B, 1), 0), HotIpOutcome.REDELIVERED, False, id="redelivered"
+    ),
+    pytest.param(lambda: _msg(_envelope(IP_B, 1), 1), HotIpOutcome.STOPPED, True, id="stopped"),
+]
+
+
+class TestNothingElsePublishes:
+    """Decision 14 item 1: "An event whose outcome is `APPLIED` publishes.
+    `UNCHANGED` and every skipped outcome publish nothing"; ruling 3: "An
+    `UNCHANGED` event, and every skipped outcome, prepares and publishes
+    nothing"."""
+
+    @pytest.mark.parametrize(("build", "expected", "stop_first"), _NOTHING_PUBLISHED)
+    async def test_no_publish_call(
+        self,
+        build: Callable[[], ConsumedMessage],
+        expected: HotIpOutcome,
+        stop_first: bool,
+    ) -> None:
+        producer = _StatsProducer()
+        bus = _ProducerBus(producer)
+        worker = _stats_worker(bus)
+        # Ruling 3: "It takes its producer from `bus.producer()`, once".
+        assert bus.producer_calls == 1
+        assert await worker.handle(_msg(_envelope(IP_A, 0), 0)) is HotIpOutcome.APPLIED
+        assert len(producer.calls) == 25
+        if stop_first:
+            await worker.stop()
+
+        outcome = await worker.handle(build())
+
+        assert outcome is expected
+        assert len(producer.calls) == 25
+        assert bus.producer_calls == 1
+
+
+class TestTheConfigurationInForce:
+    async def test_stats_carry_the_adopted_version_not_the_events(self) -> None:
+        # Decision 14 item 3: "`config_version` is `state.config.config_version`".
+        bus = InMemoryBus()
+        worker = _worker(bus=bus, config=_config(1))
+        await worker.apply_config(_config(2))
+        envelope = _envelope(IP_A, 0)
+        assert envelope.config_version == 1
+        assert envelope.payload.config_version == 1
+
+        assert await worker.handle(_msg(envelope, 0)) is HotIpOutcome.APPLIED
+
+        records = await _stats_records(bus)
+        _assert_stats(
+            records,
+            worker,
+            IP_A,
+            sequence=1,
+            config_version=2,
+            timestamp=envelope.payload.timestamp,
+            floor=8,
+        )
+
+
+class TestFamiliesAndFloors:
+    """Ruling 1: IPv4 reports `[L4, 32]`, IPv6 `[L6, 128]`, `/104` by default;
+    ruling 3: the constructor's `min_prefix_lengths`."""
+
+    async def test_an_ipv6_event_publishes_slash_104_to_slash_128(self) -> None:
+        bus = InMemoryBus()
+        worker = _worker(bus=bus, families=BOTH)
+        envelope = _envelope(IP_V6, 0)
+
+        assert await worker.handle(_msg(envelope, 0)) is HotIpOutcome.APPLIED
+
+        records = await _stats_records(bus)
+        assert len(records) == 25
+        _assert_stats(
+            records,
+            worker,
+            IP_V6,
+            sequence=1,
+            config_version=1,
+            timestamp=envelope.payload.timestamp,
+            floor=104,
+        )
+        assert _ancestor_text(IP_V6, 104) in {_key_text(record) for record in records}
+
+    async def test_custom_floors(self) -> None:
+        bus = InMemoryBus()
+        worker = _stats_worker(bus, families=BOTH, lengths={IPV4: 24, IPV6: 64})
+        v4 = _envelope(IP_A, 0)
+        v6 = _envelope(IP_V6, 1)
+
+        assert await worker.handle(_msg(v4, 0)) is HotIpOutcome.APPLIED
+        assert await worker.handle(_msg(v6, 1)) is HotIpOutcome.APPLIED
+
+        records = await _stats_records(bus)
+        assert len(records) == 9 + 65
+        _assert_stats(
+            _of_sequence(records, 1),
+            worker,
+            IP_A,
+            sequence=1,
+            config_version=1,
+            timestamp=v4.payload.timestamp,
+            floor=24,
+        )
+        _assert_stats(
+            _of_sequence(records, 2),
+            worker,
+            IP_V6,
+            sequence=2,
+            config_version=1,
+            timestamp=v6.payload.timestamp,
+            floor=64,
+        )
+
+
+class TestThePublishRunsUnderTheLock:
+    """Ruling 3: "`await publisher.publish(prepared)`, still holding the
+    worker's lock"; "While the publish is awaited, the worker holds its lock,
+    so no other writer runs: not the next `handle()`, not `apply_config()`,
+    ... and not `stop()` beyond its flag. ... They see the event whole, with
+    `event_sequence` past it"; ruling 2: every publish starts before any is
+    awaited."""
+
+    async def test_while_the_publishes_are_held(self) -> None:
+        producer = _StatsProducer(hold=lambda key: True)
+        worker = _stats_worker(_ProducerBus(producer))
+        state = worker.state
+        fs = state.of(IPV4)
+        completed: list[str] = []
+
+        handle_task = asyncio.create_task(worker.handle(_msg(_envelope(IP_A, 0), 0)))
+        handle_task.add_done_callback(lambda _task: completed.append("handle"))
+        config_task: asyncio.Task[None] | None = None
+        stop_task: asyncio.Task[None] | None = None
+        try:
+            await _yield_until(lambda: producer.in_flight == 25)
+            assert not handle_task.done()
+            assert state.event_sequence == 1
+            assert state.position == 0
+            assert fs.trie.hot_ip_count == 1
+            assert IP_A in fs.records
+
+            config_task = asyncio.create_task(worker.apply_config(_config(2)))
+            config_task.add_done_callback(lambda _task: completed.append("apply_config"))
+            stop_task = asyncio.create_task(worker.stop())
+            stop_task.add_done_callback(lambda _task: completed.append("stop"))
+            await _spin()
+
+            assert not handle_task.done()
+            assert not config_task.done()
+            assert not stop_task.done()
+            assert producer.in_flight == 25
+            assert len(producer.calls) == 25
+            assert completed == []
+        finally:
+            producer.release.set()
+
+        outcome = await asyncio.wait_for(handle_task, timeout=10.0)
+        assert config_task is not None
+        assert stop_task is not None
+        await asyncio.wait_for(asyncio.gather(config_task, stop_task), timeout=10.0)
+
+        assert outcome is HotIpOutcome.APPLIED
+        assert completed[0] == "handle"
+        assert sorted(completed) == ["apply_config", "handle", "stop"]
+
+
+class TestAFailingPublish:
+    """Ruling 5: "The worker logs `prefix_stats_publish_failed` and re-raises
+    it ... the event is applied and `position` has moved past it"; ruling 7's
+    record: error, with `family`, `topic`, `partition`, `offset` (the hot-ip
+    record's), `sequence`, `attempted`, `failed`, `error_type` (the first
+    failure's exception class, as `<module>.<qualified name>`); "The worker
+    does not log an exception's text"."""
+
+    async def test_handle_raises_and_the_event_is_applied(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        error = _PublishFailed(MARKER)
+        producer = _StatsProducer(fail={_ancestor_text(IP_A, 24): error})
+        worker = _stats_worker(_ProducerBus(producer))
+        envelope = _envelope(IP_A, 0)
+
+        with pytest.raises(PrefixStatsPublishError) as excinfo:
+            await worker.handle(_msg(envelope, 6))
+
+        assert excinfo.value.attempted == 25
+        assert excinfo.value.failed == 1
+        assert excinfo.value.sequence == 7
+        assert excinfo.value.__cause__ is error
+
+        state = worker.state
+        fs = state.of(IPV4)
+        assert fs.trie.hot_ip_count == 1
+        assert IP_A in fs.records
+        assert state.position == 6
+        assert state.event_sequence == 7
+        assert state.as_of == envelope.payload.timestamp
+        assert _updates(worker, "ipv4", "HotIpAdded", "applied") == 1
+
+        records = _logged(caplog, "prefix_stats_publish_failed")
+        assert len(records) == 1
+        record = records[0]
+        assert record.levelno == logging.ERROR
+        assert _field(record, "family") == "ipv4"
+        assert _field(record, "topic") == TOPIC
+        assert _field(record, "partition") == "0"
+        assert _field(record, "offset") == "6"
+        assert _field(record, "sequence") == "7"
+        assert _field(record, "attempted") == "25"
+        assert _field(record, "failed") == "1"
+        expected_type = f"{_PublishFailed.__module__}.{_PublishFailed.__qualname__}"
+        assert _field(record, "error_type") == expected_type
+
+        for logged in caplog.records:
+            assert MARKER not in logged.getMessage()
+            if logged.name == LOGGER:
+                assert MARKER not in repr(vars(logged))
+        assert MARKER not in caplog.text
+
+
+class TestStartupReplayPublishes:
+    """Ruling 4: "`start()` hands every replayed message to `handle()`, so the
+    replay publishes exactly as live consumption does"; "`replay_complete`
+    reports the number"; ruling 7: `replay_complete` gains
+    `prefix_stats_published`, "the publishes that returned during this
+    `start()`"; "Test seams": "a second trie that replays the same log on the
+    same bus appends nothing"."""
+
+    async def test_replay_publishes_and_a_second_worker_appends_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Amended 2026-09-24 (Amendment 3 ruling 1, and its "Test seams": "A
+        # second trie started on the same bus after a first one has published
+        # therefore re-publishes from the first one's last sequence"). The
+        # first worker finds an empty prefix-stats log (`republish_from=0`)
+        # and publishes all four state-changing events. The log's last
+        # message is then one of the event at offset 5's, whose `sequence` is
+        # 6, so the second worker's `republish_from` is 6 and it publishes
+        # only that event's 25, which the log drops as duplicates.
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        bus = InMemoryBus()
+        await _publish(bus, _envelope(IP_A, 0))  # 0 applied
+        await _publish(bus, _envelope(IP_B, 1))  # 1 applied
+        await _publish(bus, _envelope(IP_A, 2))  # 2 unchanged
+        await bus.producer().publish(TOPIC, key="junk", value=b"not json", message_id=None)  # 3
+        await _publish(bus, _envelope(IP_B, 4, removed=True))  # 4 applied
+        await _publish(bus, _envelope(IP_C, 5))  # 5 applied
+        expected = 25 * 4
+
+        first = _worker(bus=bus)
+        await first.start()
+        try:
+            assert first.caught_up is True
+            assert first.republish_from == 0
+            assert await bus.end_offset(STATS_TOPIC) == expected
+            records = _logged(caplog, "replay_complete")
+            assert len(records) == 1
+            assert _field(records[0], "prefix_stats_published") == str(expected)
+            assert _field(records[0], "republish_from") == "0"
+            event_ids = {_stats_envelope(r).event_id for r in await _stats_records(bus)}
+            assert len(event_ids) == expected
+            assert _stats_published(first) == expected
+        finally:
+            await first.stop()
+
+        caplog.clear()
+        second = _worker(bus=bus)
+        await second.start()
+        try:
+            assert second.caught_up is True
+            assert second.republish_from == 6
+            assert await bus.end_offset(STATS_TOPIC) == expected
+            records = _logged(caplog, "replay_complete")
+            assert len(records) == 1
+            assert _field(records[0], "prefix_stats_published") == "25"
+            assert _field(records[0], "republish_from") == "6"
+            assert _stats_published(second) == 25
+            # Every event was applied all the same (ruling 1 item 3).
+            assert _updates(second, "ipv4", "HotIpAdded", "applied") == 3
+            assert _updates(second, "ipv4", "HotIpRemoved", "applied") == 1
+            assert _view(second) == _view(first)
+        finally:
+            await second.stop()
+
+    async def test_start_does_not_return_before_the_publishes(self) -> None:
+        # Ruling 4: "`start()` returns once `handle()` has returned for the
+        # message that brought the worker to `replay_target`, publish
+        # included."
+        producer = _StatsProducer(hold=lambda key: True)
+        stream = _ScriptedStream([_added(0)], hold=True)
+        worker = _worker_on(_ScriptedBusWithProducer(stream, end=1, producer=producer))
+
+        task = asyncio.create_task(worker.start())
+        try:
+            try:
+                await _yield_until(lambda: producer.in_flight == 25)
+                await _spin()
+                assert not task.done()
+            finally:
+                producer.release.set()
+            await asyncio.wait_for(task, timeout=10.0)
+
+            assert worker.caught_up is True
+            assert worker.state.event_sequence == 1
+        finally:
+            await worker.stop()
+
+    async def test_a_failure_during_start(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Ruling 5: "out of `start()` (`start_failed`, exit 1, never ready)";
+        # "How a failure during `start()` is reported": the worker's
+        # `prefix_stats_publish_failed` first.
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        producer = _StatsProducer(fail={_ancestor_text(IP_A, 24): _PublishFailed(MARKER)})
+        bus = _ProducerBus(producer)
+        await _publish(bus.inner, _envelope(IP_A, 0))
+        worker = _stats_worker(bus)
+
+        try:
+            with pytest.raises(PrefixStatsPublishError):
+                await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert len(_logged(caplog, "prefix_stats_publish_failed")) == 1
+            assert _logged(caplog, "replay_complete") == []
+        finally:
+            await worker.stop()
+
+
+class TestStopFlushes:
+    """Ruling 6: `stop()` "sets the stop flag; takes the lock, so that the
+    message in hand is finished -- every publish of its stats included ...;
+    awaits `publisher.flush()`, and marks the worker stopped whether or not the
+    flush raised. Every call takes all three steps, a second call included.
+    `stop()` stays safe before `start()`"; decision 7 as amended: a flush that
+    raises "propagates out of `stop()`"."""
+
+    async def test_stop_waits_for_a_held_publish_then_flushes(self) -> None:
+        producer = _StatsProducer(hold=lambda key: True)
+        worker = _stats_worker(_ProducerBus(producer))
+
+        handle_task = asyncio.create_task(worker.handle(_msg(_envelope(IP_A, 0), 0)))
+        stop_task: asyncio.Task[None] | None = None
+        try:
+            await _yield_until(lambda: producer.in_flight == 25)
+            stop_task = asyncio.create_task(worker.stop())
+            await _spin()
+
+            assert not stop_task.done()
+            assert producer.flushes == 0
+        finally:
+            producer.release.set()
+
+        assert await asyncio.wait_for(handle_task, timeout=10.0) is HotIpOutcome.APPLIED
+        assert stop_task is not None
+        await asyncio.wait_for(stop_task, timeout=10.0)
+        assert producer.flushes == 1
+
+        await worker.stop()
+        assert producer.flushes == 2
+
+    async def test_stop_before_start_flushes(self) -> None:
+        producer = _StatsProducer()
+        worker = _stats_worker(_ProducerBus(producer))
+
+        await worker.stop()
+
+        assert producer.flushes == 1
+
+    async def test_a_flush_that_raises_propagates_and_the_worker_is_stopped(self) -> None:
+        producer = _StatsProducer()
+        producer.flush_error = _FlushFailed()
+        worker = _stats_worker(_ProducerBus(producer))
+
+        with pytest.raises(_FlushFailed):
+            await worker.stop()
+
+        assert producer.flushes == 1
+        assert await worker.handle(_msg(_envelope(IP_A, 0), 0)) is HotIpOutcome.STOPPED
+        assert producer.calls == []
+
+
+class TestPrefixStatsPublishedCounter:
+    async def test_25_per_applied_event_none_for_unchanged_and_per_family(self) -> None:
+        # Ruling 7: `prefix_stats_published`, label `family`: "publishes that
+        # returned".
+        worker = _worker(families=BOTH)
+
+        assert await worker.handle(_msg(_envelope(IP_A, 0), 0)) is HotIpOutcome.APPLIED
+        assert _stats_published(worker) == 25
+        assert await worker.handle(_msg(_envelope(IP_A, 1), 1)) is HotIpOutcome.UNCHANGED
+        assert _stats_published(worker) == 25
+        assert await worker.handle(_msg(_envelope(IP_B, 2), 2)) is HotIpOutcome.APPLIED
+        assert _stats_published(worker) == 50
+        removal = _msg(_envelope(IP_A, 3, removed=True), 3)
+        assert await worker.handle(removal) is HotIpOutcome.APPLIED
+        assert _stats_published(worker) == 75
+        unchanged_removal = _msg(_envelope(IP_C, 4, removed=True), 4)
+        assert await worker.handle(unchanged_removal) is HotIpOutcome.UNCHANGED
+        assert _stats_published(worker) == 75
+        assert _stats_published(worker, "ipv6") == 0
+
+        assert await worker.handle(_msg(_envelope(IP_V6, 5), 5)) is HotIpOutcome.APPLIED
+
+        assert _stats_published(worker, "ipv6") == 25
+        assert _stats_published(worker, "ipv4") == 75
+
+
+# ==========================================================================
+# ADR-0017 Amendment 3 ruling 1 (finding S1): "A start re-publishes from the
+# last sequence the prefix-stats log holds." Step 2a reads `last = await
+# bus.last_value(PREFIX_STATS.name)` after step 2 and before step 3, and sets
+# `republish_from` by the first row of the table that applies:
+#
+#   `None`                                   -> 0, no record
+#   `decode(last)` raises `CodecError`       -> 0, `prefix_stats_last_ignored reason=codec`
+#   payload not a `PrefixStatsChanged`       -> 0, the same, `reason=payload_type`
+#   envelope `agent_id` is not `AGENT_ID`    -> 0, the same, `reason=agent_id`
+#   envelope `sequence` > `replay_target`    -> 0, the same, `reason=ahead_of_log`
+#   anything else                            -> the envelope's `sequence`, W, no record
+#
+# Steps 5a and 5b run only for an event that changed the hot set and whose
+# `state.event_sequence` is at least `republish_from`; one below it is
+# applied, recorded, counted in `trie_updates`, and `APPLIED`, but publishes
+# nothing. `republish_from` is `None` before step 2a, and `handle()` then
+# publishes as if it were `0`. `replay_complete` gains `republish_from`; the
+# new record is a WARNING with `reason` and `replay_target`, "fixed tokens and
+# numbers only. It never carries the message's `sequence`, or anything else
+# the message holds." Decision 7 as amended: an exception from
+# `bus.last_value` propagates out of `start()`.
+# ==========================================================================
+
+PREFIX_STATS_NAME = "hammertime.prefix-stats.v1"
+
+
+def test_the_trie_agent_id_is_trie_primary() -> None:
+    # Decision 14 item 3 / Amendment 2 ruling 2: `AGENT_ID: Final = "trie-primary"`.
+    assert TRIE_AGENT_ID == "trie-primary"
+    assert PREFIX_STATS.name == PREFIX_STATS_NAME
+
+
+def _stats_value(
+    sequence: int,
+    *,
+    agent_id: str = "trie-primary",
+    prefix: str = "10.0.0.0/24",
+    payload_sequence: int | None = None,
+) -> bytes:
+    """An encoded `PrefixStatsChanged` envelope, as the last value of the
+    prefix-stats log. The envelope's `sequence` is `sequence`; the payload's
+    is the same unless `payload_sequence` is given."""
+
+    payload = PrefixStatsChanged(
+        prefix=prefix,
+        hot_count=1,
+        capacity=256,
+        sequence=sequence if payload_sequence is None else payload_sequence,
+        timestamp=T0,
+        hot_ratio=1 / 256,
+    )
+    envelope = EventEnvelope(
+        agent_id=agent_id,
+        sequence=sequence,
+        event_type="PrefixStatsChanged",
+        config_version=1,
+        timestamp=T0,
+        subject=prefix,
+        payload=payload,
+    )
+    return encode(envelope)
+
+
+def _call_sequences(calls: Iterable[tuple[object, object, object, object]]) -> list[int]:
+    """The envelope `sequence` of each recorded publish, in call order."""
+
+    sequences: list[int] = []
+    for _topic, _key, value, _message_id in calls:
+        assert isinstance(value, bytes)
+        sequences.append(decode(value).sequence)
+    return sequences
+
+
+def _replay_fields(caplog: pytest.LogCaptureFixture) -> dict[str, str | None]:
+    records = _logged(caplog, "replay_complete")
+    assert len(records) == 1
+    return {
+        name: _field(records[0], name)
+        for name in ("replay_target", "prefix_stats_published", "republish_from")
+    }
+
+
+class _LastValueFailed(Exception):
+    """Raised by `_FailingLastValueBus.last_value`; no other code raises it."""
+
+
+class _FailingLastValueBus(_ScriptedBus):
+    """A `_ScriptedBus` whose `last_value` records the call, then raises."""
+
+    async def last_value(self, topic: str) -> bytes | None:
+        self.calls.append(("last_value", topic))
+        raise _LastValueFailed
+
+
+class _ForwardingProducer:
+    """A producer that records every call and forwards it to a real producer,
+    except for a key in `fail`, for which it raises instead ("Test seams": a
+    producer that "raises for a chosen key")."""
+
+    def __init__(
+        self, inner: Producer, *, fail: Mapping[object, BaseException] | None = None
+    ) -> None:
+        self.inner = inner
+        self.calls: list[tuple[object, object, object, object]] = []
+        self._fail = dict(fail) if fail is not None else {}
+
+    async def publish(
+        self, topic: str, key: bytes | str, value: bytes, *, message_id: str | None = None
+    ) -> None:
+        self.calls.append((topic, key, value, message_id))
+        error = self._fail.get(key)
+        if error is not None:
+            raise error
+        await self.inner.publish(topic, key, value, message_id=message_id)
+
+    async def flush(self) -> None:
+        await self.inner.flush()
+
+
+class _SharedBus:
+    """One `InMemoryBus` (`inner`: both logs) whose `producer()` is the given one."""
+
+    def __init__(self, inner: InMemoryBus, producer: Producer) -> None:
+        self.inner = inner
+        self._producer = producer
+
+    def producer(self) -> Producer:
+        return self._producer
+
+    def consumer(self, group_id: str) -> Consumer:
+        return self.inner.consumer(group_id)
+
+    async def end_offset(self, topic: str) -> int:
+        return await self.inner.end_offset(topic)
+
+    async def first_offset(self, topic: str) -> int:
+        return await self.inner.first_offset(topic)
+
+    async def last_value(self, topic: str) -> bytes | None:
+        return await self.inner.last_value(topic)
+
+
+class TestRepublishFrom:
+    """Ruling 1, "The property": "`TrieWorker.republish_from -> int | None`: the
+    value step 2a set, and `None` before it"; the table's first and last
+    rows."""
+
+    async def test_it_is_none_before_start(self) -> None:
+        worker = _worker_on(_ScriptedBus(_held(range(3)), end=3, last=_stats_value(2)))
+
+        assert worker.republish_from is None
+
+    async def test_it_is_zero_when_the_prefix_stats_log_holds_no_last_message(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        bus = _ScriptedBus(_held(range(3)), end=3, last=None)
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.republish_from == 0
+            assert ("last_value", PREFIX_STATS_NAME) in bus.calls
+            # Assumption 71: "No record when the log holds no message at its
+            # last offset."
+            assert _logged(caplog, "prefix_stats_last_ignored") == []
+            assert _replay_fields(caplog)["republish_from"] == "0"
+        finally:
+            await worker.stop()
+
+    @pytest.mark.parametrize(
+        "w", [pytest.param(6, id="below-replay-target"), pytest.param(10, id="at-replay-target")]
+    )
+    async def test_it_is_the_last_messages_sequence_when_the_table_accepts_it(
+        self, w: int, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # "anything else | its envelope's `sequence`, `W` | none"; `W ==
+        # replay_target` is not "greater than `replay_target`".
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        bus = _ScriptedBus(_held(range(10)), end=10, last=_stats_value(w))
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.replay_target == 10
+            assert worker.republish_from == w
+            assert worker.caught_up is True
+            assert _logged(caplog, "prefix_stats_last_ignored") == []
+            assert _replay_fields(caplog)["republish_from"] == str(w)
+        finally:
+            await worker.stop()
+
+    async def test_the_envelopes_sequence_decides_not_the_payloads(self) -> None:
+        # The table reads "its envelope's `sequence`" (assumption 70: "The
+        # envelope's `sequence`, not the payload's").
+        value = _stats_value(7, payload_sequence=2)
+        worker = _worker_on(_ScriptedBus(_held(range(10)), end=10, last=value))
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.republish_from == 7
+        finally:
+            await worker.stop()
+
+
+class TestTheReplayPublishesFromRepublishFrom:
+    """Ruling 1 item 3: "Steps 5a and 5b run only for an event that changed the
+    hot set and whose `state.event_sequence` is at least `republish_from`. An
+    event that changed the hot set below it prepares and publishes nothing.
+    Everything else about it is as before: it is applied, step 5 records it,
+    `trie_updates` counts it, and its outcome is `APPLIED`." `replay_complete`'s
+    `prefix_stats_published` is "the publishes that returned during this
+    `start()`" (Amendment 2 ruling 7), and its `republish_from` "the value this
+    start used"."""
+
+    async def test_only_the_event_at_w_and_later_publish(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Offsets 0..9 are ten adds of distinct IPs; offset `i` is
+        # `event_sequence` `i + 1`. With W = 6 the events at offsets 5..9
+        # publish, and those at 0..4 do not.
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        producer = _StatsProducer()
+        bus = _ScriptedBusWithProducer(
+            _held(range(10)), end=10, producer=producer, last=_stats_value(6)
+        )
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            fs = worker.state.of(IPV4)
+            assert worker.republish_from == 6
+            assert worker.caught_up is True
+            # Every event was applied and counted.
+            assert fs.trie.hot_ip_count == 10
+            assert set(fs.records) == {_ip(i + 1) for i in range(10)}
+            assert _updates(worker, "ipv4", "HotIpAdded", "applied") == 10
+            # Only those at or after W published, 25 each.
+            sequences = _call_sequences(producer.calls)
+            assert len(sequences) == 25 * 5
+            assert set(sequences) == {6, 7, 8, 9, 10}
+            assert all(sequences.count(s) == 25 for s in (6, 7, 8, 9, 10))
+            assert _stats_published(worker) == 125
+            assert _replay_fields(caplog) == {
+                "replay_target": "10",
+                "prefix_stats_published": "125",
+                "republish_from": "6",
+            }
+        finally:
+            await worker.stop()
+
+    async def test_an_event_below_w_is_still_applied(self) -> None:
+        # Its outcome is `APPLIED`. `start()` "takes the next message and
+        # awaits `handle()` on it" (decision 4 step 5), so the outcomes are
+        # read by wrapping the instance's `handle`.
+        producer = _StatsProducer()
+        bus = _ScriptedBusWithProducer(
+            _held(range(4)), end=4, producer=producer, last=_stats_value(3)
+        )
+        worker = _worker_on(bus)
+        original = worker.handle
+        outcomes: list[tuple[int, HotIpOutcome, int]] = []
+
+        async def spy(message: ConsumedMessage) -> HotIpOutcome:
+            before = len(producer.calls)
+            outcome = await original(message)
+            outcomes.append((message.offset, outcome, len(producer.calls) - before))
+            return outcome
+
+        cast(Any, worker).handle = spy
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert outcomes == [
+                (0, HotIpOutcome.APPLIED, 0),
+                (1, HotIpOutcome.APPLIED, 0),
+                (2, HotIpOutcome.APPLIED, 25),
+                (3, HotIpOutcome.APPLIED, 25),
+            ]
+        finally:
+            await worker.stop()
+
+    async def test_a_removal_below_w_is_applied_and_publishes_nothing(self) -> None:
+        # "an event that changed the hot set": removals too.
+        producer = _StatsProducer()
+        stream = _ScriptedStream(
+            [
+                _msg(_envelope(IP_A, 0), 0),
+                _msg(_envelope(IP_B, 1), 1),
+                _msg(_envelope(IP_A, 2, removed=True), 2),
+                _msg(_envelope(IP_C, 3), 3),
+            ],
+            hold=True,
+        )
+        bus = _ScriptedBusWithProducer(stream, end=4, producer=producer, last=_stats_value(4))
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            fs = worker.state.of(IPV4)
+            assert set(fs.records) == {IP_B, IP_C}
+            assert _updates(worker, "ipv4", "HotIpRemoved", "applied") == 1
+            assert set(_call_sequences(producer.calls)) == {4}
+            assert len(producer.calls) == 25
+        finally:
+            await worker.stop()
+
+
+class TestAFailedStartThenARestart:
+    """Ruling 1, "What it does to a start", *A run of failed starts*: "A start
+    that fails ... has published only stats at or after its own
+    `republish_from`. The next start's `republish_from` is at least as high."
+    Here the first start fails on one publish of the third state-changing
+    event; its other 24 reach the log, so the log's last message carries that
+    event's `sequence`, and the second start re-publishes from there."""
+
+    async def test_the_second_start_continues_from_the_failed_event(self) -> None:
+        bus = InMemoryBus()
+        for i in range(5):
+            await _publish(bus, _envelope(_ip(i + 1), i))  # event_sequence i + 1
+        failing_event_sequence = 3  # offset 2, `_ip(3)`
+        failing_key = _ancestor_text(_ip(3), 32)  # one key, only in that event
+
+        failing = _ForwardingProducer(bus.producer(), fail={failing_key: _PublishFailed()})
+        first = _worker_on(_SharedBus(bus, failing))
+        try:
+            with pytest.raises(PrefixStatsPublishError):
+                await asyncio.wait_for(first.start(), timeout=10.0)
+            assert first.republish_from == 0
+        finally:
+            await first.stop()
+        # Two whole events, then 24 of the third.
+        assert await bus.end_offset(STATS_TOPIC) == 25 * 2 + 24
+        last = await bus.last_value(STATS_TOPIC)
+        assert last is not None
+        assert decode(last).sequence == failing_event_sequence
+
+        healthy = _ForwardingProducer(bus.producer())
+        second = _worker_on(_SharedBus(bus, healthy))
+        try:
+            await asyncio.wait_for(second.start(), timeout=10.0)
+
+            assert second.caught_up is True
+            assert second.republish_from == failing_event_sequence
+            sequences = _call_sequences(healthy.calls)
+            # That event and later events only, none before.
+            assert set(sequences) == {3, 4, 5}
+            assert min(sequences) == failing_event_sequence
+            assert len(sequences) == 75
+            assert _stats_published(second) == 75
+            # The missing message of the third event is now in the log; the
+            # other 24 were dropped as duplicates.
+            assert await bus.end_offset(STATS_TOPIC) == 25 * 5
+            assert second.state.of(IPV4).trie.hot_ip_count == 5
+        finally:
+            await second.stop()
+
+
+def _foreign_agent() -> bytes:
+    return _stats_value(2, agent_id="foreign-s3cr3t-agent", prefix="203.0.113.0/24")
+
+
+def _ahead_of_log() -> bytes:
+    return _stats_value(987654321)
+
+
+def _hot_ip_added_value() -> bytes:
+    return encode(_envelope(Address.parse("198.51.100.77"), 0))
+
+
+# (the last value, the reason token, text of the message no record may carry)
+_REFUSED_LAST_VALUES = [
+    pytest.param(lambda: b"not json " + MARKER.encode(), "codec", (MARKER,), id="codec"),
+    pytest.param(_hot_ip_added_value, "payload_type", ("198.51.100.77",), id="payload_type"),
+    pytest.param(_foreign_agent, "agent_id", ("s3cr3t-agent", "203.0.113"), id="agent_id"),
+    pytest.param(_ahead_of_log, "ahead_of_log", ("987654321",), id="ahead_of_log"),
+]
+
+
+class TestALastMessageTheWorkerCannotUse:
+    """Ruling 1's four refusals: each gives `republish_from == 0`, so every
+    state-changing replayed event publishes (assumption 68: it "falls back to a
+    full re-publish; it does not fail the start"), and logs
+    `prefix_stats_last_ignored` at WARNING with `reason` and `replay_target`.
+    "It carries fixed tokens and numbers only. It never carries the message's
+    `sequence`, or anything else the message holds." """
+
+    @pytest.mark.parametrize(("build", "reason", "secrets"), _REFUSED_LAST_VALUES)
+    async def test_it_republishes_everything_and_logs_one_warning(
+        self,
+        build: Callable[[], bytes],
+        reason: str,
+        secrets: tuple[str, ...],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        last = build()
+        for secret in secrets:
+            assert secret.encode() in last
+        producer = _StatsProducer()
+        bus = _ScriptedBusWithProducer(_held(range(4)), end=4, producer=producer, last=last)
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.republish_from == 0
+            assert worker.caught_up is True
+            assert set(_call_sequences(producer.calls)) == {1, 2, 3, 4}
+            assert len(producer.calls) == 100
+            assert _stats_published(worker) == 100
+
+            records = _logged(caplog, "prefix_stats_last_ignored")
+            assert len(records) == 1
+            assert records[0].levelno == logging.WARNING
+            assert _field(records[0], "reason") == reason
+            assert _field(records[0], "replay_target") == "4"
+            assert _replay_fields(caplog)["republish_from"] == "0"
+
+            for record in caplog.records:
+                for secret in secrets:
+                    assert secret not in record.getMessage(), record.getMessage()
+                    if record.name == LOGGER:
+                        assert secret not in repr(vars(record))
+            for secret in secrets:
+                assert secret not in caplog.text
+        finally:
+            await worker.stop()
+
+
+def _foreign_agent_ahead_of_log() -> bytes:
+    # Trips the `agent_id` row and the `ahead_of_log` row: 987654321 is far
+    # above the replay target of 4.
+    return _stats_value(987654321, agent_id="foreign-s3cr3t-agent", prefix="203.0.113.0/24")
+
+
+def _hot_ip_added_ahead_of_log() -> bytes:
+    # Trips the `payload_type` row, the `agent_id` row (the aggregator's
+    # `agent_id` is not `AGENT_ID`) and the `ahead_of_log` row: the envelope's
+    # `sequence` is `n + 1`, 987654321.
+    return encode(_envelope(Address.parse("198.51.100.77"), 987654320, timestamp=T0))
+
+
+# (the last value, the reason of the first row that applies, text no record
+# may carry)
+_REFUSED_BY_THE_FIRST_ROW = [
+    pytest.param(
+        _foreign_agent_ahead_of_log,
+        "agent_id",
+        ("s3cr3t-agent", "203.0.113", "987654321"),
+        id="agent_id-before-ahead_of_log",
+    ),
+    pytest.param(
+        _hot_ip_added_ahead_of_log,
+        "payload_type",
+        ("198.51.100.77", "987654321"),
+        id="payload_type-before-agent_id-and-ahead_of_log",
+    ),
+]
+
+
+class TestTheFirstRefusalThatAppliesDecides:
+    """Ruling 1 item 2: "The rows are checked in order, and the first that
+    applies decides." A last message that trips more than one refusal is
+    logged with the reason of the earliest row it trips, once."""
+
+    @pytest.mark.parametrize(("build", "reason", "secrets"), _REFUSED_BY_THE_FIRST_ROW)
+    async def test_the_earliest_row_names_the_reason(
+        self,
+        build: Callable[[], bytes],
+        reason: str,
+        secrets: tuple[str, ...],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Ruling 1 item 2's table, in its order: `payload_type`, then
+        `agent_id`, then `ahead_of_log`. Every refusal gives `republish_from
+        == 0`, and the record "carries fixed tokens and numbers only, and
+        nothing the message holds" (decision 12 as amended by ruling 1)."""
+
+        caplog.set_level(logging.DEBUG)
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        last = build()
+        for secret in secrets:
+            assert secret.encode() in last
+        producer = _StatsProducer()
+        bus = _ScriptedBusWithProducer(_held(range(4)), end=4, producer=producer, last=last)
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.replay_target == 4
+            assert worker.republish_from == 0
+            assert worker.caught_up is True
+            assert set(_call_sequences(producer.calls)) == {1, 2, 3, 4}
+
+            records = _logged(caplog, "prefix_stats_last_ignored")
+            assert len(records) == 1
+            assert records[0].levelno == logging.WARNING
+            assert _field(records[0], "reason") == reason
+            assert _field(records[0], "replay_target") == "4"
+            assert _replay_fields(caplog)["republish_from"] == "0"
+
+            for record in caplog.records:
+                for secret in secrets:
+                    assert secret not in record.getMessage(), record.getMessage()
+                    if record.name == LOGGER:
+                        assert secret not in repr(vars(record))
+            for secret in secrets:
+                assert secret not in caplog.text
+        finally:
+            await worker.stop()
+
+
+class TestAnErrorFromLastValue:
+    async def test_it_propagates_out_of_start_and_nothing_is_subscribed(self) -> None:
+        # Decision 7 as amended 2026-09-24: the row "`bus.end_offset`,
+        # `bus.first_offset`, `subscribe`" gains `bus.last_value`: an
+        # exception from it propagates out of `start()`. Step 2a runs before
+        # step 4 subscribes.
+        bus = _FailingLastValueBus(_held(range(3)), end=3)
+        worker = _worker_on(bus)
+
+        try:
+            with pytest.raises(_LastValueFailed):
+                await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert ("last_value", PREFIX_STATS_NAME) in bus.calls
+            assert _subscriptions(bus.calls) == []
+            assert worker.caught_up is False
+            assert worker.state.position is None
+        finally:
+            await worker.stop()
+
+    async def test_it_propagates_before_step_3_passes_anything(self) -> None:
+        """Ruling 1 item 1: step 2a "runs after decision 4's step 2, so that
+        `replay_target` is known, and before step 3." With `first = 5` and a
+        fresh state, step 3 would call `note_passed(4)` and make
+        `event_sequence` 5; since `last_value` raises first, the exception
+        propagates (decision 7 as amended) with nothing passed: the position
+        is still `None` and `event_sequence` still `0`."""
+
+        stream = _held(range(5, 10))
+        bus = _FailingLastValueBus(stream, end=10, first=5)
+        worker = _worker_on(bus)
+
+        try:
+            with pytest.raises(_LastValueFailed):
+                await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.state.position is None
+            assert worker.state.event_sequence == 0
+            assert worker.caught_up is False
+            assert _subscriptions(bus.calls) == []
+            assert stream.taken == 0
+            # Step 2's two reads, then step 2a, and nothing after it.
+            assert bus.calls[-3:] == [
+                ("end_offset", TOPIC),
+                ("first_offset", TOPIC),
+                ("last_value", PREFIX_STATS_NAME),
+            ]
+        finally:
+            await worker.stop()
+
+
+class TestAfterAndOutsideStart:
+    """Ruling 1 item 4: "`republish_from` is `None` until step 2a has run, and
+    `handle()` then publishes as if it were `0`. Every live event publishes:
+    the value the table keeps is at most `replay_target`, and every record
+    appended after `start()` read the log's end has a greater
+    `event_sequence`." """
+
+    async def test_a_live_event_publishes_when_republish_from_is_the_replay_target(
+        self,
+    ) -> None:
+        producer = _StatsProducer()
+        stream = _held(range(4))
+        bus = _ScriptedBusWithProducer(stream, end=4, producer=producer, last=_stats_value(4))
+        worker = _worker_on(bus)
+        await asyncio.wait_for(worker.start(), timeout=10.0)
+        assert worker.republish_from == worker.replay_target == 4
+        # Only the event at offset 3 (`event_sequence` 4) published.
+        assert set(_call_sequences(producer.calls)) == {4}
+        task = asyncio.create_task(worker.run())
+
+        stream.feed(_added(4))
+        await _yield_until(lambda: len(producer.calls) == 50 or task.done())
+
+        assert _call_sequences(producer.calls)[25:] == [5] * 25
+        assert _stats_published(worker) == 50
+        await _stop_and_join(worker, task)
+        assert task.exception() is None
+
+    async def test_handle_before_start_publishes_as_before(self) -> None:
+        # The bus would answer a high last sequence, but `start()` never ran:
+        # `republish_from` is `None` and `handle()` publishes.
+        producer = _StatsProducer()
+        bus = _ScriptedBusWithProducer(
+            _held([]), end=100, producer=producer, last=_stats_value(100)
+        )
+        worker = _worker_on(bus)
+
+        outcome = await worker.handle(_added(0))
+
+        assert outcome is HotIpOutcome.APPLIED
+        assert worker.republish_from is None
+        assert _call_sequences(producer.calls) == [1] * 25
+        assert _stats_published(worker) == 25
+        assert ("last_value", PREFIX_STATS_NAME) not in bus.calls
+
+
+# ==========================================================================
+# ADR-0017 Amendment 3 ruling 2 (finding S2), "The trie": "Such a hot-ip record
+# is now `MALFORMED` [`codec`] at decision 6 step 2, before anything is
+# applied, and the replay goes on past it." The bytes are built by editing an
+# encoded envelope ("Test seams", "An out-of-range timestamp"); `event_id` does
+# not depend on the timestamp.
+# ==========================================================================
+
+OUT_OF_RANGE_TIMESTAMP = "9999-12-31T23:59:59-01:00"
+
+
+def _out_of_range_timestamp_add(ip: Address, n: int) -> bytes:
+    """A `HotIpAdded` for `ip` whose payload `timestamp` is out of range in UTC;
+    its key and subject still name `ip`."""
+
+    doc = json.loads(encode(_envelope(ip, n)))
+    doc["payload"]["timestamp"] = OUT_OF_RANGE_TIMESTAMP
+    return json.dumps(doc).encode("utf-8")
+
+
+class TestAnOutOfRangeHotIpTimestamp:
+    async def test_it_is_malformed_codec_and_the_next_record_is_handled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        producer = _StatsProducer()
+        worker = _stats_worker(_ProducerBus(producer))
+        assert await worker.handle(_msg(_envelope(IP_C, 0), 0)) is HotIpOutcome.APPLIED
+        assert len(producer.calls) == 25
+        value = _out_of_range_timestamp_add(IP_A, 1)
+
+        outcome = await worker.handle(_message(value, 1, str(IP_A).encode()))
+
+        assert outcome is HotIpOutcome.MALFORMED
+        assert _skipped(worker, "malformed") == 1
+        assert IP_A not in worker.state.of(IPV4).records
+        assert worker.state.of(IPV4).trie.hot_ip_count == 1
+        assert worker.state.position == 1
+        assert len(producer.calls) == 25
+        records = _logged(caplog, "malformed_hot_ip_event")
+        assert len(records) == 1
+        assert _field(records[0], "reason") == "codec"
+
+        nxt = await worker.handle(_msg(_envelope(IP_A, 2), 2))
+
+        assert nxt is HotIpOutcome.APPLIED
+        assert IP_A in worker.state.of(IPV4).records
+        assert worker.state.position == 2
+        assert len(producer.calls) == 50
+
+    async def test_the_replay_completes_past_it(self) -> None:
+        producer = _StatsProducer()
+        stream = _ScriptedStream(
+            [
+                _msg(_envelope(IP_C, 0), 0),
+                _message(_out_of_range_timestamp_add(IP_A, 1), 1, str(IP_A).encode()),
+                _msg(_envelope(IP_B, 2), 2),
+            ],
+            hold=True,
+        )
+        worker = _worker_on(_ScriptedBusWithProducer(stream, end=3, producer=producer))
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            fs = worker.state.of(IPV4)
+            assert worker.caught_up is True
+            assert worker.state.event_sequence == 3
+            assert set(fs.records) == {IP_B, IP_C}
+            assert _skipped(worker, "malformed") == 1
+            assert set(_call_sequences(producer.calls)) == {1, 3}
+            assert len(producer.calls) == 50
         finally:
             await worker.stop()

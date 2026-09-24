@@ -6,11 +6,27 @@
   "required": ["prefix", "hot_count", "capacity", "sequence", "timestamp"],
   "additionalProperties": false,
   "properties": {
-    "prefix": { "type": "string" },
+    "prefix": {
+      "type": "string",
+      "description": "The prefix in canonical CIDR text, e.g. \"10.20.30.0/24\" or \"2001:db8::/104\". The trie publishes it as the message key and as the envelope's subject, so the stats of one hot-ip event carry distinct event_ids (ADR-0017 decision 14)."
+    },
     "hot_count": { "type": "integer", "minimum": 0 },
     "capacity": { "type": "string", "description": "decimal string; IPv6 capacities exceed 64-bit" },
-    "hot_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
-    "sequence": { "type": "integer", "minimum": 0 },
-    "timestamp": { "type": "string", "format": "date-time" }
+    "hot_ratio": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "hot_count / capacity, computed exactly and rounded once to the nearest double. Informational: prefix classification compares hot_count and capacity exactly (ADR-0010 decision 1). Optional here; the trie sets it on every message it publishes (ADR-0017 Amendment 2)."
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The trie's event_sequence once it has applied the hot-ip event behind these stats: the offset of the next hot-ip record it will read (ADR-0017 decision 8). Shared by every stat of one event, strictly increasing from one event to the next, and not dense. A consumer applies a PrefixStatsChanged only if its sequence is greater than the one it holds for that prefix (ADR-0013 decision 9)."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "The timestamp of the hot-ip event behind these stats, not the time they were published (ADR-0017 decision 14)."
+    }
   }
 }

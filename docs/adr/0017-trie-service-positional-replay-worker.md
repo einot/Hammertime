@@ -20,6 +20,25 @@ which of assumption 19's cases a longer deadline does not help; ADR-0010
 Amendment 1 ruling 1 gains a note on its stale `start_offset=1`; and
 ADR-0013 Amendment 11 rules which of their two errors `NatsBus`'s offset
 reads raise when both apply.
+Amended again 2026-09-23 (see "Amendment 2" at the end), to design slice 2,
+the `PrefixStatsChanged` publisher. Decision 14 item 10's four points are
+settled: IPv6 reports `/104` to `/128` under a key of its own, the service
+keeps accepting `ipv6`, and the publisher does not measure
+`hot_transition_to_prefix_update_latency`. Decisions 1, 2, 6, 7, 9, 11, 12,
+13, 14 and 16, the Test seams and Consequences carry dated notes. ADR-0010
+(Amendment 3), ADR-0013 (Amendment 12) and ADR-0016 (Amendment 1) carry
+pointer notes.
+Amended a third time 2026-09-24 (see "Amendment 3" at the end), for the
+reviewer's and the security auditor's findings on slice 2. A start
+re-publishes only from the last `sequence` that
+`hammertime.prefix-stats.v1` holds, read through a new
+`MessageBus.last_value` (ADR-0013 Amendment 13). The codec returns every
+decoded timestamp in UTC and refuses one it could not write again.
+`publish()`'s count and wait are pinned for a cancellation, and `stop()`
+marks nothing. Whether to cap the streams is left with the owner and is
+not ruled. Decisions 1, 4, 6, 7, 12, 13, 14 and 16, the Test seams,
+Consequences and Amendment 2 carry dated notes. ADR-0010 (Amendment 4) and
+ADR-0013 (Amendment 13) carry notes.
 
 Scope note. This ADR settles what epic #10 ("Trie worker, publisher &
 read-side query API") is built against. It splits the epic into slices
@@ -144,6 +163,24 @@ What was open, and blocks anyone who wants to write a test or a module:
 > `schemas/hot_ip_event.v1.json` (`window_count` required). The row's "the
 > invariant checkers" do not change: both take the widened map as they are.
 
+> Noted 2026-09-23 (Amendment 2): slice 2 is designed. Its row also covers
+> a second key, `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6` (Amendment 2
+> ruling 1), and its implementing change edits `.env.example` and
+> `CHANGES`. Slice 2 makes every start re-publish the stats of each
+> state-changing record it replays, which limits how much one start can
+> replay inside its deadline (ruling 4). So the snapshot epic must also come
+> before any deployment whose retained hot-ip log holds more such records
+> than one start can re-publish in time.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): the constraint the note above
+> adds no longer holds. A start re-publishes only from the `sequence` of
+> the last message in `hammertime.prefix-stats.v1`, when that message is
+> the trie's own. Then the number of state-changing records the log
+> retains no longer limits a start. When it is not, a start that fails
+> leaves the next one less to re-publish, so repeated starts finish. The
+> snapshot epic's place in the order rests on this decision's own reasons
+> again.
+
 ### 2. Slice 1's modules
 
 ```text
@@ -173,6 +210,14 @@ the worker, which depends on the bus. Imports run one way:
 
 Nothing in `structure` or `metadata` imports any of these. Slice 1 does
 not touch `publisher.py`, `query/views.py` or `snapshot/`.
+
+> Amended 2026-09-23 (Amendment 2 ruling 2): slice 2 fills in
+> `publisher.py`: `AGENT_ID`, `DEFAULT_MIN_PREFIX_LENGTHS`, `StatsMessage`,
+> `PreparedStats`, `PrefixStatsPublishError` and `PrefixStatsPublisher`.
+> `publisher` imports `metrics`, `hammertime.trie.structure`,
+> `hammertime.trie.metadata`, `hammertime-bus` and `hammertime-core`, and
+> `worker` imports `publisher`. `state` and `query.app` import none of it.
+> The paragraph above describes slice 1 and stays true of it.
 
 ```python
 # hammertime.trie.state   Spec: §22, §28, §33, §35, §46.5
@@ -337,6 +382,17 @@ The replay runs inside `start()`, under `HAMMERTIME_STARTUP_TIMEOUT_S`.
 ADR-0009 decisions 4 and 5 are unchanged. The consequence for a long log
 is under Consequences.
 
+> Amended 2026-09-24 (Amendment 3 ruling 1): a step 2a runs after step 2
+> and before step 3. The worker reads `last = await
+> bus.last_value(PREFIX_STATS.name)`, the value of the last message of
+> `hammertime.prefix-stats.v1`, and sets `republish_from` from it: the
+> envelope's `sequence` when the value decodes to a `PrefixStatsChanged`
+> published under `AGENT_ID` whose `sequence` is at most `replay_target`,
+> and `0` otherwise (Amendment 3 ruling 1's table). A replayed event
+> below `republish_from` is applied and not re-published. The other steps
+> keep their numbers, so that the texts citing them stay right. Step 6's
+> `replay_complete` gains the field `republish_from`.
+
 ### 5. Address families: the configured set, one trie and one record map each
 
 * **What is held.** `HAMMERTIME_TRIE_FAMILIES` (decision 11) names the
@@ -451,6 +507,34 @@ lock. Slice 2 publishes after step 5 (decision 14).
 > document. Both calls stay inside the synchronous section above. The
 > `HotIpRemoved` call is unchanged.
 
+> Amended 2026-09-23 (Amendment 2 ruling 3): the constructor gains a
+> keyword, `min_prefix_lengths: Mapping[AddressFamily, int] =
+> DEFAULT_MIN_PREFIX_LENGTHS`. It takes its producer from `bus.producer()`,
+> once, as it takes its consumer, and builds its `PrefixStatsPublisher`
+> from it. When step 4 returned `changed`, two steps follow step 5 and come
+> before step 6:
+>
+> * **5a. Prepare.** `prepared = publisher.prepare(fs.trie, payload.ip,
+>   sequence=state.event_sequence,
+>   config_version=state.config.config_version,
+>   timestamp=payload.timestamp)`, still inside the synchronous section.
+> * **5b. Publish.** `await publisher.publish(prepared)`, still under the
+>   lock. A `PrefixStatsPublishError` is logged as
+>   `prefix_stats_publish_failed` and re-raised.
+>
+> `handle()` now awaits the lock and, for an `APPLIED` event, that publish.
+> The paragraph above that begins "Steps 4 and 5 are one synchronous
+> section" describes slice 1.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): the interface gains a
+> property, `republish_from -> int | None`: the value `start()`'s step 2a
+> set (decision 4), and `None` before it. Steps 5a and 5b run only for an
+> event that changed the hot set and whose `state.event_sequence` is at
+> least `republish_from`, read as `0` while it is `None`. An event below
+> it is applied, recorded in step 5 and counted in `trie_updates` as
+> before, and its outcome is `APPLIED`, but it prepares and publishes
+> nothing.
+
 The key and subject checks mirror the aggregator's ADR-0004 check on
 observations. Every in-repo producer of hot-ip events sets both to the
 IP's canonical text (ADR-0011 decision 4 step 4). A record that names one
@@ -480,6 +564,28 @@ The worker catches no bare `Exception` anywhere.
 > is a bug and propagates, as the `apply_*` `ValueError` row says. Neither is
 > an attributes rejection, so neither takes the `attributes=None` retry or
 > counts in `attributes_rejected`.
+
+> Amended 2026-09-23 (Amendment 2 ruling 5): three rows join the table.
+>
+> * `publisher.publish` raises `PrefixStatsPublishError`: the worker logs
+>   `prefix_stats_publish_failed` and propagates the error, out of
+>   `start()` (`start_failed`, exit 1) or `run()` (`run_exited`, exit 1).
+>   The event is applied and `position` has moved past it.
+> * `publisher.prepare` raises `ValueError` or `CodecError`: cannot happen;
+>   a bug, which propagates.
+> * `publisher.flush` raises, in `stop()`: propagates out of `stop()`.
+>
+> The worker still catches no bare `Exception`: it catches
+> `PrefixStatsPublishError` by name.
+
+> Amended 2026-09-24 (Amendment 3 rulings 1 and 2): the row "`bus.end_offset`,
+> `bus.first_offset`, `subscribe`" gains `bus.last_value`: an exception
+> from it propagates out of `start()`, `start_failed`, exit 1. A last
+> message the worker cannot use is not an exception. It sets
+> `republish_from` to `0` and is logged as `prefix_stats_last_ignored`.
+> The row "`publisher.prepare` raises `ValueError` or `CodecError`: cannot
+> happen" did not hold for a hot-ip timestamp the codec decoded but could
+> not write again. Decode now refuses such a timestamp, so the row holds.
 
 ### 8. `event_sequence` is the trie's position in the log; `as_of` is the newest applied event time
 
@@ -622,6 +728,17 @@ The cost is that a long synchronous read delays the writer for as long as
 it takes. In slice 1 no reader is long. Decision 15 names slice 3's one
 candidate, `GET /prefixes/hot`.
 
+> Amended 2026-09-23 (Amendment 2 ruling 3): slice 2 keeps all three
+> rules. R1's writes still start with `apply_*` and end with
+> `note_applied`. For an event that changed the hot set, the synchronous
+> section runs on, without an `await`, through the publisher's `prepare()`,
+> which only reads. The publish is awaited after the section, under the
+> lock, and writes nothing to `TrieState`. R2 gains a fourth reader,
+> `prepare()`: it takes the event's ancestor counts and `config_version` in
+> that section and encodes every message before the first `await`. While
+> the publish is awaited, readers see the event whole, with
+> `event_sequence` past it and its stats not yet all in the log (§22).
+
 ### 10. Configuration changes: adopted by the state, under the worker's lock
 
 * **Wiring.** `TrieService` builds
@@ -683,6 +800,16 @@ Not read by slice 1:
   number). Their names and defaults are fixed now — `.env.example` and
   `integration-scenarios.md` §2.2 already use them. The snapshot epic adds
   them to `load_settings` together with the code that reads them.
+
+> Amended 2026-09-23 (Amendment 2 ruling 1): slice 2 reads
+> `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` (field `min_prefix_length`, default
+> `8`, an integer from 0 to 32: IPv4's floor) and a new key,
+> `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6` (field `min_prefix_length_ipv6`,
+> default `104`, an integer from 0 to 128). Each is read with `int()` and
+> checked against its range, both ends included. A bad value is a
+> `ValueError` naming the variable. Both are checked whatever
+> `HAMMERTIME_TRIE_FAMILIES` holds. `TrieSettings` gains the two fields,
+> with those defaults, after `config_poll_interval_s`.
 
 ### 12. Metrics and log records
 
@@ -747,6 +874,24 @@ through the runner's `exception` field.
 | `redelivered_hot_ip_event` | warning | `topic`, `partition`, `offset`, `position` |
 | `trie_invariant_violation` | error | `family`, `topic`, `partition`, `offset` |
 | `replay_complete` | info | `start_offset`, `first_offset`, `replay_target`, `event_sequence` |
+
+> Amended 2026-09-23 (Amendment 2 ruling 7): slice 2 adds a counter,
+> `prefix_stats_published` (label `family`): the `PrefixStatsChanged`
+> publishes that returned, including one the log dropped as a duplicate.
+> It adds a record, `prefix_stats_publish_failed` (error; `family`,
+> `topic`, `partition`, `offset`, `sequence`, `attempted`, `failed`,
+> `error_type`), and `replay_complete` gains a field,
+> `prefix_stats_published`. The sentence above, "slice 2 can measure it",
+> is answered no: slice 2 does not measure
+> `hot_transition_to_prefix_update_latency`, for ruling 7's reasons, and
+> the telemetry epic owns it.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): `replay_complete` gains a
+> field, `republish_from`. A record is added, `prefix_stats_last_ignored`
+> (warning; `reason`, one of `codec`, `payload_type`, `agent_id` and
+> `ahead_of_log`; `replay_target`), for a last message of
+> `hammertime.prefix-stats.v1` that the worker cannot use. It carries fixed
+> tokens and numbers only, and nothing the message holds.
 
 ### 13. Lifecycle and shutdown
 
@@ -856,6 +1001,22 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
 * **`snapshot_now()`** (ADR-0009 decision 3's table) belongs to the
   snapshot epic. `Service` does not require it.
 
+> Amended 2026-09-23 (Amendment 2 ruling 6): `TrieWorker.stop()` sets the
+> stop flag, takes the lock, then awaits `publisher.flush()`, and marks the
+> worker stopped whether or not the flush raised. Every call takes all
+> three steps. `build_service` passes `min_prefix_lengths={IPV4:
+> settings.min_prefix_length, IPV6: settings.min_prefix_length_ipv6}` to
+> the worker. `startup_fields()` gains `min_prefix_lengths`: each served
+> family's name mapped to its floor, for example `{"ipv4": 8}`.
+
+> Amended 2026-09-24 (Amendment 3 ruling 4): "It then marks the worker
+> stopped." describes no behaviour. Nothing reads such a mark: `handle()`,
+> `apply_config()`, `start()`'s step 3 and `run()` read the stop flag,
+> which is set first. The worker keeps no "stopped" state, and the note
+> above's "marks the worker stopped whether or not the flush raised" goes
+> with it: `stop()` sets the flag, takes the lock, and awaits the flush,
+> whose exception propagates.
+
 ### 14. The publisher (slice 2): what is decided now
 
 1. **Only a change is published.** An event whose outcome is `APPLIED`
@@ -912,6 +1073,23 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
       `HAMMERTIME_TRIE_FAMILIES` until that range exists;
     * whether the publisher measures
       `hot_transition_to_prefix_update_latency`.
+
+> Settled 2026-09-23 (Amendment 2): item 10's four points. The IPv6 range
+> is `[104, 128]` by default (ruling 1). `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH`
+> is IPv4's floor, default 8, from 0 to 32, and IPv6 gets a key of its own,
+> `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6`, default 104, from 0 to 128
+> (ruling 1). The service keeps accepting `ipv6`, since the range now
+> exists (ruling 1). The publisher does not measure
+> `hot_transition_to_prefix_update_latency` (ruling 7). Rulings 3 to 6
+> detail items 6 to 9.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): item 8's "every start
+> therefore re-publishes the stats of the whole retained log" no longer
+> holds. A start re-publishes only from the `sequence` of the last message
+> in `hammertime.prefix-stats.v1`, when Amendment 3 ruling 1's table
+> accepts that message, and re-publishes everything only when it does not.
+> Item 8's reason stands: an event whose stats may be missing from the log
+> is published again.
 
 ### 15. The read API (slice 3): what is decided now
 
@@ -988,6 +1166,22 @@ def build_service(settings: TrieSettings, *, bus: MessageBus | None = None,
   `HAMMERTIME_TRIE_SNAPSHOT_DIR=/snapshots`.
 * **A restored document that fails validation** is ADR-0015 decision 8's
   question. It is counted as `attributes_rejected{stage="snapshot"}`.
+
+> Amended 2026-09-23 (Amendment 2 ruling 10): two more. A restore
+> re-publishes the stats of every state-changing record after the
+> snapshot's position (decision 14 item 8). And no snapshot may record a
+> state that a `handle()` which raised has left behind: after a
+> `PrefixStatsPublishError` the state is past an event whose stats may be
+> missing from the log, and after an `InvariantViolation` the trie has been
+> found corrupt. That binds `stop()`'s final snapshot and the periodic one
+> alike. How is the epic's to design.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): the first of the two is
+> qualified. A restore replays everything after the snapshot's position,
+> as before, and the replayed events re-publish under the rule every start
+> follows: from `republish_from`. When `hammertime.prefix-stats.v1` has no
+> usable last message, that is every state-changing record after the
+> snapshot's position.
 
 ### 17. #115 and #116
 
@@ -1080,6 +1274,15 @@ written and removed in the same step.
 * **The admin app.** `TrieService.app` can be served in-process through
   `httpx.ASGITransport`, so a test can request any path, including those
   decision 13 says the app does not serve.
+
+> Added 2026-09-23 (Amendment 2): four seams for slice 2 — the producer,
+> the publisher on its own, reading what was published on the memory bus,
+> and the new log record. Amendment 2's "Test seams" describes them.
+
+> Added 2026-09-24 (Amendment 3): every bus double handed to a worker, or
+> to `build_service`, implements `last_value`. A double that returns
+> `None` keeps the replay publishing everything. Amendment 3's "Test
+> seams" describes the rest.
 
 ## Questions this ADR closes
 
@@ -1360,6 +1563,23 @@ Assumptions 26-32 were added by the revision of 2026-09-23 (see
   re-publishes the stats of every retained event (decision 14 item 8). The
   log deduplicates inside 120 s, and the detector's sequence rule absorbs
   the rest.
+
+  > Amended 2026-09-23 (Amendment 2 ruling 4): readiness waits for those
+  > publishes, and each state-changing record now costs a broker round trip
+  > and 25 acknowledged publishes. By an estimate from ADR-0013's measured
+  > publish rate, the default 60 s deadline then holds at most about 40,000
+  > such records. A longer log fails the start until the deadline is raised
+  > or the snapshot epic lands.
+
+  > Amended 2026-09-24 (Amendment 3 ruling 1): no longer so. A start
+  > re-publishes only from the `sequence` of the last message in
+  > `hammertime.prefix-stats.v1`, when Amendment 3 ruling 1's table
+  > accepts that message. It costs about what a start cost before slice 2,
+  > and a restart loop no longer appends the stats of the log's head again
+  > each time.
+  > The full re-publish, and the estimate above, apply only when that
+  > stream has no usable last message. A start that then fails keeps what
+  > it published, and the next start continues after it.
 * **The detector epic can rely on the trie's `event_sequence`** never
   going backwards across trie restarts, while the stream exists
   (decision 8).
@@ -1881,3 +2101,1388 @@ Read on 2026-09-23 for this amendment. No web source was consulted.
   `packages/hammertime-core/src/hammertime/core/runtime.py`, `run_service`
   logs `start_failed reason=startup_timeout` when `start()` outlasts the
   deadline, which is the record the runbook names.
+
+## Amendment 2 (2026-09-23) — slice 2 designed: the `PrefixStatsChanged` publisher
+
+Why: decision 14 fixed what slice 2 publishes (items 1-9) and left four
+points to slice 2's own design (item 10). The dispatch for that design
+asked for those four, and for eight more:
+
+* how the publish keeps decision 9's R1, given that item 6 awaits the
+  publisher inside `handle()`, under the lock, after step 5;
+* what startup replay does under item 8: how much it publishes, what that
+  costs in startup time, and whether readiness waits for it;
+* failure handling under item 7, including how a failure during `start()`
+  is reported;
+* `stop()`'s flush (item 9) and decision 13's shutdown order;
+* the new metrics, log records and keys, under decision 12's rules;
+* the prefix-stats topic and its producer (ADR-0013): what exists and what
+  is new;
+* the schema, and the codec's bounds for `hot_ratio` in ADR-0016's style;
+* the `CHANGES` lines, and whether any is `BREAKING`.
+
+Items 1-9 are not re-opened: every ruling below builds on them. This ADR,
+and the three others this amendment touches, are on master, so nothing
+merged is rewritten. Each place whose text is now incomplete or no longer
+true carries a dated note, and "Edits" below lists them.
+
+### Ruling 1. The reporting range is per family; IPv6 reports `/104` to `/128`
+
+| Family | Prefixes reported | Key | Default | Accepted values |
+| --- | --- | --- | --- | --- |
+| IPv4 | `[L4, 32]` | `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` | `8` | an integer from 0 to 32 |
+| IPv6 | `[L6, 128]` | `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6` | `104` | an integer from 0 to 128 |
+
+* **Why `/104`.** ADR-0010 decision 3 reports no IPv4 prefix shorter than
+  `/8`, because above that capacity no plausible `minimum_hot_ips` and
+  `minimum_hot_ratio` pair can be met: a `/7` needs 3.3 million hot IPs at
+  10 %. An IPv4 `/8` holds 2^24 addresses, and the IPv6 prefix that holds
+  2^24 addresses is `/104`. Both families therefore report prefixes of 2^24
+  addresses down to one, and an IPv6 transition publishes 25 messages at
+  the default, as an IPv4 one does. An IPv6 `/103` needs as many hot IPs as
+  an IPv4 `/7`.
+* **IPv6 gets a key of its own.** ADR-0010's assumption said that the
+  setting "must become per-family when §35 is implemented", and slice 1
+  implemented §35. `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH` keeps the name
+  ADR-0009 and ADR-0010 gave it, and is IPv4's.
+* **How a value is read.** Each value is read with Python's `int()`, as the
+  aggregator reads its integer keys, then checked against its range, both
+  ends included. A value `int()` refuses, or one outside the range, is a
+  `ValueError` naming the variable: `config_invalid`, exit 2 (decision
+  11). Both keys are read and checked whatever `HAMMERTIME_TRIE_FAMILIES`
+  holds. The value for a family the process does not serve is not used.
+* **Settings.** `TrieSettings` gains two fields after
+  `config_poll_interval_s`: `min_prefix_length: int = 8` and
+  `min_prefix_length_ipv6: int = 104`.
+* **Nothing is refused.** `HAMMERTIME_TRIE_FAMILIES` keeps accepting
+  `ipv6`. The range exists now, so there is nothing to wait for.
+* **What the range does not give IPv6.** The prefixes at which IPv6 traffic
+  usually groups — `/64`, `/56`, `/48` — hold at least 2^64 addresses. The
+  `hot_ratio` of any realistic count there is far below any
+  `minimum_hot_ratio` that also makes sense for IPv4, so no such prefix can
+  qualify under the v1 predicate. A lower floor would publish them, always
+  `NORMAL`. A scorer that does not rest on the ratio (§14) would change
+  that. This is recorded, not addressed (§43: IPv4 first).
+
+### Ruling 2. `hammertime.trie.publisher`
+
+```python
+# hammertime.trie.publisher   Spec: §3, §14, §19, §22, §35; ADR-0010 decision 3;
+#                             ADR-0017 decision 14 and Amendment 2
+AGENT_ID: Final = "trie-primary"
+DEFAULT_MIN_PREFIX_LENGTHS: Final[Mapping[AddressFamily, int]]   # read-only: {IPV4: 8, IPV6: 104}
+
+@dataclass(frozen=True, slots=True)
+class StatsMessage:
+    key: str          # the prefix text: PREFIX_STATS.key_selector(payload)
+    value: bytes      # hammertime.core.events.codec.encode(envelope)
+    message_id: str   # envelope.event_id
+
+@dataclass(frozen=True, slots=True)
+class PreparedStats:
+    family: AddressFamily
+    sequence: int
+    messages: tuple[StatsMessage, ...]   # one per ancestor_stats entry, in its order: shortest prefix first
+
+class PrefixStatsPublishError(Exception):
+    sequence: int
+    attempted: int
+    failed: int
+    def __init__(self, *, sequence: int, attempted: int, failed: int) -> None: ...
+
+class PrefixStatsPublisher:
+    def __init__(self, producer: Producer, *, metrics: TrieMetrics,
+                 min_prefix_lengths: Mapping[AddressFamily, int] = DEFAULT_MIN_PREFIX_LENGTHS) -> None: ...
+    def min_prefix_length(self, family: AddressFamily) -> int: ...
+    def prepare(self, trie: HotTrie, ip: Address, *, sequence: int, config_version: int,
+                timestamp: datetime) -> PreparedStats: ...
+    async def publish(self, prepared: PreparedStats) -> None: ...
+    async def flush(self) -> None: ...
+```
+
+* **The constructor** keeps `producer` and `metrics`, and copies
+  `min_prefix_lengths`. That mapping must hold an entry for each
+  `AddressFamily`, an `int` from 0 to that family's bit length. A missing
+  family, or a length out of range, is a `ValueError`.
+* **`min_prefix_length(family)`** returns that family's floor.
+* **`prepare(trie, ip, *, sequence, config_version, timestamp)`** is
+  synchronous and calls no producer. With `L =
+  min_prefix_length(trie.family)`, it makes one `StatsMessage` for each
+  entry `s` of `ancestor_stats(trie, ip, min_length=L)` (ADR-0015 decision
+  2), zero counts included, in that order:
+  * the payload is `PrefixStatsChanged(prefix=str(s.prefix),
+    hot_count=s.hot_count, capacity=s.capacity, sequence=sequence,
+    timestamp=timestamp, hot_ratio=s.hot_ratio)`;
+  * the envelope is `EventEnvelope(agent_id=AGENT_ID, sequence=sequence,
+    event_type="PrefixStatsChanged", config_version=config_version,
+    timestamp=timestamp, subject=str(s.prefix), payload=<the payload>)`
+    (decision 14 item 3);
+  * `key` is the prefix text, `value` the encoded envelope, and
+    `message_id` the envelope's `event_id` (item 4).
+
+  The same arguments over the same trie give the same messages. A
+  `ValueError` from `ancestor_stats` (an address of the other family) and
+  a `CodecError` from `encode` propagate. From the worker, neither can
+  happen (ruling 5).
+* **`publish(prepared)`** starts `producer.publish(PREFIX_STATS.name, key,
+  value, message_id=message_id)` for every message before it awaits any of
+  them. It returns only once every one of them has returned or raised, so
+  no publish outlives it. For each publish that returned, it counts
+  `prefix_stats_published` once, with `family=prepared.family`.
+  * If any publish raised an `Exception`, `publish()` then raises
+    `PrefixStatsPublishError(sequence=prepared.sequence, attempted=<the
+    number of messages>, failed=<the number that raised>)`. It raises it
+    from the exception of the first failed message in `messages` order,
+    which is therefore its `__cause__`. The error's text carries those
+    three numbers and nothing else of the event: no prefix, and not the
+    cause's text.
+  * A publish that raises a `BaseException` that is not an `Exception`,
+    such as a cancellation, makes `publish()` raise that same exception.
+  * The order in which one event's messages reach the log is not pinned.
+* **`flush()`** awaits `producer.flush()`.
+* **Imports.** `publisher` imports `metrics`, `hammertime.trie.structure`,
+  `hammertime.trie.metadata`, `hammertime-bus` and `hammertime-core`.
+  `worker` imports `publisher`. `state` and `query.app` import none of it
+  (decision 2).
+
+> Amended 2026-09-24 (Amendment 3 ruling 3): `publish()`'s "returns only
+> once every one of them has returned or raised" and "For each publish that
+> returned, it counts `prefix_stats_published` once" hold for every way it
+> ends, a cancellation included. When it is cancelled, it cancels the
+> publishes still in flight, waits until each has finished, and raises
+> `CancelledError`; every publish that returned is counted.
+
+### Ruling 3. The worker publishes after step 5, and R1 holds
+
+* **The constructor.** `TrieWorker(*, bus, state, metrics,
+  min_prefix_lengths: Mapping[AddressFamily, int] =
+  DEFAULT_MIN_PREFIX_LENGTHS)`. It takes its producer from `bus.producer()`,
+  once, as it takes its consumer from `bus`, and builds its
+  `PrefixStatsPublisher` from that producer, `metrics` and
+  `min_prefix_lengths`. Every slice-1 construction stays valid and gets the
+  defaults.
+* **`handle()`**, with decision 6's steps as they now run. Steps 1 to 5 are
+  unchanged. When step 4 returned `changed`, two steps follow step 5, and
+  then step 6:
+  * **5a. Prepare.** `prepared = publisher.prepare(fs.trie, payload.ip,
+    sequence=state.event_sequence,
+    config_version=state.config.config_version,
+    timestamp=payload.timestamp)`. It runs in the synchronous section that
+    step 4 opened: no `await` separates `note_applied` from it.
+    `state.event_sequence` is `message.offset + 1` at that point.
+  * **5b. Publish.** `await publisher.publish(prepared)`, still holding the
+    worker's lock. On `PrefixStatsPublishError` the worker logs
+    `prefix_stats_publish_failed` (ruling 7) and re-raises the error.
+  * **6. Outcome.** `APPLIED`, once the publish has returned. An
+    `UNCHANGED` event, and every skipped outcome, prepares and publishes
+    nothing (item 1).
+* **R1.** R1 is about writes, and its section is unchanged. It opens with
+  the first write of `apply_*`, and its last write is still
+  `note_applied`. It now runs on through `prepare()`, still without an
+  `await`, and `prepare()` only reads. The publish is awaited after the
+  section, and writes nothing to `TrieState`.
+* **`prepare()` is an R2 reader.** It takes the event's ancestor counts and
+  `config_version` in one synchronous section, and encodes every message
+  before the first `await`. The messages therefore describe the state
+  between this event and the next, and nothing written later changes them.
+* **While the publish is awaited,** the worker holds its lock, so no other
+  writer runs: not the next `handle()`, not `apply_config()`, not
+  `start()`'s step 3, and not `stop()` beyond its flag (ruling 6). Readers
+  can run: `/metrics`, and slice 3's read API. They see the event whole,
+  with `event_sequence` past it, while its stats are still on their way to
+  the log. That is the lag §22 allows between the trie and the detector,
+  and every response's `event_sequence` shows it.
+* **Why two calls.** One coroutine that read the trie and then published
+  would also read before its first `await`, but only while nobody adds an
+  `await` above the read. Two calls make the synchronous read part of the
+  interface, and a test can check it: a write to the trie after `prepare()`
+  returns does not change what `publish()` sends.
+
+### Ruling 4. Startup replay publishes, and readiness waits for it
+
+* **What happens.** `start()` hands every replayed message to `handle()`,
+  so the replay publishes exactly as live consumption does (item 8), one
+  event at a time (item 6). `start()` returns once `handle()` has returned
+  for the message that brought the worker to `replay_target`, publish
+  included. `TrieService` marks itself ready only after `start()` returns
+  (decision 4). A ready trie has therefore had every stat of every
+  state-changing record it replayed acknowledged by the log.
+  `caught_up` is about the position: it becomes true at that last
+  message's `note_applied`, before its publish returns, and only the
+  service reads it, after `start()` has returned.
+* **How much.** A record whose outcome is `APPLIED` publishes 25 messages
+  at the defaults; any other outcome publishes nothing. A replay therefore
+  publishes 25 times as many messages as the log retains state-changing
+  records, and `replay_complete` reports the number (ruling 7). The log
+  drops those whose `event_id` it has seen inside its 120 s duplicate
+  window (ADR-0013 decision 4), and appends the older ones again. The
+  detector's sequence rule ignores them: each carries the `sequence` the
+  detector already holds for its prefix, which is not greater (ADR-0013
+  decision 9).
+* **What a republished message says.** It has the original's `event_id`,
+  `sequence`, `timestamp` and payload whenever the replay reads what the
+  original run read. Two things can differ. Its `config_version` is the
+  configuration in force at the restart. And when the hot-ip log's head
+  has aged out, the replay lacks the IPs that became HOT before the oldest
+  retained record, so its counts can be lower: the loss Consequences
+  already records for a restarted trie. The sequence rule keeps either
+  from replacing what the detector holds.
+* **How long.** Each state-changing record now costs a broker round trip
+  and 25 acknowledged publishes. Before slice 2 it cost no round trip.
+  What follows is an estimate, not a measurement (assumption 55).
+  * ADR-0013 prerequisite 4 measured about 17,800 synchronous nats-py
+    publishes a second, with 500 in flight, on one node, over loopback, on
+    a 4 vCPU host.
+  * At 25 publishes a record, that is at most about 700 records a second,
+    and the replay keeps only 25 publishes in flight.
+  * So the default 60 s deadline holds at most about 40,000
+    state-changing records, and fewer once decoding, applying and encoding
+    take their share.
+
+  A longer log fails the start with `start_failed
+  reason=startup_timeout`, exit 1, until `HAMMERTIME_STARTUP_TIMEOUT_S` is
+  raised or the snapshot epic bounds the replay to what follows the
+  snapshot. The integration job (#52) is where the rate can be measured.
+* **Why readiness waits.** Items 6 and 8 put the publish inside `handle()`,
+  and `start()` hands `handle()` every message, so waiting takes no
+  mechanism of its own. Two alternatives were rejected:
+  * publishing each touched prefix's final stats once, at the end of the
+    replay (assumption 44);
+  * becoming ready after the replay's applies, and re-publishing in the
+    background (assumption 45).
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): "the replay publishes exactly
+> as live consumption does" now holds from `republish_from` on. Below it
+> the replay applies and does not publish. "How much" and "How long"
+> describe a start whose `hammertime.prefix-stats.v1` has no usable last
+> message; in the normal case a start re-publishes one event's stats. This
+> ruling costed one start and said a longer log "fails the start". A start
+> that fails has already written what it published, and under this ruling
+> as first written every restart wrote it again (finding S1). The next
+> start now continues after it.
+
+### Ruling 5. What each failure does (item 7)
+
+| Raised by | Exception | Response |
+| --- | --- | --- |
+| `publisher.publish` | `PrefixStatsPublishError` | The worker logs `prefix_stats_publish_failed` and re-raises it: out of `handle()`, then out of `start()` (`start_failed`, exit 1, never ready) or `run()` (`run_exited`, exit 1). Unlike an `InvariantViolation`, the event is applied and `position` has moved past it; some of its stats may be in the log. The restart replays it and publishes the same envelopes under the same `event_id`s (item 7). |
+| `publisher.prepare` | `ValueError` or `CodecError` | Cannot happen: the worker passes the trie of the event's own family, and every value is in range by construction (`hot_count >= 0`, `capacity >= 1` and `hot_count <= capacity`, so `hot_ratio` lies in `[0, 1]`). If it does, it is a bug, and it propagates like decision 7's other bug rows, with no record of the worker's own. Nothing of the event was published, and the state has moved past it. |
+| `publisher.flush`, in `stop()` | any exception | Propagates out of `stop()`, and the process exits 1: `TrieService.run()` logs `stop_failed` when its own call raises, and the runner logs `run_failed` when the call it makes on a signal raises. Both shipped producers' `flush()` return at once. |
+
+* **How a failure during `start()` is reported.** In this order:
+  * the worker's `prefix_stats_publish_failed` (error). It carries the
+    hot-ip record's coordinates, the event's `sequence`, how many
+    publishes were attempted and how many failed, and the first failure's
+    exception class;
+  * the runner's `start_failed`. Its `error` field is the
+    `PrefixStatsPublishError`'s text, numbers only, and its `exception`
+    field carries the traceback with the cause, such as nats-py's
+    `TimeoutError`.
+
+  `/readyz` never answers 200. Under `run()` it is the same, with
+  `run_exited` in place of `start_failed`.
+* **No retry in the process.** nats-py already waits up to 5 s for each
+  acknowledgement: its JetStream context's default request timeout, which
+  `NatsBus` does not override (Sources). A retry would hold the lock, and
+  with it the writer, longer still, and it would repeat what the restart
+  does anyway. The restart is the retry: assumption 12's reasoning, applied
+  to publishing.
+* **No bare catch.** `publish()` collects each publish's exception and
+  raises one error from the first. It drops none, so it is not a
+  catch-all: every failure still ends the process. The worker catches only
+  `PrefixStatsPublishError`, by name.
+
+> Amended 2026-09-24 (Amendment 3 ruling 2): the `publisher.prepare` row's
+> "cannot happen" did not hold for a hot-ip timestamp whose offset puts it
+> outside the years 1 to 9999 in UTC: the codec decoded it, and `encode`
+> raised `OverflowError` on it (finding S2). Decode now refuses such a
+> value as a `CodecError`, the record is `MALFORMED`, and the row holds.
+
+### Ruling 6. `stop()` flushes; the shutdown order (item 9, decision 13)
+
+* **`TrieWorker.stop()`**:
+  1. sets the stop flag;
+  2. takes the lock, so that the message in hand is finished — every
+     publish of its stats included, because `handle()` holds the lock
+     across them;
+  3. awaits `publisher.flush()`, and marks the worker stopped whether or
+     not the flush raised.
+
+  Every call takes all three steps, a second call included. `stop()` stays
+  safe before `start()`: neither shipped producer's `flush()` touches a
+  connection.
+* **The shutdown order,** end to end for the trie. §47.4 reads "flush,
+  then snapshot" for the trie (ADR-0009 Amendment 4):
+  1. `TrieService.stop()` marks readiness `stopping`, stops the poller and
+     sets the server's `should_exit`;
+  2. `worker.stop()` sets the flag, takes the lock once the message in
+     hand and its publishes are done, and flushes;
+  3. the snapshot epic writes the final snapshot, after the flush
+     (decision 16);
+  4. `run()`'s teardown gathers its tasks and closes the transport it
+     built, the bus, last.
+* **The deadline.** `HAMMERTIME_SHUTDOWN_TIMEOUT_S` (8 s by default) must
+  cover the publishes in hand, each bounded by the 5 s acknowledgement
+  wait, then the flush and the transport's close. A drain during a broker
+  outage can therefore end in a publish timeout. That event's stats are
+  then not all in the log, `run()` raises, and the process exits 1 with
+  `run_exited`. The restart re-publishes them (item 7).
+
+> Amended 2026-09-24 (Amendment 3 ruling 4): step 3's "and marks the worker
+> stopped whether or not the flush raised" is dropped. Nothing reads such a
+> mark. `stop()` sets the flag, takes the lock and awaits the flush, whose
+> exception propagates; every call takes all three steps.
+
+### Ruling 7. Metrics, log records and keys
+
+* **One new counter,** under decision 12's rules:
+
+  | Series | Kind | Labels | Meaning |
+  | --- | --- | --- | --- |
+  | `prefix_stats_published` | counter | `family` | `PrefixStatsChanged` publishes that returned: acknowledged by the log, including one it dropped as a duplicate |
+
+  There is no failure counter: the first failure ends the process, so the
+  record is the signal.
+* **Log records,** on the logger `hammertime.trie.worker`, fixed tokens and
+  numbers only:
+
+  | Record | Level | Fields |
+  | --- | --- | --- |
+  | `prefix_stats_publish_failed` | error | `family`, `topic`, `partition`, `offset` (the hot-ip record's), `sequence`, `attempted`, `failed`, `error_type` (the first failure's exception class, as `<module>.<qualified name>`) |
+  | `replay_complete` | info | as before, plus `prefix_stats_published`: the publishes that returned during this `start()` |
+
+  The worker does not log an exception's text. That reaches the log only
+  through the runner's `start_failed` or `run_exited`, as
+  `InvariantViolation`'s does (decision 12).
+* **The `starting` record.** `startup_fields()` gains `min_prefix_lengths`,
+  each served family's name mapped to its floor, for example
+  `{"ipv4": 8}`.
+* **Keys.** Ruling 1's two. `.env.example` lists both in its trie block.
+* **`hot_transition_to_prefix_update_latency` is not measured by slice 2.**
+  Three reasons:
+  * *The start point is too coarse.* The only transition time the trie
+    receives is the hot-ip payload's `timestamp`. The aggregator takes it
+    from `Clock.now()`, which returns whole epoch seconds, on another
+    host's clock (Sources). A latency of milliseconds measured from it
+    would be up to a second of truncation, plus clock skew.
+  * *The replay would swamp it.* A replayed event's timestamp can be days
+    old.
+  * *There is no histogram.* No service's metrics class has one, and the
+    aggregator does not measure §37's other latency either. One facility
+    for both is the telemetry epic's.
+
+  An accurate measurement needs a sub-second transition time from the
+  aggregator, or a log-side time carried on `ConsumedMessage`, which
+  carries none today. Both are named for the telemetry epic. Until then,
+  the trie's backlog in records — the hot-ip log's `end_offset` minus the
+  `event_sequence` series — is exact, and the telemetry epic can expose it.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): `replay_complete` also gains
+> `republish_from`, and a warning record joins the table,
+> `prefix_stats_last_ignored`, with the fields `reason` and
+> `replay_target`.
+
+### Ruling 8. The prefix-stats topic and its producer (ADR-0013)
+
+* **What exists, used as it is.**
+  * `PREFIX_STATS` in `hammertime.bus.topics`: `hammertime.prefix-stats.v1`,
+    4 partitions, one day's retention, keyed by the prefix text
+    (`_prefix_key`).
+  * Its stream, `hammertime-prefix-stats-v1`, with subjects
+    `hammertime.prefix-stats.v1.*`. `hammertime-provision` creates it with
+    every registered topic: limits retention, `max_age` one day, no byte
+    cap, discard old, file storage, one replica in the reference
+    deployment, a 120 s duplicate window (ADR-0013 decision 2).
+    `NatsBus.start()` already checks that it exists, so the trie already
+    refuses to start without it.
+  * `bus.producer()`, on `NatsBus` its one `NatsProducer`. It publishes to
+    `hammertime.prefix-stats.v1.<partition_for(prefix text, 4)>`, sends
+    `Nats-Msg-Id`, `Hammertime-Key` and the expected stream, awaits the
+    `PubAck`, and returns normally for a duplicate. Its `flush()` returns
+    at once. On `InMemoryBus` the producer appends to partition 0 and
+    deduplicates by `message_id` for the bus's life.
+* **What is new.** Nothing in `hammertime-bus`, in provisioning, in the
+  stream configuration or in the compose file. The trie becomes the
+  topic's only producer. The detector's durable, `hammertime-detector`,
+  stays the detector epic's.
+* **Order.** One prefix is one key and one subject, so a prefix's stats
+  reach the log in the order of their events: every publish of one event
+  is acknowledged before the next event is handled (item 6).
+* ADR-0013 Amendment 12 records the trie as decision 4's fourth producer.
+
+### Ruling 9. `hot_ratio`: the model, the codec and the schema (item 5)
+
+* **The model.** `PrefixStatsChanged` gains `hot_ratio: float | None =
+  None` as its last field, so every existing construction stays valid.
+* **Encode.** `None` writes no key. Otherwise the value must be an `int` or
+  a `float` and not a `bool`; a `float` must be finite; the value must be
+  `>= 0` and `<= 1`. The wire carries `float(value)`. Anything else is a
+  `CodecError`.
+* **Decode.** An absent key is `None`. A present one must be a JSON number:
+  an `int` that is not a `bool`, or a `float`. It must be finite —
+  `json.loads` reads `NaN`, `Infinity` and `-Infinity` — and `>= 0` and
+  `<= 1`. It is stored as `float(value)`. Anything else, `null` included,
+  is a `CodecError`.
+* **Order and messages,** in ADR-0016's style. The type is checked first,
+  then finiteness, then the range. So `true` is a type error, and a
+  400-digit integer is refused by the range before anything converts it to
+  a float. The check's own text names the field and the rule it broke,
+  never the value. On decode the check runs where the payload's integer
+  checks run, so a refusal is a `CodecError` whose `__cause__` is the
+  check's own error. The wrapper's text embeds the payload, which is
+  ADR-0015 Amendment 3's open item, unchanged. On encode the `CodecError`'s
+  own text names no value. The wording is not part of the contract.
+* **The bounds** are the schema's: `minimum` 0 and `maximum` 1, both
+  inclusive (JSON Schema Validation 2020-12 §6.2.2 and §6.2.4, as ADR-0016
+  read them). The codec mirrors them as a module constant, and the tests
+  read them from the schema file (ADR-0016 assumption 10).
+* **Not checked:** that `hot_ratio` equals `hot_count / capacity`. That is
+  cross-field consistency, which ADR-0016 assumption 11 leaves open.
+  `hot_ratio` is informational: the predicate compares `hot_count` and
+  `capacity` exactly (ADR-0010 decision 1).
+* **Not changed:** the eight integer fields of ADR-0016 decision 1 and
+  ADR-0015 Amendment 3 ruling 3. `hot_ratio` is a number field, not one of
+  them. ADR-0016 Amendment 1 records this.
+* **The values the trie writes** come from `Prefix.hot_ratio`, exact and
+  narrowed once (ADR-0015 decision 2). Whatever the floor, the smallest
+  non-zero one, 2^-128 at an IPv6 `/0`, is a normal double.
+* **The schema.** `schemas/prefix_stats_event.v1.json` validates exactly
+  what it did: `hot_ratio` stays optional, and no type, bound or
+  `required` entry changes. It gains `description` annotations on
+  `prefix`, `hot_ratio`, `sequence` and `timestamp`, saying what the trie
+  puts there.
+
+> Amended 2026-09-24 (Amendment 3 ruling 5): "a refusal is a `CodecError`
+> whose `__cause__` is the check's own error" is made testable. The check's
+> own error is a `ValueError`, whose text names `hot_ratio`. For every
+> value decode refuses, the cause is therefore a `ValueError`, never a
+> `TypeError` or an `OverflowError`. The wording stays outside the
+> contract.
+
+### Ruling 10. What the snapshot epic inherits (decision 16)
+
+* **A restore re-publishes** the stats of every state-changing record after
+  the snapshot's position (item 8). Since every snapshot follows a flush,
+  those at or before the position are already in the log.
+* **No snapshot after `handle()` has raised.** A `PrefixStatsPublishError`
+  leaves the state past an event whose stats may be missing from the log,
+  and an `InvariantViolation` leaves a trie found corrupt. Neither
+  `stop()`'s final snapshot nor a periodic one may record such a state.
+  The epic designs how, for example by refusing `snapshot_now()` once the
+  worker has seen `handle()` raise.
+* **The startup cost** of ruling 4 then covers only the records appended
+  after the snapshot that a restart loads.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): a restore re-publishes under
+> the rule every start follows, from `republish_from`. Only when
+> `hammertime.prefix-stats.v1` has no usable last message does it
+> re-publish every state-changing record after the snapshot's position,
+> and only then does ruling 4's cost apply to those records.
+
+### Ruling 11. `CHANGES`
+
+The implementing change adds three lines, in this order, at the top. None
+is `BREAKING`.
+
+* `Trie service publishes PrefixStatsChanged to hammertime.prefix-stats.v1 for every HotIpAdded/HotIpRemoved that changes the hot set: one message per ancestor prefix of the address, from the family's minimum reporting length to the host route (25 per transition at the defaults), keyed by the prefix and carrying it as the envelope subject, with hot_count, capacity, hot_ratio and the trie's event_sequence as sequence; a redundant or skipped event publishes nothing`
+* `Add HAMMERTIME_TRIE_MIN_PREFIX_LENGTH (default 8, 0-32) and HAMMERTIME_TRIE_MIN_PREFIX_LENGTH_IPV6 (default 104, 0-128): the shortest IPv4 and IPv6 prefixes the trie service reports in PrefixStatsChanged`
+* `Trie service re-publishes the PrefixStatsChanged of every state-changing hot-ip record it replays on start before it reports ready, so a start takes longer the more such records the log retains; a publish that fails stops the service with exit 1 (prefix_stats_publish_failed)`
+
+Why none is `BREAKING`, under `CLAUDE.md`'s rule (a running deployment
+needs action to keep working):
+
+* No trie build has shipped (Consequences; assumption 32's reasoning).
+* The event schema validates exactly what it did. `hot_ratio` was already
+  optional there, with the same bounds (ADR-0010 Consequences), and a
+  build from before this change ignores it on decode. Nothing consumes
+  `hammertime.prefix-stats.v1` yet, and nothing else produces to it.
+* No key is renamed or removed, and `ipv6` stays accepted.
+
+What gets no line (assumption 58): the codec's `hot_ratio` checks, which no
+running consumer meets (ADR-0016 assumption 12's reasoning); the counter,
+since `/metrics` renders nothing until the telemetry epic; the new fields
+of the `starting` and `replay_complete` records; and the schema's
+descriptions.
+
+> Amended 2026-09-24 (Amendment 3 ruling 7): the third line is replaced;
+> ruling 7 there gives the new text.
+
+### Test seams
+
+* **The producer.** The worker takes its producer from `bus.producer()`
+  once, in its constructor. A bus double's `producer()` can therefore
+  return a producer that records every call, holds each publish until the
+  test releases it, raises for a chosen key, or counts `flush()` calls.
+  Whether `publish()` passes `key` and `value` by position or by keyword
+  is not pinned, so a double implements the `Producer` protocol's
+  signature.
+* **The publisher on its own.** `PrefixStatsPublisher` can be built with a
+  producer double and a `TrieMetrics`. `prepare()` needs only a trie: a
+  `PatriciaTrie(family)` with addresses added through `add_hot_ip`.
+* **Reading what was published, on the memory bus.** A second consumer on
+  the same `InMemoryBus` subscribes to `PREFIX_STATS.name` positionally
+  from `0`. The memory producer deduplicates by `message_id` for the
+  bus's life, so a second trie that replays the same log on the same bus
+  appends nothing.
+* **The record.** `prefix_stats_publish_failed` is on
+  `hammertime.trie.worker`, like decision 12's other records.
+
+> Amended 2026-09-24 (Amendment 3 ruling 1): a second trie started on the
+> same bus after a first one has published now also re-publishes only from
+> the first one's last `sequence`, besides appending nothing.
+
+### Questions this amendment closes
+
+| Question | Left open by | Ruled in |
+| --- | --- | --- |
+| Which prefix lengths does the trie report for IPv6? | ADR-0010's assumption "Minimum reported prefix length 8 (IPv4), a trie setting"; decision 14 item 10 | ruling 1: `/104` to `/128` by default |
+| What is `HAMMERTIME_TRIE_MIN_PREFIX_LENGTH`, and does IPv6 get a key of its own? | ADR-0009 Consequences; ADR-0010 decision 3; decisions 11 and 14 item 10 | ruling 1 |
+| Does the service refuse `ipv6` until that range exists? | decision 14 item 10 | ruling 1: no, since the range exists |
+| Does the publisher measure `hot_transition_to_prefix_update_latency`? | decision 12; decision 14 item 10 | ruling 7: no |
+| How does the publish keep R1? | decision 14 item 6, with decision 9 | ruling 3 |
+| What does startup replay publish, what does it cost, and does readiness wait for it? | decision 14 item 8; Consequences | ruling 4 |
+| How is a publish failure handled and reported, during `start()` too? | decision 14 item 7 | ruling 5 |
+| What does `stop()` do, and in what order does the trie shut down? | decision 13; decision 14 item 9 | ruling 6 |
+| May a snapshot record the state a failed `handle()` left? | new with slice 2 | ruling 10: no |
+
+### Edits
+
+**In this ADR.** Each is a dated note; no text is replaced.
+
+* **Status line.** Closing sentences on this amendment.
+* **Decision 1.** A note after its 2026-09-23 note: the IPv6 key, the
+  `.env.example` and `CHANGES` edits, and the snapshot epic's added
+  ordering constraint.
+* **Decision 2.** A note after "Slice 1 does not touch `publisher.py`,
+  `query/views.py` or `snapshot/`.": the publisher's names and imports.
+* **Decision 6.** A note after its 2026-09-23 note: the constructor's
+  keyword, and steps 5a and 5b.
+* **Decision 7.** A note after its 2026-09-23 note: three rows.
+* **Decision 9.** A note at its end: R1 and R2 under slice 2.
+* **Decision 11.** A note after the "Not read by slice 1" list: the two
+  keys and fields.
+* **Decision 12.** A note after the log-record table: the counter, the
+  record, `replay_complete`'s field, and the latency answered no.
+* **Decision 13.** A note after its last bullet: `stop()`'s flush,
+  `build_service` and `startup_fields()`.
+* **Decision 14.** A note after item 10: item 10 settled.
+* **Decision 16.** A note after its last bullet: two more inheritances.
+* **Test seams.** A note after the last bullet, pointing here.
+* **Consequences.** A note under "Slice 2 without the snapshot epic
+  republishes.": the cost.
+* **This section.**
+
+**In other documents.** None replaces wording, except where quoted.
+
+* **`docs/adr/0010-read-apis-and-shared-prefix-predicate.md`** (Amendment
+  3): a clause on the status line; a dated note after decision 3's
+  2026-09-23 note; a dated note under the assumption "Minimum reported
+  prefix length 8 (IPv4), a trie setting."; an "Amendment 3" section.
+* **`docs/adr/0013-nats-jetstream-event-log-static-shards.md`** (Amendment
+  12): a clause on the status line; a dated italic paragraph after
+  decision 4's first paragraph; an "Amendment 12" section.
+* **`docs/adr/0016-codec-numeric-bounds-and-encode-before-persist.md`**
+  (Amendment 1): a status paragraph after "No schema file changes."; a
+  dated note under decision 1's "Not changed" bullet on properties the
+  codec does not read; an "Amendment 1" section.
+* **`schemas/prefix_stats_event.v1.json`.** `prefix`, `hot_ratio`,
+  `sequence` and `timestamp` gain a `description` each. Each of the four
+  was written on one line and is now spread over several. They were
+  `"prefix": { "type": "string" }`, `"hot_ratio": { "type": "number",
+  "minimum": 0, "maximum": 1 }`, `"sequence": { "type": "integer",
+  "minimum": 0 }` and `"timestamp": { "type": "string", "format":
+  "date-time" }`. Every type, bound and `required` entry is unchanged.
+* **`docs/spec/README.md`.** Four rows gain entries; no entry is removed.
+  * §19 gains `services/trie/publisher.py`, ADR-0016's Amendment 1, and
+    ADR-0017's decision 14 and Amendment 2. Its ADR-0017 entry was
+    "`docs/adr/0017` (decisions 3 and 6)".
+  * §32/33's ADR-0017 entry was "`docs/adr/0017` (decisions 3, 4, 8 and
+    16)", and gains Amendment 2.
+  * §35 gains the two keys, `services/trie/publisher.py`, ADR-0010
+    Amendment 3 and ADR-0017 Amendment 2. Its entries were
+    "`services/trie/config.py` (`HAMMERTIME_TRIE_FAMILIES`)" and
+    "`docs/adr/0017` (decision 5)".
+  * §37's ADR-0017 entry was "`docs/adr/0017` (decision 12)", and gains
+    Amendment 2.
+
+**Not edited here, named** (assumption 62). `docs/runbook.md`'s "Trie
+service restart" should say, once slice 2's implementation has merged,
+that the replay re-publishes and is slower for it.
+`docs/spec/integration-scenarios.md` §3 step 3 already pins slice 2's 25
+records; checks on `hot_ratio`, `agent_id` and `subject` may be added.
+
+### Assumptions
+
+Each is a judgment call that decision 14, the spec and the earlier ADRs do
+not make. Push back on them individually; numbering continues the ADR's
+list.
+
+41. **IPv6's default floor is `/104`, from ADR-0010's capacity argument.**
+    `/64`, the usual IPv6 subnet, was the alternative. It would publish 65
+    messages per transition, and every prefix from `/64` to about `/103`
+    would always be `NORMAL` under the v1 predicate at the default ratio:
+    ADR-0010's own reason for not reporting IPv4 above `/8`. `0` would
+    publish 129. The plausibility threshold behind `/8`, and so behind
+    `/104`, is itself ADR-0010's assumption. An operator who wants `/64`
+    sets the key.
+42. **Two keys, not one per-family grammar.** One key such as
+    `ipv4=8,ipv6=104` would need a grammar of its own, and would change a
+    key whose name and IPv4 default ADR-0009 and ADR-0010 already fixed.
+    The unsuffixed key stays IPv4's, §43's first family.
+43. **Both keys are read and checked whatever `HAMMERTIME_TRIE_FAMILIES`
+    holds.** The alternative follows ADR-0009 A12 and ADR-0013 Amendment 5
+    ruling 5: ignore a value the configuration does not use. That rule was
+    made for connection URLs, whose meaning depends on another key. A
+    prefix length's validity does not, and refusing a bad value at once is
+    simpler. An operator who set the IPv6 key on an IPv4-only trie loses
+    nothing.
+44. **The replay publishes per event, not once per prefix.** Coalescing
+    publishes each touched prefix's final stats once, at the end of the
+    replay, under the sequence of the last event that changed it. The
+    detector would end in the same state with fewer messages. It was
+    rejected for four reasons:
+    * it saves only a constant factor, the average number of changes per
+      prefix in the retained log, so it does not close the deadline
+      problem;
+    * it must hold the set of touched prefixes in memory, up to 25 per
+      distinct address;
+    * it is a second publish path, with failure rules of its own;
+    * a detector reading the stream would lose the intermediate edges its
+      `since` and `classification_changes` are built from.
+45. **Readiness waits for the replay's publishes.** The alternative marks
+    the trie ready after the replay's applies and re-publishes in the
+    background. That would make the trie ready sooner, but it cannot
+    rebuild each event's stats after the replay has moved on. It would
+    publish the final state per prefix under a new sequence, and so could
+    not re-publish the zero counts of prefixes the trie no longer holds.
+    The snapshot epic would also have to track a republish position beside
+    the replay position. It would re-open items 6 and 8 as well.
+46. **`prepare()` and `publish()` are two calls** (ruling 3, "Why two
+    calls").
+47. **All of an event's publishes start together, and every one is awaited
+    even after one fails.** Item 6 allowed concurrency; this makes it the
+    rule, so that an event costs about one broker round trip, not one per
+    message. Waiting for all of them means no publish outlives `handle()`,
+    so the lock covers every publish in flight, and neither `stop()`'s
+    flush nor a snapshot overlaps one. The cost: after a failure the worker
+    waits for the slowest of the others, at most nats-py's 5 s.
+48. **One named error type, with the counts, raised from the first
+    failure.** The worker needs the counts for its record, and catching
+    one named type keeps decision 7's "no bare `Exception`". Re-raising the
+    first failure as it is would make the worker catch transport-specific
+    types it does not otherwise know. An `ExceptionGroup`, which asyncio's
+    `TaskGroup` raises, was the other alternative; it would put a group,
+    not a named error, into `start_failed`.
+49. **`error_type` names the exception class.** Decision 12 allows fixed
+    tokens only, and a class name is one. It tells an operator which
+    failure it was — a timeout, a missing stream, a refused publish —
+    without the exception's text.
+50. **No retry in the process** (ruling 5).
+51. **`stop()` flushes on every call.** The service's `run()` and the
+    runner both call `stop()`, so a normal drain flushes twice. Both
+    producers' `flush()` return at once. Flushing only on the first call
+    would save nothing and add a state to test.
+52. **`prefix_stats_published` counts publishes that returned, duplicates
+    included, and there is no failure counter.** Neither producer tells its
+    caller whether a returned publish was appended or dropped: `NatsProducer`
+    discards the `PubAck`, and `MemoryProducer` returns `None` either way.
+    So the counter measures publishing work, not log growth.
+53. **`hot_transition_to_prefix_update_latency` is left to the telemetry
+    epic** (ruling 7). Decision 12 said slice 2 "can" measure it; this
+    amendment decides it should not. The single-writer signal ADR-0001
+    and ADR-0010 name is then unavailable until that epic.
+54. **Two log fields are added.** `replay_complete`'s
+    `prefix_stats_published` shows what a restart cost in publishes before
+    `/metrics` renders anything. `min_prefix_lengths` in the `starting`
+    record shows the ranges in force.
+55. **The startup estimate is derived, not measured.** It rests on ADR-0013
+    prerequisite 4's measurement of a different workload: one node,
+    loopback, a 4 vCPU host, 500 publishes in flight. It is an upper bound
+    on the replay's publish rate, not a prediction. The integration job
+    (#52) is where to measure it.
+56. **The codec accepts an `int` for `hot_ratio` and writes a `float`.**
+    JSON Schema's `number` includes integers, so `0` and `1` on the wire
+    are valid. Writing `float(value)` gives what the trie writes one wire
+    form; `Prefix.hot_ratio` returns a `float` anyway.
+57. **The schema gains descriptions, and no validation change.** A reader
+    of the schema learns what the trie puts in `sequence` and `hot_ratio`
+    without the ADRs. Making `hot_ratio` required was not chosen. The trie
+    always sets it, and requiring it would change what the codec and the
+    schema accept for no consumer's benefit. ADR-0010's Consequences kept
+    it optional, and item 5 says "reads it when present".
+58. **`CHANGES` gets three lines, none `BREAKING`, and nothing for the
+    codec, the schema, the counter or the log fields** (ruling 11).
+59. **The lengths mapping must name both families.** A publisher that
+    lacked one would fail only at that family's first event. The settings
+    always give both.
+60. **The IPv6 limitation is recorded, not addressed** (ruling 1). §43
+    puts IPv4 first, and §14's scorer is where a predicate without the
+    ratio belongs.
+61. **The worker takes its producer once from the bus, and exposes no
+    publisher.** Tests reach the producer through the bus, as they reach
+    the consumer.
+62. **The runbook and the integration scenarios are not edited here.** The
+    runbook describes the build an operator runs, and slice 2's has not
+    merged. The scenarios' existing text stays true.
+
+    > Amended 2026-09-24 (Amendment 3, assumption 86): the runbook is
+    > edited now. Slice 2's implementation is on this branch and merges
+    > with the edit. The scenarios are still not edited.
+63. **A snapshot after a failed `handle()` is forbidden now, though no
+    snapshot exists yet** (ruling 10). Slice 2 creates the state that must
+    not be recorded, so the constraint is stated with it. How it is kept is
+    the snapshot epic's.
+64. **A failure in `prepare()` gets no record of the worker's own.** ADR-0016
+    decision 4 treats an encode failure in the aggregator's emitter the
+    same way: only a bug can cause it, and the runner's record carries it.
+
+### Sources
+
+Read on 2026-09-23 for this amendment. No web source was consulted.
+
+* Repository files:
+  * `packages/hammertime-bus/src/hammertime/bus/nats.py`. `NatsBus.start()`
+    takes its JetStream context as `nc.jetstream()`, with no timeout, and
+    calls `stream_info` for every registered topic. `NatsBus.producer()`
+    returns one cached `NatsProducer`. `NatsProducer.publish` calls
+    `js.publish(subject, value, headers=headers, stream=...)` with no
+    timeout, and discards the `PubAck`. `NatsProducer.flush` returns
+    `None`.
+  * `packages/hammertime-bus/src/hammertime/bus/memory.py`:
+    `MemoryProducer.publish` returns normally, without appending, for a
+    `message_id` the topic has seen; `flush` returns `None`.
+  * `packages/hammertime-bus/src/hammertime/bus/topics.py`: `PREFIX_STATS`
+    (4 partitions, one day, `_prefix_key`).
+  * `packages/hammertime-core/src/hammertime/core/time/clock.py`:
+    `Clock.now() -> int`, "Current time as a UTC epoch second". And
+    `services/aggregator/src/hammertime/aggregator/transitions.py`:
+    `timestamp = datetime.fromtimestamp(self._clock.now(), tz=UTC)`.
+  * `packages/hammertime-core/src/hammertime/core/runtime.py`:
+    `_supervise` logs `start_failed` with `error=str(exc)` and
+    `exc_info=True`, and `run_exited` with the exception.
+  * `packages/hammertime-core/src/hammertime/core/events/models.py` and
+    `codec.py`: `PrefixStatsChanged` has no `hot_ratio`, and
+    `_decode_prefix_stats_changed` reads the five required keys inside a
+    `try` that re-raises a `CodecError` from the error.
+  * `services/trie/src/hammertime/trie/`: `worker.py`, `service.py`,
+    `config.py`, `metrics.py`, `state.py`, `metadata/combine.py`
+    (`ancestor_stats`, `PrefixStats.hot_ratio`) and
+    `structure/patricia.py` (the order of `ancestor_counts`). Its tests
+    build `TrieWorker(bus=..., state=..., metrics=...)` and
+    `TrieSettings(...)` without the new arguments, and `test_service.py`'s
+    `TestStartupFields` pins `startup_fields()`'s exact key set.
+  * `services/aggregator/src/hammertime/aggregator/config.py`
+    (`_parse_positive_int` reads an integer key with `int(value)`) and
+    `metrics.py` (no histogram).
+* nats-py 2.16.0 as installed, in `.venv/lib/python3.12/site-packages/nats/`:
+  * `js/client.py`: `JetStreamContext.__init__(self, conn, prefix=...,
+    domain=None, timeout: float = 5, ...)`; `publish(...)` sets `timeout =
+    self._timeout` when none is given, then calls `self._nc.request(subject,
+    payload, timeout=timeout, headers=hdr)`. Taken from it: the 5 s bound
+    in rulings 5 and 6.
+  * `aio/msg.py`: `Msg.Metadata.timestamp`, documented as "the time at
+    which the message was delivered". Only that such a time exists was
+    taken from it; what it measures was not checked.
+* ADR-0013 prerequisite 4's measurement, as that ADR records it. It was
+  not re-run.
+
+## Amendment 3 (2026-09-24) — the slice-2 review and audit: a start re-publishes only what the prefix-stats log may lack; a decoded timestamp can be written again; four smaller rulings; the stream cap is left with the owner
+
+Why: `reviewer` and `security-auditor` reviewed slice 2 as committed on
+branch `claude/eager-gates-lyihfk`: design 390b978, tests ed50491 and
+implementation 98d6c8e. They returned eight findings.
+
+| # | From | Severity | Finding, in short | Ruled in |
+| --- | --- | --- | --- | --- |
+| S1 | security-auditor | medium | Every start re-publishes the stats of every state-changing record it replays, and does so before the deadline can fail it. Past Amendment 2 ruling 4's threshold of about 40,000 such records, each start fails after appending up to about a million messages to the prefix-stats stream, which has no byte cap. A restart loop repeats this, so the volume grows with the number of restarts, not with the size of the log. One authenticated agent can build such a log in about 15 s of its default budget, and a full shared store makes every stream's publishes fail. | rulings 1 and 6 |
+| S2 | security-auditor | low | A hot-ip timestamp whose offset puts it outside the years 1 to 9999 in UTC decodes and is applied. `prepare()` then raises a raw `OverflowError`, so the trie stops at that record on every start. Amendment 2 ruling 5 said a `prepare()` failure cannot happen. | ruling 2 |
+| R1 | reviewer | low | If `publish()` is cancelled, the publishes that had returned are not counted in `prefix_stats_published`. | ruling 3 |
+| R2 | reviewer | low | `stop()` writes a "stopped" mark that nothing reads. | ruling 4 |
+| R3 | reviewer | low | The test of the error's `__cause__` does not tell the order of the messages from the order in which they fail. | ruling 5 |
+| R4 | reviewer | low | No test shows `publish()` waiting for the other publishes after a `BaseException` that is not an `Exception`, or when it is itself cancelled. | ruling 3 |
+| R5 | reviewer | low | No test shows `build_service` passing the IPv6 floor to the worker. | ruling 5 |
+| R6 | reviewer | low | The `hot_ratio` decode tests check only that a cause exists, so they cannot tell Amendment 2 ruling 9's order of checks from another. | ruling 5 |
+
+**The owner question S1 reopens.** Amendment 2 ruling 4 and ADR-0013
+assumption 144 accepted two things until the snapshot epic lands: every
+start re-publishes the stats of the whole retained log, and no stream gets
+a byte cap. This was put to the repository owner as a question. Under the
+pre-1.0 standing order the session accepted this ADR's recommendation and
+told the owner, who has not replied. S1 shows that the question costed the
+re-publish wrongly. It priced one start, and it described a long log only
+as "fails the start". But a failed start has already written what it
+published, and a restart loop makes the total a function of time. Ruling 1
+removes the cost where it arises. The other half of the question, a cap on
+the streams, goes back to the owner with S1's evidence (ruling 6) and is
+not ruled here.
+
+**Convention.** Amendment 2 and the other texts of slice 2 are on this
+branch and not on master, and the ADR's own convention would allow editing
+them in place (Revision 2026-09-23). They are not edited in place, because
+the reviewer and the auditor read them as they stand and quote them. Each
+place whose text no longer holds carries a dated note pointing here, as
+merged text does, and "Edits" below lists every note (assumption 83).
+
+### Ruling 1. A start re-publishes from the last sequence the prefix-stats log holds (S1)
+
+**The rule.**
+
+1. **Step 2a.** Before it subscribes, `start()` reads the value of the
+   last message of `hammertime.prefix-stats.v1`: `last = await
+   bus.last_value(PREFIX_STATS.name)` (ADR-0013 Amendment 13). This runs
+   after decision 4's step 2, so that `replay_target` is known, and before
+   step 3. It is numbered 2a so that the texts that cite decision 4's
+   steps 3 to 6 stay right.
+2. **`republish_from`.** `start()` then sets `republish_from` from `last`.
+   The rows are checked in order, and the first that applies decides:
+
+   | `last` | `republish_from` | Record |
+   | --- | --- | --- |
+   | `None`: the log holds no message at its last offset | `0` | none |
+   | `decode(last)` raises `CodecError` | `0` | `prefix_stats_last_ignored`, `reason=codec` |
+   | its payload is not a `PrefixStatsChanged` | `0` | the same, `reason=payload_type` |
+   | its envelope's `agent_id` is not `AGENT_ID` | `0` | the same, `reason=agent_id` |
+   | its envelope's `sequence` is greater than `replay_target` | `0` | the same, `reason=ahead_of_log` |
+   | anything else | its envelope's `sequence`, `W` | none |
+
+3. **Who publishes.** Steps 5a and 5b run only for an event that changed
+   the hot set and whose `state.event_sequence` is at least
+   `republish_from`. An event that changed the hot set below it prepares
+   and publishes nothing. Everything else about it is as before: it is
+   applied, step 5 records it, `trie_updates` counts it, and its outcome
+   is `APPLIED`.
+4. **Before `start()`, and after the replay.** `republish_from` is `None`
+   until step 2a has run, and `handle()` then publishes as if it were `0`.
+   Every live event publishes: the value the table keeps is at most
+   `replay_target`, and every record appended after `start()` read the
+   log's end has a greater `event_sequence`.
+
+**Why the invariant holds.** ADR-0010 decision 3's invariant is that a
+restart cannot skip an event whose stats never reached the log. Take `W`
+from the table, and an event `E` whose `event_sequence` is below `W` and
+which changed the hot set.
+
+* The trie is the prefix-stats topic's only producer (Amendment 2 ruling
+  8), one trie process runs (decision 5), and it handles events in
+  `event_sequence` order.
+* The message at the log's last offset was published by a process that was
+  handling the event whose `event_sequence` is `W`. That process had
+  already handled `E`, or, once snapshots exist, it restored a snapshot
+  taken after `E`, and a snapshot follows a flush (decision 16). Every
+  publish of one event returns before the next event is handled (decision
+  14 item 6), and a publish that fails ends the process (Amendment 2
+  ruling 5).
+* So that process either published all of `E`'s stats, every publish
+  returning, or skipped them because `E` lay below its own
+  `republish_from`. In the second case the same argument applies one start
+  earlier. A start whose `republish_from` is `0` publishes everything it
+  applies, and ends the regress.
+
+The event at `W` is published again, because a crash may have left it half
+published (decision 14 item 7). The log drops the copies it has seen inside
+its 120 s window. A later copy carries a `sequence` the detector already
+holds, and its sequence rule ignores it.
+
+The argument assumes that the earlier process applied the same events.
+"What it leaves open" lists where it did not.
+
+**What it does to a start.**
+
+* *The normal case.* The previous process published up to the last event
+  it handled. The replay applies every retained record with no publish
+  round trip, as slice 1 did, and publishes from that event on: its 25
+  messages, then those of any later event. A start takes about what it took
+  before slice 2.
+* *A run of failed starts.* A start that fails, at the deadline or on a
+  publish, has published only stats at or after its own `republish_from`.
+  The next start's `republish_from` is at least as high. So a run of failed
+  starts works through the log instead of repeating its head. Each start
+  re-appends at most the 25 messages of one event, and only outside the
+  120 s window. The volume grows with the log, not with the number of
+  restarts.
+* *No usable last message.* `republish_from` is `0` on the first start of
+  a deployment; when every message of the stream has aged out (`max_age`
+  is one day, so after a day with no transition); after a purge; when the
+  last message was deleted on its own; and on each of the four refusals.
+  The start then re-publishes the stats of every state-changing record it
+  replays, as Amendment 2 ruling 4 had every start do. If that takes longer
+  than the deadline, the start fails having published a prefix of them, in
+  order. The next start reads the last of them and continues from there. In
+  all, each retained state-changing record's stats are written about once,
+  plus one event's per failed start.
+* *Readiness* is unchanged. `start()` returns once `handle()` has returned
+  for the message that brought the worker to `replay_target`, its
+  publishes included when it has any. A ready trie has had every stat of
+  every state-changing record it replayed from `republish_from` on
+  acknowledged by the log; those below it were acknowledged under an
+  earlier start.
+
+**Why not wait for the snapshot epic.** Amendment 2's interim ran "until
+the snapshot epic lands". A restore re-publishes everything after the
+snapshot's position (Amendment 2 ruling 10), and snapshots are taken every
+300 s by default (`HAMMERTIME_TRIE_SNAPSHOT_INTERVAL_S`). A trie handling
+more than about 130 state-changing events a second would therefore have
+more than Amendment 2 ruling 4's estimate of 40,000 records to re-publish
+after a crash just before a snapshot, and would fail its restart the same
+way (assumption 82).
+With this ruling a restore replays from the snapshot and re-publishes from
+`republish_from` (decision 16, as noted).
+
+**Records.**
+
+* `replay_complete` gains a field, `republish_from`: the value this start
+  used.
+* A new record, `prefix_stats_last_ignored`, at warning level, with the
+  fields `reason` (one of the four tokens above) and `replay_target`. Like
+  decision 12's other records, it carries fixed tokens and numbers only. It
+  never carries the message's `sequence`, or anything else the message
+  holds.
+
+**The property.** `TrieWorker.republish_from -> int | None`: the value step
+2a set, and `None` before it.
+
+**What it leaves open.** Each case is recorded, not closed.
+
+* *A family added, or a floor lowered, between two starts.* The earlier
+  process did not publish the new family's events, which it skipped as
+  `FAMILY_NOT_SERVED`, nor the newly reported prefixes of earlier events.
+  Below `republish_from` those are now applied and not published. The
+  detector learns such a prefix when it next changes. Purging
+  `hammertime.prefix-stats.v1` before the restart makes the start
+  re-publish everything, and a detector then loses whatever it had not yet
+  read. The snapshot epic records the families it served (decision 16), and
+  can close this.
+* *A hot-ip log whose head has aged out.* The trie then lacks the IPs that
+  became HOT before the oldest retained record (Consequences). It can find
+  an event redundant that the earlier process applied, or apply one the
+  earlier process found redundant. Below `republish_from` neither
+  publishes. The detector keeps the earlier process's counts, which
+  included those IPs.
+* *A hot-ip stream recreated and grown past the last sequence.* The table
+  sees only a `sequence` above `replay_target`. A recreated stream whose new
+  end has passed the old last sequence goes unseen, and its events below
+  that sequence are not published. This is the class of assumption 19's
+  fourth case and decision 16's recreated-log case. The detector's sequence
+  rule already refuses the new stream's lower sequences for every prefix
+  it holds.
+* *What a restart used to refresh.* Every start used to append the stats of
+  every retained event older than 120 s again, so a detector that had lost
+  its view could rebuild much of it from them. Nothing relied on that, and
+  it was never designed as a mechanism. How the detector recovers its view
+  is the detector epic's question.
+* *Trust.* A principal that can publish to the prefix-stats stream can
+  raise `republish_from` as far as `replay_target`, and so keep the stats
+  between the true last event and the log's end from being re-published. It
+  could publish false stats directly, which is worse. That stream is inside
+  ADR-0013 assumption 13's boundary.
+
+**Where it can be seen on JetStream.** The integration job (#52) can run
+the auditor's validation. Seed a hot-ip log larger than one start can
+re-publish, lower `HAMMERTIME_STARTUP_TIMEOUT_S`, restart the trie several
+times more than 120 s apart, and read
+`stream_info(hammertime-prefix-stats-v1).state.messages` after each start.
+The count should grow by what each start published anew and then stop
+growing, and not grow by a fixed amount per restart.
+
+### Ruling 2. A timestamp the codec decodes can be encoded again (S2)
+
+* **Decode.** Every timestamp field is returned in UTC: the envelope's
+  `timestamp`, `RequestObservation.window_start`, the `timestamp` of
+  `HotIpAdded` and `HotIpRemoved`, and `PrefixStatsChanged.timestamp`. A
+  value with an offset is converted to UTC. A value with none is read as
+  UTC, as before. A value whose UTC equivalent falls outside the years 1 to
+  9999, which Python's `datetime` can hold, is a `CodecError`.
+* **Encode.** A timestamp whose conversion to UTC overflows is a
+  `CodecError`, not an `OverflowError`. After the decode rule, no decoded
+  value can cause this. The rule covers a value built in-process.
+* **The message.** The new refusal's text names the field. Its wording is
+  not part of the contract.
+* **The trie.** Such a hot-ip record is now `MALFORMED` [`codec`] at
+  decision 6 step 2, before anything is applied, and the replay goes on
+  past it. Amendment 2 ruling 5's row "`publisher.prepare` raises
+  `ValueError` or `CodecError`: cannot happen" holds again, because the timestamp
+  `prepare()` encodes is one that `decode` returned.
+* **Why in the codec, and why refuse.** The codec writes every timestamp in
+  UTC with `Z` (`_format_timestamp`), so a value it cannot convert is a
+  value it cannot write. Refusing it on decode makes the two directions
+  agree, as ADR-0015 assumption 66 asks for the other fields. It also fixes
+  every consumer at once, which is ADR-0015 assumption 64's reason for
+  putting such rules in the codec. Clamping the value would change the
+  instant.
+* **Elsewhere.** The aggregator now counts an observation whose
+  `window_start` is such a value as malformed, instead of diverting it to
+  reconciliation. Only a principal that publishes to the bus directly can
+  produce such a message, because ingest's own encode of it fails (next
+  bullet).
+* **Not ruled here.** Ingest parses `window_start` itself
+  (`services/ingest/src/hammertime/ingest/api/routes.py`,
+  `_parse_window_start`) and does not check its range. Such a value passes
+  ingest's validation, takes the dedup claim, and then fails in `encode`.
+  Ingest reports that as a 503 "retry is safe", with the claim consumed.
+  Nothing reaches the bus. It should be a 400 before the claim. That belongs
+  to the agent protocol and needs a follow-up of its own (assumption 76).
+
+### Ruling 3. `publish()` counts what returned and outlives nothing, also when it is cancelled (R1, R4)
+
+Amendment 2 ruling 2 is made exact for each way `publish()` can end: it
+returns; it raises `PrefixStatsPublishError`; it raises a publish's
+`BaseException` that is not an `Exception`; or it is itself cancelled.
+
+* **It outlives nothing.** In all four cases, `publish()` completes only
+  once every publish it started has returned or raised. When `publish()`
+  is cancelled, it cancels the publishes still in flight, waits until each
+  has finished, and then raises `CancelledError`. It raises
+  `CancelledError` even when some publish raised an `Exception`.
+* **It counts what returned.** Once `publish()` has completed, in any of
+  the four ways, `prefix_stats_published{family}` has grown by exactly the
+  number of its publishes that returned. When the counter moves while
+  other publishes are still in flight is not pinned.
+* **Not pinned:** which exception `publish()` raises when more than one
+  publish raises a `BaseException` that is not an `Exception`.
+* **The worker is unchanged.** It catches only `PrefixStatsPublishError`. A
+  cancellation therefore propagates with no `prefix_stats_publish_failed`
+  record, and `start()` logs no `replay_complete`.
+
+A cancellation of `publish()` comes from the startup deadline, from the
+shutdown deadline, or from a test. In the first two the process is ending.
+The count is pinned all the same, because Amendment 2 ruling 2's "for each
+publish that returned" made no exception for it.
+
+### Ruling 4. `stop()` marks nothing (R2)
+
+Decision 13's "It then marks the worker stopped." and Amendment 2 ruling
+6's "and marks the worker stopped whether or not the flush raised" describe
+no behaviour.
+Nothing reads such a mark. Everything that changes once `stop()` has begun
+follows from the stop flag, which is set first: `handle()` returns
+`STOPPED`, `apply_config()` changes nothing, step 3 passes nothing, and
+`run()` returns. `TrieWorker.stop()` now takes three steps: it sets the
+stop flag; it takes the lock; it awaits `publisher.flush()`, whose
+exception propagates. Every call takes all three, and the worker keeps no
+"stopped" state. No test can see the difference, and none is asked for.
+
+### Ruling 5. Three findings need tests, and no change of design (R3, R5, R6)
+
+* **R3.** Amendment 2 ruling 2 already says the cause is the exception "of
+  the first failed message in `messages` order". The test must make the order in
+  which the publishes fail differ from the order of the messages.
+* **R5.** Decision 13's note already says that `build_service` passes
+  `min_prefix_length_ipv6` to the worker. A test must show it reaching the
+  publisher.
+* **R6.** Amendment 2 ruling 9's order can be observed through the type of
+  the cause, and this is now pinned. The check's own error is a `ValueError`. For
+  every value decode refuses, the `CodecError`'s `__cause__` is a
+  `ValueError` whose text names `hot_ratio`. It is never a `TypeError`,
+  which comparing or testing a non-number first would raise, and never an
+  `OverflowError`, which converting an oversized integer first would raise.
+  The wording stays outside the contract. So the order of the finiteness
+  and range checks, which only the wording shows, is not pinned.
+
+### Ruling 6. A cap on the streams is the owner's question, and is not ruled
+
+Ruling 1 removes what made the prefix-stats stream grow with the number of
+restarts. It does not bound what live traffic writes. The four streams
+share one store, and none has a byte cap (ADR-0013 decision 2, assumption
+6). By estimate, one agent at its default budget (§36.6: 2,000 distinct IPs
+a second) can drive tens to hundreds of GB a day into them (assumption 82).
+By the auditor's reading, once the store is full every stream's publishes
+fail: ingest answers 503, and the aggregator and the trie exit 1.
+
+Whether to cap the streams, and whether a full stream drops its oldest
+messages or refuses new ones, is a question for the repository owner
+(assumption 81). It was raised on 2026-09-24 with this amendment. What each
+answer means for the consumers is set out here, so that it can be decided
+from this text:
+
+* *Prefix-stats, discard old.* Under limits retention a cap removes the
+  oldest messages whether or not the detector's durable has read them. The
+  durable then continues from the first message left. A detector that keeps
+  up loses nothing, since what goes is what it has already acknowledged. A
+  detector that lags by more than the cap loses the stats it had not read.
+  For a prefix with a later message still in the stream, it loses only the
+  edges in between, in its `since` and `classification_changes`. For a
+  prefix whose last message went unread, it keeps older stats, or none,
+  until the next transition under that prefix publishes the prefix's stats
+  again. Until then a stale detection can persist, or a new one go
+  unreported. The trie can re-derive every such stat, and slice 3's read
+  API reports it directly.
+* *Prefix-stats, discard new.* A full stream refuses the trie's publishes.
+  The trie exits 1, and every restart fails the same way until messages age
+  out, which can take up to a day. The trie's read API is down all that
+  time.
+* *Hot-ip or observations, either policy.* Unlike stats, these cannot be
+  re-derived. A hot-ip message discarded before the trie reads it is a
+  transition the trie never applies, and until the snapshot epic lands the
+  replay also loses the log's head sooner. An observation discarded before
+  the aggregator reads it is a count the aggregator never adds. Refusing
+  new messages instead stops the aggregator, or makes ingest answer 503.
+* *No cap.* The status quo: the operator sizes the store and watches it.
+
+Until the owner answers, ADR-0013 decision 2 and assumption 6 stand.
+Nothing else in this amendment depends on the answer.
+
+### Ruling 7. `CHANGES`
+
+The implementing change replaces the third of slice 2's lines. That line is
+on this branch and has not been released. It reads:
+
+    Trie service re-publishes the PrefixStatsChanged of every state-changing hot-ip record it replays on start before it reports ready, so a start takes longer the more such records the log retains; a publish that fails stops the service with exit 1 (prefix_stats_publish_failed)
+
+It becomes:
+
+    Trie service re-publishes PrefixStatsChanged on start only from the last event whose stats are in hammertime.prefix-stats.v1 (every state-changing record it replays when that stream's last message is missing or not the trie's own), and reports ready once those publishes are acknowledged; a publish that fails stops the service with exit 1 (prefix_stats_publish_failed)
+
+It is not `BREAKING`: no trie build has shipped. Rulings 2 to 5 add no line
+(assumption 84).
+
+### Test seams
+
+* **The last value.** Every bus double handed to a `TrieWorker`, or to
+  `build_service`, must implement `last_value(topic)`. A double that
+  returns `None` models a prefix-stats log with no usable last message. It
+  keeps Amendment 2's behaviour: the replay publishes everything.
+* **The memory bus.** `InMemoryBus.last_value` returns the value last
+  appended to the topic's log. A second trie started on the same bus after
+  a first one has published therefore re-publishes from the first one's
+  last sequence.
+* **`NatsBus.last_value`** can be reached like the offset reads, through a
+  stub JetStream context whose `stream_info` and `get_msg` answer what the
+  test chooses (ADR-0013 Amendment 13).
+* **An out-of-range timestamp** can no longer be written by `encode`. A test
+  builds the bytes by editing an encoded envelope, as `test_codec.py`
+  already does for out-of-range integers. An envelope's `event_id` does not
+  depend on its timestamp, so the edited bytes still pass decode's
+  `event_id` check.
+
+### Questions this amendment closes
+
+| Question | Left open by | Ruled in |
+| --- | --- | --- |
+| Must every start re-publish the whole retained log until the snapshot epic? | Amendment 2 ruling 4; decision 14 item 8 | ruling 1: no, only from the prefix-stats log's last sequence |
+| Can a hot-ip timestamp stop the trie? | Amendment 2 ruling 5, which said no | ruling 2: no longer |
+| What does `publish()` count, and wait for, when it is cancelled? | Amendment 2 ruling 2 | ruling 3 |
+| What does "marks the worker stopped" mean? | decision 13; Amendment 2 ruling 6 | ruling 4: nothing, and it is dropped |
+| Should the streams have a size cap? | ADR-0013 assumptions 6 and 144 | not ruled: with the owner (ruling 6) |
+
+### Edits
+
+**In this ADR.** Each is a dated note; no text is replaced.
+
+* **Status line.** A closing paragraph on this amendment.
+* **Decision 1.** A note after its Amendment 2 note: that note's added
+  ordering constraint no longer holds.
+* **Decision 4.** A note after the paragraph that ends "The consequence for
+  a long log is under Consequences.": step 2a.
+* **Decision 6.** A note after its Amendment 2 note: the property
+  `republish_from`, and when steps 5a and 5b run.
+* **Decision 7.** A note after its Amendment 2 note: `bus.last_value` joins
+  the row of bus reads, and the `prepare` row holds for timestamps.
+* **Decision 12.** A note after its Amendment 2 note: `replay_complete`'s
+  field and the new record.
+* **Decision 13.** A note after its Amendment 2 note: "marks the worker
+  stopped" is dropped.
+* **Decision 14.** A note after the note that settles item 10: item 8's
+  "every start" no longer holds.
+* **Decision 16.** A note after its Amendment 2 note: what a restore
+  re-publishes.
+* **Test seams.** A note after its Amendment 2 note.
+* **Consequences.** A note under "Slice 2 without the snapshot epic
+  republishes.", after its Amendment 2 note.
+* **Amendment 2.** A note at the end of each of rulings 2, 4, 5, 6, 7, 9, 10
+  and 11; one after its "Test seams"; and one under assumption 62.
+* **This section.**
+
+**In other documents.**
+
+* **`docs/adr/0013-nats-jetstream-event-log-static-shards.md`** (Amendment
+  13): a clause on the status line; in decision 3, a line in the interface
+  block, an italic paragraph after the Amendment 11 paragraph, a line in the
+  `NatsBus` block and an italic sentence after the `hammertime.bus.memory`
+  paragraph's Amendment 10 sentence; a dated note under Amendment 12's
+  assumption 144; an "Amendment 13" section.
+* **`docs/adr/0010-read-apis-and-shared-prefix-predicate.md`** (Amendment
+  4): a clause on the status line; a dated note after decision 3's
+  Amendment 3 note; an "Amendment 4" section.
+* **`docs/runbook.md`**, "Trie service restart": a bullet, "What a start
+  re-publishes", between "Its deadline" and "A corrupt trie". Nothing is
+  replaced.
+* **`docs/spec/README.md`.** Three rows gain entries; nothing is removed.
+  * §19's ADR-0017 entry was "`docs/adr/0017` (decisions 3, 6 and 14;
+    Amendment 2: the publisher)", and gains Amendment 3.
+  * §32/33: "`MessageBus.end_offset` and `first_offset`" became
+    "`MessageBus.end_offset`, `first_offset` and `last_value`";
+    "`docs/adr/0010` (Amendments 1, 2)" became "(Amendments 1, 2, 4)";
+    "`docs/adr/0013` (decisions 2, 9; Amendment 10)" became "(decisions 2,
+    9; Amendments 10 and 13)"; and the ADR-0017 entry, "(decisions 3, 4, 8
+    and 16; Amendment 2: the replay re-publishes the stats it replays)",
+    gains Amendment 3.
+  * §37's ADR-0017 entry was "`docs/adr/0017` (decision 12; Amendment 2
+    ruling 7: `prefix_stats_published`, and why slice 2 does not measure
+    `hot_transition_to_prefix_update_latency`)", and gains Amendment 3.
+
+No spec section, schema or protocol document changes (assumption 85).
+
+### Assumptions
+
+Each is a judgment call that the findings, the spec and the earlier ADRs do
+not make. Push back on them individually; numbering continues the ADR's
+list.
+
+65. **How far the stats reached is read from the prefix-stats log itself.**
+    Four alternatives were weighed.
+    * *The snapshot epic alone.* It bounds a restore by the snapshot
+      interval, which is still too much for a busy trie (ruling 1, "Why not
+      wait").
+    * *A local file recording the last sequence published.* Written after
+      every event, it costs a synchronous write per event. Written less
+      often, it goes stale, and a snapshot is that already.
+    * *A byte cap with discard old on the prefix-stats stream, the auditor's
+      smallest fix.* It keeps the damage inside that stream. But the
+      restart loop still happens, the trie still cannot start, and the
+      stream still churns.
+    * *A duplicate window as long as the stream's `max_age`.* The log would
+      drop every copy re-published within a day. But the server keeps every
+      message id of that day in memory (ADR-0013 assumption 7), and each
+      start still waits for 25 acknowledged publishes per record.
+
+    The log already records which stats reached it, and the trie is its
+    only producer. The cost is one new bus read at start, and the cases
+    under "What it leaves open".
+66. **`republish_from` is the last message's `sequence`, not one past it.**
+    The event may have been half published when the process ended, and the
+    trie cannot tell. Publishing it again costs 25 publishes, most of which
+    the log drops.
+67. **Only the message at the last offset is read.** A missing last message,
+    or one that is not the trie's own, falls back to a full re-publish. That
+    is safe, and a failed start still makes progress. Finding the trie's
+    last message behind a hole, or behind a foreign message, would need a
+    scan, for cases only an administrator or a principal on the bus can
+    cause.
+68. **A last message the trie cannot use falls back to a full re-publish;
+    it does not fail the start.** Failing would let one message on the
+    prefix-stats stream stop the trie. A full re-publish keeps the
+    invariant, and the record says why it happened.
+69. **`ahead_of_log` compares with `replay_target`.** Every `sequence` the
+    trie wrote from the current hot-ip log is at most that log's end. One
+    above it came from another numbering of the log, after the stream was
+    recreated, or from another publisher. Re-publishing is then futile for
+    the prefixes the detector holds with higher sequences, and harmless.
+70. **The envelope's `sequence`, not the payload's.** The trie writes the
+    same number in both. The envelope's is the one `event_id` is derived
+    from, and decode checks `event_id` against it.
+71. **No record when the log holds no message at its last offset.** That is
+    the first start of a deployment, or a stream a quiet day has emptied,
+    and a full re-publish is what is wanted then. `replay_complete`'s
+    `republish_from=0` shows it.
+72. **The residuals are recorded, not closed.** Closing the family and floor
+    case needs the trie to know what an earlier process served, and only
+    the snapshot epic records that. Closing the recreated-stream case needs
+    a signal that the stream was recreated, which assumption 33 already
+    found missing.
+73. **Decode returns UTC, and does not only check the range.** A value
+    returned in UTC can be written without another check, and every
+    consumer sees one form. No consumer reads the original offset: the
+    aggregator uses `timestamp()`, and the trie compares instants and
+    writes UTC.
+74. **Refuse, do not clamp.** The codec writes UTC with a four-digit year,
+    and a clamped value would be a different instant. ADR-0016 refuses an
+    out-of-range integer, rather than saturating it, in the same way.
+75. **Encode's overflow becomes a `CodecError` too,** so that encode raises
+    only `CodecError` for a value it cannot write. That is ADR-0016
+    assumption 4's reason: a producer bug made loud at the producer.
+76. **The ingest path is named, not fixed.** It is the agent protocol's
+    contract, a 400 or a 503. It is not part of either finding, and nothing
+    from it reaches the bus.
+77. **`publish()`'s count is pinned for a cancellation; the moment it moves
+    is not.** The count after completion is what an operator could read.
+    When it moves belongs to the mechanism, and leaving it open leaves the
+    coder free to choose one.
+78. **A cancellation wins over a publish failure.** A cancelled task that
+    raised anything but `CancelledError` would break asyncio's contract
+    with whoever cancelled it, and the process is ending either way.
+79. **"Marks the worker stopped" is dropped, not made a property.** No
+    reader needs one. `TrieService` awaits `worker.stop()`, and the
+    snapshot epic's final snapshot runs inside it, after the flush.
+80. **Amendment 2 ruling 9's order is pinned through the type of the cause
+    only.** That ruling kept the wording out of the contract, and this
+    amendment does not reverse it.
+81. **The cap is the owner's.** It trades a lagging consumer's unread
+    messages (discard old), or a stopped producer (discard new), against a
+    full shared store, and the right size depends on each deployment's
+    disk. ADR-0013 assumption 6 made it a deployment decision, and the
+    owner was asked about it once already.
+82. **The volumes and rates are estimates, not measurements.** At one
+    agent's default budget: about 2,000 observation messages a second (one
+    day's retention); at most about 4,000 hot-ip records a second, every IP
+    turning hot once and cold one window later (30 days' retention); and
+    prefix-stats messages up to the trie's publish rate, at most about
+    17,500 a second by Amendment 2 ruling 4's estimate (one day). At a few
+    hundred bytes a message, that is tens to hundreds of GB a day. The 130
+    events a second of ruling 1 is Amendment 2 ruling 4's 40,000 records
+    over the default 300 s snapshot interval. Nothing was measured.
+83. **Slice 2's texts get dated notes, not edits in place,** although they
+    have not merged. The reviewer and the auditor quote them, and a note
+    keeps what they read.
+84. **`CHANGES`: one line replaced, none added.** The third line described
+    every start re-publishing the whole log. Rulings 2 to 5 change nothing
+    a released build does. The codec change reaches the aggregator, which
+    is on master, only for an observation that ingest cannot publish and
+    only a principal on the bus can. The trie has not shipped. This is
+    `CLAUDE.md`'s "if unsure, it does not", and the hand-off report says so.
+85. **No spec section, schema or protocol document changes.** No section of
+    the spec describes re-publishing. `schemas/prefix_stats_event.v1.json`
+    already says the `timestamp` is the hot-ip event's, which it still is,
+    in UTC. The read API is unchanged. ADR-0015 and ADR-0016 carry no note:
+    no text of theirs becomes false, and `docs/spec/README.md`'s §19 row
+    points here.
+86. **The runbook is edited now.** Assumption 62 held the runbook back until
+    slice 2's implementation merged. That implementation is now on this
+    branch and merges with the edit, and the auditor asked for the runbook
+    to say what a failed start writes.
+
+### Sources
+
+Read on 2026-09-24 for this amendment. No web source was consulted.
+
+* Repository files:
+  * `services/trie/src/hammertime/trie/worker.py` and `publisher.py`, at
+    98d6c8e.
+  * `packages/hammertime-core/src/hammertime/core/events/codec.py`:
+    `_format_timestamp` converts with `astimezone(UTC)`, and
+    `_parse_timestamp` returns `datetime.fromisoformat`'s value with its
+    own offset.
+  * `packages/hammertime-core/src/hammertime/core/runtime.py`: `_supervise`
+    wraps `service.start()` in `asyncio.wait_for(..., startup_timeout)`,
+    which cancels it at the deadline.
+  * `packages/hammertime-bus/src/hammertime/bus/nats.py`, `memory.py` and
+    `topics.py`: `stream_config_for`, `DUPLICATE_WINDOW_S`,
+    `NatsBus.end_offset`, `InMemoryBus._append`, and the four topics'
+    retention.
+  * `services/ingest/src/hammertime/ingest/api/routes.py`
+    (`_parse_window_start`; `create_observation` answers 503 for any
+    exception from `publish`) and `publisher.py` (`encode` runs inside the
+    publish).
+  * `services/aggregator/src/hammertime/aggregator/worker.py`: it reads
+    `window_start.timestamp()`.
+  * `deploy/docker-compose.yml`, which sets no restart policy on the trie,
+    and `deploy/k8s/README.md`, which runs the trie as a StatefulSet.
+* nats-py 2.16.0 as installed, in `.venv/lib/python3.12/site-packages/nats/`:
+  * `js/manager.py`: `get_msg(stream_name, seq=None, subject=None,
+    direct=False, next=False)`. Its default form sends
+    `$JS.API.STREAM.MSG.GET.<stream>` through `_api_request`, which raises
+    `APIError.from_error` on an error response. `get_last_msg(stream_name,
+    subject)` asks by `last_by_subj`.
+  * `js/errors.py`: `APIError.from_error` raises `NotFoundError` for code
+    404.
+  * `js/api.py`: `RawStreamMsg.data: Optional[bytes]`; `StreamState`'s
+    `messages` and `last_seq`.
+  * `js/client.py`: `class JetStreamContext(JetStreamManager)`, so the bus's
+    context has `get_msg`.
+* The findings' own readings, taken as the findings state them and not
+  re-checked: the auditor's, that a full JetStream store makes every
+  stream's publishes fail, and its restart cadence and volumes; the
+  reviewer's, that `asyncio.gather` drops its results when it is cancelled.
+  Ruling 3 pins the observable, and does not rest on the second.
+* Python's `datetime` holds the years 1 to 9999 (`datetime.MINYEAR` and
+  `datetime.MAXYEAR`), and `astimezone` raises `OverflowError` past them, as
+  the auditor's finding reports. Nothing was run here.

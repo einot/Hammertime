@@ -28,6 +28,10 @@ What it models, per ADR-0013 decision 3 (`hammertime.bus.memory`):
 * `first_offset(topic)` is `0` for every topic: the log never discards, so
   `0` is a non-empty log's first index and an empty log's `end_offset`
   (Amendment 10). No retention or purge is modelled.
+* `last_value(topic)` is the value of the last record in the topic's log,
+  `None` for an empty log or a topic never published to, registered or not;
+  a publish dropped as a duplicate appends nothing and so does not change it
+  (Amendment 13).
 """
 
 import asyncio
@@ -97,6 +101,19 @@ class InMemoryBus:
         like `NatsBus.first_offset`, a broker round trip there.
         """
         return 0
+
+    async def last_value(self, topic: str) -> bytes | None:
+        """The value of the last record in `topic`'s log, or `None` when it is empty.
+
+        `None` for a topic never published to, registered or not; a publish
+        dropped as a duplicate appends nothing and so does not change it
+        (ADR-0013 decision 3, Amendment 13). `async` like
+        `NatsBus.last_value`, a broker round trip there.
+        """
+        log = self._logs.get(topic)
+        if not log:
+            return None
+        return log[-1].value
 
     async def _append(
         self, topic: str, key: bytes | None, value: bytes, message_id: str | None

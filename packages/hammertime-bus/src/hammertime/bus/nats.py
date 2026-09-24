@@ -51,6 +51,11 @@ The mapping, from ADR-0013 decisions 1, 2, 4 and 5:
   stream nothing has been written to (decision 3 as amended by Amendment
   10). `first_offset_of` is pure and is not re-exported from
   `hammertime.bus`.
+* `NatsBus.last_value(topic)` reads `stream_info(...).state`; with no
+  message it is `None` and sends no second request, otherwise it is the data
+  of `get_msg(<stream>, seq=state.last_seq)` in its default (non-direct)
+  form, `b""` when the message carries none, and `None` when that read
+  raises `NotFoundError` (Amendment 13).
 * `bus_endpoints(servers)` is the spec section 47.7 reduction for bus URLs:
   the only form in which a log record may name the servers (ADR-0013
   Amendment 2), since a NATS URL may carry a password or token in its
@@ -534,6 +539,33 @@ class NatsBus:
         spec = TOPICS[topic]
         info = await self._require_js().stream_info(spec.stream_name)
         return first_offset_of(info.state)
+
+    async def last_value(self, topic: str) -> bytes | None:
+        """The data of the message at `state.last_seq`, or `None` when there is none.
+
+        Reads `stream_info(...).state` as `end_offset` does; when
+        `state.messages` is `0` it returns `None` with no second request.
+        Otherwise it reads the message with `get_msg(<stream>,
+        seq=state.last_seq)` in its default form, the `STREAM.MSG.GET` API
+        request (the direct form is unavailable: `allow_direct` is false). A
+        `NotFoundError` from that read means no message at that sequence and
+        returns `None`; every other error propagates, a `NotFoundError` from
+        `stream_info` included. A message with no data is `b""`. An
+        unregistered topic is a `KeyError`; before `start()` it is
+        `RuntimeError("NatsBus is not started")` (ADR-0013 decision 3,
+        Amendment 13).
+        """
+        spec = TOPICS[topic]
+        js = self._require_js()
+        info = await js.stream_info(spec.stream_name)
+        state = info.state
+        if state.messages == 0:
+            return None
+        try:
+            message = await js.get_msg(spec.stream_name, seq=state.last_seq)
+        except NotFoundError:
+            return None
+        return message.data if message.data is not None else b""
 
     def _require_js(self) -> JetStreamContext:
         if self._js is None:

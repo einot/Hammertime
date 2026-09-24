@@ -48,6 +48,28 @@ snapshot's `event_sequence` (§33). Time-to-ready is reported as
   only the next hot-ip transition ends the wait: until one is published,
   every start waits again. A longer `HAMMERTIME_STARTUP_TIMEOUT_S` does
   not help in these cases.
+* **What a start re-publishes.** A start re-publishes the
+  `PrefixStatsChanged` of the records it replays only from the last event
+  whose stats are already in `hammertime.prefix-stats.v1`, normally just
+  that one event. `replay_complete` reports where it began as
+  `republish_from` (ADR-0017 Amendment 3). A start re-publishes the stats
+  of every state-changing record it replays when that stream has no usable
+  last message: on a deployment's first start, after a day with no
+  transition has aged every message out, after the stream was purged, or
+  when the trie cannot use the last message (not its own, or ahead of the
+  hot-ip log), which it logs as `prefix_stats_last_ignored` with a
+  `reason`. Such a start takes longer.
+  If it fails with `startup_timeout`, what it published stays in the log
+  and the next start carries on after it, so repeated starts finish the
+  work; a longer deadline finishes it in fewer.
+
+  After a family is added to `HAMMERTIME_TRIE_FAMILIES`, or a minimum
+  prefix length is lowered, the trie applies the earlier transitions it now
+  covers, but does not re-publish the stats of those before
+  `republish_from`; the detector learns those prefixes when they next
+  change. Purging `hammertime.prefix-stats.v1`
+  before the restart makes the start re-publish everything, and a detector
+  loses whatever it had not yet read from the stream.
 * **A corrupt trie.** A trie that finds its own structure corrupt logs
   `trie_invariant_violation` and exits 1. The restart is the rebuild: do
   not patch the state by hand.
