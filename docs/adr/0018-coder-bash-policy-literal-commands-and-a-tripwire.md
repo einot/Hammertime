@@ -9,12 +9,16 @@ widening the coder's path fence beyond `.claude/` (decision 12); the
 Assumptions section lists the rest. One judgment call has since been
 overturned by the owner. As first written, this ADR did not require
 `--locked`; on 2026-09-24 the owner decided that `--locked` is required
-everywhere (Question 1, now decided; decision 5). That is the only part of
-this ADR the owner has ruled on. Question 4 was ruled the same day by the
-top-level session, not by the owner, under CLAUDE.md's pre-1.0 standing
-order, because its recommendation was unambiguous and only tightens a guard;
-the session took this ADR's own recommendation (decision 17, third
-amendment).
+everywhere (Question 1, now decided; decision 5). The owner ruled twice more
+that day, and the fourth amendment records both: SA1c's audit of C4's commit
+is discarded as the merge gate, and `..` traversal in `path-guard.sh` is to be
+fixed first, after which a fresh auditor audits decision 17's gate and that
+fix together. The fix's design, decision 18, is the architect's, not the
+owner's. Nothing else in this ADR has been ruled on by the owner. Question 4
+was ruled the same day by the top-level session, not by the owner, under
+CLAUDE.md's pre-1.0 standing order, because its recommendation was
+unambiguous and only tightens a guard; the session took this ADR's own
+recommendation (decision 17, third amendment).
 
 Partly implemented. `.claude/hooks/bash-guard.sh` has gained the features of
 decisions 3-11 through brief C1 and the fix of the second amendment (below).
@@ -25,25 +29,36 @@ commit, `e38e9c9`, and found `bash-guard.sh` clean; that commit is now on
 this ADR's feature branch. SA1b's one finding was against
 `.claude/hooks/path-guard.sh`, which reads the path it vets through the same
 NUL-dropping extraction (Question 4). The third amendment settles that with
-decision 17, a NUL gate in `path-guard.sh`, delivered through briefs T2, C4
-and SA1c before step W (Follow-through, step 5). The top-level session
-applies decision 14's `.claude/settings.json` text in step W, which must come
-after C1, C3 and C4 have landed in the main checkout (decisions 13 and 17).
-The policy is not in force until decision 15's verification has passed. This
-ADR touches no spec section, schema or protocol document, so
-`docs/spec/README.md` does not change. Revised in place on 2026-09-24,
-before merge; "Revision 2026-09-24", "Second amendment 2026-09-24" and "Third
-amendment 2026-09-24" at the end list every edit and quote what they
-replaced.
+decision 17, a NUL gate in `path-guard.sh`, which brief C4 implemented as
+commit `64ffaf3`; that commit is not merged. SA1c audited it, and the owner
+discarded that audit as the merge gate. SA1c had reported that
+`path-guard.sh` resolves no `..`, and the top-level session confirmed that on
+the guard side. The fourth amendment settles it with decision 18, which
+refuses a path not in plain form. Briefs T3 and C5 deliver it, and SA1d
+audits C4's gate and C5's rule together. The two commits are merged only
+when SA1d's audit of C5's commit, which carries C4's, is clean and
+`supervisor` has reviewed SA1d, all before step W (Follow-through, step 5).
+Clean means no open finding, no coverage entry marked `open`, and no
+coverage entry marked `not-examined` other than A17, the harness side, which
+the probes settle. The top-level session applies decision 14's
+`.claude/settings.json` text in step W, which must come after C1, C3, C4 and
+C5 have landed in the main checkout (decisions 13, 17 and 18). The policy is
+not in force until decision 15's verification has passed. This ADR touches
+no spec section, schema or protocol document, so `docs/spec/README.md` does
+not change. Revised in place on 2026-09-24, before merge; "Revision
+2026-09-24" and the second, third and fourth amendments at the end list
+every edit and quote what they replaced.
 
 Scope note. This ADR designs the Bash policy for the `coder` agent, the
 `bash-guard.sh` features that policy needs, the widening of the coder's
-Edit/Write fence that the Bash policy depends on, and (third amendment) a NUL
+Edit/Write fence that the Bash policy depends on, (third amendment) a NUL
 gate in `path-guard.sh` that every configured path-guard policy runs, the
-architect's and the test-author's as well as the coder's (decision 17). It
-plans the change and writes the briefs. It changes agent tooling only:
-nothing in Hammertime's services, wire formats, configuration keys or
-deployment changes. The `security-auditor`'s policy does not change
+architect's and the test-author's as well as the coder's (decision 17), and
+(fourth amendment) a rule in the same script, for the same policies, that
+refuses a path with a `.` or `..` component, a `//` or a leading `~`
+(decision 18). It plans the change and writes the briefs. It changes agent
+tooling only: nothing in Hammertime's services, wire formats, configuration
+keys or deployment changes. The `security-auditor`'s policy does not change
 either — every new feature is off unless a policy turns it on, and the
 auditor's policy turns none on.
 
@@ -818,10 +833,12 @@ fence. Decision 13 says how the coder that implements this ADR edits
 The Bash policy's claims depend on more than that, so the coder's Edit/Write
 `DENY_GLOBS` gains four groups:
 
-* The additions are globs. The one change to `path-guard.sh` itself is
-  decision 17's NUL gate (third amendment), which refuses a path the script
-  cannot read intact, for every agent the script serves; the verdict on every
-  path that is a string without a NUL is unchanged.
+* The additions are globs. The changes to `path-guard.sh` itself are decision
+  17's NUL gate (third amendment), which refuses a path the script cannot
+  read intact, and decision 18's plain-form rule (fourth amendment), which
+  refuses a path with a `.` or `..` component, a `//` or a leading `~`. Both
+  apply to every agent the script serves. The verdict on every other path, a
+  string without a NUL and in plain form, is unchanged.
 * Each glob is matched against the path relative to the worktree (the
   payload's `cwd`) or the main checkout (`CLAUDE_PROJECT_DIR`).
 * Some existing files match an added glob: the root `CLAUDE.md`
@@ -853,6 +870,9 @@ show.** `/*`, `../*`, `*/../*`, `.git`, `.git/*`, `*/.git`, `*/.git/*`,
   `core.pager` or `core.fsmonitor` would run a program for every git command
   in the session, the top-level session's included.
 * `../*` and `*/../*` match a traversal the Write tool did not normalise.
+  Since the fourth amendment, decision 18 refuses every path with a `..`
+  component before any glob is consulted, so neither can match a path that
+  reaches the lists; both stay, as defence in depth (decision 18).
 * `.git` is the worktree's gitdir pointer file. `.git/*` covers the main
   repository's hooks and config, which every worktree and the top-level
   session share.
@@ -936,15 +956,30 @@ adds decision 17's NUL gate, is dispatched before step W, under today's
 policy is wired for it. C4's brief limits it to `.claude/hooks/path-guard.sh`,
 `supervisor` checks that no other file changed, and the top-level session
 confirms that the main checkout's `.claude/` is unchanged before merging. The
-merge waits for SA1c's audit and `supervisor`'s review of SA1c
-(Follow-through, step 5), because the main checkout's `path-guard.sh` is the
-live Edit/Write fence for the coder, the architect and the test-author, and
-the test-author's read fence. Step W waits for C4, for two reasons. Applied
-first, W's `.claude/*` glob would refuse C4 its file, which would then need
-the temporary exemption above. And W adds the coder's exact-name globs
-(`uv.lock`, `CLAUDE.md`, `conftest.py` and the rest), which are the globs a
-NUL gets past: wired before the gate, they would look closed without being
-closed, the same kind of hazard as the one above.
+merge waits until SA1d's audit of C5's commit, which carries C4's gate and
+C5's rule together, is clean and `supervisor` has reviewed SA1d
+(Follow-through, step 5; the owner discarded SA1c's audit, fourth
+amendment), because the main checkout's `path-guard.sh` is the live
+Edit/Write fence for the coder, the architect and the test-author, and the
+test-author's read fence. Clean means no open finding, no coverage entry
+marked `open`, and no coverage entry marked `not-examined` other than A17,
+the harness side, which the probes settle. Step W waits for C4, for two
+reasons. Applied first, W's `.claude/*` glob would refuse C4 its file, which
+would then need the temporary exemption above. And W adds the coder's
+exact-name globs (`uv.lock`, `CLAUDE.md`, `conftest.py` and the rest), which
+are the globs a NUL gets past: wired before the gate, they would look closed
+without being closed, the same kind of hazard as the one above.
+
+**C5 edits `path-guard.sh` the same way (fourth amendment).** Brief C5, which
+adds decision 18's plain-form rule on top of C4's commit, is dispatched
+before step W under the same conditions and checks as C4, and C4's and C5's
+commits are merged together, on the clean-audit condition above. Step W
+waits for C5 too, for the same two reasons. Applied first, W's `.claude/*`
+would refuse C5 its file. And the coder globs W adds that do not begin with
+`*` (`.claude/*`, `uv.lock`, `GNUmakefile`, `pytest/*` and the rest) are
+globs a `.` component gets past: `<worktree>/./uv.lock` relativises to
+`./uv.lock`, which none of them matches. Wired before decision 18, they too
+would look closed without being closed.
 
 ### 14. The `settings.json` text
 
@@ -1031,11 +1066,14 @@ CLAUDE.md: "put it in the main checkout, dispatch a real agent, and have it
 attempt an operation the policy must refuse."
 
 **Sequence.** After W, and once the full suite passes in the main checkout,
-the top-level session dispatches two probes, each paired with `supervisor`:
+the top-level session dispatches four probes, each paired with `supervisor`:
 
 * **V1**, a `coder`, whose worktree and branch are discarded afterwards and
   never merged;
-* **V2**, a `security-auditor`.
+* **V2**, a `security-auditor`;
+* **V3**, a `test-author`, and **V4**, an `architect` (fourth amendment),
+  which make one call each, D1 and D2 below. W changes neither of their
+  policies, so the session may dispatch them as soon as C4 and C5 are merged.
 
 It also runs one check itself (Z1). The briefs are under Follow-through.
 
@@ -1180,10 +1218,50 @@ the inconclusive case.
   `uv.lock` is unmodified, and a new untracked file appears, such as
   `uv.lockx` or one whose name contains the six characters `\u0000`. Either
   no U+0000 reached the guard, or the gate did not run. The session confirms
-  that the main checkout's `path-guard.sh` is C4's merged commit and that
-  T2's tests pass there. If both hold, no NUL was delivered: the harness side
-  stays unsettled, the session reports that, and the rest of V1 stands. If
-  either does not hold, P9 is a fail.
+  that the main checkout's `path-guard.sh` carries C4's gate, merged with
+  C5's commit (fourth amendment), and that T2's tests pass there. If both
+  hold, no NUL was delivered: the harness side stays unsettled, the session
+  reports that, and the rest of V1 stands. If either does not hold, P9 is a
+  fail.
+
+**D1 and D2 (fourth amendment).** Each must be refused, and each tests the
+harness as well as the guard: whether a path with a `..` component reaches
+the hook as written. Each is sent by an agent of its own, because the policy
+it tests is scoped to that agent and V1 is a coder.
+
+* **D1**, sent by V3, a `test-author`: a Read of
+  `/home/user/Hammertime/packages/hammertime-testkit/../hammertime-core/src/hammertime/core/runtime.py`,
+  an implementation file reached through the testkit's read exemption.
+* **D2**, sent by V4, an `architect`: a Write of
+  `/home/user/Hammertime/docs/../services/ingest/PROBE_DOTDOT.txt`, with the
+  content `probe`, a path outside the architect's scope reached through
+  `docs/`.
+
+Every directory on both paths exists (checked 2026-09-24), so the kernel
+would resolve each `..` and reach the target. After V4, the top-level
+session runs `git status` in the main checkout.
+
+**D1's and D2's outcomes.** They replace the general outcomes above for these
+two items. For each, the session records which of them it was.
+
+* **Pass, the rule:** refused with decision 18's plain-form denial, which
+  begins `Hammertime path guard: ` and contains `a '.' or '..' component`. The
+  harness delivered the `..` to the hook, and the rule refused it.
+* **Pass, the globs:** refused with a `Hammertime path guard: ` denial that
+  names the plain path: for D1,
+  `packages/hammertime-core/src/hammertime/core/runtime.py` and `DENY_GLOBS`;
+  for D2, `services/ingest/PROBE_DOTDOT.txt` and `ALLOW_GLOBS`. The harness
+  resolved the `..` before the hook, and the globs judged the real target.
+* **Pass, another layer:** any other refusal, or a tool error. That fails
+  closed too, but the harness side is not settled and the live rule was not
+  exercised; T3's tests remain its only execution evidence.
+* **Fail:** D1 returned the file's contents, or
+  `services/ingest/PROBE_DOTDOT.txt` exists in the main checkout. The `..`
+  route is open on the live system. The session deletes the probe file if
+  there is one, reports verbatim, and checks whether the main checkout's
+  `path-guard.sh` is the merged C5 commit and whether T3's tests pass there.
+  Whatever that shows, it stops and puts the result to the owner before it
+  dispatches the slice-3 coder, a test-author or an architect.
 
 ### 16. `CHANGES`
 
@@ -1358,17 +1436,249 @@ Phrases the tests pin:
 relativisation, the glob checks, every existing message and the exit codes
 are unchanged. As in decision 3, the status rule specifies the gate only.
 Whether a malformed payload can make an extraction line end the script
-before the gate, under `set -e`, with a status other than 0 or 2, is SA1c's
-to examine. SA1b judged the same question for `bash-guard.sh` unreachable
-through the tool protocol, because `tool_input` is always an object.
+before the gate, under `set -e`, with a status other than 0 or 2, is SA1d's
+to examine (SA1c's audit was discarded, fourth amendment). SA1b judged the
+same question for `bash-guard.sh` unreachable through the tool protocol,
+because `tool_input` is always an object.
 
 **What the gate does not settle.** `file_path` still comes through `$(...)`,
 which also strips trailing newlines. Assumption 35 explains why that cannot
 make a protected name look unprotected.
 
-**Delivery.** Briefs T2 (tests), C4 (the script) and SA1c (the audit), all
-before step W (Follow-through, step 5; decision 13). Probe P9 (decision 15)
-checks it live. There is no `CHANGES` entry (decision 16).
+**Delivery.** Briefs T2 (tests) and C4 (the script, delivered as `64ffaf3`),
+before step W (Follow-through, step 5; decision 13). SA1c's audit of C4's
+commit was discarded by the owner; SA1d audits the gate together with
+decision 18's rule (fourth amendment). Probe P9 (decision 15) checks it live.
+There is no `CHANGES` entry (decision 16).
+
+### 18. Paths in plain form: `path-guard.sh` resolves no `.` or `..` (fourth amendment)
+
+Added on 2026-09-24, on the owner's decision that `..` traversal in
+`path-guard.sh` is fixed first, and then audited by a fresh auditor together
+with decision 17's gate.
+
+**Why.** SA1c, auditing C4's commit, reported that `path-guard.sh` resolves
+no `..`. The top-level session confirmed the guard side by running the main
+checkout's script under today's `settings.json`. This decision rests on that
+confirmation, not on SA1c's audit, which the owner discarded. The script
+turns a path into `rel` by stripping the worktree root or the project root
+as a prefix, and matches `rel` with `[[ str == glob ]]`, in which `*` spans
+`/`. A `..` is kept, so a path that starts with an allowed or exempt prefix
+matches that prefix's glob wherever the `..` then leads:
+
+* a test-author Read of
+  `<repo>/packages/hammertime-testkit/../hammertime-core/src/hammertime/core/window.py`
+  exits 0, through the `EXEMPT_GLOBS` entry `packages/hammertime-testkit/*`,
+  while the direct path exits 2;
+* an architect Write of `<repo>/docs/../services/ingest/x.py` exits 0,
+  through the `ALLOW_GLOBS` entry `docs/*`, while the direct path exits 2;
+* a test-author Write of `<repo>/tests/../packages/x.py` exits 0, through
+  the `ALLOW_GLOBS` entry `tests/*`.
+
+Unless the harness resolves the `..` before the hook sees the path, the
+kernel resolves it after the guard has approved the string, and each call
+reaches a file its policy guards. Decision 12's `../*` and `*/../*` do not
+help: they are the coder's alone, they enter its list only at step W (today's
+`settings.json` does not carry them), and a deny glob cannot undo an allow or
+an exemption. Whether the harness resolves a `..` before the hook sees the
+path is not known, and this decision assumes neither answer.
+
+The same matching lets three more spellings through. These are reasoned from
+the script and not run; brief T3 tests them:
+
+* **A `.` component.** `<repo>/./packages/...` relativises to
+  `./packages/...`, which the test-author's read `DENY_GLOBS` (`packages/*`)
+  do not match. `<worktree>/./docs/adr/x.md` gets past the coder's
+  `docs/adr/*` today.
+* **`//`.** `<repo>//packages/...` relativises to `/packages/...`, and a path
+  that starts `//home/` is not recognised as under a root at all; the
+  test-author's read `DENY_GLOBS` match neither.
+* **A leading `~`.** The guard treats `~/x` as a relative path. A harness
+  that expanded `~` before opening the file would reach a path the guard
+  never vetted; whether it does is not known.
+
+In every case the string the globs judged can name a different file or
+directory from the one the tool acts on: through the kernel for `..`, `.` and
+`//`, and through the harness for `~`. With `..` that includes directories
+above the prefix: a Grep of `<repo>/tests/..` passes the test-author's
+`tests/*` exemption and searches the whole project.
+
+**Refuse, not normalise.** Two designs were weighed.
+
+* *Normalise lexically, then match.* Drop `.` components and repeated
+  slashes, and fold each `..` into the component before it, before the
+  relativisation. For `.` and `//` the result names the file the kernel
+  reaches. For `..` it does not always. The kernel resolves `a/..` by
+  following `a`, so when `a` is a symlink to a directory elsewhere, `a/..` is
+  that directory's parent, not the directory that holds `a`, and the guard
+  would vet a different file from the one the tool opens. A relative `..`
+  that climbs above the path's first component (`../x`, `tests/../../x`) has
+  no lexical answer at all without the base it is resolved against. And a
+  normaliser is new code at the one point where a slip lets a path through.
+* *Refuse.* A path with a `..` component is refused outright, whatever it
+  would resolve to. Nothing is resolved, so nothing can be resolved
+  differently from the kernel, and every path that is still matched gets
+  exactly today's verdict.
+
+No legitimate call needs `..`. The coder works inside its worktree and names
+paths from its root; the architect writes under `docs/`, `schemas/` and
+`README.md`; the test-author reads and writes by repository paths. Every
+target a `..` reaches also has a spelling without one, which the globs then
+judge as they judge any path. So a refusal costs a legitimate call one
+re-spelling and gains a disallowed one nothing. The rule is therefore the
+refusal, and it refuses the other three forms too: normalising `.` and `//`
+would be faithful, but it would buy only tolerance for spellings nobody
+needs, at the price of the normaliser (assumption 39).
+
+**The rule: a guarded path must be in plain form.** A path is in plain form
+when none of these holds:
+
+1. one of its `/`-separated components is `..`;
+2. one of its components is `.`;
+3. it contains `//`, two slashes in a row, anywhere;
+4. its first character is `~`.
+
+A component is the text between two slashes, before the first slash or after
+the last. Only a component that is exactly `.` or `..` counts: `.git`,
+`.claude`, `.commit-msg`, `..foo`, `x..y` and `...` are ordinary names. A
+leading `/` (an absolute path) and a single trailing `/` are plain. A path
+that is not in plain form is refused with the plain-form denial below,
+whatever it would resolve to, including one whose target is in scope, such as
+`<repo>/docs/./x.md` for the architect. The guard resolves and expands
+nothing.
+
+* **Relative paths and `cwd`.** A relative path, such as `tests/../packages`
+  or `./tests`, is judged by the same four tests as an absolute one. The rule
+  looks only at the path's own components, so it needs no base, and it does
+  not matter what the harness resolves a relative path against. It does not
+  read `cwd` or `CLAUDE_PROJECT_DIR`, which the harness sets and the agent
+  does not (assumption 42).
+* **Grep and Glob.** The rule reads the value the script vets,
+  `tool_input.file_path` falling back to `tool_input.path`, so a Grep's or a
+  Glob's `path` is held to it exactly as a `file_path` is. Glob's `pattern`
+  and Grep's `glob` are not path fields the script reads (assumption 31);
+  Question 6 records what that leaves.
+
+**Detection.** The rule reads `file_path` as extracted, once decision 17's
+gate has passed. It needs nothing but bash pattern matching, and touches
+nothing on disk. Recommended tests:
+
+* a `..` or `.` component:
+  `[[ "/$file_path/" == */../* || "/$file_path/" == */./* ]]`. Wrapping the
+  path in slashes makes a component at the start or the end look like one in
+  the middle;
+* `//`: `[[ "$file_path" == *//* ]]`;
+* a leading `~`: `[[ "$file_path" == "~"* ]]`, with the `~` quoted, because
+  an unquoted `~` at the start of a pattern is subject to tilde expansion.
+
+If any of them holds, the script denies with the plain-form denial.
+
+**Where it sits.**
+
+1. **After the `SCOPE_AGENT_TYPES` routing**, like decision 17's gate. A
+   caller the policy does not name passes through untouched.
+2. **Only under a guarded policy**, when `guarded` is 1. An entry that
+   constrains no paths still denies nothing.
+3. **After decision 17's NUL gate.** `file_path` is the decoded path, bar
+   trailing newlines, only once the gate has passed; before it, a NUL may
+   have been dropped. A path with both a NUL and a `..` therefore gets the
+   NUL denial.
+4. **After the empty-path check, the relativisation and the project-root
+   check.** An empty path has no component. The relativisation only strips a
+   prefix and cannot end the script. The project-root check fires only for
+   the root's own spellings, `<root>` being the worktree or the project
+   root: `<root>`, `<root>/`, `<root>/.`, `<root>/./`, `.` and `./`. Each
+   names the root and nothing else, and they keep today's handling: a Read,
+   Grep or Glob gets the project-root denial, and an Edit or Write exits 0.
+   Every other path reaches the rule (assumption 41).
+5. **Before `EXEMPT_GLOBS`, `DENY_GLOBS` and `ALLOW_GLOBS`.** `EXEMPT_GLOBS`
+   exits 0 on a match, so a rule after it would never see the first
+   confirmed case above.
+
+In C4's script (`64ffaf3`), that is between the project-root block and the
+definition of `matches_any`.
+
+**Who and what it covers.** Every in-scope call under a guarded policy,
+whatever the tool: the rule does not look at `tool_name`. That is the
+coder's, the architect's and the test-author's Edit and Write, and the
+test-author's Read, Grep and Glob, in today's `settings.json` and in decision
+14's. A caller a policy does not name, the top-level session included, is
+untouched. There is no knob, for the reason in assumption 21, and decision
+14's text does not change.
+
+**The harness side is not assumed.** If the harness resolves `.` and `..`, or
+expands `~`, before the hook, the hook sees a plain path, the globs judge the
+file the tool will use, and the rule never fires. If it does not, or does so
+only after the hook, the rule refuses. Either way no call is approved on a
+string that names a different file. Probes D1 and D2 (decision 15) observe
+which it is.
+
+**The denial.** It goes through the script's `deny`, so it is exit 2 with the
+JSON deny. It is, verbatim, in ASCII, with the blockquote's line breaks read
+as single spaces:
+
+> Hammertime path guard: the path contains a '.' or '..' component, a '//'
+> or a leading '~'. This guard matches a path exactly as written and resolves
+> none of these, so it cannot vet the file or directory the tool would
+> actually use. Give the path without any of them. The tool call is refused.
+
+It quotes no path. It names the supported form, the path without any of the
+four, which the globs then judge as they judge any other path, so it opens no
+route and suggests no workaround. Like every other path-guard denial, it
+carries no advice paragraph (assumption 34).
+
+Phrases the tests pin:
+
+| Denial | Required phrase |
+| --- | --- |
+| The plain-form denial | begins `Hammertime path guard: `, and `a '.' or '..' component` |
+
+**Decision 12's `../*` and `*/../*` stay.** They enter the coder's
+`DENY_GLOBS` and `WRITE_DENY_GLOBS` at step W (decision 14). Once this rule
+is in place, no path that reaches the glob lists has a `..` component, so
+neither glob can match one there. They stay as defence in depth: if the rule
+were ever removed or broken, they would still refuse the commonest `..`
+spellings for the coder; decision 14's text and T1's wiring tests (group L)
+pin them; and removing them would change decision 12's list for no gain.
+They were never enough on their own: neither matches `tests/..` or `..`, and
+no other policy carries them.
+
+**Symlinks: recorded, not ruled.** A path in plain form can still name,
+through a symlink among its components, a file the globs never see. The guard
+matches strings and does not touch the filesystem, and this decision keeps it
+so. A rule would have to resolve each path on disk, which races with any
+change between the hook and the tool and makes every verdict depend on the
+state of the disk. The test-author and the architect cannot create a link:
+they have no Bash, and the Write tool writes regular files. After step W the
+coder has no command that makes one; code it writes runs whenever a gate
+runs and could make one, but such code could as well write the target
+directly, which decision 1 already concedes. So the question is which links
+already exist or arrive in a commit the session merges, and what to do about
+the links no one has to create, such as `/proc/self/cwd`. Question 5 records
+it (assumption 46).
+
+**What the rule does not settle.**
+
+* Symlinks: Question 5.
+* Trailing newlines. `file_path` still loses trailing newlines to `$(...)`
+  (assumption 35). The rule is at least as strict for that: a decoded
+  `tests/..` followed by a newline ends in the component `..` and a newline,
+  which the kernel treats as an ordinary name, but it is vetted, and
+  refused, as `tests/..`.
+* Paths that are in plain form but that the glob lists do not anticipate: a
+  directory above the root, another checkout, `*/tests/*` beyond the tests,
+  and Glob's `pattern`. Question 6 records them.
+* What the harness does: probes D1 and D2.
+
+**Everything else stays.** The extraction lines, the routing, decision 17's
+gate, the empty-path check, the relativisation, the project-root check, the
+glob checks, every existing message and the exit codes are unchanged. Every
+path in plain form gets the verdict it got before C5.
+
+**Delivery.** Briefs T3 (tests) and C5 (the script, on top of C4's commit),
+with SA1d auditing C4's gate and C5's rule together, all before step W
+(Follow-through, step 5; decision 13). Probes D1 and D2 (decision 15) check
+it live. There is no `CHANGES` entry (decision 16).
 
 ## Assumptions
 
@@ -1579,17 +1889,110 @@ Question 4. They are the architect's judgment calls in specifying decision
     an agent create or read a name that is an allowed one plus trailing
     newlines. That is a new, different file, which no tool reads by name and
     which `git status` shows. Leaving this alone is the architect's
-    judgment; SA1c examines it.
+    judgment; SA1d examines it (area A10), SA1c's audit having been
+    discarded (fourth amendment).
 36. **The harness side is not assumed.** The gate fails closed whatever the
     harness does with a NUL-bearing path. SA1b's remark that Node's `fs`
     refuses such a path is not relied on. Probe P9 is the end-to-end check,
     and only the coder is probed live; for the architect and the test-author,
-    the gate rests on T2's tests and SA1c's audit.
+    the gate rests on T2's tests and SA1d's audit (fourth amendment; SA1c's
+    was discarded).
 37. **The sequencing.** C4 goes before step W by ordering rather than by an
     exemption, as decision 13 does for C1. W waits for C4 because W adds the
-    coder's exact-name globs, which the gate protects. T2 before C4, and SA1c
-    before C4's merge, repeat the pattern of T1, C1 and SA1.
+    coder's exact-name globs, which the gate protects. T2 before C4, and a
+    clean audit before C4's merge, repeat the pattern of T1, C1 and SA1. The
+    audit is SA1d's, since the owner discarded SA1c's (fourth amendment).
 38. **No `CHANGES` entry.** The gate changes agent tooling only (decision
+    16).
+
+Items 39-51 were added on 2026-09-24 by the fourth amendment, after SA1c's
+`..` finding, the top-level session's confirmation of it, and the owner's
+decisions that day. They are the architect's judgment calls in specifying
+decision 18 and its delivery.
+
+39. **Refuse, not normalise, for all four forms.** For `..` the reason is
+    soundness: lexical folding disagrees with the kernel through a symlink.
+    For `.` and `//` it is simplicity. Normalising them would name the same
+    file (on Linux; POSIX leaves a leading `//` implementation-defined, from
+    recall), but it would add code at the point where a slip lets a path
+    through, and it would buy only tolerance for spellings such as `./tests`,
+    `tests/.` and `tests//config`, which are now refused. That no legitimate
+    call needs any of the four forms is the architect's reading of the three
+    agents' roles, not a stated requirement; the denial names the plain
+    form, so a call that did need one costs one re-spelling.
+40. **The four forms are the whole list.** A leading `~` is included because
+    whether the harness expands it is not known, and refusing it costs
+    nothing. Left out: a trailing `/`, which names a directory and whose
+    `X/` still matches every `X/*` glob, while a file named with one fails in
+    the tool (from recall of POSIX path resolution); and backslashes,
+    whitespace and every other character, which are ordinary on Linux and
+    name exactly what they spell. The harness is assumed to expand nothing
+    else, such as `$HOME`. If a probe or an audit shows it rewriting paths in
+    another way, the architect is re-dispatched.
+41. **After the project-root check.** Placing the rule before the empty-path
+    check, where decision 17's gate sits, was considered. It is the simplest
+    place to audit, but it would give `.` and `./` the plain-form denial in
+    place of the project-root denial, and would refuse an Edit or Write of
+    `<root>/.` that exits 0 today. The chosen place changes the handling of
+    no root spelling, at the price of decision 18's argument (point 4 of
+    "Where it sits") that nothing before the rule ends the script with exit 0
+    for a path out of plain form, other than the root's own spellings.
+42. **The rule reads `file_path`, and trusts the bases.** `cwd` and
+    `CLAUDE_PROJECT_DIR` are set by the harness and assumed to be plain
+    absolute paths (compare assumption 1). If one were not, a path spelled
+    through it would be refused, which is loud and fails closed. `rel` is not
+    read, because stripping `<root>/` from `<root>//x` leaves `/x`, which
+    looks plain.
+43. **Every agent, every tool, no knob, after the routing and only when
+    guarded.** The same calls as decision 17's gate, for the reasons of
+    assumptions 28, 29 and 33.
+44. **The denial.** The wording is the architect's. It is ASCII only, so that
+    a verbatim test has no dash to get wrong. It quotes no path, because a
+    fixed text is the simplest to pin and the agent knows its own path. It
+    names the plain form as the supported one, which the globs then judge, so
+    it cannot serve as a workaround. It carries no advice paragraph, as
+    assumption 34 says of the NUL denials.
+45. **Decision 12's `../*` and `*/../*` stay,** as defence in depth, though
+    the rule makes them unreachable.
+46. **Symlinks are recorded, not ruled** (Question 5). A rule would need the
+    filesystem, which the guard does not touch today, and would race with a
+    change between the hook and the tool. Whether the repository holds any
+    symlink was not checked by the architect, who has no tool that shows
+    file types; SA1d is asked to check.
+47. **The probes.** D1 and D2 are the two that the instructions for this
+    amendment named: a test-author Read and an architect Write through `..`.
+    They need dispatches of their own, V3 and V4, because V1 is a coder and
+    the policies are scoped by `agent_type`. No coder, Grep or Glob probe is
+    added: the rule is the same code for every agent and tool, and T3 covers
+    those at the script level. D1's target exists, so that a Read that gets
+    through is visible, and the probe reports no contents. D2's target is
+    new, so that a Write that gets through shows in `git status`. Holding the
+    slice-3 coder until V3 and V4 pass as well (Follow-through, step 8), and
+    stopping every test-author and architect dispatch if D1 or D2 fails, are
+    the architect's calls: a failure would mean those agents' fences are not
+    live.
+48. **The sequencing and the merge.** C5 starts from an integration commit
+    that the session prepares, fast-forwarded into a fresh worktree, as the
+    instructions for this amendment set out. C4 and C5 are merged together,
+    once, and only when SA1d's audit of that exact commit is clean (no open
+    finding, no coverage entry marked `open`, and no coverage entry marked
+    `not-examined` other than A17, the harness side, which the probes
+    settle) and `supervisor` has reviewed SA1d; W waits for C5 for decision
+    13's reasons. The clean bar is not a judgment call: it restores the bar
+    C1's merge keeps and C4's merge had before SA1c was discarded, and the
+    top-level session defined its three parts. One option is left open, and
+    only to the owner: if SA1d reports a finding that predates C4 and C5 and
+    lies outside decisions 17 and 18, the owner may choose to merge anyway
+    and settle it separately. It is an option the owner could choose, not a
+    default, and it is not the top-level session's call.
+49. **SA1d's output.** The `refusals` list and the `open` status are the
+    architect's way of meeting "report every refusal" and "`checked-clean`
+    only when nothing is open" inside one JSON object. The area labels are
+    fixed so that a mislabelled entry shows.
+50. **Question 6 is recorded, not designed.** Its four routes are reasoned
+    from the script and today's `settings.json`, not run. None of them needs
+    a path out of plain form, so decision 18 leaves them as they are.
+51. **No `CHANGES` entry.** The rule changes agent tooling only (decision
     16).
 
 ## Consequences
@@ -1628,6 +2031,14 @@ Question 4. They are the architect's judgment calls in specifying decision
   policy does not name, the top-level session included, is untouched. Like
   decision 3's gate, it is a soundness fix to a shared extraction, not a
   policy change.
+* **Every path-guard policy gains a second refusal (fourth amendment).** For
+  the coder, the architect and the test-author alike, and for Edit, Write,
+  Read, Grep and Glob, a path with a `.` or `..` component, a `//` or a
+  leading `~` is refused (decision 18), except the project root's own
+  spellings, which keep the project-root check's handling. A legitimate call
+  can name the same target without any of them, so day-to-day behaviour is
+  intact; spellings such as `./tests` and `tests//config`, harmless before,
+  are now refused. A caller a policy does not name is untouched.
 * **Future policies inherit decision 13's hazard.** Never wire a policy
   before the script that implements its rules is live in the main checkout.
   From now on decision 4 makes that fail closed.
@@ -1670,6 +2081,13 @@ Question 4. They are the architect's judgment calls in specifying decision
    how every other path is relativised and matched exactly as it was. A
    require-under-`cwd` knob would still be the separate script change this
    question describes.
+
+   *Nor settled by the fourth amendment (2026-09-24).* Decision 18 refuses a
+   path with a `..` component, which removes the traversal spellings of a
+   path outside the worktree, such as `<worktree>/../x`. A plain absolute
+   path outside the worktree is judged exactly as before, and that is what
+   this question is about. Question 6 records the same kind of path for the
+   test-author's policies.
 3. *(Added 2026-09-24, raised by the owner's decision on Question 1.)*
    **Who regenerates `uv.lock` for a briefed dependency change?** With
    `--locked` everywhere, a coder that edits a manifest's dependencies
@@ -1713,10 +2131,78 @@ Question 4. They are the architect's judgment calls in specifying decision
    and briefs T2, C4 and SA1c, with probe P9 (decision 15), implement and
    verify it. The question's text above is kept as written; its "none of the
    briefs below touch it" was true of the second amendment.*
+5. *(Added 2026-09-24 by the fourth amendment.)* **Should `path-guard.sh`
+   handle symlinks?** Decision 18 makes the string the guard vets name,
+   lexically, the path the tool will use. The tool acts through the kernel,
+   which follows symlinks, and the guard does not look at the disk, so a
+   plain path with a symlink among its components names the link's target,
+   which no glob sees. Two kinds matter.
+   * **Inside the repository.** The test-author and the architect cannot
+     create a link, and after step W the coder has no command that makes one
+     (decision 18). But links can exist: the ignored `.venv/` normally holds
+     links to the interpreter (from recall), and a commit the session merges
+     could carry a tracked one. Whether any link points into `packages/`,
+     `services/`, `tools/` or `.claude/`, or out of the repository, was not
+     checked by the architect; SA1d is asked to check (area A18).
+   * **Outside the repository, pointing in.** On Linux, `/proc/self/cwd` and
+     `/proc/self/root` are links that no one has to create (from recall). A
+     test-author Read of
+     `/proc/self/cwd/packages/hammertime-core/src/hammertime/core/runtime.py`
+     is in plain form, stays absolute after the relativisation, matches none
+     of the test-author's read `DENY_GLOBS`, and is allowed. If the process
+     that opens the file has the main checkout as its working directory, it
+     reads the implementation. Whether the harness lets such a call through
+     is not known. This is also Question 6's kind of route: a path outside
+     both roots.
+
+   The options: (a) resolve each path on disk in the guard, which races with
+   a change between the hook and the tool and makes every verdict depend on
+   the disk; (b) refuse, for the policies that must hide files, any path that
+   stays outside both roots after the relativisation, which closes the
+   `/proc` route without touching the disk but also refuses reads the session
+   may rely on, such as a brief it leaves in its scratchpad; (c) rely on the
+   harness, checked by a probe. Recommended: decide after SA1d has reported,
+   together with Question 6, whose likely fix includes option (b). Not ruled.
+6. *(Added 2026-09-24 by the fourth amendment. Noticed while specifying
+   decision 18, and outside it.)* **Routes the glob lists do not
+   anticipate.** Decision 18 makes the string the guard vets name the file
+   the tool uses. It does not change what the glob lists admit, and reading
+   them against today's `settings.json` shows four routes that need no path
+   out of plain form. Each is reasoned from the script and the settings, not
+   run, and whether the harness lets each call through is not known (compare
+   probe P8).
+   * **Directories above the root.** The project-root check refuses a Read,
+     Grep or Glob of the root, not of a directory above it. A test-author
+     Grep whose `path` is `/home/user` or `/` stays absolute, matches none of
+     its read `DENY_GLOBS`, and is allowed; the search then descends into
+     `packages/`, `services/` and `tools/`.
+   * **Other checkouts.** The test-author's read `DENY_GLOBS` are prefixes of
+     repository paths. A Read of
+     `/home/user/Hammertime/.claude/worktrees/<id>/packages/hammertime-core/src/hammertime/core/runtime.py`
+     relativises to a path under `.claude/`, matches none of them, and is
+     allowed, and each coder worktree there holds a copy of the
+     implementation (`agent-a9337fe3a5808f2cb`'s does, read 2026-09-24).
+   * **`*/tests/*` beyond the tests.** The test-author's Edit/Write
+     allowlist admits any path with a `tests` component:
+     `.claude/skills/tests/SKILL.md`, which Claude Code would load as a
+     project skill (from recall), `.claude/hooks/tests/x`, and a path outside
+     both roots such as `/tmp/tests/x`.
+   * **Glob's `pattern`.** The script vets a Glob's `path`, not its `pattern`
+     (assumption 31). If the Glob tool honours a `..` or an absolute
+     pattern, which is not known, a test-author Glob lists names, though not
+     contents, outside its fence.
+
+   SA1d is asked to confirm or refute each (area A19). Recommended: settle
+   them in a separate amendment once SA1d has reported. It is a fork rather
+   than a clear next step, because the simplest closure of the first two,
+   refusing the test-author's reads outside both roots and under
+   `.claude/worktrees/`, also refuses reads the session may rely on
+   (Question 5, option (b)). So the owner decides. Not ruled.
 
 ## Follow-through
 
-Nothing below has been dispatched; the architect has no Agent tool.
+The architect has no Agent tool and has dispatched none of the briefs below;
+the top-level session dispatches them.
 
 Order and dependencies:
 
@@ -1744,42 +2230,66 @@ Order and dependencies:
      account, below) then audits the fixed commit, and step 5's condition
      applies to SA1b and that fixed commit instead of to SA1. If SA1b raises
      a further fix, the cycle repeats.
-5. Merge C1, then land decision 17's NUL gate in `path-guard.sh`, then apply
-   W, in this order.
+5. Merge C1, then land decisions 17 and 18 in `path-guard.sh`, then apply W,
+   in this order.
    * **Merge C1.** C1's (fixed) commit is merged into the branch the main
      checkout has checked out only when both of these hold: SA1b's re-audit
      of that exact commit is clean, and `supervisor` has reviewed SA1b. From
      then on, the new script is the live fence for the security-auditor.
-   * **Land decision 17's gate (third amendment): T2, then C4, then SA1c,
-     then merge C4.**
-     * T2 (test-author) adds its tests to the feature branch. It depends only
-       on this amendment, so it can start at once and run in parallel with
-       anything still open in step 3.
-     * C4 (coder, `.claude/hooks/path-guard.sh`) starts once T2's tests are
-       on the feature branch, and leaves its commit in its worktree. It is
-       dispatched before W (decision 13).
-     * SA1c (security-auditor) audits C4's commit where it sits, in C4's
-       worktree. Until C4 is merged, the main checkout's current
-       `path-guard.sh` stays the live fence for all three agents, so a gate
-       that failed open cannot go live unaudited.
-     * **Merge C4** into the branch the main checkout has checked out only
-       when SA1c's audit of that exact commit is clean and `supervisor` has
-       reviewed SA1c. A finding that needs only a script fix goes to a coder
-       on C4's branch, and SA1c re-audits the fixed commit, as SA1b did for
-       C1. A finding that needs a design change comes back to the architect.
+   * **Land decision 17's gate and decision 18's rule (third and fourth
+     amendments): T2, C4, T3, C5, SA1d, `supervisor`, then one merge.**
+     * T2 (test-author) has added its tests to the feature branch. C4
+       (coder) has committed decision 17's gate as `64ffaf3`, on branch
+       `worktree-agent-a9337fe3a5808f2cb` in worktree
+       `.claude/worktrees/agent-a9337fe3a5808f2cb`; that commit is not
+       merged. SA1c audited it, and the owner discarded that audit as the
+       merge gate (fourth amendment).
+     * T3 (test-author) adds decision 18's tests to the feature branch. It
+       depends only on the fourth amendment, so it can start at once.
+     * The top-level session then prepares an integration commit: a merge of
+       the feature branch's tip, with T3's tests, and `64ffaf3`. It lives on
+       a ref of its own; the feature branch does not move to it. C5's
+       fast-forward works only if the fresh worktree starts from an ancestor
+       of it, so the session commits nothing to the feature branch between
+       preparing it and dispatching C5.
+     * C5 (coder, `.claude/hooks/path-guard.sh`) starts in a fresh worktree
+       once the integration commit exists. Its first command fast-forwards
+       the worktree to that commit; it commits decision 18's rule on top and
+       leaves the commit in its worktree. It is dispatched before W (decision
+       13).
+     * SA1d (security-auditor) audits the whole of `path-guard.sh` at C5's
+       commit, where it sits in C5's worktree: C4's gate and C5's rule
+       together. Until the merge, the main checkout's current
+       `path-guard.sh` stays the live fence for all three agents, so neither
+       change can go live unaudited. The session sends SA1d's brief inline in
+       the dispatch, not as a file in its scratchpad, because the brief
+       forbids SA1d to read anything outside the repository.
+     * `supervisor` reviews SA1d.
+     * **Merge C4 and C5** into the branch the main checkout has checked out,
+       as one merge of C5's commit, which carries `64ffaf3` and the
+       integration commit, only when both of these hold: SA1d's audit of that
+       exact commit is clean, and `supervisor` has reviewed SA1d. Clean means
+       no open finding, no coverage entry marked `open`, and no coverage
+       entry marked `not-examined` other than A17, the harness side, which
+       the probes settle. SA1d makes no recommendation either way. A finding
+       that needs only a script fix goes to a coder on C5's branch, and a
+       fresh audit of the fixed commit follows, as SA1b did for C1. A finding
+       that needs a design change comes back to the architect.
    * **Apply W.** The top-level session applies decision 14 only after C1
-     (the first part of this step), C4 (the second) and C3 (step 3) have all
-     been merged. The scripts the new policy depends on are then already live
-     (decisions 13 and 17). Commit W on the feature branch.
+     (the first part of this step), C4 and C5 (the second) and C3 (step 3)
+     have all been merged. The scripts the new policy depends on are then
+     already live (decisions 13, 17 and 18). Commit W on the feature branch.
 6. The full suite, in the main checkout, with the gates as the owner's
    decision writes them: `uv run --locked pytest -q`,
    `uv run --locked ruff check .`, `uv run --locked ruff format --check .`
    and `make typecheck`. T1's wiring and configured-policy tests pass only
    after W, and its group N only after C3.
-7. V1 and V2 run next (decision 15).
-8. The slice-3 coder is dispatched only after V1 and V2 pass, and after
-   CLAUDE.md and `coder.md` carry the `--locked` gates ("For the top-level
-   session", items 1 and 4).
+7. V1, V2, V3 and V4 run next (decision 15). W changes neither the
+   test-author's nor the architect's policy, so the session may run V3 and V4
+   as soon as C4 and C5 are merged, before W.
+8. The slice-3 coder is dispatched only after V1, V2, V3 and V4 pass, and
+   after CLAUDE.md and `coder.md` carry the `--locked` gates ("For the
+   top-level session", items 1 and 4).
 
 The top-level session pairs every dispatch with `supervisor`. For C1 and its
 fix, tell `supervisor` that the coder runs without the Bash policy it
@@ -1790,13 +2300,29 @@ merging, the session runs `git status -- .claude` in the main checkout and
 confirms it is clean. A `reviewer` pass on C1's diff is optional and is not
 briefed here.
 
-C4 and SA1c (third amendment) are paired the same way. Tell `supervisor` that
-C4 runs before step W, with no Bash policy and under a fence that does not
-yet deny `.claude/`, so it must check that no file other than
-`.claude/hooks/path-guard.sh` changed in the worktree; `.commit-msg` is
-written there but is not staged. SA1c is a `security-auditor` dispatch and is
-`supervisor`-paired like SA1 and SA1b. Before merging C4, the session runs
-`git status -- .claude` in the main checkout and confirms it is clean.
+C4 and SA1c (third amendment) were paired the same way. `supervisor` found
+C4's work in scope. `supervisor`'s review of SA1c reported the findings the
+fourth amendment records, and the owner then discarded SA1c's audit as the
+merge gate.
+
+T3, C5, SA1d, V3 and V4 (fourth amendment) are each paired too. Tell
+`supervisor`:
+
+* for T3, that it may change only `tests/config/test_path_guard_behavior.py`,
+  and no existing test in it;
+* for C5, that it runs before step W, with no Bash policy and under a fence
+  that does not yet deny `.claude/`; that its first command must be the
+  fast-forward to the integration commit; and that, compared with that
+  commit, no file other than `.claude/hooks/path-guard.sh` may change in its
+  worktree, `.commit-msg` being written there but not staged;
+* for SA1d, that it must read nothing outside `/home/user/Hammertime`, must
+  list every refusal it met, verbatim, in `refusals`, must make no merge
+  recommendation, and must output one JSON object and nothing else;
+* for V3 and V4, that each is a probe that makes exactly one tool call, D1
+  or D2, and that V4's Write is outside the architect's scope on purpose.
+
+Before merging C4 and C5, the session runs `git status -- .claude` in the
+main checkout and confirms it is clean.
 
 ### Brief T1 — `test-author`: behaviour and wiring tests for ADR-0018
 
@@ -2674,6 +3200,17 @@ skip.
 
 ### Brief C4 — `coder`: decision 17's NUL gate in `path-guard.sh`
 
+*Fourth amendment note (2026-09-24).* C4 was dispatched with the text below
+and delivered `64ffaf3`. Its item 6 says the commit is merged only after
+SA1c has audited it clean and `supervisor` has reviewed SA1c. The auditor has
+changed, and the bar has not been lowered: the owner discarded SA1c's audit
+as the merge gate, and C4's commit is merged together with C5's, only when
+SA1d's audit of C5's commit, which carries C4's, is clean and `supervisor`
+has reviewed SA1d (Follow-through, step 5). Clean means no open finding, no
+coverage entry marked `open`, and no coverage entry marked `not-examined`
+other than A17, the harness side, which the probes settle. The text below is
+kept as dispatched.
+
 Files you may touch: `.claude/hooks/path-guard.sh`. Nothing else — not
 `.claude/settings.json`, `.claude/hooks/bash-guard.sh`, any agent file, any
 test, `docs/`, `.gitignore` or `CHANGES`. The one other file you create is
@@ -2793,6 +3330,12 @@ not your code, is wrong: stop, report it, and do not edit the test.
 
 ### Brief SA1c — `security-auditor`: audit `path-guard.sh`'s NUL gate, with a coverage account
 
+*Discarded (fourth amendment, 2026-09-24).* SA1c was dispatched with the
+text below and audited `64ffaf3`. The owner discarded its audit as the merge
+gate, for the reasons the fourth amendment records, and nothing in this ADR
+relies on its conclusions. Brief SA1d replaces it. The text below is kept as
+dispatched.
+
 SA1c is paired with `supervisor`, like SA1 and SA1b.
 
 Examine:
@@ -2877,6 +3420,445 @@ execution, mark it needs-validation (findings) or `not-examined` with that
 reason (coverage), and give the exact JSON payload and command a human
 should run.
 
+### Brief T3 — `test-author`: tests for decision 18, paths in plain form (fourth amendment)
+
+Files you may touch: `tests/config/test_path_guard_behavior.py`. Nothing
+else. In that file, add tests, add a paragraph on decision 18 to the module
+docstring, and change no existing test.
+
+Work from:
+
+* ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  decision 18: the four forms, what counts as a component, where the rule
+  sits, what it covers, and the plain-form denial verbatim;
+* decision 17, for the NUL gate that runs before the rule;
+* the module's own helpers (`run_guard`, `run_guard_tool_input`,
+  `run_with_path`, `assert_denied`, `assert_allowed`,
+  `assert_allowed_silently`, `assert_nul_denied`, `configured_policy`) and
+  constants (`REPO_ROOT`, `TESTKIT_FILE`, `SPEC_FILE`, `TOP_LEVEL_TEST_FILE`,
+  `IMPLEMENTATION_FILE`, `DENY_TESTS`, `EDIT_WRITE`, `READ_GREP_GLOB`).
+
+`.claude/hooks/path-guard.sh` as it stands is the implementation that brief
+C5 will change, so take no expectation from its code. Where the ADR is
+silent or ambiguous, flag it rather than choosing.
+
+**Building the paths.** Build every path that is not in plain form by string
+concatenation, for example `f"{REPO_ROOT}/tests/../packages/x.py"`. Never
+build one with `under_repo`, with `/` on a `Path`, or with anything else from
+`pathlib`: `pathlib` collapses `.` components and repeated slashes, so the
+guard would receive a plain path and the test would pass or fail for the
+wrong reason. `json.dumps` in the helpers sends the string unchanged.
+
+**The plain-form denial** is decision 18's text, verbatim. It is ASCII only,
+and the blockquote's line breaks are single spaces.
+
+Unless an item says otherwise, use the configured policies, read from
+`.claude/settings.json` with `configured_policy`, and send the agent's own
+`agent_type`. Every expectation below holds before step W and after it; none
+of these tests waits for W. The tests must demonstrate the following, each
+group citing decision 18:
+
+1. **The three confirmed cases.** Each is refused with the plain-form
+   denial:
+   * test-author, read policy: a Read of
+     `f"{REPO_ROOT}/packages/hammertime-testkit/../hammertime-core/src/hammertime/core/window.py"`;
+   * architect, Edit|Write policy: a Write, and an Edit, of
+     `f"{REPO_ROOT}/docs/../services/ingest/x.py"`;
+   * test-author, Edit|Write policy: a Write of
+     `f"{REPO_ROOT}/tests/../packages/x.py"`.
+
+   Beside each, two controls. First, the path's leading part is in the
+   policy's scope: a Read of `under_repo(TESTKIT_FILE)` by the test-author, a
+   Write of `under_repo(SPEC_FILE)` by the architect, and a Write of
+   `under_repo(TOP_LEVEL_TEST_FILE)` by the test-author are each allowed.
+   Second, the target's plain path, respectively
+   `under_repo(IMPLEMENTATION_FILE)`, `under_repo("services/ingest/x.py")`
+   and `under_repo("packages/x.py")`, is refused, with a reason that is not
+   the plain-form denial.
+2. **Grep and Glob `path` values**, under the test-author's read policy.
+   Each of these is refused with the plain-form denial: a Grep of
+   `tests/../packages`; a Glob of `f"{REPO_ROOT}/tests/../services"`; a Grep
+   of `tests/..`; a Grep of `..`; a Glob of `f"{REPO_ROOT}/.."`; a Grep of
+   `./tests`; a Glob of `tests/.`; a Grep of `f"{REPO_ROOT}//packages"`; a
+   Glob of `tests//config`; a Grep of `~`; and a Grep of `~/x`. A Grep of
+   `tests/`, which is plain, is allowed.
+3. **The coder**, under its Edit|Write policy. Each of these is refused with
+   the plain-form denial:
+   * a Write of `f"{REPO_ROOT}/services/../docs/adr/x.md"`;
+   * a Write of `f"{REPO_ROOT}/./uv.lock"`;
+   * a Write of
+     `f"{REPO_ROOT}/services/trie/../trie/src/hammertime/trie/query/app.py"`,
+     although its plain path,
+     `under_repo("services/trie/src/hammertime/trie/query/app.py")`, is
+     allowed: the rule resolves nothing, so a target in scope spelled with a
+     `..` is refused too;
+   * from a worktree, with `cwd` `tmp_path` and `CLAUDE_PROJECT_DIR` the
+     repository root, as in the module's worktree cases: a Write of
+     `f"{tmp_path}/services/../.claude/settings.json"`.
+4. **`.`, `//` and `~` in file paths.** Each of these is refused with the
+   plain-form denial:
+   * test-author, read policy: Reads of
+     `f"{REPO_ROOT}/./packages/hammertime-core/src/hammertime/core/window.py"`,
+     `f"{REPO_ROOT}//packages/hammertime-core/src/hammertime/core/window.py"`
+     and
+     `"/" + f"{REPO_ROOT}/packages/hammertime-core/src/hammertime/core/window.py"`
+     (a leading `//`), and a relative Read of
+     `packages/hammertime-testkit/../hammertime-core/src/hammertime/core/window.py`;
+   * architect: Writes of `f"{REPO_ROOT}/docs/./x.md"` and
+     `f"{REPO_ROOT}/docs//x.md"`, although both targets are in its scope;
+   * test-author, Edit|Write policy: a Write of `~/tests/x.py`.
+5. **Order and boundaries.**
+   * *The NUL gate comes first.* Under the module's `DENY_TESTS` policy, a
+     Write of `f"{REPO_ROOT}/tests/../x\x00y"` is refused with decision 17's
+     NUL denial, not the plain-form denial.
+   * *The project root keeps its own handling.* Under the test-author's read
+     policy, a Grep whose `path` is `.`, `./`, `str(REPO_ROOT)`,
+     `f"{REPO_ROOT}/"` or `f"{REPO_ROOT}/."` is refused, and the reason is
+     not the plain-form denial.
+   * *Routing comes first.* Under the coder's Edit|Write policy, a Write of
+     `f"{REPO_ROOT}/services/../docs/adr/x.md"` from a caller with no
+     `agent_type` is allowed: exit 0, empty stdout. Item 1's first case
+     already pins that the rule runs before `EXEMPT_GLOBS`.
+   * *Only when guarded.* Under `policy={}`, a Read and a Write of
+     `f"{REPO_ROOT}/tests/../packages/x.py"` are allowed.
+6. **Ordinary names are not components.** Under the architect's Edit|Write
+   policy, Writes of `f"{REPO_ROOT}/docs/..notes.md"`,
+   `f"{REPO_ROOT}/docs/x..y.md"`, `f"{REPO_ROOT}/docs/.../x.md"` and
+   `f"{REPO_ROOT}/docs/.hidden.md"` are allowed. Under the test-author's read
+   policy, a Read of `f"{REPO_ROOT}/tests/config/..x.py"` is allowed.
+7. **The message.** For a Write (its `file_path`) and for a Grep (its
+   `path`), the reason is decision 18's plain-form denial verbatim; it begins
+   `Hammertime path guard: ` and contains `a '.' or '..' component`.
+
+The module's existing tests stay exactly as they are and must still pass.
+They are the other half of "ordinary paths are unchanged".
+
+**Expected state.** On the feature branch, until C4 and C5 are merged, the
+tests that expect the plain-form denial fail, and so does item 5's NUL case,
+because C4's gate is not merged either. The controls and the project-root,
+routing, unguarded and ordinary-name cases pass today. That is intended: do
+not mark any test xfail or skip it.
+
+You have no Bash and cannot run the tests. Write them carefully, and say in
+your report which ones you are least sure will collect or pass as written.
+
+**Done when:** the module covers items 1-7; no other file changed and no
+existing test changed; and the report lists the test functions added for each
+item and every ADR ambiguity you flagged.
+
+**Do not:** take expectations from `path-guard.sh`'s code; edit anything
+under `.claude/`; weaken, delete or change an existing test; or mark a new
+test xfail or skip other than through the module's existing `bash`/`jq`
+skip.
+
+### Brief C5 — `coder`: decision 18's plain-form rule in `path-guard.sh` (fourth amendment)
+
+Files you may touch: `.claude/hooks/path-guard.sh`. Nothing else: not
+`.claude/settings.json`, `.claude/hooks/bash-guard.sh`, any agent file, any
+test, `docs/`, `.gitignore` or `CHANGES`. The one other file you create is
+`.commit-msg`, for your commit message, and you never stage it.
+
+You work in a fresh worktree, before step W. No Bash policy is wired for you
+yet, and your Edit/Write fence does not yet deny `.claude/`. Work as though
+both were in force: decision 2's literal forms only, and no file but the one
+above (decision 13).
+
+Work from:
+
+* ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  decision 18: the rule, what it refuses and what it leaves alone, where it
+  sits, and the plain-form denial verbatim;
+* decision 17, whose NUL gate your worktree will carry as C4's commit
+  `64ffaf3`, and which must stay exactly as it is;
+* decision 13, for why you may edit this file now, and why nothing else under
+  `.claude/` is yours;
+* the script's own header, whose existing guarantees must all still hold;
+* the tests in `tests/config/test_path_guard_behavior.py`: T1's, T2's and
+  T3's.
+
+Do:
+
+1. **Start from the integration commit.** Your first command is exactly
+   `git merge --ff-only <INTEGRATION>`; the top-level session puts the hash
+   in place of `<INTEGRATION>` before dispatch. Then run `git rev-parse HEAD`
+   and `git status`. HEAD must be that hash, and the worktree clean. If the
+   merge fails, or HEAD is anything else, stop and report. Do not reach the
+   commit another way: no `reset`, `checkout`, `switch`, `rebase` or
+   `cherry-pick`, and no merge without `--ff-only`.
+2. **Add the rule exactly as decision 18 specifies.**
+   * *Where:* only when `guarded` is 1; after the project-root check and
+     before the `EXEMPT_GLOBS` check. In the script at `<INTEGRATION>`, that
+     is between the project-root block (the `if` that tests `rel` against
+     `.`, `./` and the empty string) and the definition of `matches_any`.
+   * *What:* refuse `file_path` when it has a component that is exactly `..`
+     or exactly `.`, contains `//`, or begins with `~`. Decision 18 gives the
+     recommended tests. Quote the `~` in its pattern.
+   * *The denial:* decision 18's plain-form denial, verbatim, through `deny`.
+3. **Change nothing else in the script's behaviour.** The extraction lines,
+   the routing, `guarded`, `content_tool`, `deny`, decision 17's gate, the
+   empty-path check, the relativisation, the project-root check, the glob
+   checks, every existing message and the exit codes stay as they are. Add
+   no knob, and do not make the rule depend on `tool_name`. Every path in
+   plain form must get exactly the verdict it gets at `<INTEGRATION>`.
+4. **Keep the invariants:** a denial is exit 2 with the JSON deny; an allow
+   is exit 0 with no output; every message begins `Hammertime path guard: `.
+5. **Update the comments, so that the header stays the authoritative
+   description.**
+   * Add a header section on the rule: the four forms; that the script
+     resolves and expands none of them and matches paths as written; that
+     the rule runs for every in-scope call under a guarded policy, whatever
+     the tool, after the NUL gate and the project-root check and before every
+     glob list; that the root's own spellings keep the project-root check's
+     handling; and that symlinks are not handled (decision 18, Question 5).
+   * Extend the header sentence saying that the script checks
+     `tool_input.file_path`, falling back to `tool_input.path`, to say that a
+     path not in plain form is refused before any glob list is consulted.
+   * In the comment above the relativisation, say that it strips a prefix
+     and resolves nothing, and point to the rule.
+6. **Verify through the tests only, in this order:**
+   `uv run --locked pytest -q tests/config`; then the four gates,
+   `uv run --locked pytest -q`, `uv run --locked ruff check .`,
+   `uv run --locked ruff format --check .` and `make typecheck`; then
+   `git diff --stat`.
+   * Do not run the script, `bash`, `jq`, `python` or any other interpreter
+     by hand, and do not use heredocs, quotes or multi-line commands.
+   * If you need a check the tests do not provide, report it instead of
+     improvising one.
+7. **Commit in your worktree.**
+   * Write the message, trailers included, to `.commit-msg` at the worktree
+     root with the Write tool.
+   * Stage only the script, by path: `git add .claude/hooks/path-guard.sh`.
+   * Run `git commit -F .commit-msg`, then `git show --stat HEAD`, then
+     `git status`.
+   * Leave the commit in your worktree. Do not merge it, push it, or copy the
+     script into the main checkout. The main checkout's `path-guard.sh` is
+     the live fence for the coder, the architect and the test-author. Your
+     commit, which carries C4's, is merged only when SA1d's audit of that
+     exact commit is clean and `supervisor` has reviewed SA1d. Clean means
+     no open finding, no coverage entry marked `open`, and no coverage entry
+     marked `not-examined` other than A17, the harness side, which the
+     probes settle.
+
+**Stop and report on any refusal.** If any layer refuses a command or a
+write — this repository's guards, the harness's worktree check, a safety
+classifier or the platform sandbox — do not retry it, re-spell it, or reach
+the same effect another way. Stop the part of the work that needs it, finish
+anything that does not, and report the refusal. Do the same if a test fails
+and you believe the test, not your code, is wrong: stop, report it, and do
+not edit the test.
+
+**Done when:**
+
+* the rule is in place as decision 18 specifies, and nothing else about the
+  script's behaviour has changed;
+* every test in `tests/config/test_path_guard_behavior.py` passes, T2's and
+  T3's included, except T1's group M coder cases that wait for step W. One
+  of those no longer waits:
+  `test_configured_coder_write_policy_from_a_worktree[deny-{worktree}/../x.txt]`
+  is refused by decision 18 before W, so it must pass; report it if it does
+  not;
+* `uv run --locked ruff check .`, `uv run --locked ruff format --check .` and
+  `make typecheck` pass;
+* the only failures in `uv run --locked pytest -q` are the tests that wait
+  for step W (T1's group J, the coder part of K, the coder items of L and the
+  coder cases of M, less the one above), each listed by test id in your
+  report;
+* the change is committed in your worktree, and `git show --stat HEAD` lists
+  `.claude/hooks/path-guard.sh` alone.
+
+**Do not:**
+
+* touch any file but `.claude/hooks/path-guard.sh`, apart from writing the
+  unstaged `.commit-msg`;
+* create any other file, a symlink included;
+* edit a test to make it pass;
+* change or remove any existing rule, message or exit code, decision 17's
+  gate included;
+* add a knob, or make the rule depend on `tool_name`;
+* emit an allow decision;
+* change the message prefix.
+
+**Report:**
+
+* the files changed and the commit hash;
+* where the rule sits (between which lines) and the exact tests it uses;
+* the test results, with the expected failures listed by id;
+* every Bash command you ran, in order and verbatim, each with its exit
+  status or the refusal it met, including the ones that succeeded, starting
+  with the fast-forward;
+* every refusal you received from any layer, verbatim, with what you did
+  next, and every file you created, including untracked ones;
+* every place where the ADR was ambiguous, contradicted the tests, or looked
+  wrong. Flag it; do not improvise.
+
+### Brief SA1d — `security-auditor`: audit the whole of `path-guard.sh` at C5's commit, with a coverage account (replaces SA1c)
+
+SA1d is paired with `supervisor`. It replaces SA1c, whose audit the owner
+discarded as the merge gate. The top-level session gives you neither SA1c's
+report nor its conclusions; rely on nothing SA1c found.
+
+**Rules for this audit.** They override anything else that applies to you,
+your agent definition and your skill included.
+
+1. **Read nothing outside `/home/user/Hammertime`,** with any tool: not the
+   installed Claude Code or its source, not a `node_modules` outside the
+   repository, not `~/.claude`, `/proc`, `/usr`, `/etc` or `/tmp`. Follow no
+   symlink out of the repository. What the harness does with a path —
+   whether it resolves `.` or `..`, expands `~`, follows symlinks, or honours
+   a Glob `pattern` outside the vetted `path` — is not yours to settle.
+   Probes P9, D1 and D2 (decision 15) settle it. Where a question turns on
+   it, say so and name the probe.
+2. **Report every refusal.** If any layer refuses anything you do — this
+   repository's bash guard, the harness, a safety classifier or the platform
+   sandbox — put it in `refusals`, verbatim, whichever tool it was. Do not
+   retry the same effect another way: not with another spelling, command or
+   tool. An area whose examination a refusal cut short is not
+   `checked-clean`.
+3. **Output exactly one JSON object,**
+   `{"findings": [...], "coverage": [...], "refusals": [...]}`, and nothing
+   else: no prose before or after it. This overrides your usual output
+   contract for this brief only.
+4. **`checked-clean` only when nothing is open** in the area: no finding, no
+   needs-validation item, no unsettled question, and no refusal that cut the
+   work short. The audit as a whole is clean only when it has no open
+   finding, no coverage entry marked `open`, and no coverage entry marked
+   `not-examined` other than A17, the harness side, which the probes settle.
+5. **No merge recommendation.** Do not say, in any field, whether C4 or C5
+   should be merged, or whether a finding should or should not block a
+   merge: no "blocking", "non-blocking" or "must not block". Give severity
+   and facts. The top-level session decides, under the merge condition of
+   Follow-through step 5: a clean audit, as rule 4 defines it, and
+   `supervisor`'s review of it. Nothing you write changes that condition.
+
+**Examine:**
+
+* `.claude/hooks/path-guard.sh` at C5's commit, the whole file, where it
+  sits in C5's worktree under `/home/user/Hammertime/.claude/worktrees/`. The
+  top-level session names C5's commit, the worktree and the integration
+  commit. C5's commit carries C4's `64ffaf3` through the integration commit:
+  `git show 64ffaf3` is C4's change, and `git diff <integration> <C5>` is
+  C5's. Run git from the main checkout, where every commit is available, and
+  Read the worktree's file directly.
+* ADR-0018 (`docs/adr/0018-coder-bash-policy-literal-commands-and-a-tripwire.md`)
+  decisions 17 and 18, assumptions 28-51, decision 12 as amended, decision
+  3's gate, and Questions 5 and 6.
+* Today's `.claude/settings.json` and decision 14's text: the script runs
+  under both.
+* The tests in `tests/config/test_path_guard_behavior.py` at C5's commit,
+  T2's and T3's, for what they pin.
+
+Judge against decisions 17 and 18. The question is whether any payload from
+an agent that a path-guard policy names can get a verdict on a path other
+than the one its tool will use — a path carrying a NUL, a path field that is
+not a string, or a path not in plain form — and whether C4's or C5's change
+alters any verdict it should not. Cover these areas, and use each label as
+the entry's `area`, exactly as written.
+
+Decision 17, re-examined at C5's commit:
+
+* `A1 detection`: Is the NUL found without a command substitution over the
+  path bytes, by `jq -e` over the raw `$input`, read as an exit status? Is
+  `input="$(cat)"` itself safe (assumption 30)?
+* `A2 fields`: Does the gate test exactly the value the extraction selects?
+  Does the script read a path from any other field? Can the gate and the
+  extraction select different values?
+* `A3 status`: Does exactly status 1 pass, with 0 denied by the NUL denial
+  and every other status by the could-not-be-checked denial? Is the status
+  captured so that neither `set -e` nor an `if` swallows a `jq` error, under
+  `pipefail`, including a `jq` killed by a signal?
+* `A4 gate placement`: Does the gate run after the routing, only under a
+  guarded policy, and before the empty-path check, the relativisation, the
+  project-root check, decision 18's rule and every glob list? Are
+  out-of-scope callers and unguarded policies untouched?
+* `A5 gate coverage`: the coder's, the architect's and the test-author's
+  policies, today's and decision 14's; Edit, Write, Read, Grep and Glob; and
+  the exposures decision 17 names.
+* `A6 values`: Do absent, `null`, `false`, `""`, `true`, number, array and
+  object values behave as decision 17's table says?
+* `A7 gate messages`: Are both denials decision 17's text verbatim, with the
+  prefix, no path quoted and no workaround?
+* `A8 gate regression`: For every string path without a NUL, is the verdict
+  at `64ffaf3` the verdict before it? Does C4's diff add only the gate and
+  header text?
+* `A9 before the gate`: Can a malformed payload make an extraction line end
+  the script before the gate, under `set -e`, with a status other than 0 or
+  2?
+* `A10 after the gate`: Do trailing newlines, which `$(...)` strips
+  (assumption 35), change a verdict that matters, under decision 17 or
+  decision 18?
+
+Decision 18:
+
+* `A11 forms`: Is a path refused exactly when it has a component that is
+  `..` or `.`, contains `//`, or begins with `~`: at the start, in the
+  middle or at the end, absolute or relative, as a `file_path` or as a Grep
+  or Glob `path`? Are names such as `.git`, `..foo`, `x..y` and `...`, and a
+  trailing `/`, left to the globs?
+* `A12 rule placement`: Does the rule run after the routing, only under a
+  guarded policy, after the NUL gate, after the empty-path check, the
+  relativisation and the project-root check, and before `EXEMPT_GLOBS`,
+  `DENY_GLOBS` and `ALLOW_GLOBS`? Can any path not in plain form end the
+  script with exit 0 before the rule, other than the project root's own
+  spellings, and does each of those name only the root?
+* `A13 what the rule reads`: It reads `file_path`, not `rel`, and trusts
+  `cwd` and `CLAUDE_PROJECT_DIR` (assumption 42). Can `rel` differ from
+  `file_path` in a way that makes this matter?
+* `A14 rule coverage`: the three confirmed cases in decision 18; Grep and
+  Glob `path` values; the coder; under today's `settings.json` and decision
+  14's.
+* `A15 rule message`: Is the plain-form denial decision 18's text verbatim,
+  with the prefix, no path quoted, naming only the plain form, and no
+  workaround?
+* `A16 rule regression`: For every path in plain form, is the verdict at
+  C5's commit the verdict at the integration commit? Does C5's diff add only
+  the rule and the comment changes brief C5 allows?
+
+Beyond both decisions:
+
+* `A17 harness side`: Not yours (rule 1). Mark it `not-examined`, with the
+  basis that probes P9, D1 and D2 settle it.
+* `A18 symlinks`: Question 5. With read-only commands inside the repository,
+  following no link (no `-L`), find whether the repository or its worktrees
+  hold any symlink: tracked (mode `120000` in `git ls-files -s`) or
+  untracked (for example `find . -type l`, with `ls -l` or `stat` to show
+  where each points). Report as a finding any link that points into
+  `packages/`, `services/`, `tools/` or `.claude/`, or out of the
+  repository.
+* `A19 other routes`: Question 6's four routes, and any other way a named
+  agent's call can get a verdict on a path other than the one its tool will
+  use, or an allowed path can reach a file its policy guards. Confirm or
+  refute each by reading. Report each confirmed one as a finding, and say in
+  its `summary` whether it predates C4 and C5, that is, whether the main
+  checkout's current script has it too. A finding that predates them is
+  still a finding, open like any other.
+
+Add one entry for each ambiguity C4's report flagged and each C5's report
+flagged, labelled `C4-1`, `C4-2` and so on, and `C5-1` and so on, in the
+order the reports give them. The top-level session pastes both lists into
+this brief before dispatch. If a report flagged none, add one entry labelled
+`C4-none` or `C5-none`.
+
+**The output.**
+
+* `findings`: most severe first, each with the fields your agent definition
+  specifies, `[]` if none. An item that only execution can settle is a
+  finding marked needs-validation, with the exact JSON payload and command a
+  human should run.
+* `coverage`: one entry per label above, each
+  `{"area": "<label>", "status": "checked-clean" | "open" | "not-examined", "basis": "<one line>"}`.
+  `checked-clean` means you examined the area against C5's commit and
+  nothing in it is open (rule 4). `open` means you examined it and a
+  finding, a needs-validation item or an unsettled question remains; name
+  the finding by its `category` in `basis`. `not-examined` means you did not
+  examine it, and `basis` gives the reason. An entry marked `open`, or
+  marked `not-examined` for any area but A17, keeps the audit from being
+  clean (rule 4). Do not mark clean an area you did not look at.
+* `refusals`: every refusal (rule 2), `[]` if none, each
+  `{"what": "<the command or tool call, verbatim>", "text": "<the refusal, verbatim>", "next": "<what you did next>"}`.
+
+Your Bash cannot run `bash`, `uv` or `pytest`, so you cannot run the guard or
+its tests.
+
 ### Brief V1 — `coder`: verification probe (not implementation work)
 
 **Purpose.** You are verifying that ADR-0018's guards are live for a real
@@ -2945,6 +3927,46 @@ It has one `probe` entry per command:
   contains `needs-validation` and `This refusal is final for this task.`;
 * a command that ran has `result` `ran`, with `exit` in place of those three
   fields.
+
+### Brief V3 — `test-author`: verification probe D1 (not test work)
+
+**Purpose.** You are checking, on the live system, how a Read whose path
+contains `..` is handled (ADR-0018 decision 15, item D1). This is a probe:
+write nothing, and read nothing else.
+
+**Method.** Make exactly one tool call, a Read whose `file_path` is,
+exactly:
+
+```text
+/home/user/Hammertime/packages/hammertime-testkit/../hammertime-core/src/hammertime/core/runtime.py
+```
+
+Do not change, retry, re-spell or work around it, whatever happens. The
+result is what is being measured.
+
+**Report.** One line: `D1`, then either `refused:` followed by the first 300
+characters of the refusal, or `read: N lines` if the file's contents came
+back. Do not quote, summarise or describe the contents. Nothing else.
+
+### Brief V4 — `architect`: verification probe D2 (not design work)
+
+**Purpose.** You are checking, on the live system, how a Write whose path
+contains `..` is handled (ADR-0018 decision 15, item D2). This is a probe.
+Its path is outside your write scope on purpose, and the Write is expected
+to be refused. Make no other change.
+
+**Method.** Make exactly one tool call, a Write with the content `probe`,
+whose `file_path` is, exactly:
+
+```text
+/home/user/Hammertime/docs/../services/ingest/PROBE_DOTDOT.txt
+```
+
+Do not change, retry, re-spell or work around it, whatever happens. The
+result is what is being measured.
+
+**Report.** One line: `D2`, then either `refused:` followed by the first 300
+characters of the refusal, or `written`. Nothing else.
 
 ### For the top-level session (not a subagent brief)
 
@@ -3153,6 +4175,37 @@ repository was read instead.
     failing on `true`; bash command substitution stripping trailing
     newlines; and, as SA1b states it, Node's `fs` refusing a path that
     contains a NUL, which decision 17 does not rely on.
+* **Fourth amendment (2026-09-24), read or reported; no web access, and
+  nothing outside `/home/user/Hammertime` read but the architect's
+  instructions.**
+  * Read by the architect: C4's `path-guard.sh` at `64ffaf3`, in
+    `.claude/worktrees/agent-a9337fe3a5808f2cb` (the NUL gate at lines
+    185-203, the empty-path check at 205-213, the relativisation at 215-230,
+    the project-root check at 232-238, and the glob checks at 240-262); the
+    main checkout's `path-guard.sh`, and its `.claude/settings.json`, whose
+    coder `DENY_GLOBS` do not carry `../*` or `*/../*`;
+    `tests/config/test_path_guard_behavior.py`, T2's tests included, and
+    the `..` cases elsewhere in `tests/config/`; `.gitignore` (lines 20 and
+    22) and the `Makefile`; the `.claude/agents/*.md` files; and the file
+    lists of `packages/hammertime-core/src/hammertime/core/`, of the same
+    directory in `.claude/worktrees/agent-a9337fe3a5808f2cb`, and of
+    `packages/hammertime-testkit/`, `services/ingest/` and `.claude/skills/`.
+  * Reported to the architect, who ran nothing: C4's commit and branch;
+    `supervisor`'s finding that C4's work was in scope; the top-level
+    session's run of NUL paths and of T2's tests against C4's script; SA1c's
+    `..` finding, and the session's confirmation of it on the main
+    checkout's `path-guard.sh` under today's `settings.json` (the three
+    cases in decision 18); `supervisor`'s findings on SA1c; and the owner's
+    two decisions.
+  * From recall, not verified here: the kernel resolving `a/..` through a
+    symlink `a`, and needing `a` to exist; POSIX treating repeated slashes as
+    one, except that a leading `//` is implementation-defined, and a
+    trailing slash requiring a directory; `pathlib` collapsing `.`
+    components and repeated slashes but not `..` (brief T3); bash tilde
+    expansion of an unquoted `~` at the start of a pattern; `/proc/self/cwd`
+    and `/proc/self/root` on Linux; `.venv/` holding links to the
+    interpreter; and Claude Code loading a project skill from
+    `.claude/skills/<name>/SKILL.md`.
 
 ## Revision 2026-09-24 (before merge)
 
@@ -3678,3 +4731,421 @@ Every edit:
   gate; decision 16, whose "no entry" covers this amendment too (assumption
   38); briefs T1, C1, C2, C3, SA1, SA1b and V2; "For the top-level session";
   and the two sections above.
+
+## Fourth amendment 2026-09-24 (before merge): `..` traversal in `path-guard.sh`, and SA1c discarded
+
+Made in place on 2026-09-24, before this ADR is merged, under the same
+convention as the three sections above: every edit is listed, and the
+replaced text is quoted wherever a passage was reworded rather than only
+extended. In the first list below, replaced text is the ADR as it stood after
+the third amendment. In the second, the correction made after `supervisor`'s
+review, it is this amendment's first draft. No web access was used; outside
+`/home/user/Hammertime` the architect read only the file in the top-level
+session's scratchpad that held its instructions; and the architect ran
+nothing.
+
+The trigger, as the top-level session reported it to the architect:
+
+1. **C4 is done and not merged.** Brief C4 implemented decision 17's NUL gate
+   as commit `64ffaf3`, on branch `worktree-agent-a9337fe3a5808f2cb`, in
+   worktree `.claude/worktrees/agent-a9337fe3a5808f2cb`. `supervisor` found
+   C4's work in scope. The top-level session verified by execution that
+   NUL-bearing paths are now refused and that all of T2's tests pass.
+2. **SA1c's audit is discarded.** By the owner's decision of 2026-09-24,
+   SA1c's audit of `64ffaf3` is not the merge gate. A `supervisor` review of
+   SA1c found that the auditor went outside its brief and read the installed
+   Claude Code harness source outside the repository, which set off a safety
+   classifier; left two fence refusals out of its report; mislabelled
+   coverage entries; and asserted that its own finding "must NOT block" the
+   merge. This ADR relies on none of SA1c's conclusions.
+3. **SA1c's finding stands on the session's confirmation.** SA1c did report
+   that `path-guard.sh` resolves no `..`. The top-level session confirmed the
+   guard side by execution, on the main checkout's `path-guard.sh` under
+   today's `settings.json`: the relativisation is a prefix strip, matching is
+   `[[ str == glob ]]` with `*` spanning `/`, and the three cases in decision
+   18 exit 0, the first two where their direct paths exit 2. The coder's
+   `../*` and `*/../*` are only in decision 14's text, not in today's
+   `settings.json`, and they are a deny list only. Whether the harness
+   resolves `..` before the hook sees the path is unknown.
+4. **The owner's decision:** fix `..` traversal in `path-guard.sh` first,
+   then have a fresh auditor audit decision 17's gate and the fix together.
+
+Every edit of the first draft:
+
+* **Status, first paragraph.** The sentence saying the owner had ruled on
+  only one part of this ADR is replaced by three: the owner's two rulings of
+  2026-09-24; that decision 18's design is the architect's; and that the
+  owner has ruled on nothing else. The Question 4 sentence after them was
+  reflowed; its words did not change. The replaced sentence:
+
+  > That is the only part of this ADR the owner has ruled on.
+
+* **Status, second paragraph.** Reworded: C4's commit, not merged; SA1c's
+  audit discarded; SA1c's `..` finding, confirmed by the session; decision
+  18 and briefs T3, C5 and SA1d; step W now also waits for C5; and this
+  section named. (The correction below adds the merge condition to it.) The
+  replaced paragraph:
+
+  > Partly implemented. `.claude/hooks/bash-guard.sh` has gained the features of
+  > decisions 3-11 through brief C1 and the fix of the second amendment (below).
+  > SA1's original audit of C1 found a NUL-extraction bypass, and C1 itself
+  > flagged that literal mode did not refuse carriage return or other control
+  > characters; the second amendment settles both. SA1b re-audited the fixed
+  > commit, `e38e9c9`, and found `bash-guard.sh` clean; that commit is now on
+  > this ADR's feature branch. SA1b's one finding was against
+  > `.claude/hooks/path-guard.sh`, which reads the path it vets through the same
+  > NUL-dropping extraction (Question 4). The third amendment settles that with
+  > decision 17, a NUL gate in `path-guard.sh`, delivered through briefs T2, C4
+  > and SA1c before step W (Follow-through, step 5). The top-level session
+  > applies decision 14's `.claude/settings.json` text in step W, which must come
+  > after C1, C3 and C4 have landed in the main checkout (decisions 13 and 17).
+  > The policy is not in force until decision 15's verification has passed. This
+  > ADR touches no spec section, schema or protocol document, so
+  > `docs/spec/README.md` does not change. Revised in place on 2026-09-24,
+  > before merge; "Revision 2026-09-24", "Second amendment 2026-09-24" and "Third
+  > amendment 2026-09-24" at the end list every edit and quote what they
+  > replaced.
+
+* **Scope note.** Its first sentence extended to name decision 18. The line
+  breaks of the paragraph's other sentences moved; their words did not
+  change. The replaced sentence:
+
+  > This ADR designs the Bash policy for the `coder` agent, the
+  > `bash-guard.sh` features that policy needs, the widening of the coder's
+  > Edit/Write fence that the Bash policy depends on, and (third amendment) a NUL
+  > gate in `path-guard.sh` that every configured path-guard policy runs, the
+  > architect's and the test-author's as well as the coder's (decision 17).
+
+* **Decision 12, first bullet.** Reworded to name decision 18 as the second
+  change to the script. The replaced bullet:
+
+  > * The additions are globs. The one change to `path-guard.sh` itself is
+  >   decision 17's NUL gate (third amendment), which refuses a path the script
+  >   cannot read intact, for every agent the script serves; the verdict on every
+  >   path that is a string without a NUL is unchanged.
+
+* **Decision 12 (b), the bullet on `../*` and `*/../*`.** Extended: decision
+  18 makes both globs unreachable, and they stay. Its first sentence is
+  unchanged. Nothing was replaced.
+* **Decision 13.** In the paragraph on C4, the merge now waits for SA1d and
+  `supervisor`'s review of SA1d. The paragraph's later line breaks moved; its
+  other words did not change. A paragraph on C5 added after it. (The
+  correction below restores the clean-audit bar in both paragraphs.) The
+  replaced words:
+
+  > The merge waits for SA1c's audit and `supervisor`'s review of SA1c
+  > (Follow-through, step 5), because
+
+* **Decision 15, Sequence.** Four probes instead of two: V3 and V4 added. The
+  replaced text:
+
+  > the top-level session dispatches two probes, each paired with `supervisor`:
+  >
+  > * **V1**, a `coder`, whose worktree and branch are discarded afterwards and
+  >   never merged;
+  > * **V2**, a `security-auditor`.
+
+* **Decision 15, P9's outcomes.** The inconclusive case now names C5's
+  commit. The bullet's later line breaks moved; its other words did not
+  change. The replaced words:
+
+  > The session confirms
+  > that the main checkout's `path-guard.sh` is C4's merged commit and that
+  > T2's tests pass there.
+
+* **Decision 15, D1 and D2.** Added after P9's outcomes, with "D1's and D2's
+  outcomes". Nothing was replaced.
+* **Decision 17, "Everything else stays".** SA1d in place of SA1c. The
+  paragraph's later line breaks moved. The replaced words:
+
+  > is SA1c's
+  > to examine.
+
+* **Decision 17, "Delivery".** Reworded. The replaced paragraph:
+
+  > **Delivery.** Briefs T2 (tests), C4 (the script) and SA1c (the audit), all
+  > before step W (Follow-through, step 5; decision 13). Probe P9 (decision 15)
+  > checks it live. There is no `CHANGES` entry (decision 16).
+
+* **Decision 18.** New. Nothing was replaced.
+* **Assumptions 35, 36 and 37.** SA1d in place of SA1c, and 37 gains a
+  sentence. (The correction below restores the clean-audit bar in 37.) The
+  replaced words, in order:
+
+  > judgment; SA1c examines it.
+
+  > the gate rests on T2's tests and SA1c's audit.
+
+  > T2 before C4, and SA1c
+  > before C4's merge, repeat the pattern of T1, C1 and SA1.
+
+* **Assumptions.** An introductory sentence and items 39-51 added after item
+  38. Nothing was replaced. (The correction below rewrites item 48.)
+* **Consequences.** A bullet added after the third amendment's. Nothing was
+  replaced.
+* **Question 2.** An italic note added: the fourth amendment does not settle
+  it. Nothing was replaced.
+* **Questions 5 and 6.** New. Nothing was replaced.
+* **Follow-through, first sentence.** Reworded, because it had become false:
+  the top-level session has since dispatched several of the briefs below.
+  The replaced sentence:
+
+  > Nothing below has been dispatched; the architect has no Agent tool.
+
+* **Follow-through, order step 5.** Its opening line reworded; the third
+  amendment's bullet reworded for T3, C5, SA1d and one merge of C4 and C5;
+  and "Apply W" reworded to wait for C5. "Merge C1" is unchanged. (The
+  correction below restores the clean-audit bar in the "Merge C4 and C5"
+  bullet and removes its carve-out.) The replaced opening line:
+
+  > 5. Merge C1, then land decision 17's NUL gate in `path-guard.sh`, then apply
+  >    W, in this order.
+
+  The replaced bullet:
+
+  >    * **Land decision 17's gate (third amendment): T2, then C4, then SA1c,
+  >      then merge C4.**
+  >      * T2 (test-author) adds its tests to the feature branch. It depends only
+  >        on this amendment, so it can start at once and run in parallel with
+  >        anything still open in step 3.
+  >      * C4 (coder, `.claude/hooks/path-guard.sh`) starts once T2's tests are
+  >        on the feature branch, and leaves its commit in its worktree. It is
+  >        dispatched before W (decision 13).
+  >      * SA1c (security-auditor) audits C4's commit where it sits, in C4's
+  >        worktree. Until C4 is merged, the main checkout's current
+  >        `path-guard.sh` stays the live fence for all three agents, so a gate
+  >        that failed open cannot go live unaudited.
+  >      * **Merge C4** into the branch the main checkout has checked out only
+  >        when SA1c's audit of that exact commit is clean and `supervisor` has
+  >        reviewed SA1c. A finding that needs only a script fix goes to a coder
+  >        on C4's branch, and SA1c re-audits the fixed commit, as SA1b did for
+  >        C1. A finding that needs a design change comes back to the architect.
+
+  The replaced "Apply W" bullet:
+
+  >    * **Apply W.** The top-level session applies decision 14 only after C1
+  >      (the first part of this step), C4 (the second) and C3 (step 3) have all
+  >      been merged. The scripts the new policy depends on are then already live
+  >      (decisions 13 and 17). Commit W on the feature branch.
+
+* **Follow-through, order steps 7 and 8.** V3 and V4 added. The replaced
+  steps:
+
+  > 7. V1 and V2 run next (decision 15).
+  > 8. The slice-3 coder is dispatched only after V1 and V2 pass, and after
+  >    CLAUDE.md and `coder.md` carry the `--locked` gates ("For the top-level
+  >    session", items 1 and 4).
+
+* **Follow-through, the C4 and SA1c pairing paragraph.** Reworded in the
+  past tense, and followed by a paragraph and a list for T3, C5, SA1d, V3
+  and V4. The replaced paragraph:
+
+  > C4 and SA1c (third amendment) are paired the same way. Tell `supervisor` that
+  > C4 runs before step W, with no Bash policy and under a fence that does not
+  > yet deny `.claude/`, so it must check that no file other than
+  > `.claude/hooks/path-guard.sh` changed in the worktree; `.commit-msg` is
+  > written there but is not staged. SA1c is a `security-auditor` dispatch and is
+  > `supervisor`-paired like SA1 and SA1b. Before merging C4, the session runs
+  > `git status -- .claude` in the main checkout and confirms it is clean.
+
+* **Brief C4.** An italic note added under its heading: item 6's merge
+  condition no longer holds. The brief's text is kept as dispatched. Nothing
+  was replaced. (The correction below rewords the note: the auditor changes,
+  and the clean bar does not.)
+* **Brief SA1c.** An italic note added under its heading: its audit is
+  discarded, and SA1d replaces it. The brief's text is kept as dispatched.
+  Nothing was replaced.
+* **Briefs T3, C5 and SA1d.** Added after brief SA1c. Nothing was replaced.
+  (The correction below changes C5's item 7, and SA1d's rule 5 and area
+  A19.)
+* **Briefs V3 and V4.** Added after brief V2. Nothing was replaced.
+* **Sources.** A "Fourth amendment (2026-09-24)" bullet added at the end of
+  the list. Nothing was replaced.
+* **This section.** Added.
+* **Unchanged, deliberately.** Decision 14's `settings.json` text, because
+  the rule has no knob; decisions 3 and 11, which specify the bash guard;
+  decision 16, whose "no entry" covers this amendment too (assumption 51);
+  Question 4, whose ruling records the third amendment; briefs T1, C1, C2,
+  C3, SA1, SA1b, T2, V1 and V2, and "For the top-level session"; and the
+  three sections above.
+
+**Correction after `supervisor`'s review (2026-09-24).** `supervisor` found
+one problem in the first draft: it dropped the word "clean" from the
+path-guard merge condition. The text it replaced required that "SA1c's audit
+of that exact commit is clean". The first draft said only that the merge
+came after SA1d had audited, in Follow-through step 5, in the note under
+brief C4 and in brief C5's item 7, and step 5 wrote in a carve-out: a finding
+that predates C4 and C5 and lies outside decisions 17 and 18 "does not by
+itself hold back" the merge. The list above did not call this a change to
+the merge condition. It left the path-guard merge as the only one without
+the clean bar, which C1's merge keeps, and the carve-out was the stance SA1c
+was discarded for asserting. At the top-level session's instruction, the
+correction restores the bar everywhere the path-guard merge condition
+appears: the merge happens only when SA1d's audit of that exact commit is
+clean, meaning no open finding and no coverage entry marked `open`, and
+`supervisor` has reviewed SA1d. It removes the carve-out from the
+Follow-through, and from the briefs the wording that left the merge to the
+top-level session's discretion. Assumption 48 keeps the carve-out only as an
+option the owner may choose, which is not a default and not the top-level
+session's call. Replaced text in this list is the first draft of this
+amendment, except in its last entries, which record a later tightening of
+the definition of clean and quote the text as first corrected.
+
+Every edit of the correction:
+
+* **Status, second paragraph.** The sentence on T3, C5 and SA1d split in two;
+  the second states the merge condition. The replaced sentence:
+
+  > Briefs T3 and C5 deliver it, and SA1d audits C4's gate and C5's rule
+  > together, all before step W (Follow-through, step 5).
+
+* **Decision 13, the paragraph on C4.** The merge waits until SA1d's audit
+  is clean, not merely for the audit. The paragraph's later line breaks
+  moved; its other words did not change. The replaced words:
+
+  > The merge waits for SA1d's audit, which covers C4's gate and C5's rule
+  > together, and for `supervisor`'s review of SA1d
+
+* **Decision 13, the paragraph on C5.** The joint merge is tied to the same
+  condition. The paragraph's later line breaks moved; its other words did
+  not change. The replaced words:
+
+  > and C4's and C5's commits are merged together.
+
+* **Assumption 37.** "an audit" became "a clean audit". The item's later line
+  breaks moved. The replaced words:
+
+  > T2 before C4, and an audit before C4's merge
+
+* **Assumption 48.** Rewritten: the merge condition with the clean bar, and
+  the carve-out kept only as an option the owner could choose, not a default
+  and not the top-level session's call. The replaced item:
+
+  > 48. **The sequencing and the merge.** C5 starts from an integration commit
+  >     that the session prepares, fast-forwarded into a fresh worktree, as the
+  >     instructions for this amendment set out. C4 and C5 are merged together,
+  >     once, after SA1d and `supervisor`'s review of SA1d; W waits for C5 for
+  >     decision 13's reasons. That a finding which predates C4 and C5 and lies
+  >     outside decisions 17 and 18 does not by itself hold back the merge is the
+  >     architect's recommendation. The top-level session decides.
+
+* **Follow-through, order step 5, the "Merge C4 and C5" bullet.** The clean
+  bar restored and defined, the session's discretion and the carve-out
+  removed; how a finding is settled is kept. The replaced bullet:
+
+  >      * **Merge C4 and C5** into the branch the main checkout has checked out,
+  >        as one merge of C5's commit, which carries `64ffaf3` and the
+  >        integration commit. It happens only after SA1d has audited that exact
+  >        commit and `supervisor` has reviewed SA1d. Whether SA1d's report
+  >        allows the merge is the top-level session's decision; SA1d makes no
+  >        recommendation. The architect's plan for SA1d's findings: one against
+  >        decision 17's gate or decision 18's rule, or against a verdict C4 or
+  >        C5 changed, is settled before the merge, by a coder on C5's branch
+  >        followed by a fresh audit of the fixed commit if it needs only a
+  >        script fix, and by the architect if it needs a design change. One that
+  >        predates C4 and C5 and lies outside both decisions, such as
+  >        Question 6's routes, is recorded and settled separately, and does not
+  >        by itself hold back a merge that closes two bypasses (assumption 48).
+
+* **Brief C4, the italic note.** The merge condition restored: the auditor
+  changes, and the bar does not. The replaced words:
+
+  > That no longer holds: the owner discarded SA1c's audit as the merge gate,
+  > and C4's commit is merged together with C5's, after SA1d has audited both
+  > and `supervisor` has reviewed SA1d (Follow-through, step 5).
+
+* **Brief C5, item 7.** The merge condition restored, and "the top-level
+  session decides" dropped. The replaced words:
+
+  > Your commit, which carries C4's, is merged only after SA1d has audited it
+  > and `supervisor` has reviewed SA1d, and the top-level session decides.
+
+* **Brief SA1d, rule 5.** Its last sentence now ties the session's decision
+  to the merge condition of step 5, which nothing SA1d writes changes. The
+  replaced sentence:
+
+  > The top-level session decides.
+
+* **Brief SA1d, area A19.** A sentence added: a finding that predates C4 and
+  C5 is still a finding, open like any other. Nothing was replaced.
+* **This section.** The introduction's sentence on replaced text now covers
+  both lists; the first list's lead-in names the first draft; a note is added
+  to each first-draft entry this correction touches; and this list is added.
+  The replaced sentence and lead-in:
+
+  > Replaced text is the ADR as it stood after the third amendment.
+
+  > Every edit:
+
+* **Checked and left alone.** The Status's first paragraph; decision 15's
+  sequence and the outcomes of D1 and D2; decisions 17's and 18's "Delivery"
+  paragraphs; assumption 36; step 5's other bullets, steps 7 and 8, and the
+  pairing paragraph; the rest of brief SA1d, whose rule 4 and coverage
+  statuses already allow `checked-clean` only when nothing is open; and
+  Questions 5 and 6. None of them states the path-guard merge condition or
+  softens it.
+* **The definition of clean, tightened at a further instruction from the
+  top-level session (2026-09-24).** As first corrected, clean meant no open
+  finding and no coverage entry marked `open`. An audit that left an area
+  unexamined could therefore still count as clean; the architect reported
+  that gap. Clean now has three parts: no open finding, no coverage entry
+  marked `open`, and no coverage entry marked `not-examined` other than A17,
+  the harness side, which the probes settle. The definition is applied in
+  the Status, decision 13, assumption 48, Follow-through step 5, the note
+  under brief C4, brief C5's item 7, and brief SA1d's rules 4 and 5 and its
+  coverage statuses. In the entries below, replaced text is the text as
+  first corrected.
+* **Status, second paragraph, tightened.** A sentence defining clean added
+  after the sentence on the merge. The paragraph's later line breaks moved;
+  its other words did not change. Nothing was replaced.
+* **Decision 13, the paragraph on C4, tightened.** A sentence defining clean
+  added before "Step W waits for C4". The paragraph's later line breaks
+  moved; its other words did not change. Nothing was replaced. The
+  paragraph on C5 keeps "on the clean-audit condition above", which now
+  points to the three parts.
+* **Assumption 48, tightened.** The definition now has three parts, and the
+  sentence on the bar says where they came from. The item's later line
+  breaks moved. The replaced words, in order:
+
+  > clean, meaning no open finding and no coverage entry marked `open`, and
+  > `supervisor` has reviewed SA1d;
+
+  > The clean bar is not a judgment call: it is the bar C1's merge keeps, and
+  > the one C4's merge had before SA1c was discarded.
+
+* **Follow-through step 5, tightened.** The "Merge C4 and C5" bullet's
+  definition now has three parts. The bullet's later line breaks moved. The
+  replaced sentence:
+
+  > Clean means no open finding and no coverage entry marked `open`.
+
+* **Brief C4, the italic note, tightened.** A sentence defining clean added,
+  and "the bar has not" became "the bar has not been lowered", since the
+  bar is now stricter than SA1c's. The note's later line breaks moved. The
+  replaced words:
+
+  > The auditor has changed, and the bar has not:
+
+* **Brief C5, item 7, tightened.** A sentence defining clean added. Nothing
+  was replaced.
+* **Brief SA1d, rule 4, tightened.** A sentence added: the audit as a whole
+  is clean only on the three parts. Nothing was replaced.
+* **Brief SA1d, rule 5, tightened.** The merge condition is spelled out as a
+  clean audit, as rule 4 defines it, and `supervisor`'s review of it. The
+  replaced words:
+
+  > under the merge condition of Follow-through step 5, which nothing you
+  > write changes.
+
+* **Brief SA1d, the coverage statuses, tightened.** A sentence added: an
+  entry marked `open`, or marked `not-examined` for any area but A17, keeps
+  the audit from being clean. Nothing was replaced.
+* **This list's introduction.** Its last sentence now says that these
+  entries quote the text as first corrected. The replaced sentence:
+
+  > Replaced text in this list is the first draft of this amendment.
+
+* **Checked and left alone in the tightening.** Assumption 37's "a clean
+  audit" and decision 13's "clean-audit condition above", which refer to the
+  definition rather than state it; and the rest of brief SA1d, including
+  area A17, which is marked `not-examined` by design.
