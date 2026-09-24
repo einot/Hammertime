@@ -33,10 +33,22 @@ governance, git's internals, ignored executed state (`.venv/`, `__pycache__/`),
 files that tools find by name, and `uv.lock`. The coder cases added to
 `WRITE_CASES` and the worktree cases below encode it; they fail until the
 top-level session applies decision 14 (step W).
+
+ADR-0018 decision 17 (third amendment) adds a NUL gate to the script. The path
+is read through a command substitution, which drops NUL bytes, so the guard used
+to vet a path with every NUL removed: `uv.lock`, a NUL, then `.py` was vetted,
+and allowed, as `uv.lock.py`. The gate runs after the `SCOPE_AGENT_TYPES`
+routing, only under a guarded policy, and before the empty-path check and every
+glob list. A path containing a NUL is refused with the NUL denial; a path that
+is `true`, a number, an array or an object is refused with the
+could-not-be-checked denial; an absent, `null` or `false` path behaves as
+before. The tests at the end of this module encode it. Those that expect a NUL
+or non-string refusal fail until brief C4 lands.
 """
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -620,3 +632,412 @@ def test_configured_policies_ignore_the_top_level_session() -> None:
     policy, script = configured_policy("coder", frozenset({"Edit", "Write"}))
     result = run_guard("Write", policy=policy, file_path=under_repo(SPEC_FILE), script=script)
     assert_allowed(result, "a top-level session write against coder's policy")
+
+
+# --- decision 17: the NUL gate --------------------------------------------
+#
+# ADR-0018's third amendment (2026-09-24), brief T2. The NUL goes in the Python
+# string; `json.dumps` in `run_guard` encodes it as the \u0000 escape the payload
+# needs (assumption 30). A NUL-bearing absolute path is built by string
+# concatenation, not through `pathlib`, so nothing on the way can drop or reject
+# the NUL. The null, false and non-string cases need a payload `run_guard` cannot
+# build, so they go through `run_guard_tool_input`.
+
+# Decision 17's NUL denial, verbatim, with the ADR's blockquote line breaks joined
+# by single spaces. The dash is a literal em dash character (U+2014).
+NUL_MESSAGE = (
+    "Hammertime path guard: the path contains a NUL byte (U+0000), which cannot "
+    "be carried through this guard intact — the byte is dropped when the path is "
+    "read, so the guard cannot vet the path the tool would actually use. The "
+    "tool call is refused."
+)
+
+# Decision 17's could-not-be-checked denial, verbatim except for the status N,
+# which brief T2 says not to pin.
+NOT_CHECKED_HEAD = (
+    "Hammertime path guard: the path could not be checked for a NUL byte "
+    "(the check ended with status "
+)
+NOT_CHECKED_TAIL = (
+    " instead of a result), so the guard cannot confirm that the path it would "
+    "vet is the path the tool would use. The tool call is refused."
+)
+NOT_CHECKED_PATTERN = re.compile(rf"{re.escape(NOT_CHECKED_HEAD)}\d+{re.escape(NOT_CHECKED_TAIL)}")
+
+# Decision 17's table of phrases the tests pin.
+DENIAL_PREFIX = "Hammertime path guard: "
+NUL_PHRASE = "NUL byte (U+0000)"
+NOT_CHECKED_PHRASE = "could not be checked for a NUL byte"
+
+EDIT_WRITE = frozenset({"Edit", "Write"})
+READ_GREP_GLOB = frozenset({"Read", "Grep", "Glob"})
+SEARCH_TOOLS = frozenset({"Grep", "Glob"})
+TRIE_QUERY_FILE = "services/trie/src/hammertime/trie/query/app.py"
+EXACT_NAMES = {"DENY_GLOBS": "uv.lock CLAUDE.md"}
+
+
+def run_guard_tool_input(
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+    *,
+    policy: Mapping[str, str],
+    agent_type: str | None = None,
+    script: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Like `run_guard`, but with the whole `tool_input` given (brief T2).
+
+    `run_guard` sends only string paths and leaves out `None`. This sends
+    whatever JSON `tool_input` holds: a path that is `null`, `false`, or not a
+    string at all.
+    """
+    guard = GUARD if script is None else script
+    assert guard.is_file(), f"{guard} does not exist, so no guard can run"
+
+    payload: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": dict(tool_input),
+        "cwd": str(REPO_ROOT),
+    }
+    if agent_type is not None:
+        payload["agent_type"] = agent_type
+
+    env = dict(os.environ)
+    for name in POLICY_VARS:
+        env.pop(name, None)
+    env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
+    env.update(policy)
+
+    return subprocess.run(
+        [BASH or "bash", str(guard)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+
+def run_with_path(
+    tool_name: str,
+    path: str,
+    *,
+    policy: Mapping[str, str],
+    agent_type: str | None = None,
+    script: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`path` as a Grep or Glob `path`, or as any other tool's `file_path`."""
+    if tool_name in SEARCH_TOOLS:
+        return run_guard(
+            tool_name,
+            policy=policy,
+            search_path=path,
+            agent_type=agent_type,
+            script=script,
+        )
+    return run_guard(
+        tool_name,
+        policy=policy,
+        file_path=path,
+        agent_type=agent_type,
+        script=script,
+    )
+
+
+def with_nul_inside(path: str) -> str:
+    """`path` with a NUL inserted halfway, so that its NUL-stripped form, the
+    string the guard vetted before the gate, is `path` itself."""
+    middle = len(path) // 2
+    return f"{path[:middle]}\x00{path[middle:]}"
+
+
+def assert_nul_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 17's NUL denial: exit 2, the JSON deny, and its phrase."""
+    reason = assert_denied(result, what)
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert NUL_PHRASE in reason, (
+        f"expected decision 17's NUL denial for {what}, not another refusal.\nreason: {reason!r}"
+    )
+    return reason
+
+
+def assert_not_checked_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 17's could-not-be-checked denial, with any status number."""
+    reason = assert_denied(result, what)
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert NOT_CHECKED_PHRASE in reason, (
+        f"expected decision 17's could-not-be-checked denial for {what}.\nreason: {reason!r}"
+    )
+    assert NOT_CHECKED_PATTERN.fullmatch(reason), (
+        f"the could-not-be-checked denial for {what} must be decision 17's text "
+        f"verbatim, with N a status number.\nreason: {reason!r}"
+    )
+    return reason
+
+
+def assert_allowed_silently(result: subprocess.CompletedProcess[str], what: str) -> None:
+    """Exit 0 with nothing on stdout: no decision at all."""
+    assert_allowed(result, what)
+    assert result.stdout == "", f"expected empty stdout for {what}; got {result.stdout!r}"
+
+
+# Decision 17, brief T2 item 1: a NUL anywhere is refused.
+
+IMPLEMENTATION_PATH = under_repo(IMPLEMENTATION_FILE)
+
+NUL_POSITIONS = [
+    ("start", f"\x00{IMPLEMENTATION_PATH}"),
+    ("middle", with_nul_inside(IMPLEMENTATION_PATH)),
+    ("end", f"{IMPLEMENTATION_PATH}\x00"),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for _, path in NUL_POSITIONS],
+    ids=[case_id for case_id, _ in NUL_POSITIONS],
+)
+def test_a_nul_anywhere_in_an_allowed_path_is_refused(path: str) -> None:
+    """Decision 17: a NUL at the start, in the middle or at the end of a path the
+    policy allows is refused with the NUL denial. The same path without the NUL
+    is allowed, which keeps the refusal from passing vacuously."""
+    clean = run_guard("Write", policy=DENY_TESTS, file_path=IMPLEMENTATION_PATH)
+    assert_allowed(clean, IMPLEMENTATION_FILE)
+    result = run_guard("Write", policy=DENY_TESTS, file_path=path)
+    assert_nul_denied(result, f"a Write of {path!r}")
+
+
+def test_a_write_whose_path_is_only_a_nul_is_refused() -> None:
+    """Decision 17: a path that is only a NUL comes out of the extraction empty,
+    and a Write carrying no path is allowed. The gate runs before that check, so
+    the NUL is refused instead."""
+    assert_allowed(run_guard("Write", policy=DENY_TESTS), "a Write carrying no path")
+    result = run_guard("Write", policy=DENY_TESTS, file_path="\x00")
+    assert_nul_denied(result, "a Write whose file_path is only a NUL")
+
+
+def test_a_grep_whose_path_is_only_a_nul_gets_the_nul_denial() -> None:
+    """Decision 17: refused as a NUL, not as an unscoped search, because the gate
+    runs before the empty-path check."""
+    result = run_guard("Grep", policy=DENY_TESTS, search_path="\x00")
+    assert_nul_denied(result, "a Grep whose path is only a NUL")
+
+
+# Decision 17, brief T2 item 2: an exact-name protected file.
+
+EXACT_NAME_NUL_CASES = [
+    ("uv.lock\x00.py", "uv.lock.py"),
+    ("CLAUDE.md\x00x", "CLAUDE.mdx"),
+]
+
+
+def test_an_exact_protected_name_is_refused_by_its_deny_glob() -> None:
+    """Decision 17's premise: `uv.lock` itself is refused by `DENY_GLOBS`, and
+    not by the gate."""
+    result = run_guard("Write", policy=EXACT_NAMES, file_path=under_repo("uv.lock"))
+    reason = assert_denied(result, "uv.lock under DENY_GLOBS='uv.lock CLAUDE.md'")
+    assert NUL_PHRASE not in reason, reason
+    assert NOT_CHECKED_PHRASE not in reason, reason
+
+
+@pytest.mark.parametrize(
+    ("name", "stripped"),
+    EXACT_NAME_NUL_CASES,
+    ids=["uv.lock-NUL-.py", "CLAUDE.md-NUL-x"],
+)
+def test_a_nul_after_an_exact_protected_name_is_refused(name: str, stripped: str) -> None:
+    """Decision 17: before the gate, `name` was vetted as `stripped`, which no
+    exact-name glob matches, and so allowed. `stripped` is still allowed, which
+    keeps the refusal of `name` from passing vacuously."""
+    allowed = run_guard("Write", policy=EXACT_NAMES, file_path=under_repo(stripped))
+    assert_allowed(allowed, stripped)
+    path = f"{REPO_ROOT}/{name}"
+    result = run_guard("Write", policy=EXACT_NAMES, file_path=path)
+    assert_nul_denied(result, f"a Write of {path!r}")
+
+
+def test_the_configured_coder_policy_refuses_uv_lock_followed_by_a_nul() -> None:
+    """Decision 17, and decision 12's first bullet: the gate refuses the path for
+    every agent the script serves, before step W adds the coder's exact-name
+    globs and after."""
+    policy, script = configured_policy("coder", EDIT_WRITE)
+    path = f"{REPO_ROOT}/uv.lock\x00x"
+    result = run_guard(
+        "Write",
+        policy=policy,
+        file_path=path,
+        agent_type="coder",
+        script=script,
+    )
+    assert_nul_denied(result, f"coder writing {path!r}")
+
+
+# Decision 17, brief T2 item 3: every agent and tool path-guard serves.
+
+CONFIGURED_NUL_CASES: list[tuple[str, frozenset[str], str, str]] = [
+    ("coder", EDIT_WRITE, "Write", TRIE_QUERY_FILE),
+    ("coder", EDIT_WRITE, "Edit", TRIE_QUERY_FILE),
+    ("architect", EDIT_WRITE, "Write", SPEC_FILE),
+    ("architect", EDIT_WRITE, "Edit", SPEC_FILE),
+    ("test-author", EDIT_WRITE, "Write", TOP_LEVEL_TEST_FILE),
+    ("test-author", EDIT_WRITE, "Edit", TOP_LEVEL_TEST_FILE),
+    ("test-author", READ_GREP_GLOB, "Read", TOP_LEVEL_TEST_FILE),
+    ("test-author", READ_GREP_GLOB, "Grep", "tests"),
+    ("test-author", READ_GREP_GLOB, "Glob", "tests"),
+]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "tools", "tool_name", "path"),
+    CONFIGURED_NUL_CASES,
+    ids=[f"{agent}-{tool}-{path}" for agent, _, tool, path in CONFIGURED_NUL_CASES],
+)
+def test_every_configured_policy_refuses_a_nul_in_a_path_it_allows(
+    agent_name: str, tools: frozenset[str], tool_name: str, path: str
+) -> None:
+    """Decision 17 and assumption 28: every agent and every tool path-guard
+    serves. `path` is allowed, before step W and after it; the same path with a
+    NUL inside, which the guard would otherwise vet as `path`, is refused."""
+    policy, script = configured_policy(agent_name, tools)
+    clean = path if tool_name in SEARCH_TOOLS else under_repo(path)
+    allowed = run_with_path(
+        tool_name,
+        clean,
+        policy=policy,
+        agent_type=agent_name,
+        script=script,
+    )
+    assert_allowed(allowed, f"{agent_name} {tool_name} of {clean}")
+    nul_path = with_nul_inside(clean)
+    result = run_with_path(
+        tool_name,
+        nul_path,
+        policy=policy,
+        agent_type=agent_name,
+        script=script,
+    )
+    assert_nul_denied(result, f"{agent_name} {tool_name} of {nul_path!r}")
+
+
+def test_the_nul_gate_runs_before_the_test_author_read_exemptions() -> None:
+    """Decision 17: the NUL-stripped form of this path matches the `*/tests/*`
+    exemption, which exits 0 on a match, so the gate must run before
+    `EXEMPT_GLOBS` to see the NUL at all."""
+    policy, script = configured_policy("test-author", READ_GREP_GLOB)
+    path = f"{REPO_ROOT}/{TRIE_QUERY_FILE}\x00/tests/x"
+    result = run_guard(
+        "Read",
+        policy=policy,
+        file_path=path,
+        agent_type="test-author",
+        script=script,
+    )
+    assert_nul_denied(result, f"test-author reading {path!r}")
+
+
+def test_the_nul_gate_does_not_police_a_caller_outside_the_policy_scope() -> None:
+    """Decision 17 and assumption 29: the gate runs after the routing, so a call
+    with no `agent_type` (the top-level session) passes through untouched. As
+    everywhere in this module, that exit 0 is routing, not approval."""
+    policy, script = configured_policy("coder", EDIT_WRITE)
+    path = with_nul_inside(under_repo(SPEC_FILE))
+    result = run_guard("Write", policy=policy, file_path=path, script=script)
+    assert_allowed_silently(result, f"a top-level session Write of {path!r}")
+
+
+@pytest.mark.parametrize("tool_name", ["Read", "Write"])
+def test_the_nul_gate_does_not_run_under_a_policy_that_constrains_no_paths(
+    tool_name: str,
+) -> None:
+    """Decision 17 and assumption 29: the gate runs only under a guarded policy,
+    so an entry that constrains no paths still denies nothing, as
+    `test_agent_with_no_path_policy_is_not_guarded` requires for any path."""
+    path = with_nul_inside(IMPLEMENTATION_PATH)
+    result = run_guard(tool_name, policy={}, file_path=path)
+    assert_allowed(result, f"a {tool_name} of {path!r} with no path policy")
+
+
+# Decision 17, brief T2 item 4: a non-string path fails closed.
+
+NON_STRING_PATHS: list[tuple[str, Any]] = [
+    ("number", 42),
+    ("array", ["uv.lock"]),
+    ("object", {"a": 1}),
+    ("true", True),
+]
+
+PATH_FIELDS = [("Write", "file_path"), ("Grep", "path")]
+
+
+@pytest.mark.parametrize(("tool_name", "field"), PATH_FIELDS, ids=["Write", "Grep"])
+@pytest.mark.parametrize(
+    "value",
+    [value for _, value in NON_STRING_PATHS],
+    ids=[case_id for case_id, _ in NON_STRING_PATHS],
+)
+def test_a_non_string_path_fails_closed(tool_name: str, field: str, value: Any) -> None:
+    """Decision 17 and assumption 32: only a clean false passes the gate. The
+    check fails on `true`, a number, an array or an object, and the
+    could-not-be-checked denial follows."""
+    result = run_guard_tool_input(tool_name, {field: value}, policy=DENY_TESTS)
+    assert_not_checked_denied(result, f"a {tool_name} whose {field} is {value!r}")
+
+
+# Decision 17, brief T2 item 5: an absent, null or false path behaves as before.
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [{}, {"file_path": None}, {"file_path": False}],
+    ids=["absent", "null", "false"],
+)
+def test_a_write_with_no_path_passes_the_gate(tool_input: dict[str, Any]) -> None:
+    """Decision 17 and assumption 32: `// ""` makes the value the empty string,
+    the check passes, and an Edit or Write with no path exits 0, as before."""
+    result = run_guard_tool_input("Write", tool_input, policy=DENY_TESTS)
+    assert_allowed_silently(result, f"a Write with tool_input {tool_input!r}")
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [{}, {"path": None}, {"path": False}],
+    ids=["absent", "null", "false"],
+)
+def test_a_grep_with_no_path_gets_the_unscoped_search_denial(tool_input: dict[str, Any]) -> None:
+    """Decision 17 and assumption 32: the check passes, and a Grep with no path
+    under a guarded policy is refused as an unscoped search, as before, and by
+    neither of the gate's denials."""
+    result = run_guard_tool_input("Grep", tool_input, policy=DENY_TESTS)
+    reason = assert_denied(result, f"a Grep with tool_input {tool_input!r}")
+    assert "Grep" in reason, reason
+    assert "path" in reason, reason
+    assert NUL_PHRASE not in reason, reason
+    assert NOT_CHECKED_PHRASE not in reason, reason
+
+
+# Decision 17, brief T2 item 6: the messages.
+
+
+@pytest.mark.parametrize(("tool_name", "field"), PATH_FIELDS, ids=["Write", "Grep"])
+def test_the_nul_denial_is_decision_17s_text_verbatim(tool_name: str, field: str) -> None:
+    """Decision 17 and assumption 34: the NUL denial word for word, the ADR's
+    blockquote line breaks read as single spaces. It quotes no path and carries
+    no advice paragraph."""
+    path = f"{REPO_ROOT}/uv.lock\x00.py"
+    result = run_guard_tool_input(tool_name, {field: path}, policy=DENY_TESTS)
+    reason = assert_nul_denied(result, f"a {tool_name} whose {field} is {path!r}")
+    assert reason == NUL_MESSAGE, (
+        "the NUL denial must be decision 17's text verbatim.\n"
+        f"expected: {NUL_MESSAGE!r}\nreason:   {reason!r}"
+    )
+
+
+@pytest.mark.parametrize(("tool_name", "field"), PATH_FIELDS, ids=["Write", "Grep"])
+def test_the_not_checked_denial_is_decision_17s_text(tool_name: str, field: str) -> None:
+    """Decision 17 and assumption 34: the could-not-be-checked denial word for
+    word, except for the status number, which is not pinned."""
+    result = run_guard_tool_input(tool_name, {field: 42}, policy=DENY_TESTS)
+    reason = assert_not_checked_denied(result, f"a {tool_name} whose {field} is 42")
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert NOT_CHECKED_PHRASE in reason, reason
