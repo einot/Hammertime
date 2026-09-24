@@ -77,11 +77,21 @@ assumption 10), and is carried as `float(value)`. A refusal is a
 `CodecError` whose check never names the value. `hot_ratio` is a number, not
 one of the eight integer fields, so `_PAYLOAD_INTEGER_FIELDS` and
 `_BOUNDED_FIELDS` do not list it (ADR-0016 assumption 14).
+
+ADR-0017 Amendment 3 ruling 2 is tested after that: every timestamp field --
+the envelope's `timestamp`, `RequestObservation.window_start`, the `timestamp`
+of `HotIpAdded` and `HotIpRemoved`, and `PrefixStatsChanged.timestamp` -- is
+returned in UTC on decode, a value whose UTC equivalent falls outside the
+years 1 to 9999 is a `CodecError` on decode, and an aware value whose UTC
+conversion overflows is a `CodecError` (never an `OverflowError`) on encode.
+The wording is not asserted. Amendment 3 ruling 5 (R6) closes the file: for
+every value decode refuses in `hot_ratio`, the `CodecError`'s `__cause__` is a
+`ValueError` whose text contains `hot_ratio`.
 """
 
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -1558,3 +1568,267 @@ def test_the_schema_keeps_hot_ratio_an_optional_number_between_0_and_1() -> None
     assert prop["type"] == "number"
     assert prop["minimum"] == 0
     assert prop["maximum"] == 1
+
+
+# ==========================================================================
+# ADR-0017 Amendment 3 ruling 2 (finding S2): "A timestamp the codec decodes
+# can be encoded again." Decode: "Every timestamp field is returned in UTC:
+# the envelope's `timestamp`, `RequestObservation.window_start`, the
+# `timestamp` of `HotIpAdded` and `HotIpRemoved`, and
+# `PrefixStatsChanged.timestamp`. A value with an offset is converted to UTC.
+# A value with none is read as UTC, as before. A value whose UTC equivalent
+# falls outside the years 1 to 9999 ... is a `CodecError`." Encode: "A
+# timestamp whose conversion to UTC overflows is a `CodecError`, not an
+# `OverflowError`." "The codec writes every timestamp in UTC with `Z`." "Its
+# wording is not part of the contract", so no message is asserted.
+#
+# Test seam (Amendment 3, "An out-of-range timestamp"): "A test builds the
+# bytes by editing an encoded envelope ... An envelope's `event_id` does not
+# depend on its timestamp, so the edited bytes still pass decode's `event_id`
+# check."
+# ==========================================================================
+
+
+class _Stamp(NamedTuple):
+    event_type: str
+    path: tuple[str | int, ...]  # the wire key
+    where: str  # `_envelope`'s constructor group
+    field: str  # the constructor argument
+
+
+_TIMESTAMP_FIELDS: list[_Stamp] = [
+    *(_Stamp(event_type, ("timestamp",), "envelope", "timestamp") for event_type in EVENT_TYPES),
+    _Stamp("RequestObservation", ("payload", "window_start"), "payload", "window_start"),
+    _Stamp("HotIpAdded", ("payload", "timestamp"), "payload", "timestamp"),
+    _Stamp("HotIpRemoved", ("payload", "timestamp"), "payload", "timestamp"),
+    _Stamp("PrefixStatsChanged", ("payload", "timestamp"), "payload", "timestamp"),
+]
+
+
+def _stamp_id(stamp: _Stamp) -> str:
+    return f"{stamp.event_type}:{'.'.join(str(key) for key in stamp.path)}"
+
+
+_STAMP_IDS = [_stamp_id(stamp) for stamp in _TIMESTAMP_FIELDS]
+
+
+def _stamp_wire(stamp: _Stamp) -> bytes:
+    """Encoded bytes of a valid envelope, checked to carry the field as a string."""
+
+    data = encode(_envelope(stamp.event_type))
+    assert isinstance(_wire_value(data, stamp.path), str), stamp
+    return data
+
+
+def test_the_timestamp_fields_are_the_rulings_list() -> None:
+    """Ruling 2 names five fields: the envelope's `timestamp` (on every event
+    type), `window_start`, the two hot-ip `timestamp`s and the stats'."""
+
+    payload_fields = {
+        (stamp.event_type, stamp.path) for stamp in _TIMESTAMP_FIELDS if stamp.where == "payload"
+    }
+    assert payload_fields == {
+        ("RequestObservation", ("payload", "window_start")),
+        ("HotIpAdded", ("payload", "timestamp")),
+        ("HotIpRemoved", ("payload", "timestamp")),
+        ("PrefixStatsChanged", ("payload", "timestamp")),
+    }
+    assert {s.event_type for s in _TIMESTAMP_FIELDS if s.where == "envelope"} == set(EVENT_TYPES)
+
+
+# Each text's UTC equivalent lies outside years 1-9999.
+_OUT_OF_RANGE_TEXTS: list[Any] = [
+    pytest.param("9999-12-31T23:59:59-01:00", id="max-minus-1h"),
+    pytest.param("0001-01-01T00:00:00+01:00", id="min-plus-1h"),
+    pytest.param("9999-12-31T23:00:00-01:00", id="max-exactly-year-10000"),
+    pytest.param("0001-01-01T00:59:59+01:00", id="min-one-second-before-year-1"),
+    pytest.param("9999-12-31T12:00:00-14:00", id="max-minus-14h"),
+]
+
+
+class TestTimestampOutOfRangeOnDecode:
+    """Ruling 2: "A value whose UTC equivalent falls outside the years 1 to
+    9999, which Python's `datetime` can hold, is a `CodecError`." And nothing
+    else: an `OverflowError` escaping decode fails the test."""
+
+    @pytest.mark.parametrize("text", _OUT_OF_RANGE_TEXTS)
+    @pytest.mark.parametrize("stamp", _TIMESTAMP_FIELDS, ids=_STAMP_IDS)
+    def test_decode_refuses_it_as_a_codec_error(self, stamp: _Stamp, text: str) -> None:
+        tampered = _tamper_field(_stamp_wire(stamp), stamp.path, text)
+        assert _wire_value(tampered, stamp.path) == text
+
+        with pytest.raises(CodecError):
+            decode(tampered)
+
+    @pytest.mark.parametrize("stamp", _TIMESTAMP_FIELDS, ids=_STAMP_IDS)
+    def test_the_same_edit_to_an_in_range_value_decodes(self, stamp: _Stamp) -> None:
+        """Control for the test above: an edit of the same field to a valid
+        text decodes, so the refusal is the range and not the edit itself
+        (and the `event_id` check does not depend on the timestamp)."""
+
+        tampered = _tamper_field(_stamp_wire(stamp), stamp.path, "2026-09-14T10:05:00Z")
+
+        decoded = decode(tampered)
+
+        assert _decoded_field(decoded, stamp.path) == T0
+
+
+# In range, with an offset: the same instant as `T0`, 2026-09-14T10:05:00Z.
+_OFFSET_TEXTS: list[Any] = [
+    pytest.param("2026-09-14T15:35:00+05:30", id="plus-05-30"),
+    pytest.param("2026-09-14T02:05:00-08:00", id="minus-08-00"),
+    pytest.param("2026-09-14T10:05:00+00:00", id="plus-00-00"),
+]
+
+
+class TestTimestampDecodesToUtc:
+    """Ruling 2: "Every timestamp field is returned in UTC ... A value with an
+    offset is converted to UTC. A value with none is read as UTC, as before."
+    Assumption 73: "Decode returns UTC, and does not only check the range." And
+    the codec "writes every timestamp in UTC with `Z`"."""
+
+    @pytest.mark.parametrize("text", _OFFSET_TEXTS)
+    @pytest.mark.parametrize("stamp", _TIMESTAMP_FIELDS, ids=_STAMP_IDS)
+    def test_a_value_with_an_offset_decodes_to_the_same_instant_in_utc(
+        self, stamp: _Stamp, text: str
+    ) -> None:
+        tampered = _tamper_field(_stamp_wire(stamp), stamp.path, text)
+
+        value = _decoded_field(decode(tampered), stamp.path)
+
+        assert isinstance(value, datetime)
+        assert value.utcoffset() == timedelta(0)
+        assert value == T0
+        assert (value.year, value.month, value.day, value.hour, value.minute) == (
+            2026,
+            9,
+            14,
+            10,
+            5,
+        )
+
+    @pytest.mark.parametrize("stamp", _TIMESTAMP_FIELDS, ids=_STAMP_IDS)
+    def test_a_value_without_an_offset_is_read_as_utc(self, stamp: _Stamp) -> None:
+        tampered = _tamper_field(_stamp_wire(stamp), stamp.path, "2026-09-14T10:05:00")
+
+        value = _decoded_field(decode(tampered), stamp.path)
+
+        assert isinstance(value, datetime)
+        assert value.utcoffset() == timedelta(0)
+        assert value == T0
+
+    @pytest.mark.parametrize("text", _OFFSET_TEXTS)
+    @pytest.mark.parametrize("stamp", _TIMESTAMP_FIELDS, ids=_STAMP_IDS)
+    def test_re_encoding_writes_the_utc_text_with_z(self, stamp: _Stamp, text: str) -> None:
+        tampered = _tamper_field(_stamp_wire(stamp), stamp.path, text)
+
+        again = encode(decode(tampered))
+
+        assert _wire_value(again, stamp.path) == "2026-09-14T10:05:00Z"
+
+
+# (wire text, the UTC text re-encoding writes)
+_EDGE_TEXTS: list[Any] = [
+    pytest.param("9999-12-31T23:59:59Z", "9999-12-31T23:59:59Z", id="max-utc"),
+    pytest.param("9999-12-31T23:59:59+01:00", "9999-12-31T22:59:59Z", id="max-plus-1h"),
+    pytest.param("0001-01-01T00:00:00Z", "0001-01-01T00:00:00Z", id="min-utc"),
+    pytest.param("0001-01-01T00:00:00-01:00", "0001-01-01T01:00:00Z", id="min-minus-1h"),
+]
+
+
+class TestTimestampEdgesDecodeAndReEncode:
+    """Ruling 2's heading: "A timestamp the codec decodes can be encoded
+    again." Values whose UTC equivalent lies inside years 1-9999, at the
+    edges, decode and re-encode; assumption 74: "The codec writes UTC with a
+    four-digit year"."""
+
+    @pytest.mark.parametrize(("text", "utc_text"), _EDGE_TEXTS)
+    @pytest.mark.parametrize("stamp", _TIMESTAMP_FIELDS, ids=_STAMP_IDS)
+    def test_it_decodes_and_re_encodes(self, stamp: _Stamp, text: str, utc_text: str) -> None:
+        tampered = _tamper_field(_stamp_wire(stamp), stamp.path, text)
+
+        decoded = decode(tampered)
+        value = _decoded_field(decoded, stamp.path)
+        again = encode(decoded)
+
+        assert isinstance(value, datetime)
+        assert value.utcoffset() == timedelta(0)
+        assert value == datetime.fromisoformat(utc_text.replace("Z", "+00:00"))
+        assert _wire_value(again, stamp.path) == utc_text
+        assert decode(again) == decoded
+
+
+_OVERFLOWING_DATETIMES: list[Any] = [
+    pytest.param(
+        datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=-1))),
+        id="max-minus-1h",
+    ),
+    pytest.param(datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=1))), id="min-plus-1h"),
+]
+
+
+class TestTimestampOverflowOnEncode:
+    """Ruling 2: "A timestamp whose conversion to UTC overflows is a
+    `CodecError`, not an `OverflowError`. ... The rule covers a value built
+    in-process." Assumption 75: "encode raises only `CodecError` for a value it
+    cannot write"."""
+
+    @pytest.mark.parametrize("value", _OVERFLOWING_DATETIMES)
+    @pytest.mark.parametrize("stamp", _TIMESTAMP_FIELDS, ids=_STAMP_IDS)
+    def test_encode_raises_codec_error(self, stamp: _Stamp, value: datetime) -> None:
+        envelope = _envelope(stamp.event_type, stamp.where, stamp.field, value)
+
+        try:
+            encode(envelope)
+        except CodecError:
+            pass
+        except OverflowError as error:  # pragma: no cover - the failure being guarded
+            pytest.fail(f"encode raised OverflowError, not CodecError: {error!r}")
+        else:  # pragma: no cover
+            pytest.fail("encode wrote a timestamp whose UTC conversion overflows")
+
+
+# ==========================================================================
+# ADR-0017 Amendment 3 ruling 5 (R6), on Amendment 2 ruling 9: "The check's
+# own error is a `ValueError`. For every value decode refuses, the
+# `CodecError`'s `__cause__` is a `ValueError` whose text names `hot_ratio`. It
+# is never a `TypeError`, which comparing or testing a non-number first would
+# raise, and never an `OverflowError`, which converting an oversized integer
+# first would raise. The wording stays outside the contract." Only the field
+# name is looked for in the text.
+# ==========================================================================
+
+
+def _ratio_refused_cases() -> list[Any]:
+    return [
+        pytest.param(None, id="null"),
+        pytest.param("0.5", id="string"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param([], id="array"),
+        pytest.param({}, id="object"),
+        pytest.param(float("nan"), id="NaN"),
+        pytest.param(float("inf"), id="Infinity"),
+        pytest.param(float("-inf"), id="minus-Infinity"),
+        *_ratio_out_of_range_cases(),
+        pytest.param(-(10**400), id="minus-10-to-the-400"),
+    ]
+
+
+class TestHotRatioDecodeCause:
+    @pytest.mark.parametrize("bad", _ratio_refused_cases())
+    def test_the_cause_is_a_value_error_naming_hot_ratio(self, bad: object) -> None:
+        tampered = _tamper_field(_ratio_wire(), _HOT_RATIO_PATH, bad)
+        if isinstance(bad, int) and not isinstance(bad, bool) and abs(bad) > 10**300:
+            # A JSON integer on the wire, not a float.
+            assert type(_wire_value(tampered, _HOT_RATIO_PATH)) is int
+
+        with pytest.raises(CodecError) as excinfo:
+            decode(tampered)
+
+        cause = excinfo.value.__cause__
+        assert cause is not None
+        assert not isinstance(cause, TypeError), repr(cause)
+        assert not isinstance(cause, OverflowError), repr(cause)
+        assert isinstance(cause, ValueError), repr(cause)
+        assert "hot_ratio" in str(cause)

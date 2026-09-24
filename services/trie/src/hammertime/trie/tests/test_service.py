@@ -73,9 +73,17 @@ there) and section 47.2 and 47.4:
 Producer doubles reach the worker through a bus double's `producer()`
 (Amendment 2, "Test seams"); the hot-ip log is the double's inner
 `InMemoryBus`.
+
+ADR-0017 Amendment 3: every bus double implements `last_value` ("Test
+seams"), returning `None` or delegating to an `InMemoryBus` whose prefix-stats
+log is empty, so each replay still publishes everything; and ruling 5 (R5):
+with both families served, `build_service` passes `min_prefix_length_ipv6`
+through to the publisher, seen as an IPv6 event publishing `/120` to `/128`
+and no shorter prefix (`test_the_ipv6_floor_reaches_the_publisher`).
 """
 
 import asyncio
+import ipaddress
 import json
 from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import UTC, datetime, timedelta
@@ -96,9 +104,9 @@ from hammertime.bus.topics import HOT_IP, PREFIX_STATS
 from hammertime.core.addressing.address import Address, AddressFamily
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.errors import ConfigurationError, InvariantViolation
-from hammertime.core.events.codec import encode
+from hammertime.core.events.codec import decode, encode
 from hammertime.core.events.envelope import EventEnvelope
-from hammertime.core.events.models import HotIpAdded
+from hammertime.core.events.models import HotIpAdded, PrefixStatsChanged
 from hammertime.core.runtime import Service
 from hammertime.trie.config import TrieSettings
 from hammertime.trie.metrics import TrieMetrics
@@ -312,6 +320,12 @@ class _ScriptedBus:
     async def first_offset(self, topic: str) -> int:
         return self._first
 
+    async def last_value(self, topic: str) -> bytes | None:
+        # ADR-0017 Amendment 3 "Test seams": every bus double handed to a
+        # worker implements `last_value`; `None` keeps the replay publishing
+        # everything.
+        return None
+
 
 class _ClosableBus:
     """An `InMemoryBus` with a `close()` that counts the calls made to it."""
@@ -331,6 +345,9 @@ class _ClosableBus:
 
     async def first_offset(self, topic: str) -> int:
         return await self.inner.first_offset(topic)
+
+    async def last_value(self, topic: str) -> bytes | None:
+        return await self.inner.last_value(topic)
 
     async def close(self) -> None:
         self.closed += 1
@@ -829,6 +846,11 @@ class _ProducerBus:
     async def first_offset(self, topic: str) -> int:
         return await self.inner.first_offset(topic)
 
+    async def last_value(self, topic: str) -> bytes | None:
+        # The stats go to the double, so `inner`'s prefix-stats log is empty:
+        # `None`, and the replay publishes everything.
+        return await self.inner.last_value(topic)
+
 
 class _TracingTransport(_FakeTransport):
     """A `_FakeTransport` whose `close()` also appends `"close"` to `trace`."""
@@ -850,6 +872,31 @@ def _published(service: TrieService, family: str = "ipv4") -> int | float:
     return service.metrics.get("prefix_stats_published", family=family)
 
 
+async def _stats_prefixes(bus: InMemoryBus) -> list[str]:
+    """The `prefix` of every record on the prefix-stats topic, in log order, read
+    by a fresh consumer subscribed positionally from `0` (Amendment 2, "Test
+    seams")."""
+
+    n = await bus.end_offset(STATS_TOPIC)
+    if n == 0:
+        return []
+    consumer = bus.consumer("prefix-stats-reader")
+    stream = await consumer.subscribe(STATS_TOPIC, start_offset=0)
+    prefixes: list[str] = []
+
+    async def take() -> None:
+        async for message in stream:
+            envelope: Any = decode(message.value)
+            assert isinstance(envelope.payload, PrefixStatsChanged)
+            prefixes.append(envelope.payload.prefix)
+            if len(prefixes) == n:
+                return
+
+    await asyncio.wait_for(take(), timeout=10.0)
+    await consumer.close()
+    return prefixes
+
+
 class TestBuildServicePassesTheFloors:
     """Decision 13 as noted by Amendment 2 ruling 6: "`build_service` passes
     `min_prefix_lengths={IPV4: settings.min_prefix_length, IPV6:
@@ -865,6 +912,46 @@ class TestBuildServicePassesTheFloors:
             assert service.ready is True
             assert await bus.end_offset(STATS_TOPIC) == 9
             assert _published(service) == 9
+        finally:
+            await service.stop()
+
+    @pytest.mark.parametrize(
+        ("ip", "floor", "bits"),
+        [
+            pytest.param(Address.parse("2001:db8::1"), 120, 128, id="ipv6"),
+            pytest.param(IP_A, 24, 32, id="ipv4"),
+        ],
+    )
+    async def test_the_ipv6_floor_reaches_the_publisher(
+        self, config_path: Path, bus: InMemoryBus, ip: Address, floor: int, bits: int
+    ) -> None:
+        # ADR-0017 Amendment 3 ruling 5 (R5): "Decision 13's note already says
+        # that `build_service` passes `min_prefix_length_ipv6` to the worker. A
+        # test must show it reaching the publisher." With both families served,
+        # `min_prefix_length=24` and `min_prefix_length_ipv6=120`, an IPv6 event
+        # publishes `/120` to `/128` and an IPv4 one `/24` to `/32`: 9 each.
+        await _publish(bus, _envelope(ip, 0))
+        settings = _settings(
+            config_path,
+            families=frozenset({IPV4, IPV6}),
+            min_prefix_length=24,
+            min_prefix_length_ipv6=120,
+        )
+        service = build_service(settings, bus=bus)
+
+        await service.start()
+        try:
+            assert service.ready is True
+            prefixes = await _stats_prefixes(bus)
+            assert len(prefixes) == 9
+            assert set(prefixes) == {
+                str(ipaddress.ip_network(f"{ip}/{length}", strict=False))
+                for length in range(floor, bits + 1)
+            }
+            lengths = {int(text.rsplit("/", 1)[1]) for text in prefixes}
+            assert min(lengths) == floor
+            family = "ipv6" if bits == 128 else "ipv4"
+            assert _published(service, family) == 9
         finally:
             await service.stop()
 

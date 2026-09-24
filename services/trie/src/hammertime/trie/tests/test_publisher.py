@@ -36,12 +36,22 @@ Choices of this file's own:
   fixed number of further yields.
 * Ruling 2 does not pin when the counter moves while publishes are held, so
   it is read only once `publish()` has returned or raised.
+
+ADR-0017 Amendment 3 rulings 3 and 5 (R1, R3, R4) are tested in
+`TestPublishIsCancelled` and `TestTheCauseFollowsMessageOrder`, with a
+producer double that holds and releases each key on its own: a cancelled
+`publish()` cancels the publishes in flight, completes only once each has
+finished, raises `CancelledError` (also when a publish raised an
+`Exception`), and counts exactly the publishes that returned; a
+`BaseException` that is not an `Exception` is raised only once the held
+publish has finished; and the cause is the first failed message in
+`messages` order, not the first to fail.
 """
 
 import asyncio
 import ipaddress
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, cast
 
@@ -164,7 +174,7 @@ class _Halt(BaseException):
 
 
 def _publisher(
-    producer: _Producer | None = None,
+    producer: object | None = None,
     *,
     metrics: TrieMetrics | None = None,
     lengths: Mapping[AddressFamily, int] | None = None,
@@ -617,6 +627,209 @@ class TestPublishFails:
 
         assert excinfo.value is halt
         assert not isinstance(excinfo.value, PrefixStatsPublishError)
+
+
+class _KeyedProducer:
+    """A producer double with a hold and a release per key (ADR-0017 Amendment
+    3 rulings 3 and 5).
+
+    A publish whose key is in `hold` waits until `release(key)`; then, if its
+    key is in `fail`, it raises that exception. A publish not held raises its
+    `fail` exception at once, or returns. When a held publish is cancelled it
+    records the key in `cancel_seen`, then takes `linger` further event-loop
+    turns before it re-raises the cancellation, so that a test can watch
+    `publish()` waiting for it. `in_flight` holds the keys of the publishes
+    that have started and not yet finished, however they finish; `returned`
+    and `raised` record, in order, the keys of those that returned or raised
+    (a cancellation included)."""
+
+    def __init__(
+        self,
+        *,
+        hold: Iterable[object] = (),
+        fail: Mapping[object, BaseException] | None = None,
+        linger: int = 0,
+    ) -> None:
+        self.calls: list[_Call] = []
+        self._releases = {key: asyncio.Event() for key in hold}
+        self._fail = dict(fail) if fail is not None else {}
+        self._linger = linger
+        self.in_flight: set[object] = set()
+        self.cancel_seen: set[object] = set()
+        self.returned: list[object] = []
+        self.raised: list[object] = []
+        self.flushes = 0
+
+    def release(self, key: object) -> None:
+        self._releases[key].set()
+
+    async def publish(
+        self, topic: object, key: object, value: object, *, message_id: object = None
+    ) -> None:
+        self.calls.append(_Call(topic, key, value, message_id))
+        self.in_flight.add(key)
+        try:
+            release = self._releases.get(key)
+            if release is not None:
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    self.cancel_seen.add(key)
+                    for _ in range(self._linger):
+                        await asyncio.sleep(0)
+                    raise
+            error = self._fail.get(key)
+            if error is not None:
+                raise error
+        except BaseException:
+            self.raised.append(key)
+            raise
+        else:
+            self.returned.append(key)
+        finally:
+            self.in_flight.discard(key)
+
+    async def flush(self) -> None:
+        self.flushes += 1
+
+
+class TestPublishIsCancelled:
+    """ADR-0017 Amendment 3 ruling 3 (R1, R4): "In all four cases, `publish()`
+    completes only once every publish it started has returned or raised. When
+    `publish()` is cancelled, it cancels the publishes still in flight, waits
+    until each has finished, and then raises `CancelledError`. It raises
+    `CancelledError` even when some publish raised an `Exception`." "Once
+    `publish()` has completed, in any of the four ways,
+    `prefix_stats_published{family}` has grown by exactly the number of its
+    publishes that returned." Assumption 78: "A cancellation wins over a
+    publish failure." When the counter moves while publishes are in flight is
+    not pinned, so it is read only once the task is done."""
+
+    async def test_it_waits_for_the_cancelled_publish_then_counts_what_returned(self) -> None:
+        held = _ancestor_text(IP, 32)
+        producer = _KeyedProducer(hold=[held], linger=50)
+        metrics = _metrics()
+        publisher = _publisher(producer, metrics=metrics)
+        prepared = _prepare(publisher, _trie(IP), IP)
+
+        task = asyncio.create_task(publisher.publish(prepared))
+        await _yield_until(lambda: len(producer.returned) == 24 and producer.in_flight == {held})
+        await _spin()
+        assert not task.done()
+
+        task.cancel()
+        await _yield_until(lambda: held in producer.cancel_seen)
+        # The held publish is still finishing: `publish()` must not be done.
+        turns = 0
+        for _ in range(STEPS):
+            if held not in producer.in_flight:
+                break
+            assert not task.done(), "publish() completed while a publish it started was running"
+            turns += 1
+            await asyncio.sleep(0)
+        assert held not in producer.in_flight
+        assert turns >= 10  # non-vacuous: it was watched while it lingered
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10.0)
+
+        assert task.cancelled()
+        assert producer.in_flight == set()
+        assert producer.raised == [held]
+        assert len(producer.returned) == 24
+        assert _published(metrics) == 24
+
+    async def test_a_cancellation_wins_over_a_publish_failure(self) -> None:
+        # One publish raised an `Exception`, one is held, the rest returned.
+        failed = _ancestor_text(IP, 24)
+        held = _ancestor_text(IP, 32)
+        producer = _KeyedProducer(hold=[held], fail={failed: _PublishFailed(MARKER)})
+        metrics = _metrics()
+        publisher = _publisher(producer, metrics=metrics)
+        prepared = _prepare(publisher, _trie(IP), IP)
+
+        task = asyncio.create_task(publisher.publish(prepared))
+        await _yield_until(
+            lambda: (
+                failed in producer.raised
+                and len(producer.returned) == 23
+                and producer.in_flight == {held}
+            )
+        )
+        await _spin()
+        assert not task.done()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10.0)
+
+        assert task.cancelled()
+        assert producer.in_flight == set()
+        assert len(producer.returned) == 23
+        assert _published(metrics) == 23
+
+    async def test_a_base_exception_waits_for_the_held_publish(self) -> None:
+        # Ruling 3's third way: "it raises a publish's `BaseException` that is
+        # not an `Exception`", and "completes only once every publish it
+        # started has returned or raised".
+        halt = _Halt()
+        halting = _ancestor_text(IP, 24)
+        held = _ancestor_text(IP, 32)
+        producer = _KeyedProducer(hold=[held], fail={halting: halt})
+        metrics = _metrics()
+        publisher = _publisher(producer, metrics=metrics)
+        prepared = _prepare(publisher, _trie(IP), IP)
+
+        task = asyncio.create_task(publisher.publish(prepared))
+        await _yield_until(lambda: halting in producer.raised and producer.in_flight == {held})
+        await _spin()
+        assert not task.done()
+
+        producer.release(held)
+        with pytest.raises(_Halt) as excinfo:
+            await asyncio.wait_for(task, timeout=10.0)
+
+        assert excinfo.value is halt
+        assert producer.in_flight == set()
+        assert held in producer.returned
+        assert len(producer.returned) == 24
+        assert _published(metrics) == 24
+
+
+class TestTheCauseFollowsMessageOrder:
+    """ADR-0017 Amendment 3 ruling 5 (R3): "Amendment 2 ruling 2 already says the
+    cause is the exception 'of the first failed message in `messages` order'.
+    The test must make the order in which the publishes fail differ from the
+    order of the messages." `/24` comes before `/30` in `messages` (shortest
+    prefix first), but here `/30` fails first."""
+
+    async def test_the_cause_is_the_earlier_message_not_the_earlier_failure(self) -> None:
+        slash_24 = _ancestor_text(IP, 24)
+        slash_30 = _ancestor_text(IP, 30)
+        error_a = _PublishFailed("A")
+        error_b = _PublishFailed("B")
+        producer = _KeyedProducer(hold=[slash_24], fail={slash_24: error_a, slash_30: error_b})
+        metrics = _metrics()
+        publisher = _publisher(producer, metrics=metrics)
+        prepared = _prepare(publisher, _trie(IP), IP)
+        keys = [message.key for message in prepared.messages]
+        assert keys.index(slash_24) < keys.index(slash_30)
+
+        task = asyncio.create_task(publisher.publish(prepared))
+        await _yield_until(lambda: slash_30 in producer.raised)
+        await _spin()
+        assert not task.done()
+        assert slash_24 not in producer.raised
+
+        producer.release(slash_24)
+        with pytest.raises(PrefixStatsPublishError) as excinfo:
+            await asyncio.wait_for(task, timeout=10.0)
+
+        assert producer.raised == [slash_30, slash_24]
+        assert excinfo.value.__cause__ is error_a
+        assert excinfo.value.failed == 2
+        assert excinfo.value.attempted == 25
+        assert _published(metrics) == 23
 
 
 class TestFlush:
