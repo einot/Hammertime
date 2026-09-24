@@ -100,8 +100,10 @@ ADR-0017 Amendment 3 (2026-09-24), with the dated notes it adds to decisions
   `prefix_stats_last_ignored` at WARNING with `reason` and `replay_target`
   and nothing of the message), and the envelope's `sequence` otherwise; an
   event below it is applied and `APPLIED` but publishes nothing;
-  `replay_complete` carries `republish_from`; a failed start is continued by
-  the next; an exception from `last_value` propagates; a live event, and
+  `replay_complete` carries `republish_from`; a last message that trips
+  several refusals is logged with the first row's reason; a failed start is
+  continued by the next; an exception from `last_value` propagates, before
+  step 3 has passed anything; a live event, and
   `handle()` before `start()`, publish;
 * ruling 2: a hot-ip record whose payload `timestamp` is out of range in UTC
   is `MALFORMED` [`codec`], and the replay goes on past it.
@@ -3278,6 +3280,90 @@ class TestALastMessageTheWorkerCannotUse:
             await worker.stop()
 
 
+def _foreign_agent_ahead_of_log() -> bytes:
+    # Trips the `agent_id` row and the `ahead_of_log` row: 987654321 is far
+    # above the replay target of 4.
+    return _stats_value(987654321, agent_id="foreign-s3cr3t-agent", prefix="203.0.113.0/24")
+
+
+def _hot_ip_added_ahead_of_log() -> bytes:
+    # Trips the `payload_type` row, the `agent_id` row (the aggregator's
+    # `agent_id` is not `AGENT_ID`) and the `ahead_of_log` row: the envelope's
+    # `sequence` is `n + 1`, 987654321.
+    return encode(_envelope(Address.parse("198.51.100.77"), 987654320, timestamp=T0))
+
+
+# (the last value, the reason of the first row that applies, text no record
+# may carry)
+_REFUSED_BY_THE_FIRST_ROW = [
+    pytest.param(
+        _foreign_agent_ahead_of_log,
+        "agent_id",
+        ("s3cr3t-agent", "203.0.113", "987654321"),
+        id="agent_id-before-ahead_of_log",
+    ),
+    pytest.param(
+        _hot_ip_added_ahead_of_log,
+        "payload_type",
+        ("198.51.100.77", "987654321"),
+        id="payload_type-before-agent_id-and-ahead_of_log",
+    ),
+]
+
+
+class TestTheFirstRefusalThatAppliesDecides:
+    """Ruling 1 item 2: "The rows are checked in order, and the first that
+    applies decides." A last message that trips more than one refusal is
+    logged with the reason of the earliest row it trips, once."""
+
+    @pytest.mark.parametrize(("build", "reason", "secrets"), _REFUSED_BY_THE_FIRST_ROW)
+    async def test_the_earliest_row_names_the_reason(
+        self,
+        build: Callable[[], bytes],
+        reason: str,
+        secrets: tuple[str, ...],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Ruling 1 item 2's table, in its order: `payload_type`, then
+        `agent_id`, then `ahead_of_log`. Every refusal gives `republish_from
+        == 0`, and the record "carries fixed tokens and numbers only, and
+        nothing the message holds" (decision 12 as amended by ruling 1)."""
+
+        caplog.set_level(logging.DEBUG)
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        last = build()
+        for secret in secrets:
+            assert secret.encode() in last
+        producer = _StatsProducer()
+        bus = _ScriptedBusWithProducer(_held(range(4)), end=4, producer=producer, last=last)
+        worker = _worker_on(bus)
+
+        try:
+            await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.replay_target == 4
+            assert worker.republish_from == 0
+            assert worker.caught_up is True
+            assert set(_call_sequences(producer.calls)) == {1, 2, 3, 4}
+
+            records = _logged(caplog, "prefix_stats_last_ignored")
+            assert len(records) == 1
+            assert records[0].levelno == logging.WARNING
+            assert _field(records[0], "reason") == reason
+            assert _field(records[0], "replay_target") == "4"
+            assert _replay_fields(caplog)["republish_from"] == "0"
+
+            for record in caplog.records:
+                for secret in secrets:
+                    assert secret not in record.getMessage(), record.getMessage()
+                    if record.name == LOGGER:
+                        assert secret not in repr(vars(record))
+            for secret in secrets:
+                assert secret not in caplog.text
+        finally:
+            await worker.stop()
+
+
 class TestAnErrorFromLastValue:
     async def test_it_propagates_out_of_start_and_nothing_is_subscribed(self) -> None:
         # Decision 7 as amended 2026-09-24: the row "`bus.end_offset`,
@@ -3295,6 +3381,36 @@ class TestAnErrorFromLastValue:
             assert _subscriptions(bus.calls) == []
             assert worker.caught_up is False
             assert worker.state.position is None
+        finally:
+            await worker.stop()
+
+    async def test_it_propagates_before_step_3_passes_anything(self) -> None:
+        """Ruling 1 item 1: step 2a "runs after decision 4's step 2, so that
+        `replay_target` is known, and before step 3." With `first = 5` and a
+        fresh state, step 3 would call `note_passed(4)` and make
+        `event_sequence` 5; since `last_value` raises first, the exception
+        propagates (decision 7 as amended) with nothing passed: the position
+        is still `None` and `event_sequence` still `0`."""
+
+        stream = _held(range(5, 10))
+        bus = _FailingLastValueBus(stream, end=10, first=5)
+        worker = _worker_on(bus)
+
+        try:
+            with pytest.raises(_LastValueFailed):
+                await asyncio.wait_for(worker.start(), timeout=10.0)
+
+            assert worker.state.position is None
+            assert worker.state.event_sequence == 0
+            assert worker.caught_up is False
+            assert _subscriptions(bus.calls) == []
+            assert stream.taken == 0
+            # Step 2's two reads, then step 2a, and nothing after it.
+            assert bus.calls[-3:] == [
+                ("end_offset", TOPIC),
+                ("first_offset", TOPIC),
+                ("last_value", PREFIX_STATS_NAME),
+            ]
         finally:
             await worker.stop()
 
