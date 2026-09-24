@@ -31,6 +31,8 @@
 # falling back to tool_input.path (Grep/Glob). For an in-scope call under a
 # guarded policy, a path containing a NUL byte, or a path field that is not
 # a string, is refused first, before any other check (see NUL GATE below).
+# A path that is not in plain form is then refused before any glob list is
+# consulted (see PLAIN FORM below).
 #
 # NUL GATE (ADR-0018 decision 17, third amendment).
 #
@@ -60,6 +62,38 @@
 # could-not-be-checked denial, which names the status. An absent, null or
 # false path becomes the empty string through `// ""`, passes, and meets
 # the empty-path check as before. There is no knob to turn the gate off.
+#
+# PLAIN FORM (ADR-0018 decision 18, fourth amendment).
+#
+# The globs are matched against the path exactly as written. The script
+# resolves no `.` or `..` and expands no `~`: the relativisation below only
+# strips a root prefix. So `tests/../packages/x.py` would match `tests/*`
+# while the kernel opened `packages/x.py`. The rule therefore refuses,
+# rather than normalises, any path that is not in plain form, which is any
+# path that:
+#
+#   1. has a `/`-separated component that is exactly `..`;
+#   2. has a component that is exactly `.`;
+#   3. contains `//` anywhere;
+#   4. begins with `~`.
+#
+# Only a component that is exactly `.` or `..` counts: `.git`, `..foo`,
+# `x..y` and `...` are ordinary names. A leading `/` and a single trailing
+# `/` are plain. Relative paths are judged by the same four tests, so the
+# rule needs no base and reads neither cwd nor CLAUDE_PROJECT_DIR.
+#
+# It runs for every in-scope call under a guarded policy, whatever the
+# tool: it does not look at tool_name. It sits after the NUL gate, the
+# empty-path check, the relativisation and the project-root check, and
+# before every glob list, EXEMPT_GLOBS included. The root's own spellings
+# (`<root>`, `<root>/`, `<root>/.`, `<root>/./`, `.` and `./`) are handled
+# by the project-root check as before and never reach the rule. There is
+# no knob to turn it off.
+#
+# Symlinks are not handled: a path in plain form can still name, through
+# a symlink among its components, a file the globs never see. The guard
+# matches strings and does not touch the filesystem (ADR-0018 decision 18,
+# Question 5).
 #
 # WIRING -- read this before believing the guard is doing anything.
 #
@@ -215,6 +249,9 @@ fi
 # Normalize to a path relative to the project/worktree root when possible.
 # Note the exact-match arm: without it, a path equal to the root itself
 # fell through with `rel` still absolute and matched no glob at all.
+# This only strips a prefix; it resolves no `.`, `..` or `//` and expands
+# no `~`. A path out of plain form is refused by the rule below (see PLAIN
+# FORM in the header).
 project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
 rel="$file_path"
 for base in "$cwd" "$project_dir"; do
@@ -235,6 +272,17 @@ if [[ "$rel" == "." || "$rel" == "./" || -z "$rel" ]]; then
     deny "Hammertime path guard: a project-root ${tool_name} would search every file and can return files this agent may not read. Re-run it with an explicit in-scope 'path'."
   fi
   exit 0
+fi
+
+# Plain form (ADR-0018 decision 18; see PLAIN FORM in the header). Only
+# under a guarded policy, after the project-root check and before
+# EXEMPT_GLOBS, which exits 0 on a match. Wrapping the path in slashes makes
+# a `.` or `..` component at the start or the end look like one in the
+# middle. The `~` is quoted so that it is not subject to tilde expansion.
+if (( guarded )); then
+  if [[ "/$file_path/" == */../* || "/$file_path/" == */./* || "$file_path" == *//* || "$file_path" == "~"* ]]; then
+    deny "Hammertime path guard: the path contains a '.' or '..' component, a '//' or a leading '~'. This guard matches a path exactly as written and resolves none of these, so it cannot vet the file or directory the tool would actually use. Give the path without any of them. The tool call is refused."
+  fi
 fi
 
 matches_any() {
