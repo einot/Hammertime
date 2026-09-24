@@ -65,3 +65,6 @@ class PrefixStatsChanged:
     capacity: int
     sequence: int
     timestamp: datetime
+    #: `hot_count / capacity`, in `[0, 1]`; informational, optional on the wire
+    #: (ADR-0017 decision 14 item 5, Amendment 2 ruling 9). The trie sets it.
+    hot_ratio: float | None = None

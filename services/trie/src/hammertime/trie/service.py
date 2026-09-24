@@ -1,7 +1,7 @@
 """Composition root: the trie service the shared runner drives.
 
-Spec: section 33, section 47; ADR-0017 decisions 4, 10 and 13, ADR-0009
-decision 3.
+Spec: section 33, section 47; ADR-0017 decisions 4, 10 and 13 and Amendment 2
+(rulings 1, 4, 6 and 7), ADR-0009 decision 3.
 
 `build_service(settings, ...)` is the one place the object graph is
 assembled -- bus, `TrieState`, `TrieMetrics`, `TrieWorker`, the config poller
@@ -31,6 +31,7 @@ from fastapi import FastAPI
 from hammertime.bus.interface import MessageBus
 from hammertime.bus.memory import InMemoryBus
 from hammertime.bus.nats import TRANSIENT_ERRORS, NatsBus, bus_endpoints
+from hammertime.core.addressing.address import AddressFamily
 from hammertime.core.config.loader import load as load_detection_config
 from hammertime.core.config.models import DetectionConfig
 from hammertime.core.runtime import ConfigPoller, Readiness, connect_with_retry
@@ -206,6 +207,7 @@ class TrieService:
         `bus_endpoints` stands in for `HAMMERTIME_BUS_BROKERS`, which may carry
         userinfo (ADR-0013 Amendment 2); the value itself never appears.
         """
+        lengths = _min_prefix_lengths(self._settings)
         return {
             "bus_kind": self._settings.bus_kind,
             "bus_endpoints": bus_endpoints(self._settings.bus_brokers),
@@ -213,6 +215,11 @@ class TrieService:
             "config_version": self._poller.current.config_version,
             "bind": f"{self._settings.host}:{self._settings.port}",
             "families": sorted(family.value for family in self._settings.families),
+            # ADR-0017 Amendment 2 ruling 7: each served family's floor.
+            "min_prefix_lengths": {
+                family.value: lengths[family]
+                for family in sorted(self._settings.families, key=lambda f: f.value)
+            },
         }
 
     # --- internals ----------------------------------------------------------
@@ -250,5 +257,18 @@ def build_service(
         resolved_bus = InMemoryBus()
 
     state = TrieState(families=settings.families, config=detection_config)
-    worker = TrieWorker(bus=resolved_bus, state=state, metrics=TrieMetrics())
+    worker = TrieWorker(
+        bus=resolved_bus,
+        state=state,
+        metrics=TrieMetrics(),
+        min_prefix_lengths=_min_prefix_lengths(settings),
+    )
     return TrieService(settings, worker, detection_config, transport=transport)
+
+
+def _min_prefix_lengths(settings: TrieSettings) -> dict[AddressFamily, int]:
+    """Each family's shortest reported prefix (ADR-0017 Amendment 2 ruling 1)."""
+    return {
+        AddressFamily.IPV4: settings.min_prefix_length,
+        AddressFamily.IPV6: settings.min_prefix_length_ipv6,
+    }

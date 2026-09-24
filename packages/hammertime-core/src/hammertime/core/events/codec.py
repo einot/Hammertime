@@ -2,7 +2,8 @@
 
 Spec: section 19, section 32, section 46.2; ADR-0015 decision 5,
 Amendment 2 (ruling A) and Amendment 3 (ruling 3, assumptions 64-67); ADR-0011
-decision 3 step 1; ADR-0016 decisions 1 and 2
+decision 3 step 1; ADR-0016 decisions 1 and 2, and Amendment 1; ADR-0017
+Amendment 2 ruling 9
 
 The wire format is JSON. Every message is an `EventEnvelope` (see
 `envelope.py`) with a `payload` object whose field names match the relevant
@@ -47,6 +48,20 @@ envelope's `sequence` and `config_version` gain no bounds (ADR-0016 assumption
 `capacity` keeps its `[0-9]+` rule. Each bound is a module constant mirroring
 its schema (ADR-0016 assumption 10).
 
+`PrefixStatsChanged`'s `hot_ratio` is a JSON number, not one of the eight
+integer fields, and is optional (ADR-0017 Amendment 2 ruling 9, ADR-0016
+Amendment 1). On encode `None` writes no key; otherwise the value must be an
+`int` or a `float` and not a `bool`, a `float` must be finite, and the value
+must lie within the schema's inclusive bounds, 0 to 1; the wire carries
+`float(value)`. On decode an absent key is `None`; a present one must be an
+`int` that is not a `bool`, or a `float` -- `null` is refused -- and finite
+and within the same bounds, and is stored as `float(value)`. The type is
+checked first, then finiteness, then the range, so an oversized integer is
+refused by the range before anything converts it. Each check's text names
+the field and the rule it broke, never the value, and on decode the refusal
+is a `CodecError` whose `__cause__` is the check's own error. That
+`hot_ratio` equals `hot_count / capacity` is not checked.
+
 A `HotIpAdded`/`HotIpRemoved` payload's `attributes` document goes through
 `hammertime.core.events.attributes.canonicalize_ip_attributes`, the one
 implementation of the section 46.2 rules, on encode and on decode (ADR-0015
@@ -62,7 +77,7 @@ import json
 import math
 import re
 from datetime import UTC, datetime
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from hammertime.core.addressing.address import Address
 from hammertime.core.errors import CodecError, InvalidAddressError, InvalidAttributesError
@@ -118,6 +133,9 @@ _HOT_IP_CONFIG_VERSION = _Range(1, None)
 _PREFIX_STATS_HOT_COUNT = _Range(0, None)
 #: schemas/prefix_stats_event.v1.json: properties.sequence minimum.
 _PREFIX_STATS_SEQUENCE = _Range(0, None)
+#: schemas/prefix_stats_event.v1.json: properties.hot_ratio minimum and maximum
+#: (a JSON number, not an integer; ADR-0017 Amendment 2 ruling 9).
+_PREFIX_STATS_HOT_RATIO = _Range(0, 1)
 
 
 def _range_violation(value: int, field: str, bounds: _Range) -> str | None:
@@ -154,6 +172,44 @@ def _bounded_integer_field(value: object, field: str, bounds: _Range) -> int:
     if violation is not None:
         raise CodecError(violation)
     return number
+
+
+def _ratio_violation(value: object, field: str, bounds: _Range) -> str | None:
+    """Why `value` is not a valid bounded ratio, or None if it is.
+
+    The type first (an `int` that is not a `bool`, or a `float`), then
+    finiteness, then the range, so an oversized integer is refused by the
+    range before anything converts it. The text names the field and the rule
+    it broke, never the value (ADR-0017 Amendment 2 ruling 9).
+    """
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return f"{field} must be a number"
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"{field} must be finite"
+    if value < bounds.minimum:
+        return f"{field} must be >= {bounds.minimum}"
+    if bounds.maximum is not None and value > bounds.maximum:
+        return f"{field} must be <= {bounds.maximum}"
+    return None
+
+
+def _bounded_json_ratio(value: Any, field: str, bounds: _Range) -> float:
+    """Decode a bounded payload number, `null` refused, as a `float`.
+
+    Raises `ValueError`, which the caller turns into a `CodecError`.
+    """
+    violation = _ratio_violation(value, field, bounds)
+    if violation is not None:
+        raise ValueError(violation)
+    return float(value)
+
+
+def _bounded_ratio_field(value: object, field: str, bounds: _Range) -> float:
+    """Encode a bounded payload number as a `float`, else `CodecError`."""
+    violation = _ratio_violation(value, field, bounds)
+    if violation is not None:
+        raise CodecError(violation)
+    return float(cast("int | float", value))
 
 
 def _json_integer(value: Any, field: str) -> int:
@@ -390,7 +446,7 @@ def _encode_capacity(capacity: object) -> str:
 
 
 def _encode_prefix_stats_changed(payload: PrefixStatsChanged) -> dict[str, Any]:
-    return {
+    document: dict[str, Any] = {
         "prefix": payload.prefix,
         "hot_count": _bounded_integer_field(
             payload.hot_count, "hot_count", _PREFIX_STATS_HOT_COUNT
@@ -402,6 +458,11 @@ def _encode_prefix_stats_changed(payload: PrefixStatsChanged) -> dict[str, Any]:
         "sequence": _bounded_integer_field(payload.sequence, "sequence", _PREFIX_STATS_SEQUENCE),
         "timestamp": _format_timestamp(payload.timestamp),
     }
+    if payload.hot_ratio is not None:
+        document["hot_ratio"] = _bounded_ratio_field(
+            payload.hot_ratio, "hot_ratio", _PREFIX_STATS_HOT_RATIO
+        )
+    return document
 
 
 def _decode_prefix_stats_changed(data: dict[str, Any]) -> PrefixStatsChanged:
@@ -416,6 +477,13 @@ def _decode_prefix_stats_changed(data: dict[str, Any]) -> PrefixStatsChanged:
                 _require(data, "sequence"), "sequence", _PREFIX_STATS_SEQUENCE
             ),
             timestamp=_parse_timestamp(_require(data, "timestamp"), field="timestamp"),
+            # Optional: an absent key is None; a present one, null included,
+            # must be a finite number within its bounds (ruling 9).
+            hot_ratio=(
+                _bounded_json_ratio(data["hot_ratio"], "hot_ratio", _PREFIX_STATS_HOT_RATIO)
+                if "hot_ratio" in data
+                else None
+            ),
         )
     except (TypeError, ValueError, OverflowError) as exc:
         raise CodecError(f"malformed PrefixStatsChanged payload: {data!r}") from exc

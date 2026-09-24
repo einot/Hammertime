@@ -1,6 +1,6 @@
-"""The trie service's series: three counters, one gauge, five read off the state.
+"""The trie service's series: four counters, one gauge, five read off the state.
 
-Spec: section 37, section 46.8; ADR-0017 decision 12.
+Spec: section 37, section 46.8; ADR-0017 decision 12 and Amendment 2 ruling 7.
 
 Follows `AggregatorMetrics` (ADR-0011 decision 8, Amendment 3 A13). One series
 is one `(name, label values)` pair, and label values are compared as
@@ -26,6 +26,9 @@ COUNTERS: dict[str, tuple[str, ...]] = {
     "trie_updates": ("family", "event_type", "result"),
     "hot_ip_events_skipped": ("reason",),
     "attributes_rejected": ("stage",),
+    #: `PrefixStatsChanged` publishes that returned, duplicates included
+    #: (ADR-0017 Amendment 2 ruling 7).
+    "prefix_stats_published": ("family",),
 }
 
 #: `set` accepts these and nothing else.

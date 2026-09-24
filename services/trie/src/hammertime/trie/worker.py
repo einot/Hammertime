@@ -1,8 +1,8 @@
 """Single-writer positional replay worker applying HotIpAdded / HotIpRemoved.
 
 Spec: section 19, section 22, section 28, section 33, section 46.5; ADR-0017
-decisions 3-10, 12 and 17 (ADR-0013 decision 9, ADR-0014 A12, ADR-0015 decision 6,
-ADR-0015 Amendment 5 ruling 7).
+decisions 3-10, 12 and 17, and Amendment 2 (rulings 3-7) (ADR-0013 decision 9,
+ADR-0014 A12, ADR-0015 decision 6, ADR-0015 Amendment 5 ruling 7).
 
 Consumption (decision 3). One positional, whole-topic subscription to
 `hammertime.hot-ip.v1` (`partitions=None`, no listener), starting at
@@ -29,13 +29,27 @@ payload not a hot-ip event, key or subject not the payload's IP),
 `InvariantViolation` is logged and propagates (decision 7): the process exits
 1 and its restart is the rebuild.
 
+Publishing (Amendment 2 ruling 3). When the apply step changed the hot set,
+two steps follow step 5: 5a, `publisher.prepare()`, in the same synchronous
+section as the apply and `note_applied`; and 5b, `await publisher.publish()`,
+still under the worker's lock. The outcome is `APPLIED` once the publish has
+returned. Any other outcome publishes nothing. The worker catches only
+`PrefixStatsPublishError`: it logs `prefix_stats_publish_failed` and re-raises
+it (ruling 5), so the process exits 1 and the restart re-publishes. There is
+no retry. Startup replay goes through `handle()`, so it publishes too, and
+`start()` returns only once the last replayed message's publish has returned
+(ruling 4). `stop()` sets the flag, takes the lock, and flushes the producer
+(ruling 6).
+
 Atomicity (decision 9). Single-writer ownership on one event loop is the
 mechanism; there is no copy-on-write and no versioned snapshot pointer. The
 worker changes `TrieState` only inside `handle()` and `apply_config()`, and
-`start()`'s step 3 is one `note_passed` call under the lock, and
-`handle()` awaits nothing but the worker's lock: the apply step
-(`apply_hot_ip_added` / `apply_hot_ip_removed`, both synchronous) and
-`state.note_applied` run with no `await` between them (R1). Every reader
+`start()`'s step 3 is one `note_passed` call under the lock. The apply step
+(`apply_hot_ip_added` / `apply_hot_ip_removed`, both synchronous),
+`state.note_applied` and `publisher.prepare()` run with no `await` between
+them (R1; `prepare()` only reads). `handle()` awaits the worker's lock before
+that section and the publish after it; the publish writes nothing to the
+state. Every reader
 takes what it reports without an `await` between its first read and its last
 (R2), and no other thread touches the state (R3). A reader therefore always
 sees the state between two whole events (section 28).
@@ -52,7 +66,7 @@ are looked up when called, so a test can replace them (ADR-0017 Test seams).
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from enum import Enum, StrEnum
 from typing import Any, Final
 
@@ -65,6 +79,12 @@ from hammertime.core.events.codec import decode
 from hammertime.core.events.models import HotIpAdded, HotIpRemoved
 from hammertime.trie.metadata.ip_attributes import apply_hot_ip_added, apply_hot_ip_removed
 from hammertime.trie.metrics import TrieMetrics
+from hammertime.trie.publisher import (
+    DEFAULT_MIN_PREFIX_LENGTHS,
+    PrefixStatsPublisher,
+    PrefixStatsPublishError,
+    PreparedStats,
+)
 from hammertime.trie.state import FamilyState, TrieState
 
 logger = logging.getLogger(__name__)
@@ -112,11 +132,24 @@ class _Pump(Enum):
 class TrieWorker:
     """The trie's single writer: replays and follows the hot-ip log into `TrieState`."""
 
-    def __init__(self, *, bus: MessageBus, state: TrieState, metrics: TrieMetrics) -> None:
+    def __init__(
+        self,
+        *,
+        bus: MessageBus,
+        state: TrieState,
+        metrics: TrieMetrics,
+        min_prefix_lengths: Mapping[AddressFamily, int] = DEFAULT_MIN_PREFIX_LENGTHS,
+    ) -> None:
         self._bus = bus
         self._state = state
         self._metrics = metrics
         self._consumer = bus.consumer(CONSUMER_GROUP)
+        # The producer is taken once, as the consumer is (Amendment 2 ruling 3).
+        self._publisher = PrefixStatsPublisher(
+            bus.producer(), metrics=metrics, min_prefix_lengths=min_prefix_lengths
+        )
+        # Publishes that returned, for `replay_complete` (ruling 7).
+        self._published = 0
         metrics.bind_state(state)
         # One lock for everything that touches the state: `handle()`,
         # `apply_config()` and `stop()` (decision 6).
@@ -176,6 +209,7 @@ class TrieWorker:
             async with self._lock:
                 if not self._stopping.is_set() and first > self._state.event_sequence:
                     self._state.note_passed(first - 1)
+        published_before = self._published
         # 4. Subscribe from the next offset the trie will read.
         start_offset = self._state.event_sequence
         stream = await self._consumer.subscribe(HOT_IP.name, start_offset=start_offset)
@@ -191,11 +225,13 @@ class TrieWorker:
             )
         # 6. Replay complete.
         logger.info(
-            "replay_complete start_offset=%d first_offset=%d replay_target=%d event_sequence=%d",
+            "replay_complete start_offset=%d first_offset=%d replay_target=%d event_sequence=%d"
+            " prefix_stats_published=%d",
             start_offset,
             first,
             end,
             self._state.event_sequence,
+            self._published - published_before,
         )
 
     async def run(self) -> None:
@@ -212,26 +248,39 @@ class TrieWorker:
         await self._pump(stream, until=lambda: False)
 
     async def stop(self) -> None:
-        """Set the stop flag, then finish the message in hand; idempotent, safe before `start()`.
+        """Set the stop flag, finish the message in hand, flush; idempotent, safe before `start()`.
 
+        Taking the lock waits for the message in hand, every publish of its
+        stats included; then the producer is flushed, and the worker is
+        marked stopped whether or not the flush raised (Amendment 2 ruling
+        6). Every call takes all three steps. A flush's exception propagates.
         Does not close the consumer: the service does that, with the bus,
-        after this returns (decision 13). Slice 2 adds the producer flush
-        after the lock is taken, and the snapshot epic the final snapshot.
+        after this returns (decision 13). The snapshot epic adds the final
+        snapshot after the flush.
         """
         self._stopping.set()
         async with self._lock:
-            self._stopped = True
+            try:
+                await self._publisher.flush()
+            finally:
+                self._stopped = True
 
     async def handle(self, message: ConsumedMessage) -> HotIpOutcome:
-        """Decide and carry out one message's outcome (decision 6).
+        """Decide and carry out one message's outcome (decision 6, Amendment 2 ruling 3).
 
-        The lock is the only thing awaited: everything after it is one
-        synchronous section (decision 9, R1).
+        After the lock, steps 1-5 and 5a are one synchronous section
+        (decision 9, R1). Step 5b, the publish of an `APPLIED` event's stats,
+        is awaited after it, still under the lock.
         """
         async with self._lock:
             if self._stopping.is_set():
                 return HotIpOutcome.STOPPED
-            return self._handle(message)
+            outcome, prepared = self._handle(message)
+            if prepared is not None:
+                # 5b. Publish.
+                await self._publish(message, prepared)
+            # 6. Outcome.
+            return outcome
 
     async def apply_config(self, config: DetectionConfig) -> None:
         """Adopt `config` under the lock, unless `stop()` has begun (decision 10).
@@ -276,8 +325,37 @@ class TrieWorker:
         finally:
             await _cancel(stop_task)
 
-    def _handle(self, message: ConsumedMessage) -> HotIpOutcome:
-        """Decision 6 steps 1-6. Synchronous by construction (R1)."""
+    async def _publish(self, message: ConsumedMessage, prepared: PreparedStats) -> None:
+        """Step 5b: publish, and log and re-raise a `PrefixStatsPublishError` (ruling 5).
+
+        The record carries fixed tokens and numbers only: never a prefix, a
+        payload value or an exception's text (decision 12, ruling 7).
+        """
+        try:
+            await self._publisher.publish(prepared)
+        except PrefixStatsPublishError as exc:
+            first = exc.__cause__ if exc.__cause__ is not None else exc
+            logger.error(
+                "prefix_stats_publish_failed family=%s topic=%s partition=%d offset=%d"
+                " sequence=%d attempted=%d failed=%d error_type=%s",
+                prepared.family.value,
+                message.topic,
+                message.partition,
+                message.offset,
+                exc.sequence,
+                exc.attempted,
+                exc.failed,
+                f"{type(first).__module__}.{type(first).__qualname__}",
+            )
+            raise
+        self._published += len(prepared.messages)
+
+    def _handle(self, message: ConsumedMessage) -> tuple[HotIpOutcome, PreparedStats | None]:
+        """Decision 6 steps 1-5, and 5a when the hot set changed. Synchronous (R1).
+
+        Returns the outcome, and the stats step 5b publishes, or `None` when
+        there is nothing to publish.
+        """
         state = self._state
         position = state.position
 
@@ -290,7 +368,7 @@ class TrieWorker:
                 message.offset,
                 position,
             )
-            return HotIpOutcome.REDELIVERED
+            return HotIpOutcome.REDELIVERED, None
 
         # 2. Decode.
         decoded = self._decode(message)
@@ -306,7 +384,7 @@ class TrieWorker:
                 decoded.value,
             )
             state.note_handled(message.offset)
-            return HotIpOutcome.MALFORMED
+            return HotIpOutcome.MALFORMED, None
         payload = decoded
 
         # 3. Family.
@@ -324,7 +402,7 @@ class TrieWorker:
                 message.offset,
             )
             state.note_handled(message.offset)
-            return HotIpOutcome.FAMILY_NOT_SERVED
+            return HotIpOutcome.FAMILY_NOT_SERVED, None
 
         # 4. Apply.
         fs = state.of(family)
@@ -353,8 +431,17 @@ class TrieWorker:
             "trie_updates", family=family, event_type=event_type, result=outcome.value
         )
 
-        # 6. Outcome.
-        return outcome
+        # 5a. Prepare -- still no `await` since the apply step (R1).
+        if not changed:
+            return outcome, None
+        prepared = self._publisher.prepare(
+            fs.trie,
+            payload.ip,
+            sequence=state.event_sequence,
+            config_version=state.config.config_version,
+            timestamp=payload.timestamp,
+        )
+        return outcome, prepared
 
     def _apply_added(self, fs: FamilyState, message: ConsumedMessage, payload: HotIpAdded) -> bool:
         """`apply_hot_ip_added`; an attributes rejection is retried with the default document.
