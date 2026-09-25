@@ -2077,13 +2077,17 @@ root denial below, whatever the glob lists would say.
 | --- | --- | --- |
 | `project` | `CLAUDE_PROJECT_DIR` | an absolute path equal to the root, or beginning with the root and `/`; a relative path only when the payload's `cwd` equals the root |
 | `cwd` | the payload's `cwd` | an absolute path equal to the root, or beginning with the root and `/`; any relative path |
-| unset or empty | `cwd`, then `CLAUDE_PROJECT_DIR` (which falls back to `cwd`), as before | an absolute path inside either; any relative path |
+| unset or empty | `cwd`, then `CLAUDE_PROJECT_DIR` (which falls back to `cwd`), as before | an absolute path inside either; a relative path only when `cwd` or `CLAUDE_PROJECT_DIR` is non-empty |
 | anything else | none | a configuration error: every in-scope call is refused |
 
 * One trailing `/` is removed from a root, and from `cwd` before it is
   compared with a root, as the relativisation already does.
-* An empty root, its variable unset or empty, contains no path: every
-  guarded path is outside it.
+* The last column assumes a root that is not empty. An empty root, its
+  variable unset or empty, contains no path, absolute or relative: every
+  guarded path is outside it. With `PATH_ROOT` unset the root is empty when
+  `cwd` and `CLAUDE_PROJECT_DIR` are both empty; while either is non-empty,
+  a relative path is inside, and an absolute path is compared only with a
+  base that is non-empty (assumption 61).
 * The relativisation strips the root, or under an unset `PATH_ROOT` the two
   bases in turn, and does nothing else. As before it resolves nothing:
   decision 18's rule, which runs after it and before the root rule, refuses
@@ -2861,7 +2865,24 @@ those rest on.
     step W sets the knob. A value other than empty, `project` or `cwd` is a
     configuration error that refuses every in-scope call, as for
     `LITERAL_ONLY` (assumption 13). An empty root contains nothing, which
-    fails closed.
+    fails closed. With `PATH_ROOT` unset the root is empty only when `cwd`
+    and `CLAUDE_PROJECT_DIR` are both empty, and a relative path is then
+    outside it too. That is the architect's ruling of 2026-09-25, on the
+    top-level session's instruction, which preferred it. `supervisor`'s
+    review of C6 had found that decision 20's table then counted any
+    relative path inside under an unset `PATH_ROOT`, while the decision's
+    bullet on the empty root and this assumption counted none when both are
+    empty, and that C6 had followed the table. The ruling was taken because
+    it is what the bullet and this assumption already said; because it
+    treats the unset root as C6 already treats the `project` and `cwd`
+    roots; and because with neither base the guard cannot tell what a
+    relative path names, which is the root rule's own reason. No configured
+    policy reaches the case: a hook command cannot start with an empty
+    `CLAUDE_PROJECT_DIR` (decision 19, "What this does not settle"), and
+    from step W every path-guard policy sets `PATH_ROOT`. Under an explicit
+    policy the ruling refuses such a path even where the glob lists would
+    admit it, as the root rule does every path outside its root; before C6,
+    the glob lists alone judged it.
 62. **The coder's root is its worktree** (decision 20). The instructions for
     this amendment preferred it, and it settles Question 2 without waiting
     for P8. It rests on assumption 1: if the coder's `cwd` were the main
@@ -5159,6 +5180,21 @@ The tests must demonstrate the following, each item citing its decision.
      empty, and under `PATH_ROOT='cwd'` with `cwd` empty, Writes of
      `under_repo("services/x.py")` and of the relative `services/x.py` are
      refused with the root denial.
+     * *Follow-up to T4, added after C6 (2026-09-25).* With `PATH_ROOT`
+       unset, `cwd` and `CLAUDE_PROJECT_DIR` both empty, and
+       `DENY_GLOBS='tests/*'`, a Write of the relative `docs/x.md` is
+       refused with the root denial: with both bases empty the root is
+       empty and contains no path (decision 20's bullet on the empty root;
+       assumption 61). Controls, each allowed: the same Write with `cwd` the
+       repository root and `CLAUDE_PROJECT_DIR` still empty, and with `cwd`
+       still empty and `CLAUDE_PROJECT_DIR` the repository root. The refused
+       case fails at C6's commit `452a76d`, which counted any relative path
+       inside under an unset `PATH_ROOT`, and against the main checkout's
+       script, which has no root rule; it passes once brief C6's follow-up
+       is in the script. The controls pass at both. This case is dispatched
+       on its own, after T4's other items were written: add it, as a new
+       test in `tests/config/test_path_guard_behavior.py`, and nothing
+       else, under the rest of this brief's rules, "Do not" included.
    * *An invalid value.* `PATH_ROOT` set to `worktree`, to `Project`, and to
      `cwd` followed by a space each refuse, with `configuration error` and
      `PATH_ROOT` in the reason, a Write of `under_repo("services/x.py")`
@@ -5470,6 +5506,149 @@ not edit the test.
 * every Bash command you ran, in order and verbatim, each with its exit
   status or the refusal it met, including the ones that succeeded, starting
   with the fast-forward;
+* every refusal you received from any layer, verbatim, with what you did
+  next, and every file you created, including untracked ones;
+* every place where the ADR was ambiguous, contradicted the tests, or looked
+  wrong. Flag it; do not improvise.
+
+#### C6 follow-up, 2026-09-25
+
+*Added after `supervisor`'s review of C6, with the correction that the
+fifth amendment's log records as "Correction after C6's review,
+2026-09-25".* C6's commit, `452a76d`, followed decision 20's table as it
+then stood, which counted any relative path inside the root under an unset
+`PATH_ROOT`, even with `cwd` and `CLAUDE_PROJECT_DIR` both empty. Decision
+20 now counts one inside, under an unset `PATH_ROOT`, only when at least
+one of the two is non-empty. This item brings the script into line.
+
+Files you may touch: `.claude/hooks/path-guard.sh`. Nothing else: not
+`.claude/hooks/bash-guard.sh`, `.claude/settings.json`, any agent file, any
+test, `docs/`, `.gitignore` or `CHANGES`. The one other file you write is
+`.commit-msg`, for your commit message, and you never stage it.
+
+You work in C6's worktree, on top of C6's commit, before step W. As for C6,
+no Bash policy is wired for you yet, and your Edit/Write fence does not yet
+deny `.claude/`. Work as though both were in force: decision 2's literal
+forms only, and no file but the script (decision 13).
+
+Work from decision 20 as corrected. The copy of this ADR in your worktree
+predates the correction, so take these two passages from here:
+
+* the last cell of decision 20's table row for unset or empty now reads
+  "an absolute path inside either; a relative path only when `cwd` or
+  `CLAUDE_PROJECT_DIR` is non-empty";
+* decision 20's bullet on the empty root now reads:
+
+  > The last column assumes a root that is not empty. An empty root, its
+  > variable unset or empty, contains no path, absolute or relative: every
+  > guarded path is outside it. With `PATH_ROOT` unset the root is empty
+  > when `cwd` and `CLAUDE_PROJECT_DIR` are both empty; while either is
+  > non-empty, a relative path is inside, and an absolute path is compared
+  > only with a base that is non-empty (assumption 61).
+
+Nothing else in decisions 19-21 or in brief C6 changed with this
+correction.
+
+Do:
+
+1. **Start from C6's commit.** Your first commands are `git rev-parse HEAD`
+   and then `git status`. HEAD must be
+   `452a76d748c3e2e92b7790166b96880b3751084b`, and the worktree clean
+   (`.commit-msg` is ignored, decision 9). If either is not so, stop and
+   report. Run no `merge`, and do not reach the commit another way: no
+   `reset`, `checkout`, `switch`, `rebase` or `cherry-pick`.
+2. **The unset arm.** Where the relativisation decides whether a relative
+   path lies inside the root, the arm for an unset or empty `PATH_ROOT`
+   counts it inside only when at least one of the payload's `cwd` and
+   `CLAUDE_PROJECT_DIR` is non-empty. Test each value as given, before any
+   trailing `/` is removed, as the `project` and `cwd` arms already test
+   theirs; an unset `CLAUDE_PROJECT_DIR`, like an absent or null `cwd`,
+   counts as empty. Change nothing else: not those two arms, not the
+   comparison of a path with the bases, not the order of the checks, and no
+   message or exit code. Every payload then gets the verdict it gets at
+   `452a76d`, except a relative path that reaches the root rule under an
+   unset `PATH_ROOT` with `cwd` and `CLAUDE_PROJECT_DIR` both empty, which
+   is now refused with the root denial.
+3. **The comments.** The header's ROOT section now states both readings
+   side by side: its table's row for unset or empty admits "any relative
+   path", and the sentence after the table says that an empty root, its
+   variable unset or empty, contains no path. Make that row and that
+   sentence say what the two passages above say, and make the comment
+   above the relativisation, which says a relative path is inside "always
+   when PATH_ROOT is unset", say the same. Afterwards nothing in the script
+   may say that any relative path is inside under an unset `PATH_ROOT`.
+   Change no other comment.
+4. **Verify through the tests only, in this order,** as in C6:
+   `uv run --locked pytest -q tests/config`; then the four gates,
+   `uv run --locked pytest -q`, `uv run --locked ruff check .`,
+   `uv run --locked ruff format --check .` and `make typecheck`; then
+   `git diff --stat`.
+   * Do not run the script, `bash`, `jq`, `python` or any other interpreter
+     by hand, and do not use heredocs, quotes or multi-line commands.
+   * The test that checks this change, brief T4's follow-up case under item
+     3, "An empty root", is not in your worktree. Do not write it; the
+     top-level session runs it once your commit and it are together.
+   * If you need a check the tests do not provide, report it instead of
+     improvising one.
+5. **Commit in your worktree,** as a new commit on top of C6's.
+   * Write the message, trailers included, to `.commit-msg` at the worktree
+     root with the Write tool, replacing C6's message.
+   * Stage only the script, by path: `git add .claude/hooks/path-guard.sh`.
+   * Run `git commit -F .commit-msg`, then `git show --stat HEAD`, then
+     `git log --oneline -2`, then `git status`.
+   * Do not amend C6's commit. Leave the new commit in your worktree: do not
+     merge it, push it, or copy the script into the main checkout. The main
+     checkout's scripts are the live fences for every agent. Your commit,
+     which carries C6's, is the one SA1e audits as `<C6>` and the one that
+     is merged, only when SA1e's audit of that exact commit is clean and
+     `supervisor` has reviewed SA1e. Clean means no open finding, no
+     coverage entry marked `open`, and no coverage entry marked
+     `not-examined` other than A17, the harness side, which the probes
+     settle.
+
+**Stop and report on any refusal.** If any layer refuses a command or a
+write — this repository's guards, the harness's worktree check, a safety
+classifier or the platform sandbox — do not retry it, re-spell it, or reach
+the same effect another way. Stop the part of the work that needs it, finish
+anything that does not, and report the refusal. Do the same if a test fails
+and you believe the test, not your code, is wrong: stop, report it, and do
+not edit the test.
+
+**Done when:**
+
+* the unset arm follows decision 20 as corrected, the header and the
+  comment above the relativisation state that one reading, and nothing
+  else about the script's behaviour has changed;
+* every test in `tests/config/` gives the result it gave at `452a76d`: the
+  only failures in `uv run --locked pytest -q` are the tests brief C6's
+  "Done when" lists as waiting for step W, each listed by test id in your
+  report;
+* `uv run --locked ruff check .`, `uv run --locked ruff format --check .`
+  and `make typecheck` pass;
+* the change is committed, `git show --stat HEAD` lists
+  `.claude/hooks/path-guard.sh` alone, and `git log --oneline -2` shows
+  `452a76d` as its parent.
+
+**Do not:**
+
+* touch any file but `.claude/hooks/path-guard.sh`, apart from writing the
+  unstaged `.commit-msg`;
+* create any other file, a symlink included;
+* edit a test to make it pass, or write T4's follow-up case;
+* change any other arm, rule, message or exit code, or the order of the
+  checks;
+* add a knob;
+* emit an allow decision;
+* change a message prefix.
+
+**Report:**
+
+* the new commit's hash, and its parent's;
+* the lines changed in the script, before and after, verbatim;
+* the test results, with the expected failures listed by id, and any test
+  whose result differs from `452a76d`'s;
+* every Bash command you ran, in order and verbatim, each with its exit
+  status or the refusal it met, including the ones that succeeded;
 * every refusal you received from any layer, verbatim, with what you did
   next, and every file you created, including untracked ones;
 * every place where the ADR was ambiguous, contradicted the tests, or looked
@@ -8011,3 +8190,136 @@ Every edit of this correction:
     residual, this entry supersedes it.
   * Brief T4, decision 14's JSON and decision 22's lists: nothing the lists
     admit has changed.
+
+**Correction after C6's review, 2026-09-25.** Made in place on 2026-09-25,
+under the same convention as the entries above: every edit is listed, and
+each replaced passage is quoted verbatim. The replaced text is the ADR at
+commit `8384929`. The instructions came in a file in the top-level
+session's scratchpad, the one file outside `/home/user/Hammertime` the
+architect read. Inside the repository, beyond this ADR, the architect read
+C6's `.claude/hooks/path-guard.sh` in C6's worktree, the main checkout's
+`tests/config/test_path_guard_behavior.py` and `.gitignore`, and, under
+`.git/`, the files listed below that record which commits are checked out;
+and it searched the main checkout's `.claude/hooks/path-guard.sh` for
+`PATH_ROOT` and the root denial, and found neither, which is what "has no
+root rule" in brief T4's follow-up case rests on. No web access was used,
+nothing was run and no one was dispatched.
+
+The trigger, as the top-level session reported it to the architect:
+`supervisor`, reviewing C6, found an ambiguity in decision 20 that the ADR
+left unresolved (unresolved-spec-ambiguity, low). The table's row for an
+unset `PATH_ROOT` counted "any relative path" inside the root, while the
+bullet on the empty root ("An empty root, its variable unset or empty,
+contains no path: every guarded path is outside it") and assumption 61
+("An empty root contains nothing, which fails closed") said otherwise when
+`PATH_ROOT` is unset and `cwd` and `CLAUDE_PROJECT_DIR` are both empty.
+C6's commit `452a76d` followed the table there, so such a relative path is
+inside; its `cwd` arm, by contrast, requires a non-empty `cwd`. The case is
+probably unreachable, because the hook command cannot start with an empty
+`CLAUDE_PROJECT_DIR` (decision 19, "What this does not settle").
+
+**The ruling.** With `PATH_ROOT` unset, a relative path is inside the root
+only when at least one of `cwd` and `CLAUDE_PROJECT_DIR` is non-empty. When
+both are empty the root is empty, and every guarded path, absolute or
+relative, is outside it. This is the fail-closed reading, which the
+session's instructions preferred; the architect took it, for the reasons
+assumption 61 now gives. The table, the bullet and assumption 61 now say
+the same. Brief T4 gains a case that pins the ruling, and brief C6 a
+follow-up that brings the script into line.
+
+What this correction rests on, beyond the instructions:
+
+* The instructions said that, since there was no root rule before C6,
+  either reading changes no verdict that existed before. That holds for
+  every configured policy, which cannot reach the case, and for every test
+  in `tests/config/test_path_guard_behavior.py` at `8384929`. None of them
+  sends a relative path under an unset `PATH_ROOT` with both bases empty:
+  the architect searched the module for calls that set `cwd` or
+  `project_dir` to the empty string, and found only
+  `test_path_is_relativised_against_claude_project_dir`, whose path is
+  absolute, and T4's empty-root cases, which set `PATH_ROOT`. It does not
+  hold for an explicit policy in general: under the ruling, such a path is
+  refused even where the glob lists admit it, and before C6 the glob lists
+  alone decided it. Assumption 61 says so. The architect did not read the
+  tests in C6's worktree.
+* Read alone, the table's `project` and `cwd` rows also count a path inside
+  an empty root: the `cwd` row admits "any relative path"; the `project`
+  row admits a relative path when `cwd` equals the root, as it does when
+  both are empty; and every absolute path begins with the empty string and
+  `/`. C6's arms follow the bullet for both rows, and T4's empty-root cases
+  pin it for absolute paths under both and for a relative path under
+  `cwd`. The sentence "The last column assumes a root that is not empty",
+  added to the bullet, states that precedence for every row. It is the
+  architect's wording, added so that the table and the bullet agree in
+  every row, not only the one `supervisor` named; it changes no verdict of
+  C6's or of any test.
+* "Empty" means the value as given, before a trailing `/` is removed, as
+  "its variable unset or empty" already says and as C6's `project` and
+  `cwd` arms test it; brief C6's follow-up asks the unset arm to test it
+  the same way. So a root of `/` is not empty.
+* The instructions asked for one control for T4's follow-up case, with a
+  non-empty `cwd`. The case has a second, with `cwd` empty and
+  `CLAUDE_PROJECT_DIR` the repository root. That is the architect's
+  addition: without it no test would notice an unset arm that tested `cwd`
+  alone, which would refuse a call that the ruling admits and that both
+  `452a76d` and the main checkout's script allow.
+* C6's commit's full hash, `452a76d748c3e2e92b7790166b96880b3751084b`, was
+  read from `.git/refs/heads/worktree-agent-adcdbc2ec5344ec95`, the branch
+  that `.git/worktrees/agent-adcdbc2ec5344ec95/HEAD` names; and `8384929`
+  from `.git/refs/heads/claude/eager-gates-lyihfk`, which `.git/HEAD`
+  names. `.git/worktrees/agent-adcdbc2ec5344ec95/CLAUDE_BASE` was read as
+  well, and nothing here rests on it. No git command was run, so whether
+  either working tree differs from its commit was not checked.
+* That `.commit-msg` is ignored, as brief C6's follow-up says, is from line
+  22 of the main checkout's `.gitignore`; the worktree's copy was not read.
+
+Every edit:
+
+* **Decision 20, the table's row for unset or empty.** Its last cell
+  reworded: a relative path only when `cwd` or `CLAUDE_PROJECT_DIR` is
+  non-empty. The replaced cell:
+
+  > an absolute path inside either; any relative path
+
+* **Decision 20, the bullet on the empty root.** Reworded: the last column
+  assumes a root that is not empty; an empty root contains no path,
+  absolute or relative; and, under an unset `PATH_ROOT`, when the root is
+  empty and what lies inside it otherwise. The replaced bullet:
+
+  > * An empty root, its variable unset or empty, contains no path: every
+  >   guarded path is outside it.
+
+* **Assumption 61.** Sentences added after "which fails closed.": the
+  ruling, why it was taken, and what it costs. Nothing was replaced; the
+  item as it stood:
+
+  > 61. **An unset `PATH_ROOT` keeps today's two bases** (decision 20), so that
+  >     the module's existing tests, which set no knob, keep their meaning, and
+  >     so that the configured policies change only through the root rule until
+  >     step W sets the knob. A value other than empty, `project` or `cwd` is a
+  >     configuration error that refuses every in-scope call, as for
+  >     `LITERAL_ONLY` (assumption 13). An empty root contains nothing, which
+  >     fails closed.
+
+* **Brief T4, item 3, "An empty root".** A nested bullet added: the
+  follow-up case, its two controls, its expected state, and how it is
+  dispatched. Nothing was replaced.
+* **Brief C6.** "C6 follow-up, 2026-09-25" added at its end, before brief
+  SA1e. Nothing was replaced.
+* **This entry.** Added at the end of the section.
+* **Unchanged by this correction.**
+  * Decision 20's `project` and `cwd` rows and the rest of its text. The
+    bullet "Unset keeps today's two bases" still holds: no test that sets
+    no knob sends a call the ruling changes.
+  * Brief T4's other items and its "Expected state", "Done when" and "Do
+    not". The follow-up case states its own expected state.
+  * Brief C6's text before the follow-up, which records C6 as dispatched,
+    and brief SA1e. Where the Status, decision 13, Follow-through step 5
+    and briefs C6 and SA1e speak of C6's commit as the one SA1e audits and
+    the one merged, that is now the follow-up's commit, which carries
+    `452a76d`; the follow-up says so, and Follow-through step 5 already
+    sends a script fix to a coder on C6's branch, with a fresh audit of the
+    fixed commit.
+  * Decision 14's JSON; decisions 16, 19, 21 and 22; every other
+    assumption; the Sources; this section's entries above; and everything
+    else in the ADR.
