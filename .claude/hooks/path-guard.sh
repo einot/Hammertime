@@ -193,20 +193,31 @@
 #   cwd         the payload's cwd        an absolute path equal to the
 #                                        root or beginning with the root
 #                                        and `/`; any relative path
-#   unset/empty cwd, then                an absolute path inside either;
-#               CLAUDE_PROJECT_DIR       a relative path only when cwd
-#               (which falls back to     or CLAUDE_PROJECT_DIR is
-#               cwd), as before          non-empty
+#   unset/empty cwd, then                an absolute path inside either
+#               CLAUDE_PROJECT_DIR       usable base; a relative path
+#               (which falls back to     only when cwd is usable, or cwd
+#               cwd), as before          is empty and CLAUDE_PROJECT_DIR
+#                                        is usable
 #   other       none                     a configuration error: every
 #                                        in-scope call is refused
 #
 # One trailing `/` is removed from a root, and from cwd before it is
-# compared with a root. The last column assumes a root that is not empty.
-# An empty root, its variable unset or empty, contains no path, absolute
-# or relative: every guarded path is outside it. With PATH_ROOT unset the
-# root is empty when cwd and CLAUDE_PROJECT_DIR are both empty; while
-# either is non-empty, a relative path is inside, and an absolute path is
-# compared only with a base that is non-empty. The relativisation strips
+# compared with a root. The last column assumes a usable root. A root is
+# usable when it begins with `/`, is in plain form by decision 18's four
+# tests, and is not `/`, the one such root that is empty once its one
+# trailing `/` is removed. Any other root is treated as an empty root,
+# whatever the reason: its variable unset or empty, `/`, `//`, `/.`,
+# `/x/..`, a relative path, or anything else out of plain form. An empty
+# root contains no path, absolute or relative: every guarded path is
+# outside it. So under `project` a CLAUDE_PROJECT_DIR, and under `cwd` a
+# cwd, that is not usable puts every guarded path outside the root. With
+# PATH_ROOT unset, an absolute path is compared only with a base that is
+# usable; a relative path is inside only when cwd is usable, or when cwd
+# is empty and CLAUDE_PROJECT_DIR is usable; and with no usable base the
+# root is empty. cwd is empty when the payload's cwd is absent, null or
+# the empty string, and CLAUDE_PROJECT_DIR when it is unset or empty. The
+# usability test is applied to the value as given, before its trailing
+# `/` is removed. The relativisation strips
 # the root (or, unset, the two
 # bases in turn) and does nothing else; the path relative to the root is
 # what the glob lists see, and a relative path is kept as written.
@@ -220,7 +231,18 @@
 # and before every glob list, EXEMPT_GLOBS included; it refuses with the
 # root denial ("... is not inside this policy's root directory ..."). The
 # project root's own spellings are handled by the project-root check,
-# before the rule, as before. No knob turns the rule off: PATH_ROOT
+# before the rule, as before. Only a usable root has spellings of its own
+# there. The relativisation strips only a usable root or base, so the
+# check, which reads `rel`, fires for an absolute path only when it spells
+# a usable one: `<root>`, `<root>/`, `<root>/.` or `<root>/./`. Under a
+# root that is not usable, an absolute path keeps its form, and one in
+# plain form reaches the root rule: with CLAUDE_PROJECT_DIR and cwd both
+# `/` under PATH_ROOT='project', a Grep of `/` gets the root denial, not
+# the project-root denial. The relative spellings `.` and `./` are never
+# relativised, since a usable root or base is absolute, and keep the
+# check's handling whatever the root: a Read, Grep or Glob of either gets
+# the project-root denial, and an Edit or Write exits 0. No knob turns the
+# rule off: PATH_ROOT
 # chooses the root, not whether there is one. A path inside the root that
 # leads outside it through a symlink is not handled (Question 5).
 #
@@ -448,21 +470,31 @@ fi
 # inside it. Under PATH_ROOT='project' the root is CLAUDE_PROJECT_DIR,
 # under PATH_ROOT='cwd' the payload's cwd, and unset or empty keeps the two
 # old bases, cwd then CLAUDE_PROJECT_DIR (which falls back to cwd), tried
-# in turn. One trailing `/` is removed from a root; an empty root is
-# skipped and so contains no absolute path. Note the exact-match arm:
+# in turn. A root or base is used only when it is usable (usable_root:
+# it begins with `/`, is in plain form by decision 18's four tests, and is
+# not `/`); any other one, unset or empty included, is treated as an empty
+# root, skipped, and contains no path. Its one trailing `/` is removed only
+# after that test. Note the exact-match arm:
 # without it, a path equal to the root itself fell through with `rel`
 # still absolute and matched no glob at all. This only strips a prefix; it
 # resolves no `.`, `..` or `//` and expands no `~`. A path out of plain
 # form is refused by the rule below (see PLAIN FORM in the header).
 #
 # A relative path is kept as written and judged relative to the root:
-# inside for any non-empty root under `cwd`, only when the payload's cwd
-# equals the root under `project` (the harness resolves a relative path
-# against cwd), and when PATH_ROOT is unset only while cwd or
-# CLAUDE_PROJECT_DIR is non-empty (both empty is an empty root, which
-# contains no path). Under `project` and
-# `cwd` only an absolute path is compared with the root; unset keeps the
-# old comparison for every path.
+# under `cwd` inside only when cwd is usable; under `project` only when
+# CLAUDE_PROJECT_DIR is usable and the payload's cwd equals it, one
+# trailing `/` removed from each (the harness resolves a relative path
+# against cwd); and when PATH_ROOT is unset only when cwd is usable, or
+# when cwd is empty and CLAUDE_PROJECT_DIR is usable. With no usable base
+# the root is empty and contains no path. Under `project` and `cwd` only
+# an absolute path is compared with the root; unset keeps the old
+# comparison for every path, against usable bases only. Since a usable
+# root is absolute, `.` and `./` are never relativised and keep the
+# project-root check's handling whatever the root.
+usable_root() {
+  local root="$1"
+  [[ "$root" == /* && "$root" != / && "$root" != *//* && "/$root/" != */../* && "/$root/" != */./* ]]
+}
 project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
 case "$path_root" in
   project) root_bases=("${CLAUDE_PROJECT_DIR:-}") ;;
@@ -473,7 +505,7 @@ rel="$file_path"
 inside=0
 if [[ -z "$path_root" || "$file_path" == /* ]]; then
   for base in "${root_bases[@]}"; do
-    [[ -z "$base" ]] && continue
+    usable_root "$base" || continue
     base="${base%/}"
     if [[ "$file_path" == "$base" ]]; then
       rel="."
@@ -489,17 +521,19 @@ fi
 if (( ! inside )) && [[ "$file_path" != /* ]]; then
   case "$path_root" in
     project)
-      if [[ -n "${CLAUDE_PROJECT_DIR:-}" && "${cwd%/}" == "${CLAUDE_PROJECT_DIR%/}" ]]; then
+      if usable_root "${CLAUDE_PROJECT_DIR:-}" && [[ "${cwd%/}" == "${CLAUDE_PROJECT_DIR%/}" ]]; then
         inside=1
       fi
       ;;
     cwd)
-      if [[ -n "$cwd" ]]; then
+      if usable_root "$cwd"; then
         inside=1
       fi
       ;;
     *)
-      if [[ -n "$cwd" || -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+      if usable_root "$cwd"; then
+        inside=1
+      elif [[ -z "$cwd" ]] && usable_root "${CLAUDE_PROJECT_DIR:-}"; then
         inside=1
       fi
       ;;
