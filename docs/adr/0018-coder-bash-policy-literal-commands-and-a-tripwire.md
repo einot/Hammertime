@@ -14,12 +14,12 @@ that day, and the fourth amendment records both: SA1c's audit of C4's commit
 is discarded as the merge gate, and `..` traversal in `path-guard.sh` is to be
 fixed first, after which a fresh auditor audits decision 17's gate and that
 fix together. The fix's design, decision 18, is the architect's, not the
-owner's. On 2026-09-25 the owner ruled three times more, and the fifth
-amendment records all three. C4's and C5's commits were merged although
+owner's. On 2026-09-25 the owner ruled four times more, and the fifth
+amendment records all four. C4's and C5's commits were merged although
 SA1d's audit of them was not clean, taking the option that assumption 48
 left to the owner, because every open finding predates them. The fence gaps
 confirmed after that audit are fixed next, with step W, the probes V1-V4 and
-the slice-3 coder waiting for that round. And the criterion by which SA1e
+the slice-3 coder waiting for that round. The criterion by which SA1e
 judges symlinks, in its areas A18 and G6, is the owner's: a link is a
 finding if any call the amended policies allow, a read or a write, would
 through it act on a file its policy guards or reach a path outside the
@@ -27,9 +27,22 @@ agent's root; the untracked `.venv/` interpreter links are known links that
 are not a route, which the auditor still verifies; and Question 5 stays
 open, without by itself keeping those areas from being clean. The owner
 decided it after `supervisor` found that the fifth amendment, as first
-written, had narrowed SA1d's criterion without the owner's direction. The
-fixes' design, decisions 19-22, is the architect's, not the owner's. Nothing
-else in this ADR has been ruled on by the owner. Question 4 was ruled on
+written, had narrowed SA1d's criterion without the owner's direction. And
+the owner accepted the residual of decision 22's test-author lists under
+existing members: "a `tests` directory anywhere under a member of
+packages/, services/ or tools/" is accepted test-author territory, for
+writes and reads alike, not only the nine package test directories. A
+member is an existing uv workspace member, a directory with its own
+`pyproject.toml`. The decision does not cover a `tests` directory under a
+would-be member, such as `tools/new-tool/` with no `pyproject.toml`, which
+the lists admit too: SA1e judges that case as an ordinary question under
+its rule 4. SA1e still confirms that decision 22's account of what the
+lists admit is accurate, and that the Edit/Write deny list still refuses
+its names there; the residual under existing members, as that account
+describes it, is not a finding, and anything the lists admit beyond the
+account is. The fixes' design, decisions 19-22, is the architect's, not
+the owner's. Nothing else in this ADR has been ruled on by the owner.
+Question 4 was ruled on
 2026-09-24 by the top-level session, not by the owner, under CLAUDE.md's
 pre-1.0 standing order, because its recommendation was unambiguous and only
 tightens a guard; the session took this ADR's own recommendation (decision
@@ -2382,7 +2395,13 @@ agent-configuration list; and the test-author's lists are the ones above.
 * **The `tests` directories beyond the nine.** The test-author can create
   and change files in any directory named `tests` in the three code trees,
   not only in the nine, and read any file in one. This is recorded, not
-  tightened (assumption 53).
+  tightened (assumption 53). On 2026-09-25 the owner accepted it under
+  existing members: "a `tests` directory anywhere under a member of
+  packages/, services/ or tools/" is accepted test-author territory, where
+  a member is an existing uv workspace member, a directory with its own
+  `pyproject.toml`. The decision does not cover a `tests` directory under a
+  would-be member, such as `tools/new-tool/` with no `pyproject.toml`, the
+  case that "One effect is loud", below, describes.
   * Admitting exactly the nine would mean naming each, by member and
     package, in both lists: no glob made of `*` and literal names can hold a
     `*` to one directory level, and a shape such as
@@ -2405,7 +2424,14 @@ agent-configuration list; and the test-author's lists are the ones above.
     `pyproject.toml` (from recall), so every `uv run --locked` fails until
     the directory is removed.
 
-  SA1e's G1 and G3 are asked to confirm this account or refute it.
+  SA1e's G1 and G3 are asked to confirm this account or refute it, and, as
+  the owner directed, to confirm in particular that it says accurately what
+  the lists admit and that the Edit/Write deny list still refuses its names
+  inside such a directory. By the owner's decision, the residual under
+  existing members, as accurately described here, is not a finding. The
+  would-be-member case is not covered by that decision: SA1e judges it as
+  an ordinary question under its rule 4. Anything the lists admit beyond
+  this account is a finding.
 * The test-author's read policy is still a denylist, and an enumeration only
   has to miss one location that holds a copy of the implementation, or data
   derived from it (Question 7).
@@ -2769,8 +2795,18 @@ those rest on.
     members' source trees require, and so admit any directory named `tests`
     (decision 22). Recording that residual rather than naming the nine
     directories, and judging that it reaches little, are the architect's
-    calls, for the reasons decision 22 gives. That uv refuses a workspace
-    member without a `pyproject.toml` is from recall.
+    calls, for the reasons decision 22 gives. Accepting it under existing
+    members is not: on 2026-09-25 the owner decided that "a `tests`
+    directory anywhere under a member of packages/, services/ or tools/" is
+    accepted test-author territory, for writes and, through the read
+    exemptions, for reads. A member is an existing uv workspace member, a
+    directory with its own `pyproject.toml`, so the residual under existing
+    members, as decision 22 accurately describes it, is not a finding for
+    SA1e. The decision does not cover a `tests` directory under a would-be
+    member, such as `tools/new-tool/` with no `pyproject.toml`, which the
+    anchored entries admit too; SA1e judges that case as an ordinary
+    question under its rule 4. That uv refuses a workspace member without a
+    `pyproject.toml` is from recall.
 54. **The shape check runs before the routing, for every caller** (decision
     19). The instructions for this amendment required any non-object
     `tool_input`, and any extraction failure, to deny; where to check was the
@@ -5040,6 +5076,19 @@ rather than choosing.
 * Decisions 19 and 20's denials contain a status or a value: pin the text
   around it, not the number.
 
+**Two denials the ADR does not quote.** Items 3 and 5 name two denials that
+predate decisions 19-22.
+
+* The `DENY_GLOBS` denial: assert that its reason begins
+  `Hammertime path guard: ` and contains `matched DENY_GLOBS`, the phrase
+  decision 15's D3-D8 outcomes give for it. Pin nothing else of its text.
+* The project-root denial: the ADR pins no phrase for it. Where item 3
+  names it, assert only a refusal, as the module's `assert_denied` checks
+  one, whose reason is not the root denial, the plain-form denial or the
+  shape denial: it contains none of
+  `is not inside this policy's root directory`, `a '.' or '..' component`
+  and `could not be read as a single tool call`.
+
 The tests must demonstrate the following, each item citing its decision.
 
 1. **Payload shape, `path-guard.sh`** (decision 19). Each of these is
@@ -5070,14 +5119,22 @@ The tests must demonstrate the following, each item citing its decision.
      The same holds for a caller outside the policy's scope.
    * With a `jq` that exits 3 and prints nothing, the same Write is refused
      with exit 2, nothing on stdout, and stderr containing the shape denial:
-     the shape check fails, and `deny` falls back to stderr.
+     the shape check fails, and `deny` falls back to stderr. The same holds
+     for a caller outside the policy's scope, for example a payload with no
+     `agent_type` under the module's `SCOPED_TO_CODER`: the shape check runs
+     before the routing, for every caller (decision 19, part 3), so the
+     routing is never reached.
 3. **The root, `path-guard.sh`** (decision 20), under explicit policies,
    with `run_guard`'s `cwd` and `project_dir`.
    * *`PATH_ROOT` unset,* with `cwd` and `CLAUDE_PROJECT_DIR` both the
      repository root. Under `ALLOW_GLOBS='*/tests/*'`, a Write of
      `f"{tmp_path}/tests/x.py"` is refused with the root denial, although
-     the glob would match it, and a Write of `under_repo("tests/x.py")` is
-     allowed. Under `DENY_GLOBS='packages packages/*'`, a Grep of
+     the glob would match it, and a Write of
+     `under_repo("services/ingest/tests/x.py")` is allowed, because the
+     glob matches its relative form, `services/ingest/tests/x.py`. (Not
+     `under_repo("tests/x.py")`: its relative form, `tests/x.py`, has no `/`
+     before `tests`, so the glob does not match it and the allowlist refuses
+     it.) Under `DENY_GLOBS='packages packages/*'`, a Grep of
      `str(tmp_path)`, one of `str(REPO_ROOT.parent)` and one of `/` are each
      refused with the root denial, and a Grep of `docs` is allowed.
    * *`PATH_ROOT='project'`,* `CLAUDE_PROJECT_DIR` the repository root,
@@ -5214,10 +5271,15 @@ The tests must demonstrate the following, each item citing its decision.
      policy with `agent_type` `coder`, where the reason then ends with
      decision 11's paragraph after one space; under the auditor's policy
      with `agent_type` `security-auditor`, where it carries no paragraph;
-     under a policy with no `ALLOW_CMDS`; and with no `agent_type` under
-     each of the two scoped policies, where the paragraph follows that
-     policy's `DENY_ADVICE`. Controls: the well-formed payload is allowed,
-     or passed through, in each case.
+     under `policy={}` with `agent_type` `coder`, where it carries no
+     paragraph either; and with no `agent_type` under each of the two
+     scoped policies, where the paragraph follows that policy's
+     `DENY_ADVICE`. `policy={}` sets no knob. It is this script's policy
+     that constrains nothing (decision 19, part 3): with no `ALLOW_CMDS` it
+     polices no well-formed command, and with no `DENY_ADVICE` its denials
+     carry no paragraph (decision 11). Controls: the well-formed payload is
+     allowed, or passed through, in each case; under `policy={}` it passes
+     through, with exit 0 and empty stdout.
    * With a `jq` that exits 1 and prints nothing, `git status` under the
      coder policy is refused: exit 2, and stdout a JSON deny whose reason
      begins with the bash prefix, contains `before reaching a verdict`, is
@@ -5241,6 +5303,11 @@ You have no Bash and cannot run the tests. Write them carefully, and say in
 your report which ones you are least sure will collect or pass as written.
 Name among them the failing-`jq` tests, which rest on decision 19's order of
 checks, and the newline pattern, which rests on `jq`'s regular expressions.
+
+Ruff's line length in this repository is 100 characters (`ruff.toml`,
+`line-length = 100`); keep every line of the three modules within it. It is
+stated here because a project-root Glob is refused for you, so you cannot
+look it up.
 
 **Done when:** the three modules cover items 1-7; no other file changed and
 no existing test, helper or constant changed; and the report lists the test
@@ -5624,8 +5691,20 @@ The gaps, as the section "Fifth amendment 2026-09-25" records them:
   "What it does not settle": that the entries admit any `tests` directory in
   those trees, existing or new, and not only the nine package test
   directories; that the nine are all there are; and that what the residual
-  reaches is what that account says. Whether the residual is a finding, and
-  at what severity, is yours to judge under rule 4; if you report it, say
+  reaches is what that account says. By the owner's decision of
+  2026-09-25, "a `tests` directory anywhere under a member of packages/,
+  services/ or tools/" is accepted test-author territory, where a member
+  is an existing uv workspace member, a directory with its own
+  `pyproject.toml`. So the residual under existing members, as that
+  account accurately describes it, is not yours to judge: it is not a
+  finding, and does not by itself keep this area from being
+  `checked-clean`. The decision does not cover a `tests` directory under a
+  would-be member, such as `tools/new-tool/` with no `pyproject.toml`,
+  which the entries admit too. That case remains an ordinary question
+  under rule 4: judge it, as a finding or not and at what severity, and
+  give your basis. Anything the test-author can write beyond that account
+  is a finding, and so is any name on decision 22's deny list that it can
+  write inside a `tests` directory. If you report any of these, say
   whether it lies in C6's diff or in decision 14's text.
 * `G2 above the root`: Can the test-author Read, Grep or Glob any path
   outside the project root, `/home/user` and `/proc/self/cwd/...` included,
@@ -5638,7 +5717,18 @@ The gaps, as the section "Fifth amendment 2026-09-25" records them:
   or refute decision 22's account of the read exemptions: that they exempt
   every directory named `tests` anywhere under a member of the three code
   trees, with everything under it, and that nothing the coder writes
-  through its fences lands there.
+  through its fences lands there. By the owner's decision of 2026-09-25,
+  "a `tests` directory anywhere under a member of packages/, services/ or
+  tools/" is accepted test-author territory, for reads as for writes,
+  where a member is an existing uv workspace member, as in G1: the
+  exemptions' reach into such a directory, as that account accurately
+  describes it, is not a finding, and does not by itself keep this area
+  from being `checked-clean`. The decision does not cover a `tests`
+  directory under a would-be member, such as `tools/new-tool/` with no
+  `pyproject.toml`, which the exemptions admit too. That case remains an
+  ordinary question under rule 4: judge it, as a finding or not and at
+  what severity, and give your basis. Anything the read exemptions admit
+  beyond that account is still a finding.
 * `G4 patterns`: Does decision 21's rule refuse every Glob `pattern` and
   Grep `glob` outside its grammar, whatever the value's type, and nothing
   inside it? Is the field chosen by the payload's `tool_name` as decision 21
@@ -7620,3 +7710,304 @@ Every edit of these corrections:
     what the guard admits.
   * This section's entries above, which record the amendment as first
     written.
+
+**Corrections before T4, 2026-09-25.** Made in place on 2026-09-25, before
+brief T4 is dispatched again, under the same convention as the entries
+above: every edit is listed, and each replaced passage is quoted verbatim.
+The replaced text is the ADR at commit `66cad04`. Outside
+`/home/user/Hammertime` the architect read only the file in the top-level
+session's scratchpad that held its instructions. No web access was used,
+nothing was run and no one was dispatched.
+
+The trigger, as the top-level session reported it to the architect:
+
+1. **The owner's decision on G1's residual (2026-09-25).** The
+   test-author's anchored lists, `packages/*/tests/*`, `services/*/tests/*`
+   and `tools/*/tests/*` and the matching read exemptions, admit any
+   directory named `tests` anywhere under a member of those trees, not only
+   the nine package test directories. The owner accepts this: a `tests`
+   directory anywhere under a member of `packages/`, `services/` or
+   `tools/` is accepted test-author territory. SA1e must still confirm that
+   decision 22's account of what the globs admit is accurate, and that the
+   deny list still refuses its names there. The residual itself, as
+   accurately described, is not a finding; anything the globs admit beyond
+   that account still is. *(Corrected by the entry "Correction after
+   `supervisor`'s review of these corrections", below: as first recorded,
+   this item also said "existing or new", which were the session's words,
+   not the owner's.)*
+2. **Errors in brief T4, found by the test-author,** which stopped, before
+   writing anything, after a guard refusal:
+   * item 3's first bullet expected a Write of `under_repo("tests/x.py")`
+     to be allowed under `ALLOW_GLOBS='*/tests/*'` with `PATH_ROOT` unset.
+     Relativised, the path is `tests/x.py`, and `*/tests/*` needs a `/`
+     before `tests`. The top-level session confirmed by execution that
+     today's `path-guard.sh` exits 2 for it;
+   * items 3 and 5 named "the `DENY_GLOBS` denial", and item 3 "the
+     project-root denial", without saying what a test pins of either;
+   * item 7's "a policy with no `ALLOW_CMDS`" named no policy and no
+     `agent_type`; the test-author proposed `policy={}` with `agent_type`
+     `coder`, expecting no advice paragraph;
+   * item 2's case at exit 3 did not say whether a caller outside the
+     policy's scope is checked, although decision 19 runs the shape check
+     for every caller.
+3. **Ruff's line length.** A project-root Glob is refused for the
+   test-author, so it cannot find `ruff.toml` itself, and brief T4 did not
+   say.
+
+What the corrections rest on, beyond this ADR:
+
+* Item 1 is the owner's decision as the top-level session reported it. That
+  it covers a would-be member's `tests` directory, which decision 22's
+  account includes, is the architect's reading (assumption 53).
+* T4's `DENY_GLOBS` phrase is taken from this ADR's own text: decision 15's
+  D3-D8 outcomes give `matched DENY_GLOBS` as what that denial contains.
+  The architect then read the denial in the main checkout's
+  `.claude/hooks/path-guard.sh` only to confirm that the two agree, and
+  they do (line 305). The ADR quotes no text of the project-root denial and
+  pins no phrase for it. The architect saw that denial's text in the script
+  too (line 272) and pinned none of it, so T4 asserts only a refusal that
+  is not the root, plain-form or shape denial.
+* That a bash-guard policy with no `ALLOW_CMDS` polices no well-formed
+  command was not stated in this ADR before; T4's item 7 now states it for
+  `policy={}`. It is the script's existing behaviour, which decision 19
+  leaves in place: the architect read it in the main checkout's
+  `.claude/hooks/bash-guard.sh`, in its header ("An empty ALLOW_CMDS exits
+  0") and at line 728. That an unset `DENY_ADVICE` adds no paragraph is
+  decision 11's. `run_guard` in `tests/config/test_bash_guard_behavior.py`
+  clears every policy variable from the inherited environment, so
+  `policy={}` sends no knob.
+* Ruff's line length: `ruff.toml`, line 1, `line-length = 100`.
+* To check T4 for the same mistake as item 3's, the architect matched by
+  hand every other path in items 3, 4 and 5 that T4 expects a glob list to
+  admit or refuse against the list in force, before step W or after it as
+  each case says, using the helpers and constants of
+  `tests/config/test_path_guard_behavior.py` (`under_repo`, `run_guard`,
+  `SCOPED_TO_CODER` and the file constants) and decisions 14, 20 and 22.
+  No other expectation was wrong. The root-denial cases also rest on
+  pytest's `tmp_path` lying outside the repository; `pyproject.toml` sets no
+  `basetemp`.
+
+Every edit:
+
+* **Status, first paragraph.** "three times more" became "four times more",
+  and "records all three" "records all four"; "And the criterion" became
+  "The criterion"; two sentences on the owner's acceptance of decision 22's
+  residual were inserted before "The fixes' design, decisions 19-22"; and
+  the line breaks of the lines after them moved, their words unchanged. The
+  replaced words, in order:
+
+  > On 2026-09-25 the owner ruled three times more, and the fifth
+  > amendment records all three.
+
+  > And the criterion by which SA1e
+  > judges symlinks
+
+* **Decision 22, "What it does not settle", its first item.** Its opening
+  gains the owner's decision, and its closing sentence is extended: SA1e
+  confirms the account, as the owner directed, and the residual as
+  described is not a finding. The replaced words, in order:
+
+  > tightened (assumption 53).
+
+  > SA1e's G1 and G3 are asked to confirm this account or refute it.
+
+* **Assumption 53.** Two sentences inserted after "for the reasons decision
+  22 gives.": accepting the residual is the owner's decision, and the
+  architect's reading of how far it reaches. The item's last lines moved.
+  Nothing was replaced; the lines as they stood:
+
+  > calls, for the reasons decision 22 gives. That uv refuses a workspace
+  > member without a `pyproject.toml` is from recall.
+
+* **Brief SA1e, G1.** Its last sentence replaced by the owner's decision:
+  the residual as accurately described is not a finding, and anything
+  beyond it, or a name on the deny list inside such a directory, still is.
+  The replaced text:
+
+  > Whether the residual is a finding, and
+  > at what severity, is yours to judge under rule 4; if you report it, say
+  > whether it lies in C6's diff or in decision 14's text.
+
+* **Brief SA1e, G3.** Two sentences added at the end, on the owner's
+  decision for the read exemptions. Nothing was replaced.
+* **Brief T4, after "Building the payloads".** A paragraph, "Two denials
+  the ADR does not quote", added: the `DENY_GLOBS` denial is pinned by
+  `matched DENY_GLOBS`, and for the project-root denial a test asserts only
+  a refusal that is not the root, plain-form or shape denial. Nothing was
+  replaced.
+* **Brief T4, item 2, its second bullet.** A sentence added: the same holds
+  for a caller outside the policy's scope, because the shape check runs
+  before the routing. Nothing was replaced.
+* **Brief T4, item 3, its first bullet.** The allowed control is now a
+  Write of `under_repo("services/ingest/tests/x.py")`, which `*/tests/*`
+  matches, and a parenthesis says why `under_repo("tests/x.py")` does not
+  serve. The replaced words:
+
+  > and a Write of `under_repo("tests/x.py")` is
+  > allowed.
+
+* **Brief T4, item 7, its first bullet.** "A policy with no `ALLOW_CMDS`"
+  is now `policy={}` with `agent_type` `coder`, with its expectations: no
+  paragraph, and a control that passes through. The replaced text:
+
+  > under a policy with no `ALLOW_CMDS`; and with no `agent_type` under
+  > each of the two scoped policies, where the paragraph follows that
+  > policy's `DENY_ADVICE`. Controls: the well-formed payload is allowed,
+  > or passed through, in each case.
+
+* **Brief T4, after "You have no Bash".** A paragraph added: ruff's line
+  length is 100 (`ruff.toml`). Nothing was replaced.
+* **This section.** These corrections added at its end.
+* **Unchanged by these corrections.**
+  * Decision 14's JSON, decision 22's lists, and decisions 19-21: the lists
+    admit exactly what they did.
+  * The gaps table's rows G1 and G3, the Consequences bullet on the lists,
+    and Question 7. They say what the residual is, which has not changed;
+    the owner's decision settles whether it is a finding, which the Status,
+    decision 22, assumption 53 and brief SA1e now record.
+  * In brief T4, every other expectation, "Work from", "Expected state",
+    "Done when" and "Do not". Item 3's corrected control and item 7's
+    `policy={}` control pass today, as controls must, and the case added to
+    item 2 fails until C6 like the rest of that item, so "Expected state"
+    still holds.
+  * SA1e's rules 1-5 and its other areas; briefs C6 and V1-V4; decision 15;
+    the Sources.
+  * This section's entries above.
+
+**Correction after `supervisor`'s review of these corrections,
+2026-09-25.** `supervisor` reviewed the corrections above and found one
+issue (owner-decision-overreach, medium). The top-level session's
+instructions for those corrections introduced it. They said that the
+test-author's lists admit any `tests` directory "anywhere under a member of
+those trees, existing or new", and gave that as what the owner accepted.
+The owner's words were "a `tests` directory anywhere under a member of
+packages/, services/ or tools/". "Existing or new" was the session's
+addition, and the session has since said that it was its error. The
+architect carried it into the operative text as the owner's decision: the
+Status, decision 22's first "What it does not settle" item and brief
+SA1e's G1 and G3 presented the broader reading as the owner's, and
+assumption 53 recorded, as the architect's reading, that the acceptance
+covers a would-be member's `tests` directory, such as
+`tools/new-tool/tests/`. Together they told SA1e not to report the
+would-be-member case. A would-be member, such as `tools/new-tool/` with no
+`pyproject.toml`, is not a member. The instructions for this correction
+came inline from the top-level session. In making it, no web access was
+used, nothing outside `/home/user/Hammertime` was read, nothing was run and
+no one was dispatched.
+
+What the session directed, and this correction does:
+
+* The owner's acceptance covers a directory named `tests` anywhere under
+  an existing workspace member of `packages/`, `services/` or `tools/`: a
+  directory that has its own `pyproject.toml` and is a uv workspace member.
+* A `tests` directory under a would-be member, such as
+  `tools/new-tool/tests/`, is not covered by the owner's decision. For
+  SA1e it remains an ordinary question under rule 4, and G1 and G3 now say
+  so and ask the auditor to judge it.
+* "Existing or new" is removed wherever it was attributed to the owner,
+  and assumption 53 no longer claims the broader reading.
+
+The architect also read `pyproject.toml` line 18, whose `members` globs,
+`packages/*`, `services/*` and `tools/*`, name the workspace's members.
+
+Every edit of this correction:
+
+* **Status, first paragraph.** The two sentences on the owner's acceptance
+  of decision 22's residual rewritten: the owner's words quoted, a member
+  said to be an existing uv workspace member, the would-be-member case
+  said not to be covered and left to SA1e under its rule 4, and the
+  residual that is not a finding limited to existing members. The lines
+  after them were re-broken, their words unchanged. The replaced text:
+
+  > the owner accepted the residual of decision 22's test-author lists: a
+  > directory named `tests` anywhere under a member of `packages/`,
+  > `services/` or `tools/`, existing or new, is accepted test-author
+  > territory, for writes and reads alike, not only the nine package test
+  > directories. SA1e still confirms that decision 22's account of what the
+  > lists admit is accurate, and that the Edit/Write deny list still refuses
+  > its names there; the residual as that account describes it is not a
+  > finding, and anything the lists admit beyond the account is.
+
+* **Decision 22, "What it does not settle", its first item, the opening.**
+  The owner's decision restated in the owner's words and limited to
+  existing members; the would-be-member case, which the item's bullet "One
+  effect is loud" describes, said not to be covered. The replaced text:
+
+  > tightened (assumption 53), and the owner accepted it on 2026-09-25: a
+  > directory named `tests` anywhere under a member of `packages/`,
+  > `services/` or `tools/`, existing or new, is accepted test-author
+  > territory.
+
+* **Decision 22, the same item, its closing.** The residual that is not a
+  finding limited to existing members, and the would-be-member case left
+  to SA1e under its rule 4. The replaced text:
+
+  > By the owner's decision, the residual as
+  > accurately described here is not a finding; anything the lists admit
+  > beyond this account still is.
+
+* **Assumption 53.** The owner's decision restated in the owner's words and
+  limited to existing members; the architect's broader reading removed;
+  the would-be-member case said not to be covered. The replaced text:
+
+  > Accepting it is not: on
+  > 2026-09-25 the owner decided that a directory named `tests` anywhere
+  > under a member of `packages/`, `services/` or `tools/`, existing or new,
+  > is accepted test-author territory, for writes and, through the read
+  > exemptions, for reads, so the residual as decision 22 accurately
+  > describes it is not a finding for SA1e. That the acceptance covers the
+  > whole residual decision 22 describes, a would-be member's `tests`
+  > directory such as `tools/new-tool/tests/` included, is the architect's
+  > reading of it.
+
+* **Brief SA1e, G1.** Rewritten from its sentence on the owner's decision:
+  the owner's words quoted, the residual under existing members not a
+  finding, and the would-be-member case an ordinary question under rule 4
+  for the auditor to judge. The replaced text:
+
+  > Whether the residual itself is a
+  > finding is no longer yours to judge: by the owner's decision of
+  > 2026-09-25, a directory named `tests` anywhere under a member of
+  > `packages/`, `services/` or `tools/`, existing or new, is accepted
+  > test-author territory, so the residual as that account accurately
+  > describes it is not a finding, and does not by itself keep this area from
+  > being `checked-clean`. Anything the test-author can write beyond that
+  > account is still a finding, and so is any name on decision 22's deny list
+  > that it can write inside such a directory; if you report one, say whether
+  > it lies in C6's diff or in decision 14's text.
+
+* **Brief SA1e, G3.** Rewritten in the same way for the read exemptions.
+  The replaced text:
+
+  > By the owner's decision of 2026-09-25,
+  > every such directory is accepted test-author territory, for reads as for
+  > writes: the exemptions' reach into them, as that account accurately
+  > describes it, is not a finding, and does not by itself keep this area
+  > from being `checked-clean`. Anything the read exemptions admit beyond
+  > that account is still a finding.
+
+* **This section, the trigger's item 1.** "Existing or new" removed, since
+  the item gives the owner's decision, and an italic note added saying so.
+  The item's later lines were re-broken, their words unchanged. The
+  replaced words:
+
+  > directory named `tests` anywhere under a member of those trees, existing
+  > or new, not only the nine package test directories.
+
+* **This entry.** Added at the end of the section.
+* **Unchanged by this correction.**
+  * Decision 22's account of what the lists admit, "What the anchored
+    entries admit" and the bullet "One effect is loud" included; the
+    Consequences bullet on the lists; brief SA1e's questions on that
+    account; and the fifth amendment's earlier corrections. Where they say
+    "existing or new" or name a would-be member, they describe the globs,
+    not the owner's decision.
+  * The first bullet under "What the corrections rest on", above. It
+    records the architect's reading as first made, that the owner's
+    acceptance covers a would-be member's `tests` directory. That reading
+    is withdrawn.
+  * The rest of the entry above, which records the corrections as first
+    made. Where it describes the owner's decision as covering the whole
+    residual, this entry supersedes it.
+  * Brief T4, decision 14's JSON and decision 22's lists: nothing the lists
+    admit has changed.
