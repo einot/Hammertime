@@ -74,6 +74,21 @@ The tests after decision 18's encode them (brief T4). Those for decisions 19-21
 fail until brief C6 lands, except their controls; those that read the
 configured policies after step W fail until W, except the cases marked as
 holding after C6, which fail only until C6 lands.
+
+ADR-0018's sixth amendment (2026-09-25) closes two gaps. Decision 22's read
+deny list for the test-author, which decision 14's text carries into step W,
+gains the caches of Hypothesis, pytest, ruff and uv, `.git`, coverage's data
+files and `snapshots`, each with what lies under it. Decision 20 gains a usable
+root: one that begins with `/`, is in plain form by decision 18's four tests,
+and is not `/`. Any other root (`/`, `//`, `/.`, one with a `..` component, a
+relative one) is an empty root that contains no path, so under PATH_ROOT
+`project` or `cwd` every guarded path is refused with the root denial,
+unchanged. With PATH_ROOT unset an absolute path is compared only with a usable
+base, and a relative path is inside only when `cwd` is usable, or `cwd` is empty
+and CLAUDE_PROJECT_DIR is usable. The tests at the end of this module encode it
+(brief T5). The read list's refusals fail until step W; the root cases fail
+until brief C7 lands, except their controls and the silent passes outside the
+root rule's reach.
 """
 
 import json
@@ -2596,3 +2611,317 @@ def test_configured_test_author_write_policy_ignores_the_top_level_session() -> 
     path = under_repo(".claude/skills/tests/SKILL.md")
     result = run_rooted("Write", policy=policy, file_path=path, script=script)
     assert_allowed_silently(result, "a top-level session Write of .claude/skills/tests/SKILL.md")
+
+
+# --- the sixth amendment: the test-author's read list and a usable root -------
+#
+# ADR-0018's sixth amendment (2026-09-25), brief T5. Every root and every path out
+# of plain form is built by string formatting, never through `pathlib`, which
+# collapses `.` components and repeated slashes.
+
+# Decisions 20 and 22, brief T5 item 2: the sixth amendment's names under the
+# configured read policy, after step W, with `cwd` and CLAUDE_PROJECT_DIR the
+# repository root. Each is refused with the DENY_GLOBS denial, not the root denial.
+SIXTH_AMENDMENT_READ_REFUSED: list[tuple[str, str]] = [
+    ("Read", under_repo(".hypothesis/constants/fb05b1883236f3ed")),
+    ("Read", under_repo(".hypothesis/unicode_data/15.0.0/charmap.json.gz")),
+    ("Read", under_repo(".pytest_cache/v/cache/nodeids")),
+    ("Read", under_repo(".pytest_cache/v/cache/lastfailed")),
+    ("Read", under_repo(".ruff_cache/0.16.7/3614437143458050706")),
+    ("Read", under_repo(".git/COMMIT_EDITMSG")),
+    ("Read", under_repo(".git/logs/HEAD")),
+    ("Read", under_repo(".git/index")),
+    ("Read", under_repo(".coverage")),
+    ("Read", under_repo(".coverage.host.1.2")),
+    ("Read", under_repo(".uv/x")),
+    ("Read", under_repo("snapshots/x")),
+    ("Grep", ".hypothesis"),
+    ("Grep", ".pytest_cache"),
+    ("Grep", ".ruff_cache"),
+    ("Grep", ".git"),
+    ("Grep", ".uv"),
+    ("Grep", "snapshots"),
+]
+
+# The controls: `.git`, `.git/*`, `.coverage` and `.coverage.*` match no more than
+# their names. These hold today and after step W.
+SIXTH_AMENDMENT_READ_CONTROLS = [
+    under_repo(".gitignore"),
+    under_repo(".github/workflows/ci.yml"),
+    under_repo(".coveragerc"),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path"),
+    SIXTH_AMENDMENT_READ_REFUSED,
+    ids=[f"{tool}-{repo_relative_id(path)}" for tool, path in SIXTH_AMENDMENT_READ_REFUSED],
+)
+def test_configured_test_author_read_policy_refuses_the_sixth_amendments_names(
+    tool_name: str, path: str
+) -> None:
+    """Decisions 14, 20 and 22, and assumption 76: after step W the test-author's
+    read DENY_GLOBS refuse the caches of Hypothesis, pytest, ruff and uv, `.git`,
+    coverage's data files and `snapshots`, each by a Read inside it and, for the
+    directories, by a Grep of it. The path is inside the root, so the refusal is
+    the DENY_GLOBS denial, not the root denial."""
+    result = run_configured_rooted(
+        "test-author",
+        READ_GREP_GLOB,
+        tool_name,
+        path,
+        cwd=str(REPO_ROOT),
+        project_dir=str(REPO_ROOT),
+    )
+    assert_verdict(result, VERDICT_DENY_GLOBS, f"test-author {tool_name} of {path}")
+
+
+@pytest.mark.parametrize("path", SIXTH_AMENDMENT_READ_CONTROLS, ids=repo_relative_id)
+def test_configured_test_author_read_policy_allows_names_beside_the_sixth_amendments(
+    path: str,
+) -> None:
+    """Decision 22, brief T5 item 2's controls: `.gitignore`, `.github/` and
+    `.coveragerc` are not `.git`, `.git/*`, `.coverage` or `.coverage.*`."""
+    result = run_configured_rooted(
+        "test-author",
+        READ_GREP_GLOB,
+        "Read",
+        path,
+        cwd=str(REPO_ROOT),
+        project_dir=str(REPO_ROOT),
+    )
+    assert_allowed(result, f"test-author Read of {path}")
+
+
+# Decision 20, brief T5 items 3-7: a root the guard cannot use. No call sets an
+# `agent_type` unless stated. A template's `{tmp}`, `{repo}`, `{parent}` and
+# `{dotdot}` are filled in by `fill_root`; `cwd` and CLAUDE_PROJECT_DIR are always
+# given, and an empty string sends an empty value.
+
+# The repository root out of plain form: the directory above it, then back down.
+REPO_ROOT_VIA_DOTDOT = f"{REPO_ROOT}/../{REPO_ROOT.name}"
+
+
+def fill_root(template: str, tmp_path: Path) -> str:
+    """`fill`'s sibling: `{tmp}`, `{repo}` and `{parent}` as there, and `{dotdot}`,
+    REPO_ROOT_VIA_DOTDOT."""
+    return template.format(
+        tmp=tmp_path, repo=REPO_ROOT, parent=REPO_ROOT.parent, dotdot=REPO_ROOT_VIA_DOTDOT
+    )
+
+
+def run_unusable_root_case(
+    tmp_path: Path,
+    policy: Mapping[str, str],
+    tool_name: str,
+    path: str,
+    *,
+    cwd: str,
+    project_dir: str,
+    agent_type: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`run_root_case`'s sibling: `path`, `cwd` and CLAUDE_PROJECT_DIR filled in by
+    `fill_root`, then sent as a search's `path` or another tool's `file_path`."""
+    filled = fill_root(path, tmp_path)
+    search = tool_name in SEARCH_TOOLS
+    return run_rooted(
+        tool_name,
+        policy=policy,
+        file_path=None if search else filled,
+        search_path=filled if search else None,
+        agent_type=agent_type,
+        cwd=fill_root(cwd, tmp_path),
+        project_dir=fill_root(project_dir, tmp_path),
+    )
+
+
+# Brief T5 item 3: PATH_ROOT='project', DENY_GLOBS='tests/*'. Each row is an id, the
+# tool, its path, `cwd` and CLAUDE_PROJECT_DIR. Every one is refused with the root
+# denial.
+PROJECT_UNUSABLE_ROOT_CASES: list[tuple[str, str, str, str, str]] = [
+    ("both-slash-absolute-repo", "Write", "{repo}/services/x.py", "/", "/"),
+    ("both-slash-absolute-tmp", "Write", "{tmp}/x.py", "/", "/"),
+    ("both-slash-absolute-tests", "Write", "/tests/x.py", "/", "/"),
+    ("both-slash-relative", "Write", "services/x.py", "/", "/"),
+    ("both-slash-grep-slash", "Grep", "/", "/", "/"),
+    ("dir-slash-cwd-empty-relative", "Write", "services/x.py", "", "/"),
+    ("dir-slash-cwd-repo-absolute-repo", "Write", "{repo}/services/x.py", "{repo}", "/"),
+    ("both-double-slash-relative", "Write", "services/x.py", "//", "//"),
+    ("both-dotdot-relative", "Write", "services/x.py", "{dotdot}", "{dotdot}"),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path", "cwd", "project_dir"),
+    [case[1:] for case in PROJECT_UNUSABLE_ROOT_CASES],
+    ids=[case[0] for case in PROJECT_UNUSABLE_ROOT_CASES],
+)
+def test_an_unusable_project_directory_contains_no_path(
+    tmp_path: Path, tool_name: str, path: str, cwd: str, project_dir: str
+) -> None:
+    """Decision 20, "A root the guard cannot use", and assumption 77: under
+    PATH_ROOT='project' a CLAUDE_PROJECT_DIR of `/`, `//` or the repository root
+    through `..` is not usable, so no path is inside it, absolute or relative,
+    whatever `cwd` is, and each call is refused with the root denial."""
+    result = run_unusable_root_case(
+        tmp_path, PROJECT_ROOT_POLICY, tool_name, path, cwd=cwd, project_dir=project_dir
+    )
+    what = f"a {tool_name} of {path!r}, cwd {cwd!r}, CLAUDE_PROJECT_DIR {project_dir!r}"
+    assert_verdict(result, VERDICT_ROOT, f"{what}, under {PROJECT_ROOT_POLICY!r}")
+
+
+# Brief T5 item 4: PATH_ROOT='cwd', DENY_GLOBS='tests/*', CLAUDE_PROJECT_DIR the
+# repository root. Each row is an id, the Write's path, `cwd` and the verdict.
+CWD_UNUSABLE_ROOT_CASES: list[tuple[str, str, str, str]] = [
+    ("cwd-slash-absolute-repo", "{repo}/services/x.py", "/", VERDICT_ROOT),
+    ("cwd-slash-absolute-tmp", "{tmp}/x.py", "/", VERDICT_ROOT),
+    ("cwd-slash-relative", "services/x.py", "/", VERDICT_ROOT),
+    ("cwd-double-slash-relative", "services/x.py", "//", VERDICT_ROOT),
+    ("cwd-tmp-dot-relative", "services/x.py", "{tmp}/.", VERDICT_ROOT),
+    ("cwd-relative-relative", "services/x.py", "tests", VERDICT_ROOT),
+    ("control-cwd-tmp-slash-absolute", "{tmp}/services/x.py", "{tmp}/", VERDICT_ALLOW),
+    ("control-cwd-tmp-slash-relative", "services/x.py", "{tmp}/", VERDICT_ALLOW),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "cwd", "verdict"),
+    [case[1:] for case in CWD_UNUSABLE_ROOT_CASES],
+    ids=[case[0] for case in CWD_UNUSABLE_ROOT_CASES],
+)
+def test_an_unusable_working_directory_contains_no_path(
+    tmp_path: Path, path: str, cwd: str, verdict: str
+) -> None:
+    """Decision 20, "A root the guard cannot use", and assumption 77: under
+    PATH_ROOT='cwd' a `cwd` of `/`, `//`, one with a `.` component or a relative
+    one is not usable, so no path is inside it and each Write is refused with the
+    root denial. The controls: a `cwd` with one trailing `/` is usable."""
+    result = run_unusable_root_case(
+        tmp_path, CWD_ROOT_POLICY, "Write", path, cwd=cwd, project_dir="{repo}"
+    )
+    what = f"a Write of {path!r}, cwd {cwd!r}, CLAUDE_PROJECT_DIR the repository root"
+    assert_verdict(result, verdict, f"{what}, under {CWD_ROOT_POLICY!r}")
+
+
+# Brief T5 item 5: PATH_ROOT unset, DENY_GLOBS='tests/*'. Each row is an id, the
+# Write's path, `cwd`, CLAUDE_PROJECT_DIR and the verdict.
+UNSET_UNUSABLE_ROOT_CASES: list[tuple[str, str, str, str, str]] = [
+    ("cwd-slash-absolute-tmp", "{tmp}/x.py", "/", "{repo}", VERDICT_ROOT),
+    ("cwd-slash-relative", "services/x.py", "/", "{repo}", VERDICT_ROOT),
+    ("cwd-slash-absolute-repo-tests", "{repo}/tests/x.py", "/", "{repo}", VERDICT_DENY_GLOBS),
+    ("control-cwd-slash-absolute-repo", "{repo}/services/x.py", "/", "{repo}", VERDICT_ALLOW),
+    ("dir-slash-absolute-tmp", "{tmp}/x.py", "{repo}", "/", VERDICT_ROOT),
+    ("control-dir-slash-absolute-repo", "{repo}/services/x.py", "{repo}", "/", VERDICT_ALLOW),
+    ("control-dir-slash-relative", "services/x.py", "{repo}", "/", VERDICT_ALLOW),
+    (
+        "control-dir-slash-absolute-repo-tests",
+        "{repo}/tests/x.py",
+        "{repo}",
+        "/",
+        VERDICT_DENY_GLOBS,
+    ),
+    ("cwd-empty-dir-slash-relative", "services/x.py", "", "/", VERDICT_ROOT),
+    ("cwd-empty-dir-slash-absolute-repo", "{repo}/services/x.py", "", "/", VERDICT_ROOT),
+    ("both-slash-absolute-repo", "{repo}/services/x.py", "/", "/", VERDICT_ROOT),
+    ("cwd-double-slash-relative", "services/x.py", "//", "{repo}", VERDICT_ROOT),
+    (
+        "control-cwd-double-slash-absolute-repo",
+        "{repo}/services/x.py",
+        "//",
+        "{repo}",
+        VERDICT_ALLOW,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "cwd", "project_dir", "verdict"),
+    [case[1:] for case in UNSET_UNUSABLE_ROOT_CASES],
+    ids=[case[0] for case in UNSET_UNUSABLE_ROOT_CASES],
+)
+def test_an_unset_path_root_uses_only_usable_bases(
+    tmp_path: Path, path: str, cwd: str, project_dir: str, verdict: str
+) -> None:
+    """Decision 20, the table's row for PATH_ROOT unset and "A root the guard
+    cannot use", and assumption 77: an absolute path is compared only with a
+    usable base, so a usable base keeps judging the paths inside it through its
+    glob lists; a relative path is inside only when `cwd` is usable, or `cwd` is
+    empty and CLAUDE_PROJECT_DIR is usable, so a `cwd` of `/` or `//` puts every
+    relative path outside; and with no usable base the root is empty."""
+    result = run_unusable_root_case(
+        tmp_path, UNSET_ROOT_POLICY, "Write", path, cwd=cwd, project_dir=project_dir
+    )
+    what = f"a Write of {path!r}, cwd {cwd!r}, CLAUDE_PROJECT_DIR {project_dir!r}"
+    assert_verdict(result, verdict, f"{what}, under {UNSET_ROOT_POLICY!r}")
+
+
+# Brief T5 item 6: the boundaries, with `cwd` `/` and CLAUDE_PROJECT_DIR the
+# repository root. Each row is an id and the policy.
+UNUSABLE_ROOT_SILENT_POLICIES: list[tuple[str, Mapping[str, str]]] = [
+    ("path-root-only", {"PATH_ROOT": "cwd"}),
+    ("outside-scope-cwd", {**SCOPED_TO_CODER, "PATH_ROOT": "cwd"}),
+]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in UNUSABLE_ROOT_SILENT_POLICIES],
+    ids=[case_id for case_id, _ in UNUSABLE_ROOT_SILENT_POLICIES],
+)
+def test_an_unusable_root_polices_only_in_scope_calls_under_a_guarded_policy(
+    tmp_path: Path, policy: Mapping[str, str]
+) -> None:
+    """Decision 20, "Where it sits", and "A root the guard cannot use", reason 3:
+    the empty root adds no place in the order of checks, so a policy that
+    constrains no paths, and a policy scoped to the coder with a call that sets
+    no `agent_type`, allow a Write outside an unusable root silently."""
+    result = run_unusable_root_case(
+        tmp_path, policy, "Write", "{tmp}/x.py", cwd="/", project_dir="{repo}"
+    )
+    assert_verdict(result, VERDICT_ALLOW, f"a Write of <tmp>/x.py, cwd '/', under {dict(policy)!r}")
+
+
+def test_an_unusable_root_refuses_the_caller_the_policy_names(tmp_path: Path) -> None:
+    """Decision 20, "A root the guard cannot use": the coder, whom the scoped
+    policy names, is refused the same Write with the root denial, which keeps
+    the silent passes above from being vacuous."""
+    policy = {**SCOPED_TO_CODER, "PATH_ROOT": "cwd"}
+    result = run_unusable_root_case(
+        tmp_path, policy, "Write", "{tmp}/x.py", cwd="/", project_dir="{repo}", agent_type="coder"
+    )
+    assert_verdict(result, VERDICT_ROOT, f"coder writing <tmp>/x.py, cwd '/', under {policy!r}")
+
+
+# Brief T5 item 7: the message. Each row is an id, the policy, the tool, its path,
+# `cwd` and CLAUDE_PROJECT_DIR.
+UNUSABLE_ROOT_MESSAGE_CASES: list[tuple[str, Mapping[str, str], str, str, str, str]] = [
+    ("cwd-Write", CWD_ROOT_POLICY, "Write", "{tmp}/x.py", "/", "{repo}"),
+    ("project-Grep", PROJECT_ROOT_POLICY, "Grep", "/", "/", "/"),
+]
+
+
+@pytest.mark.parametrize(
+    ("policy", "tool_name", "path", "cwd", "project_dir"),
+    [case[1:] for case in UNUSABLE_ROOT_MESSAGE_CASES],
+    ids=[case[0] for case in UNUSABLE_ROOT_MESSAGE_CASES],
+)
+def test_an_unusable_root_gets_decision_20s_root_denial_verbatim(
+    tmp_path: Path,
+    policy: Mapping[str, str],
+    tool_name: str,
+    path: str,
+    cwd: str,
+    project_dir: str,
+) -> None:
+    """Decision 20, "A root the guard cannot use", reason 3, and assumption 77:
+    the sixth amendment adds no denial, so a call outside an unusable root gets
+    the root denial word for word."""
+    result = run_unusable_root_case(
+        tmp_path, policy, tool_name, path, cwd=cwd, project_dir=project_dir
+    )
+    what = f"a {tool_name} of {path!r}, cwd {cwd!r}, CLAUDE_PROJECT_DIR {project_dir!r}"
+    reason = assert_root_denied(result, f"{what}, under {dict(policy)!r}")
+    assert reason == ROOT_MESSAGE, (
+        "the root denial must be decision 20's text verbatim.\n"
+        f"expected: {ROOT_MESSAGE!r}\nreason:   {reason!r}"
+    )

@@ -49,6 +49,15 @@ carries decision 22's agent-configuration list; the test-author's lists are
 decision 22's; and the architect's allowlist is unchanged. Those items fail
 until step W.
 
+ADR-0018's sixth amendment (2026-09-25) extends decision 22's read deny list
+for the test-author, and decision 14's text with it: the caches of Hypothesis,
+pytest, ruff and uv, `.git`, coverage's data files and `snapshots`, each with
+what lies under it (assumption 76). The ADR counts them as 16 globs; the list it
+gives, which is what is pinned, has 14 words. The module's last test pins the
+test-author's Read|Grep|Glob `DENY_GLOBS` exactly, where brief T4 pinned only a
+subset, so a name added by mistake fails as well as one left out (brief T5,
+item 1; assumption 80). It fails until step W.
+
 See also `.claude/hooks/path-guard.sh` and `.claude/hooks/bash-guard.sh`, whose
 own headers record the probes of the frontmatter wiring, and
 `tests/config/test_path_guard_behavior.py`, which exercises the guard script
@@ -950,4 +959,45 @@ def test_architect_write_allow_globs_are_unchanged() -> None:
     assert allow == ARCHITECT_WRITE_ALLOW_GLOBS, (
         f"the architect's Edit|Write ALLOW_GLOBS are {sorted(allow)}; ADR-0018 decisions 14 "
         f"and 22 keep them {sorted(ARCHITECT_WRITE_ALLOW_GLOBS)}"
+    )
+
+
+# --- ADR-0018's sixth amendment: the test-author's read list, exactly -------
+#
+# Brief T5, item 1. Compared as a set of words.
+
+# Decision 22 as the sixth amendment extends it (assumption 76): the globs the
+# test-author's read DENY_GLOBS gain beyond TEST_AUTHOR_READ_DENY_GLOBS.
+TEST_AUTHOR_READ_DENY_GLOBS_SIXTH_AMENDMENT = frozenset(
+    [
+        ".hypothesis",
+        ".hypothesis/*",
+        ".pytest_cache",
+        ".pytest_cache/*",
+        ".ruff_cache",
+        ".ruff_cache/*",
+        ".uv",
+        ".uv/*",
+        ".git",
+        ".git/*",
+        ".coverage",
+        ".coverage.*",
+        "snapshots",
+        "snapshots/*",
+    ]
+)
+
+
+def test_test_author_read_deny_globs_are_exactly_decision_14s() -> None:
+    """ADR-0018 decisions 14 and 22, as the sixth amendment extends them: the
+    test-author's Read|Grep|Glob DENY_GLOBS are exactly the code trees, `.claude`,
+    `.mypy_cache`, the build and coverage output, and the sixth amendment's
+    caches, `.git`, coverage data files and `snapshots` (assumptions 76 and 80)."""
+    command = path_guard_policy("test-author", READ_GREP_GLOB)
+    deny = words(command, "DENY_GLOBS")
+    expected = TEST_AUTHOR_READ_DENY_GLOBS | TEST_AUTHOR_READ_DENY_GLOBS_SIXTH_AMENDMENT
+    assert deny == expected, (
+        "the test-author's Read|Grep|Glob DENY_GLOBS differ from ADR-0018 decision 14's.\n"
+        f"missing: {sorted(expected - deny)}\n"
+        f"extra: {sorted(deny - expected)}"
     )
