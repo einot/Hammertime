@@ -1801,7 +1801,12 @@ If any of them holds, the script denies with the plain-form denial.
    root: `<root>`, `<root>/`, `<root>/.`, `<root>/./`, `.` and `./`. Each
    names the root and nothing else, and they keep today's handling: a Read,
    Grep or Glob gets the project-root denial, and an Edit or Write exits 0.
-   Every other path reaches the rule (assumption 41).
+   Every other path reaches the rule (assumption 41). *(Sixth amendment:
+   `<root>` is a usable root. Under a root that is not usable, `.` and `./`
+   name the working directory, not a root, and assumption 41 does not
+   reach them. That they still get this handling, exit 0 for an Edit or
+   Write included, is the architect's acceptance, new in the corrections
+   before C7 (decision 20, "Where it sits", item 3, and assumption 83).)*
 5. **Before `EXEMPT_GLOBS`, `DENY_GLOBS` and `ALLOW_GLOBS`.** `EXEMPT_GLOBS`
    exits 0 on a match, so a rule after it would never see the first
    confirmed case above.
@@ -2243,10 +2248,16 @@ and the coder's worktree, each an absolute path in plain form (assumption
   T4's follow-up case pins. With no usable base the root is empty.
 
 In every case a guarded path outside the root meets the root rule and its
-denial, both unchanged. Under a root that is not usable, the denial's "Give
-an absolute path inside the root" cannot be met: every guarded call is
-refused, which is loud, and only the session can see why the harness gave
-such a root.
+denial, both unchanged, unless an earlier check has handled it: decision
+18's rule refuses a path out of plain form, and the project-root check
+handles `.` and `./` ("Where it sits", item 3). Under a root that is not
+usable, the denial's "Give an absolute path inside the root" cannot be
+met: every guarded call is refused, which is loud, and only the session can
+see why the harness gave such a root. The one exception is an Edit or Write
+whose path is empty, `.` or `./`, which names no file either tool can write
+and exits 0, as it already does under any root in C6's code. Accepting that
+under a root that is not usable is new in the corrections before C7, and is
+the architect's acceptance, not assumption 41's (assumption 83).
 
 *Detection.* Recommended, as a function defined before the relativisation:
 
@@ -2289,7 +2300,18 @@ policies.
    that a path out of plain form keeps decision 18's denial; before
    `EXEMPT_GLOBS`, which exits 0 on a match. The project root's own
    spellings are handled by the project-root check, before the rule, as
-   before.
+   before. Since the sixth amendment, only a usable root has spellings of
+   its own there. The relativisation strips only a usable root or base, so
+   the check, which reads `rel`, fires for an absolute path only when it
+   spells a usable one: `<root>`, `<root>/`, `<root>/.` or `<root>/./`.
+   Under a root that is not usable, an absolute path keeps its form, and one
+   in plain form reaches the root rule: with `CLAUDE_PROJECT_DIR` and `cwd`
+   both `/` under `PATH_ROOT='project'`, a Grep of `/` gets the root
+   denial, not the project-root denial. The relative spellings `.` and `./`
+   are never relativised, since a usable root or base is absolute, and keep
+   the check's handling whatever the root: a Read, Grep or Glob of either
+   gets the project-root denial, and an Edit or Write exits 0 (assumption
+   83).
 
 **No knob turns the rule off.** It is built in, for every guarded policy,
 for the reason of assumption 21; `PATH_ROOT` chooses the root, not whether
@@ -3358,7 +3380,8 @@ decisions and instructions, and the environmental facts they rest on.
       base keeps judging the absolute paths inside it.
     * *The root denial is reused, unchanged.* Its "Give an absolute path
       inside the root" cannot be met under a root that is not usable. Every
-      guarded call is refused, which is loud; the root comes from the
+      guarded call but an Edit or Write whose path is empty, `.` or `./` is
+      refused (assumption 83), which is loud; the root comes from the
       harness, and only the session can see why.
     * *What remains.* A usable root that is not the directory the policy
       was written for, such as an ancestor of the project, is not detected
@@ -3438,6 +3461,60 @@ decisions and instructions, and the environmental facts they rest on.
     W; and no probe can set a root, as none can send a malformed payload
     (assumption 72).
 82. **No `CHANGES` entry** (decision 16): agent tooling only.
+
+Item 83 was added on 2026-09-25, before C7 was dispatched, after the
+test-author, writing brief T5's tests, flagged that decision 20 did not
+say which denial a Grep of `/` gets under a root of `/`. The ruling is the
+architect's, on the session's recommendation; it is not the owner's.
+
+83. **The project-root check under a root that is not usable** (decision
+    20, "Where it sits", item 3; brief C7). The session recommended that a
+    root that is not usable, being empty, is not the project root for the
+    project-root check, so that a Grep of `/` with `CLAUDE_PROJECT_DIR` and
+    `cwd` both `/` under `PATH_ROOT='project'` reaches the root rule and
+    gets the root denial, as brief T5's items 3 and 7 expect. The architect
+    found no reason it cannot hold, and adopted it. These are the
+    architect's:
+    * *Stated through `rel`.* The check reads `rel`, and after C7 the
+      relativisation strips only a usable root or base, so an absolute path
+      that no usable one contains keeps its form, and the check does not
+      fire for it. That needs no change to the check: C7's recommended
+      detection skips a base that is not usable before its trailing `/` is
+      removed. At `f276009` the empty-root test ran before that removal, so
+      a root of `/` passed it and became the empty string, the path `/`
+      relativised to the empty string, and under a guarded policy the check
+      refused the Grep with the project-root denial and let a Write of `/`
+      exit 0. Reasoned from the script in C6's worktree, not run.
+    * *`.` and `./` keep the check's handling whatever the root.* For
+      either, `rel` is `.`, `./` or empty under every root, at `f276009` and
+      after C7 alike, so the check fires. Sending them past it under a root
+      that is not usable would need a change to the check that no test asks
+      for, and would give them decision 18's denial, not the root denial,
+      since that rule runs first. As kept, a Read, Grep or Glob of either is
+      refused with the project-root denial, whose "project-root" is then a
+      misnomer and whose advice cannot be met; and an Edit or Write of either
+      exits 0, which the last item below accepts.
+    * *Spellings out of plain form.* An absolute spelling of a root that is
+      not usable and is out of plain form, such as `/.` under a
+      `CLAUDE_PROJECT_DIR` of `/`, is no longer relativised to `.`: it now
+      gets decision 18's denial, where at `f276009` it got the project-root
+      check's handling.
+    * *What still exits 0, and whose acceptance that is.* Under a root that
+      is not usable, every guarded call is refused but an Edit or Write whose
+      path is empty, `.` or `./`, which exits 0. Accepting that is new in the
+      corrections before C7, and the acceptance is the architect's, not
+      assumption 41's. Assumption 41, with decision 18's "Where it sits",
+      item 4, accepts exit 0 for `.` and `./` only as spellings of the root,
+      and says nothing of a root that is not usable, which only the sixth
+      amendment introduced; before these corrections, decision 20's "A root
+      the guard cannot use" and assumption 77 said that under such a root
+      every guarded call is refused, and they now say otherwise. The
+      architect accepts it because it matches C6's existing code, which
+      exits 0 there under any root: an empty path meets the empty-path check
+      first, and a relative `.` or `./` is never relativised into anything
+      the project-root check does not catch. The call names no file either
+      tool can write, only a directory or nothing, and the acceptance grants
+      no permission in code that `f276009` does not already grant.
 
 ## Consequences
 
@@ -6695,7 +6772,8 @@ the script (decision 13).
 
 Work from decision 20 as the sixth amendment amends it. The copy of this
 ADR in your worktree predates the amendment, so take these passages from
-here. Nothing else in decisions 17-21 changed with it.
+here. Nothing else in decisions 17-21 that your change depends on changed
+with it.
 
 * The last cell of decision 20's table row for `PATH_ROOT` unset or empty
   now reads "an absolute path inside either usable base; a relative path
@@ -6736,6 +6814,20 @@ here. Nothing else in decisions 17-21 changed with it.
   status cannot end the script under `set -e`, and every expansion of
   `CLAUDE_PROJECT_DIR` stays safe under `set -u`. Nothing else in the order
   of checks moves.
+* Decision 20's "Where it sits", item 3, now ends, after "as before.":
+
+  > Since the sixth amendment, only a usable root has spellings of its own
+  > there. The relativisation strips only a usable root or base, so the
+  > check, which reads `rel`, fires for an absolute path only when it spells
+  > a usable one: `<root>`, `<root>/`, `<root>/.` or `<root>/./`. Under a
+  > root that is not usable, an absolute path keeps its form, and one in
+  > plain form reaches the root rule: with `CLAUDE_PROJECT_DIR` and `cwd`
+  > both `/` under `PATH_ROOT='project'`, a Grep of `/` gets the root
+  > denial, not the project-root denial. The relative spellings `.` and `./`
+  > are never relativised, since a usable root or base is absolute, and keep
+  > the check's handling whatever the root: a Read, Grep or Glob of either
+  > gets the project-root denial, and an Edit or Write exits 0 (assumption
+  > 83).
 
 Do:
 
@@ -6763,13 +6855,21 @@ Do:
    * Use the test only in a condition, `if`, `||` or `&&`, and keep every
      expansion of `CLAUDE_PROJECT_DIR` safe under `set -u`, as the script's
      lines already are.
+   * Leave the project-root check as it is. Because the loop skips a base
+     that is not usable, `rel` keeps an absolute path as written when no
+     usable root or base contains it, and the check does not fire for it:
+     with `CLAUDE_PROJECT_DIR` and `cwd` both `/` under
+     `PATH_ROOT='project'`, a guarded Grep of `/` and a guarded Write of `/`
+     must each reach the root rule and get the root denial. `.` and `./`
+     keep the check's handling whatever the root.
    * Change nothing else: not the order of the checks, the root rule, the
      denial texts, the configuration error for `PATH_ROOT`, the project-root
      check or any other rule, and no message or exit code. Every payload
      then gets the verdict it gets at `f276009`, except a guarded call whose
      verdict depended on a root that is not usable: its path is now outside
-     that root and meets the root rule, or, under an unset `PATH_ROOT`, is
-     judged against the other base if that one is usable.
+     that root, and meets decision 18's rule if it is out of plain form and
+     the root rule otherwise; or, under an unset `PATH_ROOT`, it is judged
+     against the other base if that one is usable.
 3. **The comments.** The header's ROOT section and the comment above the
    relativisation say that an empty root is one whose variable is unset or
    empty, that such a base is skipped, and, for an unset `PATH_ROOT`, that a
@@ -6823,8 +6923,9 @@ not edit the test.
 * a root is usable exactly as the passages above say; a root that is not
   usable contains no path under `project` and `cwd`; the arms for an unset
   `PATH_ROOT` follow the rule above; the header and the comment above the
-  relativisation say so; and nothing else about the script's behaviour has
-  changed;
+  relativisation say so; the project-root check fires for no absolute
+  spelling of a root that is not usable; and nothing else about the
+  script's behaviour has changed;
 * `uv run --locked pytest -q tests/config` gives the result of your
   baseline run, and the only failures in `uv run --locked pytest -q` are
   the tests brief C6's "Done when" lists as waiting for step W, each listed
@@ -9836,7 +9937,7 @@ which the brief names (assumption 79).
   the owner's decision (A) gave, and, by the architect's judgement, from the
   check of the repository root that the session's instructions asked for,
   `.uv`, `.git`, coverage's data files and `snapshots`, each with what lies
-  under it: 16 globs, appended to the list in decision 14's text. Step W
+  under it: 14 globs, appended to the list in decision 14's text. Step W
   applies them. Assumption 76 gives the check, the criterion and the
   reasoning for every location included or left out.
 * **A usable root** (decision 20). The owner's decision (A) was only that a
@@ -9923,7 +10024,7 @@ Every edit:
   >   directories (decisions 20 and 22).
 
 * **Decision 14, the JSON.** In the test-author's Read|Grep|Glob line, the
-  16 globs
+  14 globs
   `.hypothesis .hypothesis/* .pytest_cache .pytest_cache/* .ruff_cache .ruff_cache/* .uv .uv/* .git .git/* .coverage .coverage.* snapshots snapshots/*`
   appended to `DENY_GLOBS`. Nothing else in that line or in the JSON
   changed. The replaced value:
@@ -10471,3 +10572,164 @@ Nothing else changed. The places that credit the extension to G5 to the
 owner stand as they were, and so does this entry's list of edits above,
 whose entry for the trigger's item 3 describes the note as these
 corrections first wrote it.
+
+**Corrections before C7, 2026-09-25.** Made in place on 2026-09-25, before
+brief C7 was dispatched, on instructions that came inline from the
+top-level session, which reported two points the test-author flagged while
+writing brief T5's tests. In making them, no web access was used, nothing
+was run, no one was dispatched, and nothing outside `/home/user/Hammertime`
+was read. Inside it, the architect read this ADR and, for the second point,
+lines 420-549 of `.claude/hooks/path-guard.sh` as it stands in C6's
+worktree, `.claude/worktrees/agent-adcdbc2ec5344ec95`.
+
+1. **The count of the sixth amendment's globs.** "The fixes" and this
+   section's entry for decision 14's JSON said 16 globs, but the list they
+   name, in decisions 14 and 22 and in brief T5, has 14 words. The list is
+   right: seven locations, two globs each, of which the first three
+   locations, six globs, carry out the owner's decision (A), as decision 22
+   says. The count was wrong, and is corrected where it was stated.
+2. **Which denial a Grep of `/` gets under a root of `/`.** With
+   `CLAUDE_PROJECT_DIR` and `cwd` both `/` under `PATH_ROOT='project'`,
+   decision 20's "Where it sits", item 3, sent the project root's own
+   spellings to the project-root check, which runs before the root rule,
+   while brief T5's items 3 and 7 expect the root denial for this call. The
+   session recommended that a root that is not usable, being empty, is not
+   the project root for the project-root check, so that the call reaches
+   the root rule and gets the root denial. The architect found no reason it
+   cannot hold, and ruled so. The ruling needs no change to the check's
+   code: once C7's change is in, the relativisation strips only a usable
+   root, so `/` keeps its form and the check does not fire. Assumption 83
+   gives the reasoning and the judgment calls, among them that `.` and `./`
+   keep the check's handling whatever the root.
+
+Every edit:
+
+* **This section, "The fixes", its first item.** The count corrected. The
+  replaced line:
+
+  >   under it: 16 globs, appended to the list in decision 14's text. Step W
+
+* **This section, the list of edits, "Decision 14, the JSON".** The count
+  corrected. The replaced line:
+
+  >   16 globs
+
+* **Decision 18, "Where it sits", item 4.** An italic note added at its
+  end: `<root>` is a usable root, and under a root that is not usable only
+  `.` and `./` keep the project-root check's handling. Nothing was replaced.
+* **Decision 20, "Where it sits", item 3.** Sentences added after "as
+  before.": the ruling. Nothing was replaced.
+* **Decision 20, "A root the guard cannot use", the paragraph after "For
+  each value".** Rewritten: a path out of plain form meets decision 18's
+  rule first, and `.` and `./` the project-root check; and under a root
+  that is not usable every guarded call is refused but an Edit or Write
+  whose path is empty, `.` or `./`. The replaced paragraph:
+
+  > In every case a guarded path outside the root meets the root rule and its
+  > denial, both unchanged. Under a root that is not usable, the denial's "Give
+  > an absolute path inside the root" cannot be met: every guarded call is
+  > refused, which is loud, and only the session can see why the harness gave
+  > such a root.
+
+* **Assumption 77, "The root denial is reused, unchanged".** Its third
+  sentence narrowed in the same way. The replaced line:
+
+  >       guarded call is refused, which is loud; the root comes from the
+
+* **Assumptions.** An introductory sentence and item 83 added after item
+  82. Nothing was replaced.
+* **Brief C7, its introduction.** "Nothing else in decisions 17-21 changed
+  with it" narrowed to what the change depends on, since decision 18's note
+  and decision 20's paragraph above changed too. The replaced line:
+
+  > here. Nothing else in decisions 17-21 changed with it.
+
+* **Brief C7, the passages.** A bullet added after the recommended
+  detection, quoting decision 20's new sentences in "Where it sits", item
+  3. Nothing was replaced.
+* **Brief C7, "Do", item 2.** A bullet added before "Change nothing else":
+  leave the project-root check as it is, and what it then does. In "Change
+  nothing else", the last sentence reworded: a path outside a root that is
+  not usable meets decision 18's rule if it is out of plain form, and the
+  root rule otherwise. The replaced lines:
+
+  >      that root and meets the root rule, or, under an unset `PATH_ROOT`, is
+  >      judged against the other base if that one is usable.
+
+* **Brief C7, "Done when", its first item.** A clause added: the
+  project-root check fires for no absolute spelling of a root that is not
+  usable. The replaced lines:
+
+  >   relativisation say so; and nothing else about the script's behaviour has
+  >   changed;
+
+* **This entry.** Added at the end of the section.
+
+**Unchanged by these corrections.**
+
+* Decision 14's JSON, decision 22's list and brief T5's item 1: the list
+  was right. The corrections after `supervisor`'s review still quote "The
+  fixes" as first written, "16 globs" included, since that quote records
+  the replaced text.
+* The project-root check, the root rule and every message: the ruling is
+  what C7's recommended detection already does.
+* Brief T5, whose items 3 and 7 already expect the root denial; brief
+  SA1f, whose A12, A22, A23 and A28 audit decision 20 as amended, the
+  project-root check under a root that is not usable included; and
+  assumptions 41 and 80.
+
+**Follow-up to the corrections before C7, 2026-09-25.** Made in place the
+same day, on a further instruction that came inline from the top-level
+session, after `supervisor` found one issue in the corrections before C7
+(misattributed-precedent, low): assumption 83, and the passages that echo
+it, credited to assumption 41 the acceptance of exit 0 for an Edit or Write
+of `.` or `./` under a root that is not usable. Assumption 41, with decision
+18's "Where it sits", item 4, accepts exit 0 for `.` and `./` only as
+spellings of the root, and says nothing of a root that is not usable, which
+only the sixth amendment introduced. In making the follow-up, no web access
+was used, nothing was run, no one was dispatched, and nothing was read but
+this ADR. Every edit:
+
+* **Assumption 83, its second item.** The credit to assumption 41 removed;
+  the item now points to its last item. The replaced lines:
+
+  >       exits 0, as assumption 41 accepts under every root: each names a
+  >       directory, which neither tool can write.
+
+* **Assumption 83, its last item.** Rewritten: accepting exit 0 for an Edit
+  or Write whose path is empty, `.` or `./` under a root that is not usable
+  is new in the corrections before C7, and is the architect's acceptance,
+  not assumption 41's; with the reasons, that it matches C6's existing
+  code, that the call names no file either tool can write, and that it
+  grants no permission in code that `f276009` does not already grant. The
+  replaced item:
+
+  >     * *What still exits 0.* Under a root that is not usable, every guarded
+  >       call is refused but an Edit or Write whose path is empty, `.` or `./`.
+  >       Decision 20's "A root the guard cannot use" and assumption 77 now say
+  >       so; they had said that every guarded call is refused, which the
+  >       empty-path check and the project-root check already contradicted.
+
+* **Decision 20, "A root the guard cannot use", the paragraph after "For
+  each value".** Its last sentence's "as before" replaced: the exit 0 is
+  what C6's code already does, and accepting it under a root that is not
+  usable is new in the corrections before C7, and the architect's, not
+  assumption 41's. The replaced line:
+
+  > and exits 0 under any root, as before (assumption 83).
+
+* **Decision 18, "Where it sits", item 4, the note the corrections before
+  C7 added.** Reworded: under a root that is not usable, `.` and `./` name
+  the working directory, assumption 41 does not reach them, and that they
+  still get the check's handling is the architect's acceptance, new in
+  those corrections. The replaced lines:
+
+  >    `<root>` is a usable root. Under a root that is not usable, only `.` and
+  >    `./` keep this handling, and they name the working directory, not a
+  >    root; decision 20, "Where it sits", item 3, and assumption 83.)*
+
+Nothing else changed. Decision 20's "Where it sits", item 3, brief C7's
+quotation of it and its bullet in "Do", item 2, and assumption 77 say only
+that `.` and `./` keep the check's handling, or cite assumption 83, and
+credit assumption 41 with nothing, so they stand. So does the list of edits
+of the corrections before C7, which describes their text as first written.
