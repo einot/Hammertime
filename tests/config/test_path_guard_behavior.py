@@ -2115,6 +2115,38 @@ def test_an_empty_root_contains_no_path(
     assert_root_denied(result, f"{what}, under {dict(policy)!r}")
 
 
+# Brief T4 item 3, "An empty root", its follow-up added after C6 (2026-09-25):
+# PATH_ROOT unset, DENY_GLOBS='tests/*', a Write of the relative `docs/x.md`. Each
+# row is an id, `cwd`, CLAUDE_PROJECT_DIR and the verdict.
+UNSET_ROOT_POLICY = {"DENY_GLOBS": "tests/*"}
+UNSET_EMPTY_ROOT_CASES: list[tuple[str, str, str, str]] = [
+    ("both-empty", "", "", VERDICT_ROOT),
+    ("cwd-repo-dir-empty", "{repo}", "", VERDICT_ALLOW),
+    ("cwd-empty-dir-repo", "", "{repo}", VERDICT_ALLOW),
+]
+
+
+@pytest.mark.parametrize(
+    ("cwd", "project_dir", "verdict"),
+    [case[1:] for case in UNSET_EMPTY_ROOT_CASES],
+    ids=[case[0] for case in UNSET_EMPTY_ROOT_CASES],
+)
+def test_an_unset_path_root_with_both_bases_empty_contains_no_relative_path(
+    tmp_path: Path, cwd: str, project_dir: str, verdict: str
+) -> None:
+    """Decision 20 and assumption 61, as corrected after C6's review: with
+    PATH_ROOT unset a relative path is inside the root only when `cwd` or
+    CLAUDE_PROJECT_DIR is non-empty. With both empty the root is empty, contains
+    no path, and the relative Write is refused with the root denial; with either
+    one the repository root, it is allowed."""
+    path = "docs/x.md"
+    result = run_root_case(
+        tmp_path, UNSET_ROOT_POLICY, "Write", path, cwd=cwd, project_dir=project_dir
+    )
+    what = f"a Write of {path!r}, cwd {cwd!r}, CLAUDE_PROJECT_DIR {project_dir!r}"
+    assert_verdict(result, verdict, f"{what}, under {UNSET_ROOT_POLICY!r}")
+
+
 def test_a_path_out_of_plain_form_keeps_decision_18s_denial_outside_the_root(
     tmp_path: Path,
 ) -> None:
