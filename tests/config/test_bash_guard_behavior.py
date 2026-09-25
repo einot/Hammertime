@@ -34,6 +34,20 @@ Groups, each citing the decision it encodes:
 Groups J and K read `.claude/settings.json`, so the coder half of them fails
 until the top-level session applies decision 14 (step W). Everything else
 fails until brief C1 lands. That is intended; nothing here is xfailed.
+
+ADR-0018's fifth amendment (2026-09-25) adds decision 19, which group P
+encodes (brief T4, item 7). A payload the guard cannot read as one tool call
+-- not exactly one JSON object, a `tool_input` that is not an object, a
+`tool_name` that is not a string, a `cwd` or `agent_type` that is neither a
+string nor `null` -- is refused with the bash shape denial. The check runs
+before the `SCOPE_AGENT_TYPES` routing, for every caller and under every
+policy, and the denial goes through `deny`, so it carries decision 11's
+paragraph exactly when the policy's `DENY_ADVICE` asks for it. A guard that
+would end with any status other than 0 or 2 denies instead, with the backstop
+denial, which never carries the paragraph. When `deny`'s own `jq` fails, the
+reason goes to stderr and the exit is still 2. Group P fails until brief C6
+lands, except its controls, which pass today. A `command` that is not a
+string still meets decision 3's could-not-be-checked denial (group O).
 """
 
 import json
@@ -1473,3 +1487,258 @@ def test_a_missing_command_passes_the_gate_as_empty(
     check exits 1, and the guard exits 0 at the empty-command check."""
     result = run_guard_tool_input(tool_input, policy=CODER_POLICY, cwd=tmp_path, agent_type="coder")
     assert_allowed(result, f"tool_input {tool_input!r} under the coder policy")
+
+
+# --- P. a payload the guard cannot read, and a guard that fails (decision 19) --
+#
+# ADR-0018's fifth amendment (2026-09-25), brief T4, item 7. The payloads decision
+# 19 needs cannot be built by `run_guard`, so they go through `run_guard_stdin`,
+# which sends a stdin text unchanged. Wherever a payload has a well-formed
+# `tool_input` and `tool_name`, they are `{"command": "git status"}` and `"Bash"`,
+# a command every policy below allows or passes through.
+
+
+def status_pattern(template: str) -> re.Pattern[str]:
+    """`template`, verbatim, with its `status N` matching any status number, which
+    brief T4 says not to pin."""
+    head, _, tail = template.partition("status N")
+    return re.compile(rf"{re.escape(head)}status \d+{re.escape(tail)}")
+
+
+# Decision 19's bash shape denial, verbatim, with the ADR's blockquote line breaks
+# joined by single spaces and N standing for the status.
+BASH_SHAPE_TEMPLATE = (
+    "Hammertime bash guard: the hook payload could not be read as a single tool "
+    "call (the check ended with status N). A payload must be one JSON object "
+    "whose tool_input is an object, whose tool_name is a string, and whose cwd "
+    "and agent_type are strings, null or absent; without that, the guard cannot "
+    "tell what command would run or who sent it. The command is refused."
+)
+BASH_SHAPE_PATTERN = status_pattern(BASH_SHAPE_TEMPLATE)
+
+# Decision 19's bash backstop denial, the same way.
+BASH_BACKSTOP_TEMPLATE = (
+    "Hammertime bash guard: the guard stopped with status N before reaching a "
+    "verdict, so it cannot vouch for this command. The command is refused."
+)
+BASH_BACKSTOP_PATTERN = status_pattern(BASH_BACKSTOP_TEMPLATE)
+
+# Decision 19's table of phrases the tests pin.
+SHAPE_PHRASE = "could not be read as a single tool call"
+BACKSTOP_PHRASE = "before reaching a verdict"
+
+# The policy variables `run_guard_stdin` clears: the module's own, and the path
+# guard's `PATH_ROOT` (brief T4 asks every new helper to clear it).
+ROOTED_POLICY_VARS = (*POLICY_VARS, "PATH_ROOT")
+
+NEEDS_BIN_SH = pytest.mark.skipif(
+    not Path("/bin/sh").exists(),
+    reason="the failing jq stand-in is a /bin/sh script, and /bin/sh does not exist",
+)
+
+
+def run_guard_stdin(
+    stdin: str,
+    *,
+    policy: Mapping[str, str],
+    jq_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Send `stdin` to the guard unchanged (brief T4), with `run_guard`'s
+    environment handling, `PATH_ROOT` cleared as well.
+
+    With `jq_dir`, `PATH` is that directory, then `:`, then the inherited
+    `PATH`, so a `jq` placed there replaces the real one. The guard itself is
+    still started with the absolute `bash` found at import.
+    """
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+
+    env = dict(os.environ)
+    for name in ROOTED_POLICY_VARS:
+        env.pop(name, None)
+    env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
+    if jq_dir is not None:
+        env["PATH"] = f"{jq_dir}:{os.environ.get('PATH', '')}"
+    env.update(policy)
+
+    return subprocess.run(
+        [BASH or "bash", str(GUARD)],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+
+def write_failing_jq(directory: Path, status: int) -> None:
+    """An executable `jq` in `directory` that prints nothing and exits `status`."""
+    jq = directory / "jq"
+    jq.write_text(f"#!/bin/sh\nexit {status}\n", encoding="utf-8")
+    jq.chmod(0o755)
+
+
+ABSENT: Any = object()
+
+
+def bash_payload(agent_type: str | None, field: str | None = None, value: Any = None) -> str:
+    """A well-formed Bash payload for `git status`, from `agent_type`, with `field`
+    set to `value`, or removed when `value` is ABSENT, as JSON text."""
+    payload: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+        "cwd": str(REPO_ROOT),
+    }
+    if agent_type is not None:
+        payload["agent_type"] = agent_type
+    if field is not None:
+        if value is ABSENT:
+            payload.pop(field, None)
+        else:
+            payload[field] = value
+    return json.dumps(payload)
+
+
+# Decision 19's payloads (brief T4, items 1 and 7). A stdin that is not one JSON
+# object is sent as it stands; the rest are the well-formed payload with one
+# field changed, or sent twice.
+RAW_PAYLOADS: dict[str, str] = {
+    "not-json": "not json",
+    "empty": "",
+    "array": "[]",
+    "string": '"x"',
+    "number": "42",
+    "null": "null",
+}
+TWO_PAYLOADS = "two-payloads"
+FIELD_CHANGES: dict[str, tuple[str, Any]] = {
+    "tool_input-string": ("tool_input", "x"),
+    "tool_input-number": ("tool_input", 42),
+    "tool_input-array": ("tool_input", ["x"]),
+    "tool_input-true": ("tool_input", True),
+    "tool_input-false": ("tool_input", False),
+    "tool_input-null": ("tool_input", None),
+    "tool_input-absent": ("tool_input", ABSENT),
+    "tool_name-absent": ("tool_name", ABSENT),
+    "tool_name-null": ("tool_name", None),
+    "tool_name-number": ("tool_name", 42),
+    "cwd-number": ("cwd", 42),
+    "cwd-array": ("cwd", ["x"]),
+    "agent_type-number": ("agent_type", 42),
+    "agent_type-object": ("agent_type", {"a": 1}),
+}
+MALFORMED_CASES = [*RAW_PAYLOADS, TWO_PAYLOADS, *FIELD_CHANGES]
+
+
+def malformed_stdin(case: str, agent_type: str | None) -> str:
+    """The stdin for one of MALFORMED_CASES, from `agent_type` wherever the
+    payload has a well-formed one."""
+    if case in RAW_PAYLOADS:
+        return RAW_PAYLOADS[case]
+    if case == TWO_PAYLOADS:
+        one = bash_payload(agent_type)
+        return f"{one}\n{one}"
+    field, value = FIELD_CHANGES[case]
+    return bash_payload(agent_type, field, value)
+
+
+# Each scenario is an id, the policy and the `agent_type`. `policy={}` sets no
+# knob: with no ALLOW_CMDS it polices no well-formed command, and with no
+# DENY_ADVICE its denials carry no paragraph (decisions 11 and 19).
+SHAPE_SCENARIOS: list[tuple[str, Mapping[str, str], str | None]] = [
+    ("coder", CODER_POLICY, "coder"),
+    ("security-auditor", AUDITOR_POLICY, "security-auditor"),
+    ("no-policy", {}, "coder"),
+    ("coder-policy-no-agent-type", CODER_POLICY, None),
+    ("auditor-policy-no-agent-type", AUDITOR_POLICY, None),
+]
+
+
+@pytest.mark.parametrize(
+    ("policy", "agent_type"),
+    [scenario[1:] for scenario in SHAPE_SCENARIOS],
+    ids=[scenario[0] for scenario in SHAPE_SCENARIOS],
+)
+@pytest.mark.parametrize("case", MALFORMED_CASES)
+def test_a_payload_the_guard_cannot_read_gets_the_bash_shape_denial(
+    case: str, policy: Mapping[str, str], agent_type: str | None
+) -> None:
+    """Decision 19 and assumptions 54 and 55: the shape check runs before the
+    routing, for every caller and under a policy that constrains nothing. The
+    denial goes through `deny`, so it ends with decision 11's paragraph, after
+    one space, exactly when the policy sets DENY_ADVICE (the coder's), whether
+    or not the payload names the agent the policy is scoped to."""
+    result = run_guard_stdin(malformed_stdin(case, agent_type), policy=policy)
+    what = f"the {case} payload from agent_type={agent_type!r} under {dict(policy)!r}"
+    reason = assert_denied(result, what)
+    assert SHAPE_PHRASE in reason, reason
+    body = reason
+    if policy.get("DENY_ADVICE"):
+        assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+        body = reason.removesuffix(f" {FINAL_PARAGRAPH}")
+    else:
+        assert FINAL_SENTENCE not in reason, reason
+    assert BASH_SHAPE_PATTERN.fullmatch(body), (
+        f"the shape denial for {what} must be decision 19's text verbatim, with N a "
+        f"status number.\nreason: {reason!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "agent_type"),
+    [scenario[1:] for scenario in SHAPE_SCENARIOS],
+    ids=[scenario[0] for scenario in SHAPE_SCENARIOS],
+)
+def test_the_well_formed_payload_is_judged_as_before(
+    policy: Mapping[str, str], agent_type: str | None
+) -> None:
+    """Decision 19's controls: the well-formed `git status` payload is allowed by
+    the coder's and the auditor's policies, passed through by `policy={}`, and
+    passed through by each scoped policy when it carries no `agent_type`."""
+    result = run_guard_stdin(bash_payload(agent_type), policy=policy)
+    assert_allowed(result, f"git status from agent_type={agent_type!r} under {dict(policy)!r}")
+
+
+@NEEDS_BIN_SH
+def test_a_bash_guard_that_fails_after_the_shape_check_gets_the_backstop_denial(
+    tmp_path: Path,
+) -> None:
+    """Decision 19, parts 1 and 3, and assumption 56: with a `jq` that exits 1 and
+    prints nothing, the shape check reads status 1 and passes, the first
+    extraction line fails, and the `EXIT` trap denies with the backstop text. It
+    carries no decision 11 paragraph under any DENY_ADVICE. With the real `jq`,
+    the same command is allowed."""
+    payload = bash_payload("coder")
+    assert_allowed(run_guard_stdin(payload, policy=CODER_POLICY), "git status with the real jq")
+    write_failing_jq(tmp_path, 1)
+    result = run_guard_stdin(payload, policy=CODER_POLICY, jq_dir=tmp_path)
+    what = "git status under the coder policy with a jq that exits 1"
+    reason = assert_denied(result, what)
+    assert BACKSTOP_PHRASE in reason, reason
+    assert FINAL_SENTENCE not in reason, reason
+    assert BASH_BACKSTOP_PATTERN.fullmatch(reason), (
+        f"the backstop denial for {what} must be decision 19's text verbatim, with N a "
+        f"status number, and no paragraph.\nreason: {reason!r}"
+    )
+
+
+@NEEDS_BIN_SH
+def test_a_bash_shape_check_that_fails_denies_on_stderr(tmp_path: Path) -> None:
+    """Decision 19, parts 2 and 3, and assumption 57: with a `jq` that exits 3 and
+    prints nothing, the shape check does not complete, so the shape denial
+    follows; `deny`'s own `jq` fails too, so the reason `deny` builds, decision
+    11's paragraph included, goes to stderr, and the exit is still 2."""
+    write_failing_jq(tmp_path, 3)
+    result = run_guard_stdin(bash_payload("coder"), policy=CODER_POLICY, jq_dir=tmp_path)
+    what = "git status under the coder policy with a jq that exits 3"
+    assert result.returncode == 2, (
+        f"expected the guard to DENY {what} (exit 2), got exit {result.returncode}.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert result.stdout == "", f"expected nothing on stdout for {what}; got {result.stdout!r}"
+    expected = re.compile(BASH_SHAPE_PATTERN.pattern + re.escape(f" {FINAL_PARAGRAPH}"))
+    assert expected.search(result.stderr), (
+        f"expected the bash shape denial and decision 11's paragraph on stderr for {what}.\n"
+        f"stderr: {result.stderr!r}"
+    )

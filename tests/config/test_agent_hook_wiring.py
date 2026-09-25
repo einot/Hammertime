@@ -40,6 +40,15 @@ interpreters and writers, and decision 12's Edit/Write globs, which decision 7
 requires to equal the Bash policy's `WRITE_DENY_GLOBS`. Those coder items fail
 until the top-level session applies decision 14 (step W).
 
+ADR-0018's fifth amendment (2026-09-25) extends decision 14's text with
+decisions 20 and 22, and the module's final section pins them (brief T4, item
+6): every `path-guard.sh` policy sets `PATH_ROOT`, to `cwd` for the coder and
+to `project` for the architect and the test-author; no `ALLOW_GLOBS` or
+`EXEMPT_GLOBS` glob begins with `*`; every Edit/Write policy's `DENY_GLOBS`
+carries decision 22's agent-configuration list; the test-author's lists are
+decision 22's; and the architect's allowlist is unchanged. Those items fail
+until step W.
+
 See also `.claude/hooks/path-guard.sh` and `.claude/hooks/bash-guard.sh`, whose
 own headers record the probes of the frontmatter wiring, and
 `tests/config/test_path_guard_behavior.py`, which exercises the guard script
@@ -727,3 +736,218 @@ def test_coder_edit_write_deny_globs_cover_decision_12() -> None:
         f"the coder's Edit|Write DENY_GLOBS lacks ADR-0018 decision 12's {sorted(missing)}"
     )
     assert ".claude/*" in words(command, "DENY_GLOBS")
+
+
+# --- ADR-0018's fifth amendment: PATH_ROOT and decision 22's lists ---------
+#
+# Brief T4, item 6. Every list is compared as a set of words.
+
+# Decision 20: the root each agent's path-guard.sh policies name.
+EXPECTED_PATH_ROOTS = {"coder": "cwd", "architect": "project", "test-author": "project"}
+
+# Decision 22's agent-configuration list, which every Edit/Write policy carries.
+AGENT_CONFIGURATION_GLOBS = frozenset(
+    [
+        ".claude",
+        ".claude/*",
+        "*/.claude",
+        "*/.claude/*",
+        "CLAUDE.md",
+        "*/CLAUDE.md",
+        "CLAUDE.local.md",
+        "*/CLAUDE.local.md",
+        ".mcp.json",
+        "*/.mcp.json",
+    ]
+)
+
+# Decision 22: the test-author's Edit/Write allowlist, exactly.
+TEST_AUTHOR_WRITE_ALLOW_GLOBS = frozenset(
+    [
+        "tests/*",
+        "packages/*/tests/*",
+        "services/*/tests/*",
+        "tools/*/tests/*",
+        "packages/hammertime-testkit/*",
+    ]
+)
+
+# Decision 22: git's internals and the ignored executed state of decision 12 (b),
+# which the test-author's Edit/Write deny list adds to the agent-configuration list.
+TEST_AUTHOR_WRITE_GIT_AND_IGNORED_GLOBS = frozenset(
+    [
+        ".git",
+        ".git/*",
+        "*/.git",
+        "*/.git/*",
+        ".venv/*",
+        "*/.venv/*",
+        "__pycache__/*",
+        "*/__pycache__/*",
+    ]
+)
+
+# Decision 22: the test-author's read exemptions, exactly.
+TEST_AUTHOR_READ_EXEMPT_GLOBS = frozenset(
+    [
+        "tests",
+        "tests/*",
+        "packages/*/tests",
+        "packages/*/tests/*",
+        "services/*/tests",
+        "services/*/tests/*",
+        "tools/*/tests",
+        "tools/*/tests/*",
+        "packages/hammertime-testkit",
+        "packages/hammertime-testkit/*",
+    ]
+)
+
+# Decision 22 (brief T4): what the test-author's read DENY_GLOBS must contain.
+TEST_AUTHOR_READ_DENY_GLOBS = frozenset(
+    [
+        "packages",
+        "packages/*",
+        "services",
+        "services/*",
+        "tools",
+        "tools/*",
+        ".claude",
+        ".claude/*",
+        ".mypy_cache",
+        ".mypy_cache/*",
+        "build",
+        "build/*",
+        "dist",
+        "dist/*",
+        "htmlcov",
+        "htmlcov/*",
+    ]
+)
+
+# Decision 14: the architect's Edit/Write allowlist, unchanged by decision 22.
+ARCHITECT_WRITE_ALLOW_GLOBS = frozenset(["docs/*", "schemas/*", "README.md"])
+
+EDIT_WRITE = frozenset({"Edit", "Write"})
+READ_GREP_GLOB = frozenset({"Read", "Grep", "Glob"})
+
+
+def path_guard_policies() -> list[HookCommand]:
+    return [command for command in HOOK_COMMANDS if Path(command.script).name == PATH_GUARD]
+
+
+def path_guard_policy(agent_name: str, tools: frozenset[str]) -> HookCommand:
+    matching = [
+        command
+        for command in path_guard_policies()
+        if agent_name in command.scoped_agents and tools <= command.matched_tools
+    ]
+    assert len(matching) == 1, (
+        f"expected exactly one PreToolUse policy in {SETTINGS_PATH} scoped to "
+        f"'{agent_name}', matching {sorted(tools)} and running {PATH_GUARD} (ADR-0018 "
+        f"decision 14); found {len(matching)}"
+    )
+    return matching[0]
+
+
+def test_path_guard_policies_are_found() -> None:
+    """The path-guard invariants below must not pass vacuously."""
+    assert path_guard_policies(), f"no PreToolUse policy in {SETTINGS_PATH} runs {PATH_GUARD}"
+
+
+def test_every_path_guard_policy_sets_its_path_root() -> None:
+    """ADR-0018 decisions 14 and 20: every path-guard.sh policy names its root,
+    `cwd` for the coder, whose root is its worktree, and `project` for the
+    architect and the test-author. An unset PATH_ROOT keeps the two old bases,
+    and a policy scoped to agents with different roots cannot name one."""
+    offenders = []
+    for command in path_guard_policies():
+        roots = {
+            EXPECTED_PATH_ROOTS[agent]
+            for agent in command.scoped_agents
+            if agent in EXPECTED_PATH_ROOTS
+        }
+        value = command.env.get("PATH_ROOT")
+        valid = value in {"cwd", "project"} and (not roots or roots == {value})
+        if not valid:
+            offenders.append(f"PATH_ROOT={value!r}, expected {sorted(roots)}: {command.command}")
+    assert not offenders, (
+        "these path-guard.sh policies do not set the PATH_ROOT ADR-0018 decision 20 "
+        f"gives them: {offenders}"
+    )
+
+
+def test_no_path_guard_allow_or_exempt_glob_begins_with_a_star() -> None:
+    """ADR-0018 decisions 20 and 22: an allow or exempt glob that begins with `*`
+    matches paths it was never written for, in any directory (gap G1)."""
+    offenders = []
+    for command in path_guard_policies():
+        for variable in ("ALLOW_GLOBS", "EXEMPT_GLOBS"):
+            starred = sorted(glob for glob in words(command, variable) if glob.startswith("*"))
+            if starred:
+                offenders.append(f"{variable} {starred}: {command.command}")
+    assert not offenders, (
+        f"these path-guard.sh policies allow or exempt a glob beginning with '*': {offenders}"
+    )
+
+
+def test_every_edit_write_path_guard_policy_denies_agent_configuration() -> None:
+    """ADR-0018 decision 22: every Edit/Write policy's DENY_GLOBS carries the
+    agent-configuration list, so no agent writes a `.claude/`, a `CLAUDE.md` or
+    a `.mcp.json` at any depth."""
+    policies = [command for command in path_guard_policies() if EDIT_WRITE & command.matched_tools]
+    assert policies, f"no Edit/Write policy in {SETTINGS_PATH} runs {PATH_GUARD}"
+    offenders = {
+        command.command: sorted(AGENT_CONFIGURATION_GLOBS - words(command, "DENY_GLOBS"))
+        for command in policies
+        if AGENT_CONFIGURATION_GLOBS - words(command, "DENY_GLOBS")
+    }
+    assert not offenders, (
+        f"these Edit/Write policies' DENY_GLOBS lack decision 22's globs: {offenders}"
+    )
+
+
+def test_test_author_write_allow_globs_are_decision_22s() -> None:
+    command = path_guard_policy("test-author", EDIT_WRITE)
+    allow = words(command, "ALLOW_GLOBS")
+    assert allow == TEST_AUTHOR_WRITE_ALLOW_GLOBS, (
+        "the test-author's Edit|Write ALLOW_GLOBS differ from ADR-0018 decision 22's.\n"
+        f"missing: {sorted(TEST_AUTHOR_WRITE_ALLOW_GLOBS - allow)}\n"
+        f"extra: {sorted(allow - TEST_AUTHOR_WRITE_ALLOW_GLOBS)}"
+    )
+
+
+def test_test_author_write_deny_globs_cover_decision_22() -> None:
+    command = path_guard_policy("test-author", EDIT_WRITE)
+    required = AGENT_CONFIGURATION_GLOBS | TEST_AUTHOR_WRITE_GIT_AND_IGNORED_GLOBS
+    missing = required - words(command, "DENY_GLOBS")
+    assert not missing, (
+        f"the test-author's Edit|Write DENY_GLOBS lack ADR-0018 decision 22's {sorted(missing)}"
+    )
+
+
+def test_test_author_read_exempt_globs_are_decision_22s() -> None:
+    command = path_guard_policy("test-author", READ_GREP_GLOB)
+    exempt = words(command, "EXEMPT_GLOBS")
+    assert exempt == TEST_AUTHOR_READ_EXEMPT_GLOBS, (
+        "the test-author's Read|Grep|Glob EXEMPT_GLOBS differ from ADR-0018 decision 22's.\n"
+        f"missing: {sorted(TEST_AUTHOR_READ_EXEMPT_GLOBS - exempt)}\n"
+        f"extra: {sorted(exempt - TEST_AUTHOR_READ_EXEMPT_GLOBS)}"
+    )
+
+
+def test_test_author_read_deny_globs_cover_decision_22() -> None:
+    command = path_guard_policy("test-author", READ_GREP_GLOB)
+    missing = TEST_AUTHOR_READ_DENY_GLOBS - words(command, "DENY_GLOBS")
+    assert not missing, (
+        f"the test-author's Read|Grep|Glob DENY_GLOBS lack decision 22's {sorted(missing)}"
+    )
+
+
+def test_architect_write_allow_globs_are_unchanged() -> None:
+    command = path_guard_policy("architect", EDIT_WRITE)
+    allow = words(command, "ALLOW_GLOBS")
+    assert allow == ARCHITECT_WRITE_ALLOW_GLOBS, (
+        f"the architect's Edit|Write ALLOW_GLOBS are {sorted(allow)}; ADR-0018 decisions 14 "
+        f"and 22 keep them {sorted(ARCHITECT_WRITE_ALLOW_GLOBS)}"
+    )
