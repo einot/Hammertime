@@ -194,15 +194,20 @@
 #                                        root or beginning with the root
 #                                        and `/`; any relative path
 #   unset/empty cwd, then                an absolute path inside either;
-#               CLAUDE_PROJECT_DIR       any relative path
-#               (which falls back to
-#               cwd), as before
+#               CLAUDE_PROJECT_DIR       a relative path only when cwd
+#               (which falls back to     or CLAUDE_PROJECT_DIR is
+#               cwd), as before          non-empty
 #   other       none                     a configuration error: every
 #                                        in-scope call is refused
 #
 # One trailing `/` is removed from a root, and from cwd before it is
-# compared with a root. An empty root, its variable unset or empty,
-# contains no path. The relativisation strips the root (or, unset, the two
+# compared with a root. The last column assumes a root that is not empty.
+# An empty root, its variable unset or empty, contains no path, absolute
+# or relative: every guarded path is outside it. With PATH_ROOT unset the
+# root is empty when cwd and CLAUDE_PROJECT_DIR are both empty; while
+# either is non-empty, a relative path is inside, and an absolute path is
+# compared only with a base that is non-empty. The relativisation strips
+# the root (or, unset, the two
 # bases in turn) and does nothing else; the path relative to the root is
 # what the glob lists see, and a relative path is kept as written.
 #
@@ -453,7 +458,9 @@ fi
 # A relative path is kept as written and judged relative to the root:
 # inside for any non-empty root under `cwd`, only when the payload's cwd
 # equals the root under `project` (the harness resolves a relative path
-# against cwd), and always when PATH_ROOT is unset. Under `project` and
+# against cwd), and when PATH_ROOT is unset only while cwd or
+# CLAUDE_PROJECT_DIR is non-empty (both empty is an empty root, which
+# contains no path). Under `project` and
 # `cwd` only an absolute path is compared with the root; unset keeps the
 # old comparison for every path.
 project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
@@ -492,7 +499,9 @@ if (( ! inside )) && [[ "$file_path" != /* ]]; then
       fi
       ;;
     *)
-      inside=1
+      if [[ -n "$cwd" || -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+        inside=1
+      fi
       ;;
   esac
 fi
