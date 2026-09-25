@@ -74,7 +74,56 @@
 #
 # Reads the PreToolUse JSON payload on stdin (see
 # https://code.claude.com/docs/en/hooks) and inspects tool_input.command.
-# Any tool other than Bash passes through.
+# Any tool other than Bash passes through. A payload this guard cannot read
+# is refused first, for every caller (see PAYLOAD SHAPE below).
+#
+# A GUARD THAT FAILS DENIES (ADR-0018 decision 19, fifth amendment). This
+# script ends with status 0 (allow, with no output) or 2 (deny) and nothing
+# else. Before this, any command that failed under `set -e` -- an
+# extraction line whose jq could not read the payload, or the jq inside
+# `deny` -- ended the script with some other status, which the harness
+# treats as a non-blocking hook error, so the call went through. Three
+# parts, built in for every policy, with no knob:
+#
+#   FAIL-CLOSED EXIT. An EXIT trap, installed as the first command after
+#   `set -f -e -u -o pipefail`, turns any exit status other than 0 or 2
+#   into the backstop denial ("... the guard stopped with status N before
+#   reaching a verdict ...") and exit 2. It writes the JSON deny with
+#   printf and a fixed template, never with jq, which may be what failed.
+#   It carries no DENY_ADVICE paragraph, in any mode, because it can fire
+#   before the knobs are read: it is the one exception to decision 11's
+#   "every denial".
+#
+#   DENY'S FALLBACK. `deny` still writes the JSON deny with `jq -n` and
+#   exits 2. If that jq fails, it writes the same reason, the DENY_ADVICE
+#   paragraph included, to stderr instead, and still exits 2, which blocks
+#   whether or not JSON is printed.
+#
+#   PAYLOAD SHAPE. Between reading stdin and the first extraction line, one
+#   `jq -e -s` call over the raw payload asks whether it is malformed. It
+#   is well formed when it is exactly one JSON value, that value is an
+#   object, its tool_input is an object, its tool_name is a string, and its
+#   cwd and agent_type are each a string, null or absent. Only status 1 (a
+#   clean false: well formed) passes; status 0 (malformed) and any other
+#   status (not JSON, or jq failed) get the shape denial ("... could not be
+#   read as a single tool call ..."), which names the status and goes
+#   through `deny`. This is the one check in the script that runs BEFORE
+#   the tool_name test and the SCOPE_AGENT_TYPES routing, for every caller
+#   the hook sees, the top-level session included, and under a policy that
+#   constrains nothing: the routing reads agent_type through an extraction
+#   line, so a script that cannot read the payload cannot tell whether the
+#   caller is in scope. `deny`, DENY_ADVICE and FINAL_PARAGRAPH are
+#   therefore defined above the extraction lines. A field inside tool_input
+#   is not this check's business: a command that is not a string still
+#   meets the NUL gate's could-not-be-checked denial. Once the shape passes,
+#   no extraction line can fail on the payload, only through the
+#   environment, and the trap turns that into the backstop denial.
+#
+#   The cost: a missing or broken jq now refuses every call this hook sees,
+#   the top-level session's included, until jq is restored from outside
+#   the session. A guard process that never finishes (killed by a signal
+#   or by the hook timeout), or a hook command that cannot start, is
+#   outside what the script can do.
 #
 # WIRING -- read this before believing the guard is doing anything.
 #
@@ -644,11 +693,24 @@
 
 set -f -e -u -o pipefail
 
+# Fail-closed exit (ADR-0018 decision 19, part 1; see FAIL-CLOSED EXIT in
+# the header). Installed first, so that it covers every line below: any
+# status but 0 or 2 becomes the backstop denial and exit 2. Written with
+# printf and a fixed template, never with jq, which may be what failed; the
+# text has no `"` and no `\`, and the status is an integer, so nothing
+# needs escaping. No advice paragraph: it can fire before DENY_ADVICE is
+# read. The handler runs under `set -e` too, so its printf is guarded with
+# `|| :` and cannot end it early, and its last command is `exit 2`.
+on_exit() {
+  local status="$1"
+  if (( status != 0 && status != 2 )); then
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "Hammertime bash guard: the guard stopped with status ${status} before reaching a verdict, so it cannot vouch for this command. The command is refused." || :
+    exit 2
+  fi
+}
+trap 'on_exit "$?"' EXIT
+
 input="$(cat)"
-tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
-command_str="$(printf '%s' "$input" | jq -r '.tool_input.command // empty')"
-cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
-agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
 
 # DENY_ADVICE (ADR-0018 decision 11). Unset, empty or `needs-validation`
 # keeps every message exactly as it was. Any other value -- including a
@@ -664,7 +726,9 @@ FINAL_PARAGRAPH="This refusal is final for this task. Do not retry the same effe
 
 # Every refusal in this file goes through here, which is what makes the
 # paragraph reach every denial in stop-and-report mode, configuration
-# errors and the shared rules included.
+# errors and the shared rules included. If jq cannot write the JSON deny,
+# the same reason goes to stderr instead, and the exit is still 2, which
+# blocks whether or not JSON is printed (ADR-0018 decision 19, part 2).
 deny() {
   local reason="$1"
   if (( stop_and_report )); then
@@ -676,9 +740,28 @@ deny() {
       permissionDecision: "deny",
       permissionDecisionReason: $reason
     }
-  }'
+  }' || printf '%s\n' "$reason" >&2
   exit 2
 }
+
+# Payload shape (ADR-0018 decision 19, part 3; see PAYLOAD SHAPE in the
+# header). The one check before the routing, for every caller: a payload
+# that is not one JSON object whose tool_input is an object, whose
+# tool_name is a string, and whose cwd and agent_type are strings, null or
+# absent is refused, so that no extraction line below can fail on the
+# payload's shape. Only status 1 (a clean false: well formed) passes; the
+# status is captured with `|| shape_status=$?` so that neither `set -e` nor
+# an `if` condition can turn a jq error into a pass.
+shape_status=0
+printf '%s' "$input" | jq -e -s 'length != 1 or (.[0] | (type != "object") or ((.tool_input | type) != "object") or ((.tool_name | type) != "string") or ([.cwd, .agent_type] | any(. != null and type != "string")))' >/dev/null 2>&1 || shape_status=$?
+if [[ "$shape_status" != 1 ]]; then
+  deny "Hammertime bash guard: the hook payload could not be read as a single tool call (the check ended with status ${shape_status}). A payload must be one JSON object whose tool_input is an object, whose tool_name is a string, and whose cwd and agent_type are strings, null or absent; without that, the guard cannot tell what command would run or who sent it. The command is refused."
+fi
+
+tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
+command_str="$(printf '%s' "$input" | jq -r '.tool_input.command // empty')"
+cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
+agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
 
 [[ "$tool_name" == "Bash" ]] || exit 0
 
@@ -691,9 +774,10 @@ deny() {
 # "deny". Unset behaves as it always has and polices every Bash call
 # that reaches this hook, which is what the test suite exercises.
 #
-# This test deliberately sits first, before the allowlist and the
-# command are even looked at, so that an out-of-scope caller costs
-# nothing and cannot be affected by this policy's configuration.
+# This test deliberately sits first, after only the payload-shape check
+# above, and before the allowlist and the command are even looked at, so
+# that an out-of-scope caller costs nothing and cannot be affected by
+# this policy's configuration.
 if [[ -n "${SCOPE_AGENT_TYPES:-}" ]]; then
   in_scope=0
   if [[ -n "$agent_type" ]]; then
