@@ -89,6 +89,27 @@ and CLAUDE_PROJECT_DIR is usable. The tests at the end of this module encode it
 (brief T5). The read list's refusals fail until step W; the root cases fail
 until brief C7 lands, except their controls and the silent passes outside the
 root rule's reach.
+
+ADR-0018's seventh amendment (2026-09-25) fixes SA1f's findings. Decision 24:
+a path is read from its tool's own field, `file_path` for a Read, Edit or Write
+and `path` for a Grep or Glob; a call from any other tool, or one whose other
+field is anything but absent, `null` or `false`, is refused, before the NUL
+gate. Decision 17 gains a trailing-newline test, directly after the NUL gate.
+Decision 18's fourth test refuses a `~` at the start of any component, and a
+root with such a component is not usable (decision 20). Decision 23: in a Grep
+or a Glob no string may begin with `-`, no component of a Glob pattern or a
+Grep glob may begin with `.` and then `*` or `?`, and the search path may hold
+only ASCII letters, digits and `_ - . /`. Decision 19 reads at most 8 MiB and
+one byte of the payload, keeping a raw NUL as U+0002, which the shape check
+refuses with status 0; it turns a status 2 that `deny` did not make into the
+backstop denial; and it refuses, with the backstop denial, an extraction that
+reads a field as empty that is not, and a `cwd` that ends with a newline or
+holds a NUL. Decision 12 (e) and (f) add `tests`, `*/tests` and the testkit to
+the coder's fence at step W. The tests at the end of this module encode them
+(brief T6). They fail until brief C8 lands, except their controls and silent
+passes, the raw U+0002 cases if `jq` already refuses a raw control character,
+the `/dev/full` case and the `jq` killed by a signal, which pass today; the
+coder's cases for decision 12 fail until step W, except their control.
 """
 
 import json
@@ -2925,3 +2946,942 @@ def test_an_unusable_root_gets_decision_20s_root_denial_verbatim(
         "the root denial must be decision 20's text verbatim.\n"
         f"expected: {ROOT_MESSAGE!r}\nreason:   {reason!r}"
     )
+
+
+# --- the seventh amendment: SA1f's findings -----------------------------------
+#
+# ADR-0018's seventh amendment (2026-09-25), brief T6. Every path that carries a
+# newline or a NUL is built by string concatenation, and `json.dumps` writes each
+# as an escape. A payload with a raw byte in it is built with `json.dumps`, and
+# then has the escape replaced by the byte itself (`raw_bytes`); it goes through
+# `run_guard_stdin`, which sends it unchanged.
+
+# Decision 24's denial, verbatim, with the ADR's blockquote line breaks joined by
+# single spaces. It is ASCII only.
+FIELD_MESSAGE = (
+    "Hammertime path guard: this guard reads the path of a Read, Edit or Write "
+    "from file_path and the path of a Grep or Glob from path, and this call "
+    "either comes from another tool or also names a path in the other field, "
+    "so the guard cannot tell which path the tool would act on. The tool call "
+    "is refused."
+)
+FIELD_PHRASE = "cannot tell which path the tool would act on"
+
+# Decision 17's trailing-newline denial, the same way.
+TRAILING_NEWLINE_MESSAGE = (
+    "Hammertime path guard: the path ends with a newline, or could not be "
+    "checked for one, and trailing newlines are dropped when the path is "
+    "read, so the guard cannot vet the path the tool would actually use. "
+    "Give the path without the newline. The tool call is refused."
+)
+TRAILING_NEWLINE_PHRASE = "the path ends with a newline"
+
+# Decision 23's denial for its rules 1 and 2, the same way.
+SEARCH_VALUE_MESSAGE = (
+    "Hammertime path guard: no value in a Grep or a Glob may begin with '-', "
+    "and no part of a Glob pattern or a Grep glob between slashes may begin "
+    "with '.' followed by '*' or '?', because the tool could read such a value "
+    "as an option, or match such a part against the '..' entry and search "
+    "above the path being searched. Give the value in another form; a Grep "
+    "pattern that has to match a leading '-' can begin with '[-]' instead. The "
+    "tool call is refused."
+)
+SEARCH_VALUE_PHRASE = "no value in a Grep or a Glob may begin with '-'"
+
+# Decision 23's denial for its rule 3, the same way.
+SEARCH_PATH_MESSAGE = (
+    "Hammertime path guard: the path of a Grep or a Glob may contain only "
+    "letters, digits and the characters _ - . /, because the tool could read "
+    "any other character as part of a pattern or an option and search "
+    "somewhere other than the path this guard vetted. Give the path in that "
+    "form. The tool call is refused."
+)
+SEARCH_PATH_PHRASE = "the path of a Grep or a Glob may contain only"
+
+
+def assert_denied_with(
+    result: subprocess.CompletedProcess[str], message: str, phrase: str, what: str
+) -> str:
+    """A denial that begins with the prefix, contains `phrase`, and is `message`
+    word for word (brief T6)."""
+    reason = assert_denied(result, what)
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert phrase in reason, (
+        f"expected the denial containing {phrase!r} for {what}, not another refusal.\n"
+        f"reason: {reason!r}"
+    )
+    assert reason == message, (
+        f"the denial for {what} must be the ADR's text verbatim.\n"
+        f"expected: {message!r}\nreason:   {reason!r}"
+    )
+    return reason
+
+
+def assert_field_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 24's denial, verbatim."""
+    return assert_denied_with(result, FIELD_MESSAGE, FIELD_PHRASE, what)
+
+
+def assert_trailing_newline_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 17's trailing-newline denial, verbatim."""
+    return assert_denied_with(result, TRAILING_NEWLINE_MESSAGE, TRAILING_NEWLINE_PHRASE, what)
+
+
+def assert_search_value_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 23's denial for its rules 1 and 2, verbatim."""
+    return assert_denied_with(result, SEARCH_VALUE_MESSAGE, SEARCH_VALUE_PHRASE, what)
+
+
+def assert_search_path_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 23's denial for its rule 3, verbatim."""
+    return assert_denied_with(result, SEARCH_PATH_MESSAGE, SEARCH_PATH_PHRASE, what)
+
+
+# Decision 24, brief T6 item 1: each tool's own field. The Grep's `path` is one
+# the test-author's read list refuses, and its `file_path` one its read
+# exemptions admit.
+
+GREP_WITH_BOTH_FIELDS: dict[str, Any] = {
+    "pattern": "PROBE",
+    "path": under_repo("packages"),
+    "file_path": under_repo("tests/x"),
+}
+NOTEBOOK_EDIT_INPUT: dict[str, Any] = {"notebook_path": under_repo("services/x.ipynb")}
+
+OTHER_FIELD_READ_CASES: list[tuple[str, str, dict[str, Any]]] = [
+    ("Grep-path-and-file_path", "Grep", GREP_WITH_BOTH_FIELDS),
+    (
+        "Glob-path-and-file_path",
+        "Glob",
+        {"pattern": "*.py", "path": under_repo("packages"), "file_path": under_repo("tests")},
+    ),
+    (
+        "Read-file_path-and-path",
+        "Read",
+        {"file_path": under_repo(TOP_LEVEL_TEST_FILE), "path": under_repo("packages")},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in OTHER_FIELD_READ_CASES],
+    ids=[case[0] for case in OTHER_FIELD_READ_CASES],
+)
+def test_a_test_author_call_that_names_the_other_field_is_refused(
+    tool_name: str, tool_input: dict[str, Any]
+) -> None:
+    """Decision 24, rules 2 and 3: a Grep or a Glob is judged on its `path` and a
+    Read on its `file_path`, and a call that also names the other kind's field
+    is refused, whatever that field holds. Before, the Grep and the Glob were
+    judged on the `file_path`, which the read exemptions admit."""
+    result = run_test_author_search(tool_name, tool_input)
+    assert_field_denied(result, f"test-author {tool_name} with the fields {sorted(tool_input)}")
+
+
+OTHER_FIELD_DENY_TESTS_CASES: list[tuple[str, str, dict[str, Any]]] = [
+    ("Write-path", "Write", {"path": under_repo(SERVICE_FILE)}),
+    ("Write-null-and-path", "Write", {"file_path": None, "path": under_repo(SERVICE_FILE)}),
+    ("Edit-empty-path", "Edit", {"file_path": under_repo(SERVICE_FILE), "path": ""}),
+    ("NotebookEdit", "NotebookEdit", NOTEBOOK_EDIT_INPUT),
+    ("MultiEdit", "MultiEdit", {"file_path": under_repo(SERVICE_FILE)}),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in OTHER_FIELD_DENY_TESTS_CASES],
+    ids=[case[0] for case in OTHER_FIELD_DENY_TESTS_CASES],
+)
+def test_a_call_from_another_tool_or_naming_the_other_field_is_refused(
+    tool_name: str, tool_input: dict[str, Any]
+) -> None:
+    """Decision 24, rules 1 and 2: under a guarded policy, a Write or an Edit whose
+    `path` is anything but absent, `null` or `false`, the empty string included,
+    and a call from a tool whose path field the script does not know, are
+    refused."""
+    result = run_rooted(tool_name, policy=DENY_TESTS, tool_input=tool_input)
+    assert_field_denied(result, f"a {tool_name} with the fields {sorted(tool_input)}")
+
+
+@pytest.mark.parametrize("file_path", [ABSENT, None, False], ids=["absent", "null", "false"])
+def test_a_grep_whose_file_path_is_absent_null_or_false_is_judged_on_its_path(
+    file_path: Any,
+) -> None:
+    """Decision 24, rule 2's control: a Grep's `file_path` that is absent, `null`
+    or `false` names no other path, so the Grep is judged on its `path`, which
+    the read list refuses with the DENY_GLOBS denial."""
+    tool_input: dict[str, Any] = {"pattern": "PROBE", "path": under_repo("packages")}
+    if file_path is not ABSENT:
+        tool_input["file_path"] = file_path
+    result = run_test_author_search("Grep", tool_input)
+    shown = "absent" if file_path is ABSENT else repr(file_path)
+    reason = assert_deny_globs_denied(result, f"test-author Grep of packages, file_path {shown}")
+    assert FIELD_PHRASE not in reason, reason
+
+
+def test_a_write_whose_path_field_is_null_is_judged_on_its_file_path() -> None:
+    """Decision 24, rule 2's control: a Write's `path` of `null` names no other
+    path, so a Write of a path the policy allows is allowed."""
+    tool_input = {"file_path": under_repo(SERVICE_FILE), "path": None}
+    result = run_rooted("Write", policy=DENY_TESTS, tool_input=tool_input)
+    assert_allowed_silently(result, f"a Write with tool_input {tool_input!r}")
+
+
+def test_the_field_check_runs_before_the_nul_gate() -> None:
+    """Decision 24, "Where it sits": before decision 17's NUL gate, so a Write
+    with a NUL in its `file_path` and a `path` beside it gets decision 24's
+    denial, not the NUL denial."""
+    tool_input = {"file_path": under_repo(SERVICE_FILE) + "\x00", "path": "x"}
+    result = run_rooted("Write", policy=DENY_TESTS, tool_input=tool_input)
+    reason = assert_field_denied(result, "a Write with a NUL in its file_path and a path")
+    assert NUL_PHRASE not in reason, reason
+
+
+FIELD_BOUNDARY_CALLS: list[tuple[str, str, dict[str, Any]]] = [
+    ("NotebookEdit", "NotebookEdit", NOTEBOOK_EDIT_INPUT),
+    ("Grep-both-fields", "Grep", GREP_WITH_BOTH_FIELDS),
+]
+
+FIELD_SILENT_POLICIES: list[tuple[str, Mapping[str, str]]] = [
+    ("no-policy", {}),
+    ("outside-scope", SCOPED_TO_CODER),
+]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in FIELD_SILENT_POLICIES],
+    ids=[case_id for case_id, _ in FIELD_SILENT_POLICIES],
+)
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in FIELD_BOUNDARY_CALLS],
+    ids=[case[0] for case in FIELD_BOUNDARY_CALLS],
+)
+def test_the_field_check_polices_only_in_scope_calls_under_a_guarded_policy(
+    tool_name: str, tool_input: dict[str, Any], policy: Mapping[str, str]
+) -> None:
+    """Decision 24, "Where it sits": after the routing and only under a guarded
+    policy, so a policy that constrains no paths, and a policy scoped to the
+    coder with a call that sets no `agent_type`, allow both calls silently."""
+    result = run_rooted(tool_name, policy=policy, tool_input=tool_input)
+    assert_allowed_silently(result, f"a {tool_name} with no agent_type under {dict(policy)!r}")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in FIELD_BOUNDARY_CALLS],
+    ids=[case[0] for case in FIELD_BOUNDARY_CALLS],
+)
+def test_the_field_check_refuses_the_caller_a_scoped_policy_names(
+    tool_name: str, tool_input: dict[str, Any]
+) -> None:
+    """Decision 24: the coder, whom the scoped policy names, is refused both
+    calls, which keeps the silent passes above from being vacuous."""
+    result = run_rooted(
+        tool_name, policy=SCOPED_TO_CODER, tool_input=tool_input, agent_type="coder"
+    )
+    assert_field_denied(result, f"coder {tool_name} under {SCOPED_TO_CODER!r}")
+
+
+# Decision 17's trailing newline, brief T6 item 2.
+
+TRAILING_NEWLINE_ARCHITECT_PATHS: list[tuple[str, str]] = [
+    ("root", f"{REPO_ROOT}\n"),
+    ("root-slash", f"{REPO_ROOT}/\n"),
+    ("newline-only", "\n"),
+    ("dot", ".\n"),
+    ("docs-file", under_repo("docs/x.md") + "\n"),
+    ("docs-file-two-newlines", under_repo("docs/x.md") + "\n\n"),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for _, path in TRAILING_NEWLINE_ARCHITECT_PATHS],
+    ids=[case_id for case_id, _ in TRAILING_NEWLINE_ARCHITECT_PATHS],
+)
+def test_an_architect_write_whose_path_ends_with_a_newline_is_refused(path: str) -> None:
+    """Decision 17, "The trailing newline": the root, `<root>/` or `.` followed
+    by a newline was vetted as the root and let through, and a path of newlines
+    only as no path; each names a file no list judged. A path that ends with one
+    newline or more is refused, whatever it names."""
+    result = run_configured_rooted("architect", EDIT_WRITE, "Write", path)
+    assert_trailing_newline_denied(result, f"architect writing {repo_relative_id(path)!r}")
+
+
+TRAILING_NEWLINE_READS: list[tuple[str, str, str]] = [
+    ("Grep-tests", "Grep", "tests\n"),
+    ("Read-test-file", "Read", under_repo(TOP_LEVEL_TEST_FILE) + "\n"),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path"),
+    [case[1:] for case in TRAILING_NEWLINE_READS],
+    ids=[case[0] for case in TRAILING_NEWLINE_READS],
+)
+def test_a_test_author_read_whose_path_ends_with_a_newline_is_refused(
+    tool_name: str, path: str
+) -> None:
+    """Decision 17, "The trailing newline": the test covers every in-scope call,
+    the test-author's Read and Grep included."""
+    result = run_configured_rooted("test-author", READ_GREP_GLOB, tool_name, path)
+    assert_trailing_newline_denied(result, f"test-author {tool_name} of {repo_relative_id(path)!r}")
+
+
+def test_a_guarded_write_whose_path_ends_with_a_newline_is_refused() -> None:
+    """Decision 17, "The trailing newline", under an explicit guarded policy."""
+    path = under_repo(SERVICE_FILE) + "\n"
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    assert_trailing_newline_denied(result, f"a Write of {SERVICE_FILE} and a newline")
+
+
+TRAILING_NEWLINE_CONTROLS: list[tuple[str, str]] = [
+    ("plain", under_repo("docs/x.md")),
+    ("newline-inside-a-name", f"{REPO_ROOT}/docs/a\nb.md"),
+    ("trailing-carriage-return", under_repo("docs/x.md") + "\r"),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for _, path in TRAILING_NEWLINE_CONTROLS],
+    ids=[case_id for case_id, _ in TRAILING_NEWLINE_CONTROLS],
+)
+def test_a_newline_inside_a_path_or_a_trailing_carriage_return_is_judged_as_written(
+    path: str,
+) -> None:
+    """Decision 17, "The trailing newline": only a newline at the end is
+    refused. A newline inside a name is carried intact and judged as written,
+    and so is a carriage return at the end."""
+    result = run_configured_rooted("architect", EDIT_WRITE, "Write", path)
+    assert_allowed_silently(result, f"architect writing {repo_relative_id(path)!r}")
+
+
+def test_the_nul_gate_runs_before_the_trailing_newline_test() -> None:
+    """Decision 17, "The trailing newline", "Where it sits": directly after the
+    NUL gate, so a path with a NUL and a trailing newline keeps the NUL denial."""
+    path = under_repo(SERVICE_FILE) + "\x00\n"
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    reason = assert_nul_denied(result, f"a Write of {SERVICE_FILE}, a NUL and a newline")
+    assert TRAILING_NEWLINE_PHRASE not in reason, reason
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in FIELD_SILENT_POLICIES],
+    ids=[case_id for case_id, _ in FIELD_SILENT_POLICIES],
+)
+def test_the_trailing_newline_test_polices_only_in_scope_calls_under_a_guarded_policy(
+    policy: Mapping[str, str],
+) -> None:
+    """Decision 17: like the NUL gate, the test runs after the routing and only
+    under a guarded policy."""
+    result = run_rooted("Write", policy=policy, file_path=f"{REPO_ROOT}\n")
+    assert_allowed_silently(result, f"a Write of the root and a newline under {dict(policy)!r}")
+
+
+# Decision 18's fourth test as amended, and decision 20's usable root, brief T6
+# item 3: a `~` at the start of any component.
+
+TILDE_COMPONENT_CASES: list[tuple[str, str, frozenset[str], str, str]] = [
+    (
+        "test-author-Read-tilde-directory",
+        "test-author",
+        READ_GREP_GLOB,
+        "Read",
+        f"{REPO_ROOT}/~/packages/hammertime-core/pyproject.toml",
+    ),
+    ("test-author-Read-tilde-name", "test-author", READ_GREP_GLOB, "Read", under_repo("tests/~x")),
+    ("test-author-Grep-tilde-name", "test-author", READ_GREP_GLOB, "Grep", "tests/~x"),
+    ("architect-Write-tilde-name", "architect", EDIT_WRITE, "Write", under_repo("docs/~x.md")),
+]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "tools", "tool_name", "path"),
+    [case[1:] for case in TILDE_COMPONENT_CASES],
+    ids=[case[0] for case in TILDE_COMPONENT_CASES],
+)
+def test_a_component_that_begins_with_a_tilde_is_refused(
+    agent_name: str, tools: frozenset[str], tool_name: str, path: str
+) -> None:
+    """Decision 18's fourth test, as the seventh amendment extends it: a path any
+    of whose components begins with `~` is out of plain form, and gets the
+    plain-form denial, which is unchanged."""
+    result = run_configured_rooted(agent_name, tools, tool_name, path)
+    what = f"{agent_name} {tool_name} of {repo_relative_id(path)!r}"
+    reason = assert_plain_form_denied(result, what)
+    assert reason == PLAIN_FORM_MESSAGE, (
+        "the plain-form denial must be decision 18's text verbatim.\n"
+        f"expected: {PLAIN_FORM_MESSAGE!r}\nreason:   {reason!r}"
+    )
+
+
+TILDE_CONTROL_CASES: list[tuple[str, str, frozenset[str], str, str]] = [
+    ("test-author-Read-last-tilde", "test-author", READ_GREP_GLOB, "Read", under_repo("tests/x~")),
+    ("architect-Write-inner-tilde", "architect", EDIT_WRITE, "Write", under_repo("docs/a~b.md")),
+]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "tools", "tool_name", "path"),
+    [case[1:] for case in TILDE_CONTROL_CASES],
+    ids=[case[0] for case in TILDE_CONTROL_CASES],
+)
+def test_a_tilde_that_does_not_begin_a_component_is_ordinary(
+    agent_name: str, tools: frozenset[str], tool_name: str, path: str
+) -> None:
+    """Decision 18's fourth test: only a component's first character counts."""
+    result = run_configured_rooted(agent_name, tools, tool_name, path)
+    assert_allowed_silently(result, f"{agent_name} {tool_name} of {repo_relative_id(path)!r}")
+
+
+@pytest.mark.parametrize(
+    ("leaf", "verdict"),
+    [("~x", VERDICT_ROOT), ("x~", VERDICT_ALLOW)],
+    ids=["tilde-first-root", "tilde-last-control"],
+)
+def test_a_working_directory_with_a_component_beginning_with_a_tilde_is_not_usable(
+    tmp_path: Path, leaf: str, verdict: str
+) -> None:
+    """Decision 20's usable root, as the seventh amendment amends it: a root with
+    a component that begins with `~` is not in plain form, so it is not usable,
+    and under PATH_ROOT='cwd' a relative Write is outside it."""
+    cwd = f"{tmp_path}/{leaf}"
+    result = run_rooted(
+        "Write",
+        policy=CWD_ROOT_POLICY,
+        file_path="services/x.py",
+        cwd=cwd,
+        project_dir=str(REPO_ROOT),
+    )
+    assert_verdict(result, verdict, f"a Write of services/x.py, cwd <tmp>/{leaf}")
+
+
+# Decision 23, rules 1 and 2, brief T6 item 4: a search's values, under the
+# test-author's configured read policy.
+
+SEARCH_VALUE_REFUSED: list[tuple[str, str, dict[str, Any]]] = [
+    ("Grep-path-dash", "Grep", {"path": "-u", "pattern": "PROBE"}),
+    ("Grep-pattern-dash", "Grep", {"path": "tests", "pattern": "--pre=sh"}),
+    ("Grep-type-dash", "Grep", {"path": "tests", "pattern": "x", "type": "-u"}),
+    ("Grep-glob-dash", "Grep", {"path": "tests", "pattern": "x", "glob": "-*.py"}),
+    ("Glob-pattern-dash", "Glob", {"path": "tests", "pattern": "-x*.py"}),
+    (
+        "Glob-dot-question-first",
+        "Glob",
+        {"path": "tests", "pattern": ".?/packages/*/pyproject.toml"},
+    ),
+    ("Glob-dot-star-first", "Glob", {"path": "tests", "pattern": ".*/x"}),
+    ("Glob-dot-question-last", "Glob", {"path": "tests", "pattern": "config/.?"}),
+    ("Grep-glob-dot-star", "Grep", {"path": "tests", "pattern": "x", "glob": "a/.*.py"}),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in SEARCH_VALUE_REFUSED],
+    ids=[case[0] for case in SEARCH_VALUE_REFUSED],
+)
+def test_a_search_value_that_begins_with_a_dash_or_a_dot_wildcard_is_refused(
+    tool_name: str, tool_input: dict[str, Any]
+) -> None:
+    """Decision 23, rules 1 and 2: no string in a Grep's or a Glob's
+    `tool_input` may begin with `-`, whichever field holds it, and no component
+    of a Glob `pattern` or a Grep `glob` may begin with `.` followed by `*` or
+    `?`. Each value here is in decision 21's grammar."""
+    result = run_test_author_search(tool_name, tool_input)
+    assert_search_value_denied(result, f"test-author {tool_name} with tool_input {tool_input!r}")
+
+
+SEARCH_VALUE_ALLOWED: list[tuple[str, str, dict[str, Any]]] = [
+    ("Glob-inner-dot-question", "Glob", {"path": "tests", "pattern": "x.?y"}),
+    ("Glob-leading-question", "Glob", {"path": "tests", "pattern": "?*/config/*.py"}),
+    ("Grep-pattern-bracketed-dash", "Grep", {"path": "tests", "pattern": "[-]-locked"}),
+    ("Grep-pattern-inner-dash", "Grep", {"path": "tests", "pattern": "a-b"}),
+    (
+        "Read-pattern-dash",
+        "Read",
+        {"file_path": under_repo(TOP_LEVEL_TEST_FILE), "pattern": "-x"},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in SEARCH_VALUE_ALLOWED],
+    ids=[case[0] for case in SEARCH_VALUE_ALLOWED],
+)
+def test_a_search_value_decision_23_admits_is_allowed(
+    tool_name: str, tool_input: dict[str, Any]
+) -> None:
+    """Decision 23's controls: a `.` and a wildcard that do not begin a
+    component, a `-` that is not a value's first character, and a Read, which
+    the rules do not reach."""
+    result = run_test_author_search(tool_name, tool_input)
+    assert_allowed_silently(result, f"test-author {tool_name} with tool_input {tool_input!r}")
+
+
+def test_decision_21s_pattern_denial_comes_before_decision_23s() -> None:
+    """Decision 23, "Where it sits": directly after decision 21's check, so a
+    value decision 21 refuses keeps decision 21's denial."""
+    tool_input = {"path": "tests", "pattern": "-../x"}
+    result = run_test_author_search("Glob", tool_input)
+    reason = assert_pattern_denied(result, f"test-author Glob with tool_input {tool_input!r}")
+    assert SEARCH_VALUE_PHRASE not in reason, reason
+
+
+def test_the_search_value_rules_police_only_in_scope_calls_under_a_guarded_policy() -> None:
+    """Decision 23: every other call keeps its verdict, a call from a caller the
+    policy does not name and a call under a policy that constrains no paths
+    among them."""
+    tool_input = {"path": "-u", "pattern": "PROBE"}
+    outside = run_test_author_search("Grep", tool_input, agent_type=None)
+    assert_allowed_silently(outside, f"a Grep with no agent_type and tool_input {tool_input!r}")
+    unguarded = run_rooted("Grep", policy={}, tool_input=tool_input)
+    assert_allowed_silently(unguarded, f"a Grep with tool_input {tool_input!r}, no policy")
+
+
+# Decision 23, rule 3, brief T6 item 5: a search's path, under the test-author's
+# configured read policy.
+
+SEARCH_PATH_REFUSED: list[tuple[str, str, dict[str, Any]]] = [
+    ("Glob-star-in-path", "Glob", {"path": f"{REPO_ROOT}/pack*", "pattern": "*.toml"}),
+    ("Grep-space", "Grep", {"path": "tests/x y", "pattern": "PROBE"}),
+    ("Grep-bracket", "Grep", {"path": "tests/[a]", "pattern": "PROBE"}),
+    ("Grep-brace", "Grep", {"path": "tests/a{b,c}", "pattern": "PROBE"}),
+    ("Grep-backslash", "Grep", {"path": "tests/a\\b", "pattern": "PROBE"}),
+    ("Grep-non-ascii", "Grep", {"path": "tests/é", "pattern": "PROBE"}),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in SEARCH_PATH_REFUSED],
+    ids=[case[0] for case in SEARCH_PATH_REFUSED],
+)
+def test_a_search_path_outside_decision_23s_characters_is_refused(
+    tool_name: str, tool_input: dict[str, Any]
+) -> None:
+    """Decision 23, rule 3: a Grep's or a Glob's `path` holds only ASCII letters,
+    digits and `_ - . /`. The `pack*` case was allowed, because no list matches
+    the string `pack*`. The non-ASCII case checks that `jq`'s ranges are
+    codepoints."""
+    result = run_test_author_search(tool_name, tool_input)
+    what = f"test-author {tool_name} of {repo_relative_id(tool_input['path'])!r}"
+    assert_search_path_denied(result, what)
+
+
+SEARCH_PATH_ALLOWED: list[tuple[str, str, dict[str, Any]]] = [
+    ("Grep-tests-config", "Grep", {"path": "tests/config", "pattern": "PROBE"}),
+    ("Grep-every-allowed-character", "Grep", {"path": "tests/x-y_z.1", "pattern": "PROBE"}),
+    ("Glob-absolute", "Glob", {"path": under_repo("tests/config"), "pattern": "*.py"}),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in SEARCH_PATH_ALLOWED],
+    ids=[case[0] for case in SEARCH_PATH_ALLOWED],
+)
+def test_a_search_path_in_decision_23s_characters_is_allowed(
+    tool_name: str, tool_input: dict[str, Any]
+) -> None:
+    """Decision 23, rule 3's controls: the repository's root is in the grammar,
+    so an absolute path under it is judged by the lists as before."""
+    result = run_test_author_search(tool_name, tool_input)
+    what = f"test-author {tool_name} of {repo_relative_id(tool_input['path'])!r}"
+    assert_allowed_silently(result, what)
+
+
+def test_a_search_path_out_of_plain_form_keeps_decision_18s_denial() -> None:
+    """Decision 23, "Where it sits": rule 3 runs after decision 18's rule."""
+    tool_input = {"path": "tests/../x y", "pattern": "PROBE"}
+    result = run_test_author_search("Grep", tool_input)
+    reason = assert_plain_form_denied(result, "test-author Grep of 'tests/../x y'")
+    assert SEARCH_PATH_PHRASE not in reason, reason
+
+
+def test_a_search_path_outside_the_root_keeps_decision_20s_denial() -> None:
+    """Decision 23, "Where it sits": rule 3 runs after decision 20's root rule."""
+    tool_input = {"path": f"{REPO_ROOT.parent}/x y", "pattern": "PROBE"}
+    result = run_test_author_search("Grep", tool_input)
+    reason = assert_root_denied(result, "test-author Grep of '<parent>/x y'")
+    assert SEARCH_PATH_PHRASE not in reason, reason
+
+
+# Decision 19, part 3 as amended, and decision 25, rule 1, brief T6 item 6:
+# reading the payload. The payloads are T4's well-formed Write of
+# IMPLEMENTATION_PATH with no `agent_type`, which each of SHAPE_POLICIES allows or
+# passes through, but for the raw byte or the size.
+
+# Decision 25, rule 1: the most of a payload either script reads.
+PAYLOAD_BOUND = 8388609
+MIB = 1024 * 1024
+OVER_8_MIB = 9 * MIB
+JUST_UNDER_8_MIB = 8 * MIB - 4096
+
+# Decision 19's table: a raw NUL or U+0002 gets the shape denial naming status 0.
+SHAPE_STATUS_0 = "(the check ended with status 0)"
+
+
+def raw_bytes(text: str) -> str:
+    """`text`, a JSON text, with each JSON escape of a NUL or of U+0002 replaced by
+    that character itself (brief T6)."""
+    return text.replace("\\u0000", "\x00").replace("\\u0002", "\x02")
+
+
+def write_payload(path: str) -> str:
+    """`shape_payload`'s well-formed Write, with `path` as its `file_path`."""
+    return shape_payload("tool_input", {"file_path": path})
+
+
+U0002_PATH = with_nul_inside(IMPLEMENTATION_PATH).replace("\x00", "\x02")
+
+RAW_BYTE_PAYLOADS: list[tuple[str, str]] = [
+    ("nul-inside-the-path", raw_bytes(write_payload(with_nul_inside(IMPLEMENTATION_PATH)))),
+    ("nul-after-the-closing-brace", WELL_FORMED_PAYLOAD + "\x00"),
+    ("only-a-nul", "\x00"),
+    ("u0002-inside-the-path", raw_bytes(write_payload(U0002_PATH))),
+]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in SHAPE_POLICIES],
+    ids=[case_id for case_id, _ in SHAPE_POLICIES],
+)
+@pytest.mark.parametrize(
+    "stdin",
+    [stdin for _, stdin in RAW_BYTE_PAYLOADS],
+    ids=[case_id for case_id, _ in RAW_BYTE_PAYLOADS],
+)
+def test_a_payload_holding_a_raw_nul_or_u0002_gets_the_shape_denial(
+    stdin: str, policy: Mapping[str, str]
+) -> None:
+    """Decision 19, part 3 as amended, and its table: the payload is read with
+    each raw NUL kept as U+0002, and a payload holding a raw U+0002 is
+    malformed, with status 0, before the routing and under every policy. Before,
+    a raw NUL was dropped unseen."""
+    assert "\x00" in stdin or "\x02" in stdin, "the payload must hold a raw byte"
+    result = run_guard_stdin(stdin, policy=policy)
+    reason = assert_shape_denied(result, f"a payload holding a raw byte under {dict(policy)!r}")
+    assert SHAPE_STATUS_0 in reason, reason
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in SHAPE_POLICIES],
+    ids=[case_id for case_id, _ in SHAPE_POLICIES],
+)
+def test_a_payload_over_8_mib_gets_the_shape_denial(policy: Mapping[str, str]) -> None:
+    """Decision 25, rule 1, and decision 19's table: a payload longer than
+    8388609 bytes is cut there, and the cut text is not one JSON value."""
+    stdin = tool_payload("Write", {"file_path": IMPLEMENTATION_PATH, "content": "x" * OVER_8_MIB})
+    assert len(stdin.encode("utf-8")) > PAYLOAD_BOUND
+    result = run_guard_stdin(stdin, policy=policy)
+    assert_shape_denied(result, f"a Write payload over 8 MiB under {dict(policy)!r}")
+
+
+def test_a_raw_nul_after_an_exact_protected_name_gets_the_shape_denial() -> None:
+    """Decision 19, part 3 as amended: SA1f's reproduction. `uv.lock`, a raw NUL,
+    then `x` was vetted as `uv.lockx`, and allowed."""
+    policy = {"DENY_GLOBS": "uv.lock"}
+    stdin = raw_bytes(tool_payload("Write", {"file_path": under_repo("uv.lock") + "\x00x"}))
+    assert "\x00" in stdin, "the payload must hold a raw NUL"
+    result = run_guard_stdin(stdin, policy=policy)
+    reason = assert_shape_denied(result, "a Write of uv.lock, a raw NUL, then x")
+    assert SHAPE_STATUS_0 in reason, reason
+
+
+def test_a_payload_just_under_8_mib_is_judged_as_before() -> None:
+    """Decision 25, rule 1's control: a well-formed payload under the bound is
+    read whole and judged as before, within the helper's timeout."""
+    content = "x" * JUST_UNDER_8_MIB
+    stdin = tool_payload("Write", {"file_path": under_repo(SERVICE_FILE), "content": content})
+    assert len(stdin.encode("utf-8")) < PAYLOAD_BOUND
+    result = run_guard_stdin(stdin, policy=DENY_TESTS)
+    assert_allowed_silently(result, f"a Write of {SERVICE_FILE} with a payload just under 8 MiB")
+
+
+# Decision 19, parts 1, 2 and 4, and decision 17, brief T6 items 7-9: wrapper
+# `jq`s. Each tells the script's calls apart by their arguments only, as
+# decisions 17, 19 and 24 and brief C8 fix them: the shape check is the one call
+# with `-s`, an extraction line a `-r` call whose filter names its field (the path
+# line's names `file_path`), and the NUL gates' filters contain `any(. == 0)`.
+
+NEEDS_DEV_FULL = pytest.mark.skipif(
+    not Path("/dev/full").exists(),
+    reason="the failing printf writes to /dev/full, and /dev/full does not exist",
+)
+
+
+def sh_lines(*lines: str) -> str:
+    """`lines` as the text of a shell script, one to a line."""
+    return "".join(f"{line}\n" for line in lines)
+
+
+# The start of every wrapper: it notes whether an argument is `-r` or `-s`, alone
+# or in a cluster of short options, and defines `has`, true when the arguments,
+# joined by spaces, contain the given text.
+WRAPPER_JQ_HEAD = sh_lines(
+    "#!/bin/sh",
+    "raw=0",
+    "slurp=0",
+    'for arg in "$@"; do',
+    '  case "$arg" in',
+    "    --raw-output) raw=1 ;;",
+    "    --slurp) slurp=1 ;;",
+    "    --*) : ;;",
+    "    -*)",
+    '      case "$arg" in *r*) raw=1 ;; esac',
+    '      case "$arg" in *s*) slurp=1 ;; esac',
+    "      ;;",
+    "  esac",
+    "done",
+    'all=" $* "',
+    "has() {",
+    '  case "$all" in *"$1"*) return 0 ;; esac',
+    "  return 1",
+    "}",
+)
+
+# Item 7: prints nothing, and exits 1 for the shape check and 2 for every other call.
+STATUS_2_RULE = sh_lines(
+    "cat >/dev/null",
+    'if [ "$slurp" = 1 ]; then exit 1; fi',
+    "exit 2",
+)
+
+# Item 9: a NUL gate's `jq` sends itself SIGKILL.
+KILL_NUL_GATE_RULE = sh_lines(
+    "if has 'any(. == 0)'; then",
+    "  cat >/dev/null",
+    "  kill -KILL $$",
+    "fi",
+)
+
+# Item 8: the condition that picks out each extraction line of `path-guard.sh`.
+EXTRACTION_LINES = {"agent_type": "has agent_type", "path": "has file_path"}
+
+
+def blank_extraction_rule(condition: str) -> str:
+    """Item 8: print nothing and exit 0 for the `-r` call `condition` picks out."""
+    return sh_lines(
+        f'if [ "$raw" = 1 ] && {condition}; then',
+        "  cat >/dev/null",
+        "  exit 0",
+        "fi",
+    )
+
+
+def write_wrapper_jq(directory: Path, rule: str) -> None:
+    """An executable `jq` in `directory`: WRAPPER_JQ_HEAD, then `rule`, then the
+    real `jq` found at import, run with the same arguments and stdin."""
+    real = shlex.quote(JQ or "jq")
+    jq = directory / "jq"
+    jq.write_text(WRAPPER_JQ_HEAD + rule + f'exec {real} "$@"\n', encoding="utf-8")
+    jq.chmod(0o755)
+
+
+def run_guard_stdin_stderr_full(
+    stdin: str,
+    *,
+    policy: Mapping[str, str],
+    jq_dir: Path,
+) -> subprocess.CompletedProcess[str]:
+    """`run_guard_stdin`'s sibling with the guard's stderr opened on `/dev/full`,
+    where every write fails, so that `deny`'s fallback `printf` fails (brief T6,
+    item 7). Only stdout is captured; `stderr` is None."""
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+
+    env = dict(os.environ)
+    for name in ROOTED_POLICY_VARS:
+        env.pop(name, None)
+    env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
+    env["PATH"] = f"{jq_dir}:{os.environ.get('PATH', '')}"
+    env.update(policy)
+
+    with open("/dev/full", "w", encoding="utf-8") as full:
+        return subprocess.run(
+            [BASH or "bash", str(GUARD)],
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=full,
+            text=True,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+
+
+def assert_backstop_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 19's backstop denial on stdout: exit 2, the JSON deny, the prefix,
+    its phrase, and its text verbatim but for the status."""
+    reason = assert_denied(result, what)
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert BACKSTOP_PHRASE in reason, f"expected the backstop denial for {what}: {reason!r}"
+    assert BACKSTOP_PATTERN.fullmatch(reason), (
+        f"the backstop denial for {what} must be decision 19's text verbatim, with N a "
+        f"status number.\nreason: {reason!r}"
+    )
+    return reason
+
+
+def assert_backstop_status(
+    result: subprocess.CompletedProcess[str], status: int, what: str
+) -> None:
+    """Decision 19's backstop denial, verbatim, naming `status`."""
+    reason = assert_backstop_denied(result, what)
+    expected = BACKSTOP_TEMPLATE.replace("status N", f"status {status}")
+    assert reason == expected, f"expected {expected!r} for {what}\nreason: {reason!r}"
+
+
+@NEEDS_BIN_SH
+def test_a_command_that_fails_with_status_2_gets_the_backstop_denial(tmp_path: Path) -> None:
+    """Decision 19, part 1 as amended: the handler lets through only `deny`'s own
+    exit 2. With a `jq` that passes the shape check and then exits 2, the first
+    extraction line ends the script with status 2 and no reason, which the
+    handler turns into the backstop denial, naming status 2. With the real `jq`,
+    the same Write is allowed."""
+    path = under_repo(SERVICE_FILE)
+    control = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    assert_allowed_silently(control, f"a Write of {SERVICE_FILE} with the real jq")
+    write_wrapper_jq(tmp_path, STATUS_2_RULE)
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path, jq_dir=tmp_path)
+    assert_backstop_status(result, 2, f"a Write of {SERVICE_FILE} with a jq that exits 2")
+
+
+@NEEDS_BIN_SH
+@NEEDS_DEV_FULL
+def test_a_deny_whose_fallback_printf_fails_gets_the_backstop_denial(tmp_path: Path) -> None:
+    """Decision 19, parts 1 and 2: with a `jq` that exits 3, the shape check does
+    not complete and `deny`'s own `jq` fails; with stderr on `/dev/full`, its
+    fallback `printf` fails too, and the handler writes the backstop denial on
+    stdout and exits 2."""
+    write_failing_jq(tmp_path, 3)
+    stdin = tool_payload("Write", {"file_path": under_repo(SERVICE_FILE)})
+    result = run_guard_stdin_stderr_full(stdin, policy=DENY_TESTS, jq_dir=tmp_path)
+    assert_backstop_denied(result, f"a Write of {SERVICE_FILE}, jq exiting 3, stderr full")
+
+
+EXTRACTION_CASES: list[tuple[str, Mapping[str, str], str | None]] = [
+    ("agent_type", SCOPED_TO_CODER, "coder"),
+    ("path", DENY_TESTS, None),
+]
+
+
+@NEEDS_BIN_SH
+@pytest.mark.parametrize(
+    ("line", "policy", "agent_type"),
+    EXTRACTION_CASES,
+    ids=[case[0] for case in EXTRACTION_CASES],
+)
+def test_an_extraction_line_that_reads_its_field_as_empty_gets_the_backstop_denial(
+    tmp_path: Path, line: str, policy: Mapping[str, str], agent_type: str | None
+) -> None:
+    """Decision 19, part 4: the extraction check asks whether each extracted
+    field is empty exactly when the payload's is. A `jq` that prints nothing for
+    one extraction line makes that field read as empty, and the check refuses
+    with the backstop denial. Before, an empty `agent_type` routed the call out
+    of scope and an empty path let a Write through. With the real `jq`, the same
+    Write gets the DENY_GLOBS denial."""
+    path = under_repo("tests/x.py")
+    control = run_rooted("Write", policy=policy, file_path=path, agent_type=agent_type)
+    assert_deny_globs_denied(control, f"a Write of tests/x.py under {dict(policy)!r}")
+    write_wrapper_jq(tmp_path, blank_extraction_rule(EXTRACTION_LINES[line]))
+    result = run_rooted(
+        "Write", policy=policy, file_path=path, agent_type=agent_type, jq_dir=tmp_path
+    )
+    assert_backstop_denied(result, f"a Write of tests/x.py with the {line} line read as empty")
+
+
+BAD_CWDS: list[tuple[str, str]] = [
+    ("trailing-newline", f"{REPO_ROOT}\n"),
+    ("nul", f"{REPO_ROOT}\x00x"),
+]
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    [cwd for _, cwd in BAD_CWDS],
+    ids=[case_id for case_id, _ in BAD_CWDS],
+)
+def test_a_cwd_that_cannot_be_read_faithfully_gets_the_backstop_denial(cwd: str) -> None:
+    """Decision 19, part 4: `$(...)` would read a `cwd` that ends with a newline
+    or holds a NUL as another directory, so the extraction check fails and the
+    script ends with status 3, which the handler names."""
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=under_repo(SERVICE_FILE), cwd=cwd)
+    assert_backstop_status(result, 3, f"a Write of {SERVICE_FILE} with cwd {cwd!r}")
+
+
+def test_the_cwd_check_runs_before_the_routing() -> None:
+    """Decision 19, part 4, "Every caller": the check runs before the routing,
+    so a call with no `agent_type` under a policy scoped to the coder is refused
+    the same way."""
+    cwd = f"{REPO_ROOT}\n"
+    path = under_repo(SERVICE_FILE)
+    result = run_rooted("Write", policy=SCOPED_TO_CODER, file_path=path, cwd=cwd)
+    assert_backstop_status(result, 3, f"a Write with no agent_type and cwd {cwd!r}")
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [DENY_TESTS, SCOPED_TO_CODER],
+    ids=["guarded", "outside-scope"],
+)
+def test_a_cwd_read_faithfully_passes_the_extraction_check(policy: Mapping[str, str]) -> None:
+    """Decision 19, part 4's controls: the same Writes, with `cwd` the repository
+    root, are allowed."""
+    path = under_repo(SERVICE_FILE)
+    result = run_rooted("Write", policy=policy, file_path=path, cwd=str(REPO_ROOT))
+    assert_allowed_silently(result, f"a Write of {SERVICE_FILE} under {dict(policy)!r}")
+
+
+@NEEDS_BIN_SH
+def test_a_nul_gate_killed_by_a_signal_gets_the_not_checked_denial(tmp_path: Path) -> None:
+    """Decisions 3 and 17, and assumption 100: a NUL gate whose `jq` is killed by
+    SIGKILL ends with status 137, neither 0 nor 1, so the could-not-be-checked
+    denial follows, naming 137."""
+    write_wrapper_jq(tmp_path, KILL_NUL_GATE_RULE)
+    path = under_repo(SERVICE_FILE)
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path, jq_dir=tmp_path)
+    reason = assert_not_checked_denied(result, f"a Write of {SERVICE_FILE}, the NUL gate killed")
+    assert "(the check ended with status 137 instead" in reason, reason
+
+
+# Decision 12 (e) and (f), brief T6 item 12: the coder's `tests` names and the
+# testkit, after step W, with `cwd` and CLAUDE_PROJECT_DIR the repository root.
+
+CODER_TESTS_AND_TESTKIT_AFTER_W: list[tuple[str, str]] = [
+    ("tests", VERDICT_DENY_GLOBS),
+    ("services/trie/src/hammertime/trie/structure/tests", VERDICT_DENY_GLOBS),
+    ("packages/hammertime-testkit", VERDICT_DENY_GLOBS),
+    (TESTKIT_FILE, VERDICT_DENY_GLOBS),
+    ("services/trie/src/hammertime/trie/structure/tests.py", VERDICT_ALLOW),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "verdict"),
+    CODER_TESTS_AND_TESTKIT_AFTER_W,
+    ids=[f"{verdict}-{path}" for path, verdict in CODER_TESTS_AND_TESTKIT_AFTER_W],
+)
+def test_configured_coder_write_policy_refuses_tests_names_and_the_testkit_after_step_w(
+    path: str, verdict: str
+) -> None:
+    """Decision 12 (e) and (f): the coder's DENY_GLOBS gain `tests` and `*/tests`,
+    which refuse a file of that name at any depth, and the testkit's directory
+    and everything under it. `tests.py` is another name."""
+    result = run_configured_rooted(
+        "coder",
+        EDIT_WRITE,
+        "Write",
+        under_repo(path),
+        cwd=str(REPO_ROOT),
+        project_dir=str(REPO_ROOT),
+    )
+    assert_verdict(result, verdict, f"coder writing {path}")

@@ -48,6 +48,20 @@ denial, which never carries the paragraph. When `deny`'s own `jq` fails, the
 reason goes to stderr and the exit is still 2. Group P fails until brief C6
 lands, except its controls, which pass today. A `command` that is not a
 string still meets decision 3's could-not-be-checked denial (group O).
+
+ADR-0018's seventh amendment (2026-09-25) adds group Q (brief T6). Decision 19
+as amended reads at most 8 MiB and one byte of the payload, keeping a raw NUL
+as U+0002, and a payload holding a raw U+0002 gets the bash shape denial,
+naming status 0; a status 2 that `deny` did not make gets the backstop denial;
+and an extraction that reads a field as empty that is not, or a `cwd` that
+ends with a newline or holds a NUL, is refused with the backstop denial.
+Decision 25 refuses an in-scope command longer than 16384 characters, after
+the routing and before literal mode, under every policy. Decision 7 refuses a
+write-mode `ruff format` operand that is a directory or a symbolic link.
+Decision 12 (f) puts the testkit on the coder's `WRITE_DENY_GLOBS` at step W.
+Group Q fails until brief C8 lands, except its controls, the raw U+0002 cases
+if `jq` already refuses a raw control character, the `/dev/full` case and the
+`jq` killed by a signal, which pass today; its testkit case fails until step W.
 """
 
 import json
@@ -1742,3 +1756,504 @@ def test_a_bash_shape_check_that_fails_denies_on_stderr(tmp_path: Path) -> None:
         f"expected the bash shape denial and decision 11's paragraph on stderr for {what}.\n"
         f"stderr: {result.stderr!r}"
     )
+
+
+# --- Q. the seventh amendment (decisions 7, 19 and 25) --------------------------
+#
+# ADR-0018's seventh amendment (2026-09-25), brief T6. A payload with a raw byte in
+# it is built with `json.dumps`, and then has the escape replaced by the byte
+# itself (`raw_bytes`); it goes through `run_guard_stdin`, which sends it
+# unchanged.
+
+# Decision 25's denial, verbatim, with the ADR's blockquote line breaks joined by
+# single spaces. It is ASCII only.
+BOUND_MESSAGE = (
+    "Hammertime bash guard: the command is longer than 16384 characters, which "
+    "is more than this guard vets in one call, so that vetting it stays well "
+    "inside the hook's time limit. Split it into shorter commands. The command "
+    "is refused."
+)
+BOUND_PHRASE = "longer than 16384 characters"
+
+# Decision 7's phrase for a write-mode operand that is a directory or a link.
+DIRECTORY_OR_LINK_PHRASE = "is a directory or a symbolic link"
+
+# Decision 25, rule 1: the most of a payload the script reads.
+PAYLOAD_BOUND = 8388609
+MIB = 1024 * 1024
+OVER_8_MIB = 9 * MIB
+JUST_UNDER_8_MIB = 8 * MIB - 4096
+
+# Decision 19's table: a raw NUL or U+0002 gets the shape denial naming status 0.
+SHAPE_STATUS_0 = "(the check ended with status 0)"
+
+TESTKIT_FILE = "packages/hammertime-testkit/src/hammertime/testkit/generators.py"
+
+
+def raw_bytes(text: str) -> str:
+    """`text`, a JSON text, with each JSON escape of a NUL or of U+0002 replaced by
+    that character itself (brief T6)."""
+    return text.replace("\\u0000", "\x00").replace("\\u0002", "\x02")
+
+
+def command_payload(
+    command: str,
+    *,
+    agent_type: str | None,
+    cwd: str | None = None,
+    description: str | None = None,
+) -> str:
+    """A well-formed Bash payload for `command`, from `agent_type`, as JSON text:
+    `cwd` is the repository root unless given, and `tool_input` carries a
+    `description` when one is given."""
+    tool_input: dict[str, Any] = {"command": command}
+    if description is not None:
+        tool_input["description"] = description
+    payload: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": tool_input,
+        "cwd": str(REPO_ROOT) if cwd is None else cwd,
+    }
+    if agent_type is not None:
+        payload["agent_type"] = agent_type
+    return json.dumps(payload)
+
+
+def shape_denial_body(
+    result: subprocess.CompletedProcess[str], policy: Mapping[str, str], what: str
+) -> str:
+    """Decision 19's bash shape denial, as group P checks it: decision 11's
+    paragraph after one space exactly when the policy sets DENY_ADVICE, and the
+    rest verbatim with any status. Returns the rest."""
+    reason = assert_denied(result, what)
+    assert SHAPE_PHRASE in reason, reason
+    body = reason
+    if policy.get("DENY_ADVICE"):
+        assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+        body = reason.removesuffix(f" {FINAL_PARAGRAPH}")
+    else:
+        assert FINAL_SENTENCE not in reason, reason
+    assert BASH_SHAPE_PATTERN.fullmatch(body), (
+        f"the shape denial for {what} must be decision 19's text verbatim, with N a "
+        f"status number.\nreason: {reason!r}"
+    )
+    return body
+
+
+# Decision 19, part 3 as amended, and decision 25, rule 1, brief T6 item 6:
+# reading the payload, under the scenarios group P uses.
+
+RAW_BYTE_CASES = [
+    "nul-inside-the-command",
+    "nul-after-the-closing-brace",
+    "only-a-nul",
+    "u0002-inside-the-command",
+]
+
+
+def raw_byte_stdin(case: str, agent_type: str | None) -> str:
+    """The stdin for one of RAW_BYTE_CASES, from `agent_type`."""
+    if case == "nul-inside-the-command":
+        return raw_bytes(command_payload("git\x00 status", agent_type=agent_type))
+    if case == "nul-after-the-closing-brace":
+        return command_payload("git status", agent_type=agent_type) + "\x00"
+    if case == "only-a-nul":
+        return "\x00"
+    return raw_bytes(command_payload("git\x02 status", agent_type=agent_type))
+
+
+@pytest.mark.parametrize(
+    ("policy", "agent_type"),
+    [scenario[1:] for scenario in SHAPE_SCENARIOS],
+    ids=[scenario[0] for scenario in SHAPE_SCENARIOS],
+)
+@pytest.mark.parametrize("case", RAW_BYTE_CASES)
+def test_a_payload_holding_a_raw_nul_or_u0002_gets_the_bash_shape_denial(
+    case: str, policy: Mapping[str, str], agent_type: str | None
+) -> None:
+    """Decision 19, part 3 as amended, and its table: the payload is read with
+    each raw NUL kept as U+0002, and a payload holding a raw U+0002 is
+    malformed, with status 0, before the routing and under every policy. Before,
+    a raw NUL was dropped unseen."""
+    stdin = raw_byte_stdin(case, agent_type)
+    assert "\x00" in stdin or "\x02" in stdin, "the payload must hold a raw byte"
+    result = run_guard_stdin(stdin, policy=policy)
+    what = f"the {case} payload from agent_type={agent_type!r} under {dict(policy)!r}"
+    body = shape_denial_body(result, policy, what)
+    assert SHAPE_STATUS_0 in body, body
+
+
+@pytest.mark.parametrize(
+    ("policy", "agent_type"),
+    [scenario[1:] for scenario in SHAPE_SCENARIOS],
+    ids=[scenario[0] for scenario in SHAPE_SCENARIOS],
+)
+def test_a_payload_over_8_mib_gets_the_bash_shape_denial(
+    policy: Mapping[str, str], agent_type: str | None
+) -> None:
+    """Decision 25, rule 1, and decision 19's table: a payload longer than
+    8388609 bytes is cut there, and the cut text is not one JSON value."""
+    stdin = command_payload("git status", agent_type=agent_type, description="x" * OVER_8_MIB)
+    assert len(stdin.encode("utf-8")) > PAYLOAD_BOUND
+    result = run_guard_stdin(stdin, policy=policy)
+    shape_denial_body(result, policy, f"a payload over 8 MiB from agent_type={agent_type!r}")
+
+
+def test_a_raw_nul_in_a_command_allowed_without_it_gets_the_bash_shape_denial() -> None:
+    """Decision 19, part 3 as amended: the command is refused for the raw NUL,
+    not vetted as `uv run --locked ruff format --check .`, and the denial ends
+    with decision 11's paragraph."""
+    command = "uv run --locked ruff format\x00 --check ."
+    stdin = raw_bytes(command_payload(command, agent_type="coder"))
+    assert "\x00" in stdin, "the payload must hold a raw NUL"
+    result = run_guard_stdin(stdin, policy=CODER_POLICY)
+    body = shape_denial_body(result, CODER_POLICY, f"{command!r} with a raw NUL, as the coder")
+    assert SHAPE_STATUS_0 in body, body
+
+
+def test_a_bash_payload_just_under_8_mib_is_judged_as_before() -> None:
+    """Decision 25, rule 1's control: a well-formed payload under the bound is
+    read whole and judged as before, within the helper's timeout."""
+    description = "x" * JUST_UNDER_8_MIB
+    stdin = command_payload("git status", agent_type="coder", description=description)
+    assert len(stdin.encode("utf-8")) < PAYLOAD_BOUND
+    result = run_guard_stdin(stdin, policy=CODER_POLICY)
+    assert_allowed(result, "git status in a payload just under 8 MiB, as the coder")
+
+
+# Decision 19, parts 1, 2 and 4, and decision 3, brief T6 items 7-9: wrapper
+# `jq`s. Each tells the script's calls apart by their arguments only, as
+# decisions 17, 19 and 24 and brief C8 fix them: the shape check is the one call
+# with `-s`, an extraction line a `-r` call whose filter names its field, and the
+# NUL gates' filters contain `any(. == 0)`.
+
+NEEDS_DEV_FULL = pytest.mark.skipif(
+    not Path("/dev/full").exists(),
+    reason="the failing printf writes to /dev/full, and /dev/full does not exist",
+)
+
+
+def sh_lines(*lines: str) -> str:
+    """`lines` as the text of a shell script, one to a line."""
+    return "".join(f"{line}\n" for line in lines)
+
+
+# The start of every wrapper: it notes whether an argument is `-r` or `-s`, alone
+# or in a cluster of short options, and defines `has`, true when the arguments,
+# joined by spaces, contain the given text.
+WRAPPER_JQ_HEAD = sh_lines(
+    "#!/bin/sh",
+    "raw=0",
+    "slurp=0",
+    'for arg in "$@"; do',
+    '  case "$arg" in',
+    "    --raw-output) raw=1 ;;",
+    "    --slurp) slurp=1 ;;",
+    "    --*) : ;;",
+    "    -*)",
+    '      case "$arg" in *r*) raw=1 ;; esac',
+    '      case "$arg" in *s*) slurp=1 ;; esac',
+    "      ;;",
+    "  esac",
+    "done",
+    'all=" $* "',
+    "has() {",
+    '  case "$all" in *"$1"*) return 0 ;; esac',
+    "  return 1",
+    "}",
+)
+
+# Item 7: prints nothing, and exits 1 for the shape check and 2 for every other call.
+STATUS_2_RULE = sh_lines(
+    "cat >/dev/null",
+    'if [ "$slurp" = 1 ]; then exit 1; fi',
+    "exit 2",
+)
+
+# Item 9: a NUL gate's `jq` sends itself SIGKILL.
+KILL_NUL_GATE_RULE = sh_lines(
+    "if has 'any(. == 0)'; then",
+    "  cat >/dev/null",
+    "  kill -KILL $$",
+    "fi",
+)
+
+# Item 8: the condition that picks out each extraction line of `bash-guard.sh`.
+# `tool_name` excludes a filter naming `file_path`, `path-guard.sh`'s path line.
+EXTRACTION_LINES = {
+    "agent_type": "has agent_type",
+    "command": "has command",
+    "tool_name": "has tool_name && ! has file_path",
+}
+
+
+def blank_extraction_rule(condition: str) -> str:
+    """Item 8: print nothing and exit 0 for the `-r` call `condition` picks out."""
+    return sh_lines(
+        f'if [ "$raw" = 1 ] && {condition}; then',
+        "  cat >/dev/null",
+        "  exit 0",
+        "fi",
+    )
+
+
+def write_wrapper_jq(directory: Path, rule: str) -> None:
+    """An executable `jq` in `directory`: WRAPPER_JQ_HEAD, then `rule`, then the
+    real `jq` found at import, run with the same arguments and stdin."""
+    real = shlex.quote(JQ or "jq")
+    jq = directory / "jq"
+    jq.write_text(WRAPPER_JQ_HEAD + rule + f'exec {real} "$@"\n', encoding="utf-8")
+    jq.chmod(0o755)
+
+
+def run_guard_stdin_stderr_full(
+    stdin: str,
+    *,
+    policy: Mapping[str, str],
+    jq_dir: Path,
+) -> subprocess.CompletedProcess[str]:
+    """`run_guard_stdin`'s sibling with the guard's stderr opened on `/dev/full`,
+    where every write fails, so that `deny`'s fallback `printf` fails (brief T6,
+    item 7). Only stdout is captured; `stderr` is None."""
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+
+    env = dict(os.environ)
+    for name in ROOTED_POLICY_VARS:
+        env.pop(name, None)
+    env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
+    env["PATH"] = f"{jq_dir}:{os.environ.get('PATH', '')}"
+    env.update(policy)
+
+    with open("/dev/full", "w", encoding="utf-8") as full:
+        return subprocess.run(
+            [BASH or "bash", str(GUARD)],
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=full,
+            text=True,
+            env=env,
+            timeout=30,
+            check=False,
+        )
+
+
+def assert_bash_backstop_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 19's bash backstop denial on stdout, verbatim but for the status,
+    with no decision 11 paragraph under any DENY_ADVICE."""
+    reason = assert_denied(result, what)
+    assert BACKSTOP_PHRASE in reason, f"expected the backstop denial for {what}: {reason!r}"
+    assert FINAL_SENTENCE not in reason, reason
+    assert BASH_BACKSTOP_PATTERN.fullmatch(reason), (
+        f"the backstop denial for {what} must be decision 19's text verbatim, with N a "
+        f"status number, and no paragraph.\nreason: {reason!r}"
+    )
+    return reason
+
+
+def assert_bash_backstop_status(
+    result: subprocess.CompletedProcess[str], status: int, what: str
+) -> None:
+    """Decision 19's bash backstop denial, verbatim, naming `status`."""
+    reason = assert_bash_backstop_denied(result, what)
+    expected = BASH_BACKSTOP_TEMPLATE.replace("status N", f"status {status}")
+    assert reason == expected, f"expected {expected!r} for {what}\nreason: {reason!r}"
+
+
+@NEEDS_BIN_SH
+def test_a_bash_command_that_fails_with_status_2_gets_the_backstop_denial(
+    tmp_path: Path,
+) -> None:
+    """Decision 19, part 1 as amended: the handler lets through only `deny`'s own
+    exit 2. With a `jq` that passes the shape check and then exits 2, the first
+    extraction line ends the script with status 2 and no reason, which the
+    handler turns into the backstop denial, naming status 2. With the real `jq`,
+    the same command is allowed."""
+    payload = command_payload("git status", agent_type="coder")
+    assert_allowed(run_guard_stdin(payload, policy=CODER_POLICY), "git status with the real jq")
+    write_wrapper_jq(tmp_path, STATUS_2_RULE)
+    result = run_guard_stdin(payload, policy=CODER_POLICY, jq_dir=tmp_path)
+    assert_bash_backstop_status(result, 2, "git status, as the coder, with a jq that exits 2")
+
+
+@NEEDS_BIN_SH
+@NEEDS_DEV_FULL
+def test_a_bash_deny_whose_fallback_printf_fails_gets_the_backstop_denial(
+    tmp_path: Path,
+) -> None:
+    """Decision 19, parts 1 and 2: with a `jq` that exits 3, the shape check does
+    not complete and `deny`'s own `jq` fails; with stderr on `/dev/full`, its
+    fallback `printf` fails too, and the handler writes the backstop denial on
+    stdout and exits 2."""
+    write_failing_jq(tmp_path, 3)
+    payload = command_payload("git status", agent_type="coder")
+    result = run_guard_stdin_stderr_full(payload, policy=CODER_POLICY, jq_dir=tmp_path)
+    assert_bash_backstop_denied(result, "git status, as the coder, jq exiting 3, stderr full")
+
+
+PYTHON_COMMAND = "python3 -c pass"
+
+
+@NEEDS_BIN_SH
+@pytest.mark.parametrize("line", sorted(EXTRACTION_LINES))
+def test_a_bash_extraction_line_that_reads_its_field_as_empty_gets_the_backstop_denial(
+    tmp_path: Path, line: str
+) -> None:
+    """Decision 19, part 4: a `jq` that prints nothing for one extraction line
+    makes that field read as empty, and the extraction check refuses with the
+    backstop denial. Before, an empty `agent_type` routed the call out of scope,
+    and an empty `tool_name` or command ended the script with exit 0. With the
+    real `jq`, the same command gets the not-allowed-command denial."""
+    payload = command_payload(PYTHON_COMMAND, agent_type="coder")
+    control = assert_denied(run_guard_stdin(payload, policy=CODER_POLICY), PYTHON_COMMAND)
+    assert_phrase(control, "uv run --locked pytest", f"{PYTHON_COMMAND} with the real jq")
+    assert control.endswith(f" {FINAL_PARAGRAPH}"), control
+    write_wrapper_jq(tmp_path, blank_extraction_rule(EXTRACTION_LINES[line]))
+    result = run_guard_stdin(payload, policy=CODER_POLICY, jq_dir=tmp_path)
+    assert_bash_backstop_denied(result, f"{PYTHON_COMMAND} with the {line} line read as empty")
+
+
+BAD_CWDS: list[tuple[str, str]] = [
+    ("trailing-newline", f"{REPO_ROOT}\n"),
+    ("nul", f"{REPO_ROOT}\x00x"),
+]
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    [cwd for _, cwd in BAD_CWDS],
+    ids=[case_id for case_id, _ in BAD_CWDS],
+)
+def test_a_bash_cwd_that_cannot_be_read_faithfully_gets_the_backstop_denial(cwd: str) -> None:
+    """Decision 19, part 4: `$(...)` would read a `cwd` that ends with a newline
+    or holds a NUL as another directory, so the extraction check fails and the
+    script ends with status 3, which the handler names."""
+    result = run_guard("git status", policy=CODER_POLICY, cwd=cwd, agent_type="coder")
+    assert_bash_backstop_status(result, 3, f"git status, as the coder, with cwd {cwd!r}")
+
+
+def test_a_bash_cwd_read_faithfully_passes_the_extraction_check() -> None:
+    """Decision 19, part 4's control: the same command, with `cwd` the repository
+    root, is allowed."""
+    result = run_guard("git status", policy=CODER_POLICY, cwd=REPO_ROOT, agent_type="coder")
+    assert_allowed(result, "git status, as the coder, with cwd the repository root")
+
+
+@NEEDS_BIN_SH
+def test_a_bash_nul_gate_killed_by_a_signal_gets_the_not_checked_denial(tmp_path: Path) -> None:
+    """Decisions 3 and 17, and assumption 100: a NUL gate whose `jq` is killed by
+    SIGKILL ends with status 137, neither 0 nor 1, so decision 11's
+    could-not-be-checked denial follows, naming 137, with the coder's
+    paragraph."""
+    write_wrapper_jq(tmp_path, KILL_NUL_GATE_RULE)
+    payload = command_payload("git status", agent_type="coder")
+    result = run_guard_stdin(payload, policy=CODER_POLICY, jq_dir=tmp_path)
+    reason = assert_denied(result, "git status, as the coder, with the NUL gate killed")
+    assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+    body = reason.removesuffix(f" {FINAL_PARAGRAPH}")
+    assert NOT_CHECKED_PATTERN.fullmatch(body), (
+        f"the could-not-be-checked denial must be decision 11's text verbatim: {reason!r}"
+    )
+    assert "(the check ended with status 137 instead" in body, body
+
+
+# Decision 25, rule 2, brief T6 item 10: the command bound.
+
+AT_THE_BOUND = "ls" + " a" * 8191
+OVER_THE_BOUND = AT_THE_BOUND + "a"
+FAR_OVER_THE_BOUND = "ls" + " a" * 499_999
+
+
+def test_a_command_of_16384_characters_is_allowed(tmp_path: Path) -> None:
+    """Decision 25, rule 2: a command of exactly 16384 characters is within the
+    bound, and the auditor's policy allows it."""
+    assert len(AT_THE_BOUND) == 16384
+    result = auditor(AT_THE_BOUND, tmp_path)
+    assert_allowed(result, "ls and 8191 words, 16384 characters, under the auditor's policy")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [OVER_THE_BOUND, FAR_OVER_THE_BOUND],
+    ids=["16385-characters", "1000000-characters"],
+)
+def test_a_command_over_16384_characters_is_refused(tmp_path: Path, command: str) -> None:
+    """Decision 25, rule 2: under every policy, the auditor's included, a longer
+    command is refused before literal mode and every per-word rule, so even a
+    command of a million characters is decided within the helper's timeout. The
+    auditor sets no DENY_ADVICE, so the denial is decision 25's text alone."""
+    assert len(command) in (16385, 1_000_000)
+    reason = assert_denied(auditor(command, tmp_path), f"a command of {len(command)} characters")
+    assert_phrase(reason, BOUND_PHRASE, f"a command of {len(command)} characters")
+    assert reason == BOUND_MESSAGE, (
+        "the bound's denial must be decision 25's text verbatim.\n"
+        f"expected: {BOUND_MESSAGE!r}\nreason:   {reason!r}"
+    )
+
+
+def test_the_coders_denial_of_a_long_command_carries_the_paragraph(tmp_path: Path) -> None:
+    """Decision 25: the denial goes through `deny`, so in `stop-and-report` mode
+    it ends with decision 11's paragraph after one space."""
+    reason = assert_denied(coder(OVER_THE_BOUND, tmp_path), "a command of 16385 characters")
+    expected = f"{BOUND_MESSAGE} {FINAL_PARAGRAPH}"
+    assert reason == expected, (
+        "the coder's denial must be decision 25's text and decision 11's paragraph.\n"
+        f"expected: {expected!r}\nreason:   {reason!r}"
+    )
+
+
+def test_the_command_bound_comes_after_the_routing(tmp_path: Path) -> None:
+    """Decision 25, "Where it sits": after the routing, so a call with no
+    `agent_type` under the coder's policy is passed through."""
+    result = run_guard(OVER_THE_BOUND, policy=CODER_POLICY, cwd=tmp_path, agent_type=None)
+    assert_allowed(result, "a command of 16385 characters with no agent_type")
+
+
+# Decision 7, "A directory or a link in write mode", brief T6 item 11.
+
+
+def assert_directory_or_link_denied(result: subprocess.CompletedProcess[str], command: str) -> None:
+    """Decision 7's write-mode denial for a directory or a link: its phrase, and
+    decision 11's `uv run --locked ruff format` and `.py`."""
+    reason = assert_denied(result, command)
+    assert_phrase(reason, DIRECTORY_OR_LINK_PHRASE, command)
+    assert_phrase(reason, "uv run --locked ruff format", command)
+    assert_phrase(reason, ".py", command)
+    assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+
+
+def test_ruff_format_refuses_a_directory_named_like_a_python_file(tmp_path: Path) -> None:
+    """Decision 7: an operand whose name ends in `.py` but that is a directory
+    would make ruff rewrite every Python file beneath it, a test file included."""
+    tests_dir = tmp_path / "probe_dir.py" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_probe.py").write_text("", encoding="utf-8")
+    command = "uv run --locked ruff format probe_dir.py"
+    assert_directory_or_link_denied(coder(command, tmp_path), command)
+
+
+def test_ruff_format_refuses_a_symbolic_link_and_allows_its_target(tmp_path: Path) -> None:
+    """Decision 7: an operand that is a symbolic link would make ruff rewrite
+    whatever it points to. The file it points to, named directly, is allowed."""
+    (tmp_path / "ok.py").write_text("", encoding="utf-8")
+    (tmp_path / "link.py").symlink_to("ok.py")
+    command = "uv run --locked ruff format link.py"
+    assert_directory_or_link_denied(coder(command, tmp_path), command)
+    allowed = "uv run --locked ruff format ok.py"
+    assert_allowed(coder(allowed, tmp_path), f"{allowed} beside the link")
+
+
+# Decision 12 (f), brief T6 item 12: the testkit, after step W.
+
+
+def test_configured_coder_bash_policy_refuses_formatting_the_testkit_after_step_w() -> None:
+    """Decision 12 (f): the coder's `WRITE_DENY_GLOBS` gain the testkit, so a
+    write-mode `ruff format` of a testkit file gets the write-mode denial. The
+    file is a regular file, so the denial is not the one for a directory or a
+    link."""
+    command = f"uv run --locked ruff format {TESTKIT_FILE}"
+    reason = assert_denied(run_configured("coder", command), f"{command} (configured coder)")
+    assert_phrase(reason, "uv run --locked ruff format", command)
+    assert_phrase(reason, ".py", command)
+    assert DIRECTORY_OR_LINK_PHRASE not in reason, reason
+    assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason

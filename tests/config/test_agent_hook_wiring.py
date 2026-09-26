@@ -58,6 +58,14 @@ test-author's Read|Grep|Glob `DENY_GLOBS` exactly, where brief T4 pinned only a
 subset, so a name added by mistake fails as well as one left out (brief T5,
 item 1; assumption 80). It fails until step W.
 
+ADR-0018's seventh amendment (2026-09-25), with its follow-up of 2026-09-26,
+extends decision 12, and decision 14's text with it: the coder's Edit|Write
+`DENY_GLOBS` and its Bash `WRITE_DENY_GLOBS` gain `tests` and `*/tests`, which
+refuse a file of that name at any depth (group (e)), and
+`packages/hammertime-testkit` and `packages/hammertime-testkit/*`, the testkit
+(group (f), the owner's decision on Question 11). The module's last test pins
+the four in both lists (brief T6, item 12). It fails until step W.
+
 See also `.claude/hooks/path-guard.sh` and `.claude/hooks/bash-guard.sh`, whose
 own headers record the probes of the frontmatter wiring, and
 `tests/config/test_path_guard_behavior.py`, which exercises the guard script
@@ -1000,4 +1008,37 @@ def test_test_author_read_deny_globs_are_exactly_decision_14s() -> None:
         "the test-author's Read|Grep|Glob DENY_GLOBS differ from ADR-0018 decision 14's.\n"
         f"missing: {sorted(expected - deny)}\n"
         f"extra: {sorted(deny - expected)}"
+    )
+
+
+# --- ADR-0018's seventh amendment: the coder's `tests` names and the testkit ---
+#
+# Brief T6, item 12. Compared as a set of words.
+
+# Decision 12 (e) and (f): the globs the coder's two deny lists gain.
+CODER_TESTS_AND_TESTKIT_GLOBS = frozenset(
+    [
+        "tests",
+        "*/tests",
+        "packages/hammertime-testkit",
+        "packages/hammertime-testkit/*",
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    ("tool", "script_name", "variable"),
+    [("Write", PATH_GUARD, "DENY_GLOBS"), ("Bash", BASH_GUARD, "WRITE_DENY_GLOBS")],
+    ids=["Edit|Write-DENY_GLOBS", "Bash-WRITE_DENY_GLOBS"],
+)
+def test_coder_deny_lists_refuse_tests_names_and_the_testkit(
+    tool: str, script_name: str, variable: str
+) -> None:
+    """ADR-0018 decisions 12 (e) and (f) and 14: after step W the coder's Edit|Write
+    `DENY_GLOBS` and its Bash `WRITE_DENY_GLOBS` each contain `tests`, `*/tests`,
+    `packages/hammertime-testkit` and `packages/hammertime-testkit/*`."""
+    command = coder_policy(tool, script_name)
+    missing = CODER_TESTS_AND_TESTKIT_GLOBS - words(command, variable)
+    assert not missing, (
+        f"the coder's {tool} policy's {variable} lacks ADR-0018 decision 12's {sorted(missing)}"
     )
