@@ -110,6 +110,23 @@ the coder's fence at step W. The tests at the end of this module encode them
 passes, the raw U+0002 cases if `jq` already refuses a raw control character,
 the `/dev/full` case and the `jq` killed by a signal, which pass today; the
 coder's cases for decision 12 fail until step W, except their control.
+
+ADR-0018's eighth amendment (2026-09-26) fixes SA1g's findings. Decision 26:
+under a guarded policy, an in-scope call whose path begins or ends with an edge
+character (U+0000-U+0020, U+007F-U+00A0, U+1680, U+180E, U+2000-U+200A,
+U+2028, U+2029, U+202F, U+205F, U+3000 or U+FEFF) is refused with decision
+26's denial, directly after decision 17's trailing-newline test, so before
+decisions 18, 20, 21 and 23 and every glob list; a tool that trims its path
+would otherwise act on a path no list judged. Such a character inside a path
+is judged as written, so decision 17's control for a carriage return at the end
+goes. Decision 20, "An empty `cwd`": with PATH_ROOT unset a relative path is
+inside the root only when `cwd` is usable, so with `cwd` absent, `null` or
+empty it gets the root denial, and T4's follow-up case `cwd-empty-dir-repo`
+changes with it. Decision 25's eighth-amendment note: a coder Write whose path
+has 200,000 components is decided within the helper's timeout. The tests at the
+end of this module encode them (brief T7). Decision 26's refusals and its order
+cases, and decision 20's refused cases, fail until brief C9 lands; their
+controls and boundaries, and the long path, pass today.
 """
 
 import json
@@ -2158,7 +2175,7 @@ UNSET_ROOT_POLICY = {"DENY_GLOBS": "tests/*"}
 UNSET_EMPTY_ROOT_CASES: list[tuple[str, str, str, str]] = [
     ("both-empty", "", "", VERDICT_ROOT),
     ("cwd-repo-dir-empty", "{repo}", "", VERDICT_ALLOW),
-    ("cwd-empty-dir-repo", "", "{repo}", VERDICT_ALLOW),
+    ("cwd-empty-dir-repo", "", "{repo}", VERDICT_ROOT),
 ]
 
 
@@ -2170,11 +2187,11 @@ UNSET_EMPTY_ROOT_CASES: list[tuple[str, str, str, str]] = [
 def test_an_unset_path_root_with_both_bases_empty_contains_no_relative_path(
     tmp_path: Path, cwd: str, project_dir: str, verdict: str
 ) -> None:
-    """Decision 20 and assumption 61, as corrected after C6's review: with
-    PATH_ROOT unset a relative path is inside the root only when `cwd` or
-    CLAUDE_PROJECT_DIR is non-empty. With both empty the root is empty, contains
-    no path, and the relative Write is refused with the root denial; with either
-    one the repository root, it is allowed."""
+    """Decision 20 and assumption 61, as the eighth amendment's "An empty `cwd`"
+    leaves them: with PATH_ROOT unset a relative path is inside the root only
+    when `cwd` is usable. With `cwd` empty the relative Write is refused with
+    the root denial, whatever CLAUDE_PROJECT_DIR is; with `cwd` the repository
+    root, it is allowed."""
     path = "docs/x.md"
     result = run_root_case(
         tmp_path, UNSET_ROOT_POLICY, "Write", path, cwd=cwd, project_dir=project_dir
@@ -3241,7 +3258,6 @@ def test_a_guarded_write_whose_path_ends_with_a_newline_is_refused() -> None:
 TRAILING_NEWLINE_CONTROLS: list[tuple[str, str]] = [
     ("plain", under_repo("docs/x.md")),
     ("newline-inside-a-name", f"{REPO_ROOT}/docs/a\nb.md"),
-    ("trailing-carriage-return", under_repo("docs/x.md") + "\r"),
 ]
 
 
@@ -3250,12 +3266,11 @@ TRAILING_NEWLINE_CONTROLS: list[tuple[str, str]] = [
     [path for _, path in TRAILING_NEWLINE_CONTROLS],
     ids=[case_id for case_id, _ in TRAILING_NEWLINE_CONTROLS],
 )
-def test_a_newline_inside_a_path_or_a_trailing_carriage_return_is_judged_as_written(
+def test_a_newline_inside_a_path_is_judged_as_written(
     path: str,
 ) -> None:
     """Decision 17, "The trailing newline": only a newline at the end is
-    refused. A newline inside a name is carried intact and judged as written,
-    and so is a carriage return at the end."""
+    refused. A newline inside a name is carried intact and judged as written."""
     result = run_configured_rooted("architect", EDIT_WRITE, "Write", path)
     assert_allowed_silently(result, f"architect writing {repo_relative_id(path)!r}")
 
@@ -3885,3 +3900,320 @@ def test_configured_coder_write_policy_refuses_tests_names_and_the_testkit_after
         project_dir=str(REPO_ROOT),
     )
     assert_verdict(result, verdict, f"coder writing {path}")
+
+
+# --- the eighth amendment: SA1g's findings ------------------------------------
+#
+# ADR-0018's eighth amendment (2026-09-26), brief T7. Every path that carries
+# whitespace, a control character or a character outside ASCII is built by string
+# concatenation, with the character in the Python string (written below as its
+# Python escape, so that the source shows which one it is); `json.dumps` writes
+# it as a JSON escape, as the harness would send it.
+
+# Decision 26's denial, verbatim, with the ADR's blockquote line breaks joined by
+# single spaces. It is ASCII only.
+EDGE_MESSAGE = (
+    "Hammertime path guard: the path begins or ends with whitespace or a "
+    "control character, or could not be checked for one, and a tool that trims "
+    "its path would act on a path other than the one this guard vetted. Give "
+    "the path without them. The tool call is refused."
+)
+EDGE_PHRASE = "begins or ends with whitespace or a control character"
+
+# Decision 14's coder Edit|Write DENY_GLOBS, copied from its text. It equals the
+# coder's Bash WRITE_DENY_GLOBS there.
+DECISION_14_CODER_GLOBS = (
+    "tests tests/* */tests */tests/* packages/hammertime-testkit "
+    "packages/hammertime-testkit/* docs/spec/* docs/adr/* docs/protocol/* schemas/* "
+    ".claude .claude/* */.claude */.claude/* CLAUDE.md */CLAUDE.md CLAUDE.local.md "
+    "*/CLAUDE.local.md .mcp.json */.mcp.json /* ../* */../* .git .git/* */.git */.git/* "
+    ".venv/* */.venv/* __pycache__/* */__pycache__/* conftest.py */conftest.py "
+    "test_*.py */test_*.py *_test.py test*.txt */test*.txt pytest.toml */pytest.toml "
+    ".pytest.toml */.pytest.toml pytest.ini */pytest.ini .pytest.ini */.pytest.ini "
+    "tox.ini */tox.ini setup.cfg */setup.cfg mypy.ini */mypy.ini .mypy.ini */.mypy.ini "
+    ".ruff.toml */.ruff.toml */ruff.toml uv.toml */uv.toml .python-version "
+    "*/.python-version sitecustomize.py */sitecustomize.py usercustomize.py "
+    "*/usercustomize.py pytest pytest/* ruff ruff/* mypy mypy/* GNUmakefile makefile "
+    "uv.lock"
+)
+
+DOCS_X_PATH = under_repo("docs/x.md")
+
+
+def assert_edge_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 26's denial, verbatim."""
+    return assert_denied_with(result, EDGE_MESSAGE, EDGE_PHRASE, what)
+
+
+def edge_id(path: str) -> str:
+    """`path` for a message, independent of where the checkout lives, with every
+    character outside printable ASCII written as its escape."""
+    return ascii(repo_relative_id(path))
+
+
+# Decision 26, brief T7 item 1: under the test-author's configured read policy.
+
+EDGE_TEST_AUTHOR_READS: list[tuple[str, str, str]] = [
+    ("Read-space-first-implementation", "Read", " " + under_repo(IMPLEMENTATION_FILE)),
+    ("Read-space-last-test-file", "Read", under_repo(TOP_LEVEL_TEST_FILE) + " "),
+    ("Read-tab-first-test-file", "Read", "\t" + under_repo(TOP_LEVEL_TEST_FILE)),
+    ("Read-newline-first-implementation", "Read", "\n" + under_repo(IMPLEMENTATION_FILE)),
+    ("Grep-space-first-tests", "Grep", " tests"),
+    ("Grep-space-last-tests", "Grep", "tests "),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path"),
+    [case[1:] for case in EDGE_TEST_AUTHOR_READS],
+    ids=[case[0] for case in EDGE_TEST_AUTHOR_READS],
+)
+def test_a_test_author_path_with_whitespace_or_a_control_at_either_end_is_refused(
+    tool_name: str, path: str
+) -> None:
+    """Decision 26: a path whose first or last character is an edge character is
+    refused, whatever the tool, a Grep's `path` included. The first case is the
+    one the session reproduced: one space before an absolute path under
+    `packages/` made it look relative, and no glob anchored at the root matched
+    it. A newline at the start is one decision 17's trailing-newline test does not
+    reach."""
+    result = run_configured_rooted("test-author", READ_GREP_GLOB, tool_name, path)
+    assert_edge_denied(result, f"test-author {tool_name} of {edge_id(path)}")
+
+
+# Decision 26, brief T7 item 1: under the architect's configured Edit|Write policy.
+
+EDGE_ARCHITECT_WRITES: list[tuple[str, str]] = [
+    ("space-last-docs-claude-md", under_repo("docs/CLAUDE.md") + " "),
+    ("carriage-return-last", DOCS_X_PATH + "\r"),
+    ("del-last", DOCS_X_PATH + "\x7f"),
+    ("u0085-last", DOCS_X_PATH + "\x85"),
+    ("no-break-space-last", DOCS_X_PATH + "\N{NO-BREAK SPACE}"),
+    ("ideographic-space-last", DOCS_X_PATH + "\N{IDEOGRAPHIC SPACE}"),
+    ("byte-order-mark-first", "\N{ZERO WIDTH NO-BREAK SPACE}" + DOCS_X_PATH),
+    ("line-separator-first", "\N{LINE SEPARATOR}" + DOCS_X_PATH),
+    ("one-space", " "),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for _, path in EDGE_ARCHITECT_WRITES],
+    ids=[case_id for case_id, _ in EDGE_ARCHITECT_WRITES],
+)
+def test_an_architect_write_with_an_edge_character_at_either_end_is_refused(path: str) -> None:
+    """Decision 26: a C0 control, the space, DEL, a C1 control, the no-break
+    space, U+2028, U+3000 and U+FEFF are each refused at either end. A trailing
+    space after `docs/CLAUDE.md` matched no exact-name glob, and a path that is
+    one space names no file a list judged."""
+    result = run_configured_rooted("architect", EDIT_WRITE, "Write", path)
+    assert_edge_denied(result, f"architect writing {edge_id(path)}")
+
+
+def test_a_write_with_a_leading_space_is_refused_under_an_explicit_guarded_policy() -> None:
+    """Decision 26: under DENY_TESTS, one space before `/tmp/...` made the path
+    look relative, and so inside `cwd`."""
+    path = " /tmp/hammertime-probe.txt"
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    assert_edge_denied(result, f"a Write of {path!r}")
+
+
+def test_a_write_with_a_leading_space_is_refused_for_the_caller_a_scoped_policy_names() -> None:
+    """Decision 26, "Who and what it covers": the coder, whom the scoped policy
+    names, is refused."""
+    path = " " + under_repo(SERVICE_FILE)
+    result = run_rooted("Write", policy=SCOPED_TO_CODER, file_path=path, agent_type="coder")
+    assert_edge_denied(result, f"coder writing {edge_id(path)}")
+
+
+EDGE_CONTROLS: list[tuple[str, str]] = [
+    ("space-inside-a-name", under_repo("docs/a b.md")),
+    ("tab-inside-a-name", under_repo("docs/a\tb.md")),
+    ("non-ascii-letter-last", DOCS_X_PATH + "\xe9"),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for _, path in EDGE_CONTROLS],
+    ids=[case_id for case_id, _ in EDGE_CONTROLS],
+)
+def test_whitespace_inside_a_path_or_a_letter_at_its_end_is_judged_as_written(
+    path: str,
+) -> None:
+    """Decision 26: trimming reaches only the ends, so a space or a tab inside a
+    name names exactly what it spells, and a letter outside ASCII is not an edge
+    character. Each Write is in the architect's scope and allowed."""
+    result = run_configured_rooted("architect", EDIT_WRITE, "Write", path)
+    assert_allowed_silently(result, f"architect writing {edge_id(path)}")
+
+
+# Decision 26, "Where it sits", brief T7 item 1: the order.
+
+
+def test_the_nul_gate_runs_before_the_edge_check() -> None:
+    """Decision 26: a path with a NUL keeps the NUL denial."""
+    path = " " + under_repo(SERVICE_FILE) + "\x00"
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    reason = assert_nul_denied(result, f"a Write of {edge_id(path)}")
+    assert EDGE_PHRASE not in reason, reason
+
+
+def test_the_trailing_newline_test_runs_before_the_edge_check() -> None:
+    """Decision 26: directly after decision 17's trailing-newline test, so a path
+    that ends with a newline keeps the trailing-newline denial."""
+    path = " " + under_repo(SERVICE_FILE) + "\n"
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    assert_trailing_newline_denied(result, f"a Write of {edge_id(path)}")
+
+
+def test_the_edge_check_runs_before_the_plain_form_rule() -> None:
+    """Decision 26 and assumption 112: before decision 18's rule, so a path with
+    a leading space and a `..` gets decision 26's denial, not decision 18's."""
+    path = " " + under_repo("tests/../x.py")
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    reason = assert_edge_denied(result, f"a Write of {edge_id(path)}")
+    assert PLAIN_FORM_PHRASE not in reason, reason
+
+
+def test_the_edge_check_runs_before_the_pattern_rule() -> None:
+    """Decision 26: before decision 21's check, so a Glob whose path ends with a
+    space and whose pattern decision 21 refuses gets decision 26's denial."""
+    tool_input = {"path": "tests ", "pattern": "../x"}
+    result = run_test_author_search("Glob", tool_input)
+    reason = assert_edge_denied(result, f"test-author Glob with tool_input {tool_input!r}")
+    assert PATTERN_PHRASE not in reason, reason
+
+
+# Decision 26, "Who and what it covers", brief T7 item 1: the boundaries.
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in FIELD_SILENT_POLICIES],
+    ids=[case_id for case_id, _ in FIELD_SILENT_POLICIES],
+)
+def test_the_edge_check_polices_only_in_scope_calls_under_a_guarded_policy(
+    policy: Mapping[str, str],
+) -> None:
+    """Decision 26: a policy that constrains no paths, and a policy scoped to the
+    coder with a call that sets no `agent_type`, are untouched."""
+    path = " " + under_repo(SERVICE_FILE)
+    result = run_rooted("Write", policy=policy, file_path=path)
+    assert_allowed_silently(result, f"a Write of {edge_id(path)} under {dict(policy)!r}")
+
+
+# Decision 26, brief T7 item 1: the message.
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path"),
+    [("Write", " /tmp/hammertime-probe.txt"), ("Grep", "tests ")],
+    ids=["Write-file_path", "Grep-path"],
+)
+def test_the_edge_denial_is_decision_26s_text_verbatim(tool_name: str, path: str) -> None:
+    """Decision 26: the denial word for word, the ADR's blockquote line breaks read
+    as single spaces. It quotes no path."""
+    search = tool_name in SEARCH_TOOLS
+    result = run_rooted(
+        tool_name,
+        policy=DENY_TESTS,
+        file_path=None if search else path,
+        search_path=path if search else None,
+    )
+    reason = assert_edge_denied(result, f"a {tool_name} of {path!r}")
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert reason == EDGE_MESSAGE, reason
+
+
+# Decision 20, "An empty `cwd`", brief T7 item 2: PATH_ROOT unset, DENY_GLOBS
+# 'tests/*', CLAUDE_PROJECT_DIR the repository root. The payloads are built with
+# `json.dumps` from a dictionary without `cwd`, or with it `None`, and sent
+# through `run_guard_stdin`.
+
+
+def write_payload_with_cwd(file_path: str, cwd: Any) -> str:
+    """A Write payload for `file_path`, as JSON text, whose `cwd` is `cwd`, or
+    which has no `cwd` when `cwd` is ABSENT."""
+    payload: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": file_path},
+    }
+    if cwd is not ABSENT:
+        payload["cwd"] = cwd
+    return json.dumps(payload)
+
+
+EMPTY_CWD_REFUSED: list[tuple[str, Any]] = [("cwd-absent", ABSENT), ("cwd-null", None)]
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    [cwd for _, cwd in EMPTY_CWD_REFUSED],
+    ids=[case_id for case_id, _ in EMPTY_CWD_REFUSED],
+)
+def test_a_relative_path_without_a_cwd_is_outside_the_root(cwd: Any) -> None:
+    """Decision 20, "An empty `cwd`": with PATH_ROOT unset a relative path is
+    inside only when `cwd` is usable, so with `cwd` absent or `null` the relative
+    Write is refused with the root denial, although CLAUDE_PROJECT_DIR is usable.
+    The case with `cwd` empty is T4's `cwd-empty-dir-repo`."""
+    stdin = write_payload_with_cwd("docs/x.md", cwd)
+    result = run_guard_stdin(stdin, policy=UNSET_ROOT_POLICY, project_dir=str(REPO_ROOT))
+    shown = "absent" if cwd is ABSENT else repr(cwd)
+    assert_root_denied(result, f"a Write of 'docs/x.md', cwd {shown}")
+
+
+EMPTY_CWD_CONTROLS: list[tuple[str, str, Any]] = [
+    ("absolute-cwd-absent", DOCS_X_PATH, ABSENT),
+    ("absolute-cwd-null", DOCS_X_PATH, None),
+    ("absolute-cwd-empty", DOCS_X_PATH, ""),
+    ("relative-cwd-repo", "docs/x.md", str(REPO_ROOT)),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "cwd"),
+    [case[1:] for case in EMPTY_CWD_CONTROLS],
+    ids=[case[0] for case in EMPTY_CWD_CONTROLS],
+)
+def test_an_absolute_path_without_a_cwd_is_still_judged_against_the_project(
+    path: str, cwd: Any
+) -> None:
+    """Decision 20, "An empty `cwd`": an absolute path is unaffected, and is still
+    compared with each usable base, CLAUDE_PROJECT_DIR among them; a relative path
+    with `cwd` the repository root gets the verdict it got before."""
+    stdin = write_payload_with_cwd(path, cwd)
+    result = run_guard_stdin(stdin, policy=UNSET_ROOT_POLICY, project_dir=str(REPO_ROOT))
+    shown = "absent" if cwd is ABSENT else repr(cwd)
+    assert_allowed_silently(result, f"a Write of {repo_relative_id(path)!r}, cwd {shown}")
+
+
+# Decision 25's eighth-amendment note, brief T7 item 6: a long path.
+
+LONG_PATH_COMPONENTS = 200_000
+
+
+def test_a_long_coder_path_is_decided_within_the_timeout(tmp_path: Path) -> None:
+    """Decision 25, its eighth-amendment note, and assumption 116: matching a path
+    against decision 14's coder DENY_GLOBS, two of which have a `*` that is
+    neither first nor last, takes time linear in the path's length. A Write
+    whose path has 200,000 components `test_a`, and which no glob matches, is
+    allowed within the helper's timeout."""
+    policy = {
+        "SCOPE_AGENT_TYPES": "coder",
+        "PATH_ROOT": "cwd",
+        "DENY_GLOBS": DECISION_14_CODER_GLOBS,
+    }
+    path = f"{tmp_path}/a" + "/test_a" * LONG_PATH_COMPONENTS + ".md"
+    result = run_rooted(
+        "Write",
+        policy=policy,
+        tool_input={"file_path": path, "content": "x"},
+        agent_type="coder",
+        cwd=str(tmp_path),
+        project_dir=str(REPO_ROOT),
+    )
+    assert_allowed_silently(
+        result, f"a coder Write of <tmp>/a, /test_a {LONG_PATH_COMPONENTS} times, then .md"
+    )

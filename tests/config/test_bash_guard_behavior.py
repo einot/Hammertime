@@ -62,6 +62,21 @@ Decision 12 (f) puts the testkit on the coder's `WRITE_DENY_GLOBS` at step W.
 Group Q fails until brief C8 lands, except its controls, the raw U+0002 cases
 if `jq` already refuses a raw control character, the `/dev/full` case and the
 `jq` killed by a signal, which pass today; its testkit case fails until step W.
+
+ADR-0018's eighth amendment (2026-09-26) adds group R (brief T7). Decision 7, in
+write mode: an operand less one leading `./` that has a `.` component, contains
+`//` or begins with `/` is not in plain form, and is refused with the
+write-mode denial, before `WRITE_DENY_GLOBS` is consulted, since the kernel
+reads such a spelling as the plain file a glob would have refused; the list's
+own refusal now goes through the write-mode denial too; and an operand any of
+whose components is a symbolic link is refused, not only one whose last
+component is. Read-only mode is unchanged. Decision 19's part 6 removes every
+command substitution and here-string after the extraction check, and keeps the
+splitting and normalisation each rule sees exactly as they were, which group R
+pins. Group R's decision 7 cases fail until brief C9 lands, except their
+controls and the target of a link, which pass today; its cases under the
+configured coder policy fail until step W as well; its decision 19 cases pass
+today.
 """
 
 import json
@@ -2257,3 +2272,269 @@ def test_configured_coder_bash_policy_refuses_formatting_the_testkit_after_step_
     assert_phrase(reason, ".py", command)
     assert DIRECTORY_OR_LINK_PHRASE not in reason, reason
     assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+
+
+# --- R. the eighth amendment (decisions 7 and 19) -------------------------------
+#
+# ADR-0018's eighth amendment (2026-09-26), brief T7. The directories, files and
+# symbolic links decision 7's cases need are created inside `tmp_path`, which is
+# the payload's `cwd`.
+
+# Decision 14's coder Bash WRITE_DENY_GLOBS, copied from its text. It equals the
+# coder's Edit|Write DENY_GLOBS there. Unlike DECISION_12_GLOBS, it holds the
+# testkit's globs (decision 12 (f)).
+DECISION_14_CODER_GLOBS = (
+    "tests tests/* */tests */tests/* packages/hammertime-testkit "
+    "packages/hammertime-testkit/* docs/spec/* docs/adr/* docs/protocol/* schemas/* "
+    ".claude .claude/* */.claude */.claude/* CLAUDE.md */CLAUDE.md CLAUDE.local.md "
+    "*/CLAUDE.local.md .mcp.json */.mcp.json /* ../* */../* .git .git/* */.git */.git/* "
+    ".venv/* */.venv/* __pycache__/* */__pycache__/* conftest.py */conftest.py "
+    "test_*.py */test_*.py *_test.py test*.txt */test*.txt pytest.toml */pytest.toml "
+    ".pytest.toml */.pytest.toml pytest.ini */pytest.ini .pytest.ini */.pytest.ini "
+    "tox.ini */tox.ini setup.cfg */setup.cfg mypy.ini */mypy.ini .mypy.ini */.mypy.ini "
+    ".ruff.toml */.ruff.toml */ruff.toml uv.toml */uv.toml .python-version "
+    "*/.python-version sitecustomize.py */sitecustomize.py usercustomize.py "
+    "*/usercustomize.py pytest pytest/* ruff ruff/* mypy mypy/* GNUmakefile makefile "
+    "uv.lock"
+)
+
+# Decision 7, "Write-mode operands, the list's refusal and links": the phrases
+# brief T7 pins, beside decision 11's `uv run --locked ruff format` and `.py`.
+PLAIN_FORM_OPERAND_PHRASE = "is not in plain form"
+LIST_REFUSAL_PHRASE = "in WRITE_DENY_GLOBS"
+RUFF_FORMAT_PHRASE = "uv run --locked ruff format"
+
+# The testkit file less its first component, for spelling it out of plain form.
+TESTKIT_REST = "hammertime-testkit/src/hammertime/testkit/generators.py"
+
+
+def coder_decision_14(command: str, cwd: str | Path) -> subprocess.CompletedProcess[str]:
+    """Run `command` as the coder under CODER_POLICY, with WRITE_DENY_GLOBS decision
+    14's coder list."""
+    return coder(command, cwd, WRITE_DENY_GLOBS=DECISION_14_CODER_GLOBS)
+
+
+def assert_write_mode_denied(
+    result: subprocess.CompletedProcess[str], command: str, phrase: str
+) -> str:
+    """Decision 7's write-mode denial carrying `phrase`: the bash prefix, decision
+    11's `uv run --locked ruff format` and `.py`, and, under the coder's policy,
+    decision 11's paragraph after one space."""
+    reason = assert_denied(result, command)
+    assert_phrase(reason, phrase, command)
+    assert_phrase(reason, RUFF_FORMAT_PHRASE, command)
+    assert_phrase(reason, ".py", command)
+    assert reason.endswith(f" {FINAL_PARAGRAPH}"), reason
+    return reason
+
+
+# Decision 7, change 1, brief T7 item 3: write-mode operands in plain form.
+
+TESTKIT_SPELLINGS: list[tuple[str, str]] = [
+    ("testkit-dot-component", "packages/./" + TESTKIT_REST),
+    ("testkit-double-slash", "packages//" + TESTKIT_REST),
+    ("testkit-two-leading-dot-slashes", "././" + TESTKIT_FILE),
+]
+
+# The operands after `uv run --locked ruff format`; the last case has two.
+NOT_PLAIN_OPERANDS: list[tuple[str, str]] = [
+    *TESTKIT_SPELLINGS,
+    ("service-dot-component", "services/trie/./src/hammertime/trie/query/app.py"),
+    ("leading-slash-after-dot-slash", ".//x.py"),
+    ("second-operand", "ok.py services//x.py"),
+]
+
+
+@pytest.mark.parametrize(
+    "operands",
+    [operands for _, operands in NOT_PLAIN_OPERANDS],
+    ids=[case_id for case_id, _ in NOT_PLAIN_OPERANDS],
+)
+def test_ruff_format_refuses_an_operand_out_of_plain_form(tmp_path: Path, operands: str) -> None:
+    """Decision 7, change 1: in write mode an operand whose `rel`, the operand
+    less one leading `./`, has a `.` component, contains `//` or begins with `/`
+    is refused with the write-mode denial. The first case is the one the session
+    reproduced: the kernel reads it as the testkit file, which the plain spelling's
+    glob refuses. `.//x.py` begins with `/` once its `./` is removed, and the last
+    case is refused for its second operand."""
+    command = f"uv run --locked ruff format {operands}"
+    assert_write_mode_denied(
+        coder_decision_14(command, tmp_path), command, PLAIN_FORM_OPERAND_PHRASE
+    )
+
+
+def test_ruff_format_refuses_the_plain_testkit_spelling_with_the_lists_refusal(
+    tmp_path: Path,
+) -> None:
+    """Decision 7, changes 1 and 2: the plain spelling is in plain form, so it
+    meets WRITE_DENY_GLOBS, whose testkit glob refuses it with the list's refusal,
+    not the plain-form one."""
+    command = f"uv run --locked ruff format {TESTKIT_FILE}"
+    reason = assert_write_mode_denied(
+        coder_decision_14(command, tmp_path), command, LIST_REFUSAL_PHRASE
+    )
+    assert PLAIN_FORM_OPERAND_PHRASE not in reason, reason
+
+
+PLAIN_FORM_CONTROLS: list[tuple[str, str]] = [
+    (
+        "one-leading-dot-slash",
+        "uv run --locked ruff format ./services/trie/src/hammertime/trie/query/app.py",
+    ),
+    ("read-only-format-check", "uv run --locked ruff format --check services//trie"),
+    ("read-only-check", "uv run --locked ruff check services/./trie"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [command for _, command in PLAIN_FORM_CONTROLS],
+    ids=[case_id for case_id, _ in PLAIN_FORM_CONTROLS],
+)
+def test_ruff_format_allows_one_leading_dot_slash_and_read_only_spellings(
+    tmp_path: Path, command: str
+) -> None:
+    """Decision 7, change 1: one leading `./` stays allowed, and read-only mode,
+    which writes nothing, is unchanged, so the rule does not reach it."""
+    assert_allowed(coder_decision_14(command, tmp_path), command)
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [operand for _, operand in TESTKIT_SPELLINGS],
+    ids=[case_id for case_id, _ in TESTKIT_SPELLINGS],
+)
+def test_configured_coder_policy_refuses_testkit_spellings_out_of_plain_form(
+    operand: str,
+) -> None:
+    """Decision 7, change 1, after step W: under the coder's configured Bash
+    policy, with `cwd` the repository root, each spelling is refused with the
+    plain-form refusal."""
+    command = f"uv run --locked ruff format {operand}"
+    result = run_configured("coder", command)
+    assert_write_mode_denied(result, f"{command} (configured coder)", PLAIN_FORM_OPERAND_PHRASE)
+
+
+# Decisions 7 and 11, change 2, brief T7 item 4: the list's refusal.
+
+LIST_REFUSED_OPERANDS = [
+    "tests/config/test_x.py",
+    "services/x/src/y/tests/test_z.py",
+    "pytest/__main__.py",
+]
+
+
+@pytest.mark.parametrize("operand", LIST_REFUSED_OPERANDS)
+def test_the_lists_refusal_is_the_write_mode_denial(tmp_path: Path, operand: str) -> None:
+    """Decisions 7 and 11, change 2: the refusal of an operand that matches
+    WRITE_DENY_GLOBS goes through the write-mode denial, so it carries
+    `uv run --locked ruff format` and decision 11's paragraph."""
+    command = f"uv run --locked ruff format {operand}"
+    assert_write_mode_denied(coder(command, tmp_path), command, LIST_REFUSAL_PHRASE)
+
+
+# Decision 7, change 3, brief T7 item 5: a symbolic link at any component.
+
+
+def make_linked_tree(tmp_path: Path) -> None:
+    """`real/x.py`, and a symbolic link `link` to `real`, inside `tmp_path`."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "x.py").write_text("", encoding="utf-8")
+    (tmp_path / "link").symlink_to("real")
+
+
+def test_ruff_format_refuses_an_operand_through_a_linked_directory(tmp_path: Path) -> None:
+    """Decision 7, change 3: `link/x.py`, with `link` a link to a directory,
+    would make ruff rewrite a file in the link's target, which no list judged.
+    Its last component is a regular file, so only a test of every component
+    sees the link."""
+    make_linked_tree(tmp_path)
+    command = "uv run --locked ruff format link/x.py"
+    assert_directory_or_link_denied(coder(command, tmp_path), command)
+
+
+def test_ruff_format_allows_the_file_a_linked_directory_leads_to(tmp_path: Path) -> None:
+    """Decision 7, change 3's control: the same file, named through the
+    directory itself, has no link among its components."""
+    make_linked_tree(tmp_path)
+    command = "uv run --locked ruff format real/x.py"
+    assert_allowed(coder(command, tmp_path), f"{command} beside the link")
+
+
+def test_ruff_format_refuses_an_operand_under_a_link_inside_a_directory(tmp_path: Path) -> None:
+    """Decision 7, change 3: a link at an inner component, `pkg/inner` to
+    `../real`, is refused the same way."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "x.py").write_text("", encoding="utf-8")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "inner").symlink_to("../real")
+    command = "uv run --locked ruff format pkg/inner/x.py"
+    assert_directory_or_link_denied(coder(command, tmp_path), command)
+
+
+# Decision 19, part 6, brief T7 item 7: the splitting and normalisation that part
+# 6 keeps, with `cwd` `tmp_path`.
+
+AUDITOR_SPLIT_REFUSED: list[tuple[str, str]] = [
+    ("quoted-output-option", 'git log --ou"t"put=probe-out -1'),
+    ("tab-before-output-option", "git log\t--output=probe-out -1"),
+    ("pipe-to-sed", "git status | sed -n 1p"),
+    ("and-then-rg-pre", "git status && rg --pre=sh x ."),
+]
+
+AUDITOR_SPLIT_ALLOWED: list[tuple[str, str]] = [
+    ("two-blanks-around", "  git status  "),
+    ("semicolon", "git status ; git log -1"),
+]
+
+CODER_SPLIT_ALLOWED: list[tuple[str, str]] = [
+    ("pipe-to-tail", "git status | tail -5"),
+    ("two-blanks-inside", "ls  services"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [command for _, command in AUDITOR_SPLIT_REFUSED],
+    ids=[case_id for case_id, _ in AUDITOR_SPLIT_REFUSED],
+)
+def test_the_auditor_words_and_segments_are_split_and_normalised_as_before(
+    tmp_path: Path, command: str
+) -> None:
+    """Decision 19, part 6: each word is normalised in place by the three
+    deletions, so `--ou"t"put` is vetted as `--output`; a tab splits words; and
+    every segment after `|` or `&&` is vetted."""
+    assert_denied(auditor(command, tmp_path), f"{command!r} (auditor)")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [command for _, command in AUDITOR_SPLIT_ALLOWED],
+    ids=[case_id for case_id, _ in AUDITOR_SPLIT_ALLOWED],
+)
+def test_the_auditor_blanks_and_separators_are_split_as_before(
+    tmp_path: Path, command: str
+) -> None:
+    """Decision 19, part 6: blanks around a command and a `;` between two
+    allowed commands leave each segment what it was."""
+    assert_allowed(auditor(command, tmp_path), f"{command!r} (auditor)")
+
+
+def test_the_coder_commit_option_is_vetted_as_before(tmp_path: Path) -> None:
+    """Decision 19, part 6: SA1g's case. `--no-verify` is vetted, and refused."""
+    command = "git commit --no-verify -F .commit-msg"
+    assert_denied(coder(command, tmp_path), command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [command for _, command in CODER_SPLIT_ALLOWED],
+    ids=[case_id for case_id, _ in CODER_SPLIT_ALLOWED],
+)
+def test_the_coder_segments_and_blanks_are_split_as_before(tmp_path: Path, command: str) -> None:
+    """Decision 19, part 6: in literal mode, a pipe between two allowed commands
+    and two blanks between words leave each segment what it was."""
+    assert_allowed(coder(command, tmp_path), command)
