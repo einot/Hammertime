@@ -34,60 +34,117 @@
 #                       every in-scope call.
 #
 # Reads the PreToolUse JSON payload on stdin (see
-# https://code.claude.com/docs/en/hooks) and checks tool_input.file_path,
-# falling back to tool_input.path (Grep/Glob). A payload the guard cannot
-# read is refused first of all, for every caller (see A GUARD THAT FAILS
-# DENIES below). For an in-scope call under a guarded policy, a path
-# containing a NUL byte, or a path field that is not a string, is refused
-# before any other check (see NUL GATE below), and a Glob pattern or Grep
-# glob outside a narrow grammar right after it (see SEARCH PATTERNS
-# below). A path that is not in plain form is then refused, and after it a
-# path that does not lie inside the policy's root, before any glob list is
-# consulted (see PLAIN FORM and ROOT below).
+# https://code.claude.com/docs/en/hooks) and checks the path in the tool's
+# own field: tool_input.file_path for a Read, Edit or Write, and
+# tool_input.path for a Grep or Glob (see FIELDS below). A payload the
+# guard cannot read is refused first of all, for every caller (see A GUARD
+# THAT FAILS DENIES below). For an in-scope call under a guarded policy,
+# another tool, or a call that also names a path in the other kind's field,
+# is refused first (see FIELDS); then a path containing a NUL byte, or a
+# path field that is not a string (see NUL GATE below), and a path that
+# ends with a newline (see TRAILING NEWLINE below); then a Glob pattern or
+# Grep glob outside a narrow grammar (see SEARCH PATTERNS below), and a
+# search value that begins with `-` or a pattern component that could
+# match `..` (see SEARCH VALUES below). A path that is not in plain form is
+# then refused, and after it a path that does not lie inside the policy's
+# root, and last a search path with a character outside a narrow grammar,
+# before any glob list is consulted (see PLAIN FORM, ROOT and SEARCH
+# VALUES below).
 #
-# A GUARD THAT FAILS DENIES (ADR-0018 decision 19, fifth amendment). This
-# script ends with status 0 (allow, with no output) or 2 (deny) and nothing
-# else. Before this, any command that failed under `set -e` -- an
-# extraction line whose jq could not read the payload, or the jq inside
-# `deny` -- ended the script with some other status, which the harness
-# treats as a non-blocking hook error, so the call went through. Three
-# parts, built in for every policy, with no knob:
+# A GUARD THAT FAILS DENIES (ADR-0018 decision 19, fifth amendment; parts 1
+# and 3 amended, and parts 4 and 5 added, by the seventh). This script
+# ends with status 0 (allow, with no output) or 2 (deny) and nothing else.
+# Before this, any command that failed under `set -e` -- an extraction line
+# whose jq could not read the payload, or the jq inside `deny` -- ended the
+# script with some other status, which the harness treats as a
+# non-blocking hook error, so the call went through. Five parts, built in
+# for every policy, with no knob:
 #
 #   FAIL-CLOSED EXIT. An EXIT trap, installed as the first command after
-#   `set -f -e -u -o pipefail`, turns any exit status other than 0 or 2
-#   into the backstop denial ("... the guard stopped with status N before
-#   reaching a verdict ...") and exit 2. It writes the JSON deny with
-#   printf and a fixed template, never with jq, which may be what failed.
+#   `set -f -e -u -o pipefail`, turns any exit status other than 0, and
+#   other than the 2 of `deny`'s own `exit 2`, into the backstop denial
+#   ("... the guard stopped with status N before reaching a verdict ...")
+#   and exit 2. `deny` sets a flag immediately before its `exit 2`, after
+#   its jq or its fallback, so a command that fails with status 2 anywhere
+#   else gets the backstop, not a refusal with no reason. The trap writes
+#   the JSON deny with printf and a fixed template, never with jq, which
+#   may be what failed.
 #
 #   DENY'S FALLBACK. `deny` still writes the JSON deny with `jq -n` and
 #   exits 2. If that jq fails, it writes the same reason to stderr instead,
 #   and still exits 2, which blocks whether or not JSON is printed.
 #
-#   PAYLOAD SHAPE. Between reading stdin and the first extraction line, one
-#   `jq -e -s` call over the raw payload asks whether it is malformed. It
-#   is well formed when it is exactly one JSON value, that value is an
-#   object, its tool_input is an object, its tool_name is a string, and its
-#   cwd and agent_type are each a string, null or absent. Only status 1 (a
-#   clean false: well formed) passes; status 0 (malformed) and any other
+#   PAYLOAD SHAPE. The payload is read with `head -c 8388609`, so at most
+#   its first 8 MiB and one byte (decision 25), through `tr`, which keeps
+#   each NUL byte as U+0002, a control character no JSON text holds raw;
+#   the rest of stdin is then read and discarded. So the command
+#   substitution drops nothing unseen, and a payload that holds a raw NUL
+#   is not judged with the byte removed. Between reading stdin and the
+#   first extraction line, one `jq -e -s` call over the payload asks
+#   whether it is malformed. A payload that holds a raw U+0002, whatever
+#   put it there, is malformed without that call, with status 0. It is
+#   well formed when it is exactly one JSON value, that value is an object,
+#   its tool_input is an object, its tool_name is a string, and its cwd and
+#   agent_type are each a string, null or absent. A payload longer than
+#   the bound is cut there, so it is not one JSON value unless the cut
+#   falls after one whole value and nothing but whitespace. Only status 1
+#   (a clean false: well formed) passes; status 0 (malformed) and any other
 #   status (not JSON, or jq failed) get the shape denial ("... could not be
 #   read as a single tool call ..."), which names the status and goes
-#   through `deny`. This is the one check in the script that runs BEFORE
-#   the SCOPE_AGENT_TYPES routing, for every caller the hook sees, the
-#   top-level session included, and under a policy that constrains
-#   nothing: the routing reads agent_type through an extraction line, so a
-#   script that cannot read the payload cannot tell whether the caller is
-#   in scope. `deny` is therefore defined above the extraction lines. A
-#   field inside tool_input is not this check's business: a path that is
-#   not a string still meets the NUL gate's could-not-be-checked denial.
-#   Once the shape passes, no extraction line can fail on the payload, only
-#   through the environment, and the trap turns that into the backstop
-#   denial.
+#   through `deny`. This check runs BEFORE the SCOPE_AGENT_TYPES routing,
+#   for every caller the hook sees, the top-level session included, and
+#   under a policy that constrains nothing: the routing reads agent_type
+#   through an extraction line, so a script that cannot read the payload
+#   cannot tell whether the caller is in scope. `deny` is therefore defined
+#   above the extraction lines. A field inside tool_input is not this
+#   check's business: a path that is not a string still meets the NUL
+#   gate's could-not-be-checked denial. Once the shape passes, no
+#   extraction line can fail on the payload, only through the environment.
+#
+#   EXTRACTION CHECK. Each extraction line reads its field through a
+#   command substitution, which bash may expand to nothing when it cannot
+#   make its pipe, and which drops NUL bytes and trailing newlines.
+#   Directly after the four extraction lines, and so also before the
+#   routing, for every caller, one `jq -e` call over the payload, told only
+#   which extracted fields are empty, asks whether each is empty exactly
+#   when the payload's field, as `$(...)` renders it, is empty; and whether
+#   cwd, when it is a string, ends with a newline or holds a NUL, which
+#   `$(...)` would read as another directory. Only status 1 passes; any
+#   other status ends the script with status 3, which the trap turns into
+#   the backstop denial.
+#
+#   ONE TOP-LEVEL COMMAND. Every command after the trap is inside one brace
+#   group, which ends every path through it with `exit`, and the script's
+#   last line, after the group, is `exit 3`. If bash abandoned a command
+#   part-way rather than exiting, only `exit 3` would be left to run, and
+#   the trap turns it into the backstop denial; so no path reaches exit 0
+#   with a check before it skipped.
 #
 #   The cost: a missing or broken jq now refuses every call this hook sees,
 #   the top-level session's included, until jq is restored from outside
-#   the session. A guard process that never finishes (killed by a signal
-#   or by the hook timeout), or a hook command that cannot start, is
-#   outside what the script can do.
+#   the session. A guard process that never finishes (killed by a signal),
+#   or a hook command that cannot start, is outside what the script can do.
+#   The bound on the payload keeps this script's work a fixed number of
+#   passes over at most 8 MiB, well inside the hook's time limit.
+#
+# FIELDS (ADR-0018 decision 24, seventh amendment).
+#
+# The path is read from its tool's own field, through one selector that the
+# extraction line, the extraction check, the NUL gate and the
+# trailing-newline test share: tool_input.file_path for a Read, Edit or
+# Write, tool_input.path for a Grep or Glob, and nothing for any other
+# tool. Before, the extraction took tool_input.file_path falling back to
+# tool_input.path whatever the tool, so a Grep or Glob that carried a
+# file_path beside its path was vetted on the file_path while the tool
+# searched the path. Under a guarded policy, for an in-scope call, the
+# tool must be one of those five, and the other kind's field
+# (tool_input.path for a Read, Edit or Write, tool_input.file_path for a
+# Grep or Glob) must be absent, null or false; the empty string counts as
+# a field. Anything else is refused with the fields denial ("... cannot
+# tell which path the tool would act on ..."). The check runs after the
+# routing, the PATH_ROOT check and `guarded`, and before the NUL gate, so
+# before every other check that reads the path. It reads jq's exit status;
+# only status 1 passes. There is no knob to turn it off.
 #
 # NUL GATE (ADR-0018 decision 17, third amendment).
 #
@@ -98,9 +155,9 @@
 # on the bytes before the NUL would use a different path from the one
 # vetted. The gate therefore does not trust file_path: it asks jq, over the
 # raw payload, whether the DECODED path -- the very value the extraction
-# selects, tool_input.file_path falling back to tool_input.path -- contains
-# codepoint 0, and reads the answer from jq's exit status rather than from
-# any captured string.
+# selects, the tool's own field by decision 24's selector (see FIELDS) --
+# contains codepoint 0, and reads the answer from jq's exit status rather
+# than from any captured string.
 #
 # It runs for every in-scope call under a guarded policy (DENY_GLOBS or
 # ALLOW_GLOBS set), whatever the tool: it does not look at tool_name. It
@@ -118,6 +175,20 @@
 # false path becomes the empty string through `// ""`, passes, and meets
 # the empty-path check as before. There is no knob to turn the gate off.
 #
+# TRAILING NEWLINE (ADR-0018 decision 17, seventh amendment).
+#
+# `$(...)` also drops trailing newlines, so a path that ends with one would
+# be vetted without it: the project root followed by a newline would be
+# vetted as the root, and a path of newlines only as no path, while the
+# tool would act on a name that ends in a newline. Under a guarded policy,
+# directly after the NUL gate, and so before the empty-path and
+# project-root checks, jq asks over the raw payload whether the path, the
+# tool's own field, ends with a newline (U+000A). Only status 1 passes;
+# status 0, and any other status, get the trailing-newline denial ("the
+# path ends with a newline, or could not be checked for one ..."). A path
+# with both a NUL and a trailing newline keeps the NUL denial. A newline
+# inside a path is carried intact and judged as written. There is no knob.
+#
 # PLAIN FORM (ADR-0018 decision 18, fourth amendment).
 #
 # The globs are matched against the path exactly as written. The script
@@ -130,7 +201,8 @@
 #   1. has a `/`-separated component that is exactly `..`;
 #   2. has a component that is exactly `.`;
 #   3. contains `//` anywhere;
-#   4. begins with `~`.
+#   4. begins with `~`, or has a component that begins with `~` (seventh
+#      amendment: a `~` after any `/`, such as `<repo>/~x`).
 #
 # Only a component that is exactly `.` or `..` counts: `.git`, `..foo`,
 # `x..y` and `...` are ordinary names. A leading `/` and a single trailing
@@ -139,7 +211,8 @@
 #
 # It runs for every in-scope call under a guarded policy, whatever the
 # tool: it does not look at tool_name. It sits after the NUL gate, the
-# empty-path check, the relativisation and the project-root check, and
+# trailing-newline test, the search checks before the empty-path check,
+# the empty-path check, the relativisation and the project-root check, and
 # before every glob list, EXEMPT_GLOBS included. The root's own spellings
 # (`<root>`, `<root>/`, `<root>/.`, `<root>/./`, `.` and `./`) are handled
 # by the project-root check as before and never reach the rule. There is
@@ -172,9 +245,39 @@
 # build a `..` from. The check runs entirely in jq over the raw payload and
 # is read from jq's exit status; only status 1 passes.
 #
-# It runs for every in-scope call under a guarded policy, directly after
-# the NUL gate and before the empty-path check and every glob list,
-# EXEMPT_GLOBS included. There is no knob to turn it off.
+# It runs for every in-scope call under a guarded policy, after the NUL
+# gate and the trailing-newline test and before the empty-path check and
+# every glob list, EXEMPT_GLOBS included. There is no knob to turn it off.
+# One exception to "only paths under the searched path": an engine that
+# lists a directory's `.` and `..` entries matches a component such as
+# `.?` against `..`; SEARCH VALUES refuses such a component.
+#
+# SEARCH VALUES (ADR-0018 decision 23, seventh amendment).
+#
+# How the Grep and Glob tools hand their values on is not known, so for an
+# in-scope Grep or Glob under a guarded policy the guard refuses what a
+# tool could misread, whatever the tool would do:
+#
+#   1. no string anywhere in tool_input may begin with `-` (the path,
+#      Grep's pattern, glob or type, Glob's pattern, or any other field),
+#      which a tool that passed it on as it stands could read as an option;
+#   2. no `/`-separated component of Glob's pattern or Grep's glob may
+#      begin with `.` followed by `*` or `?`, which an engine that lists
+#      `.` and `..` could match against `..`;
+#   3. the path, when it is a string, may hold only ASCII letters, digits
+#      and `_ - . /`, so that no glob syntax or other special character in
+#      it can make the tool search a place no list judged. It is tested as
+#      given, the root's part included.
+#
+# Rules 1 and 2 are one jq check, directly after SEARCH PATTERNS' check and
+# before the empty-path check, with the denial "no value in a Grep or a
+# Glob may begin with '-' ...". Rule 3 is a second check, after the root
+# rule and directly before EXEMPT_GLOBS, so that a path out of plain form,
+# a path outside the root and the root's own spellings keep their earlier
+# handling; its denial is "the path of a Grep or a Glob may contain only
+# ...". Each reads jq's exit status over the raw payload; only status 1
+# passes. A Read, Edit or Write, a caller the policy does not name and a
+# policy that constrains no paths are untouched. There is no knob.
 #
 # ROOT (ADR-0018 decision 20, fifth amendment).
 #
@@ -204,7 +307,10 @@
 # One trailing `/` is removed from a root, and from cwd before it is
 # compared with a root. The last column assumes a usable root. A root is
 # usable when it begins with `/`, is in plain form by decision 18's four
-# tests, and is not `/`, the one such root that is empty once its one
+# tests (the fourth, since the seventh amendment, refusing a `~` at the
+# start of any component, so a root with a later component that begins
+# with `~` is not usable either), and is not `/`, the one such root that
+# is empty once its one
 # trailing `/` is removed. Any other root is treated as an empty root,
 # whatever the reason: its variable unset or empty, `/`, `//`, `/.`,
 # `/x/..`, a relative path, or anything else out of plain form. An empty
@@ -309,29 +415,51 @@
 
 set -f -e -u -o pipefail
 
-# Fail-closed exit (ADR-0018 decision 19, part 1; see A GUARD THAT FAILS
-# DENIES in the header). Installed first, so that it covers every line
-# below: any status but 0 or 2 becomes the backstop denial and exit 2.
-# Written with printf and a fixed template, never with jq, which may be
-# what failed; the text has no `"` and no `\`, and the status is an
-# integer, so nothing needs escaping. The handler runs under `set -e` too,
-# so its printf is guarded with `|| :` and cannot end it early, and its
-# last command is `exit 2`.
+# Fail-closed exit (ADR-0018 decision 19, part 1, as the seventh amendment
+# leaves it; see A GUARD THAT FAILS DENIES in the header). Installed first,
+# so that it covers every line below: any status but 0, and but the 2 of
+# `deny`'s own `exit 2` (which sets `denying` just before it), becomes the
+# backstop denial and exit 2. A status 2 that `deny` did not make gets the
+# backstop too. Written with printf and a fixed template, never with jq,
+# which may be what failed; the text has no `"` and no `\`, and the status
+# is an integer, so nothing needs escaping. The handler runs under `set -e`
+# too, so its printf is guarded with `|| :` and cannot end it early, and
+# its last command is `exit 2`. `${denying:-0}` keeps it safe under
+# `set -u` wherever it fires.
 on_exit() {
   local status="$1"
-  if (( status != 0 && status != 2 )); then
+  if (( status != 0 )) && ! (( status == 2 && ${denying:-0} )); then
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "Hammertime path guard: the guard stopped with status ${status} before reaching a verdict, so it cannot vouch for this tool call. The tool call is refused." || :
     exit 2
   fi
 }
 trap 'on_exit "$?"' EXIT
 
-input="$(cat)"
+# One top-level command (ADR-0018 decision 19, part 5). Every command after
+# the trap is inside this brace group, which ends every path through it
+# with `exit`. The script's last line, after the group, is `exit 3`: only a
+# command that bash abandoned part-way can reach it, and the trap turns it
+# into the backstop denial. The group's body is not re-indented, so that
+# the lines inside it read as they did before.
+{
+
+# The payload (ADR-0018 decision 19, part 3, and decision 25, rule 1). At
+# most its first 8388609 bytes, 8 MiB and one byte, are read; each NUL byte
+# is kept as U+0002, which no JSON text holds raw, so that the command
+# substitution drops nothing unseen. The rest of stdin is then read and
+# discarded, so that the harness is never left writing into a closed pipe.
+# A longer payload is cut there, and the shape check below refuses it
+# unless the cut falls after one whole JSON value and nothing but
+# whitespace.
+input="$(head -c 8388609 | tr '\000' '\002')"
+cat >/dev/null
 
 # If jq cannot write the JSON deny, the same reason goes to stderr instead,
 # and the exit is still 2, which blocks whether or not JSON is printed
 # (ADR-0018 decision 19, part 2). Defined here, above the extraction lines,
-# because the payload-shape check below uses it.
+# because the payload-shape check below uses it. `denying` is set
+# immediately before `exit 2`, after the jq or its fallback, so that a
+# failure of either still reaches the trap with its own status (part 1).
 deny() {
   local reason="$1"
   jq -n --arg reason "$reason" '{
@@ -341,6 +469,7 @@ deny() {
       permissionDecisionReason: $reason
     }
   }' || printf '%s\n' "$reason" >&2
+  denying=1
   exit 2
 }
 
@@ -349,19 +478,46 @@ deny() {
 # caller: a payload that is not one JSON object whose tool_input is an
 # object, whose tool_name is a string, and whose cwd and agent_type are
 # strings, null or absent is refused, so that no extraction line below can
-# fail on the payload's shape. Only status 1 (a clean false: well formed)
+# fail on the payload's shape. A payload that holds a raw U+0002, which is
+# where a raw NUL byte went when it was read, is malformed without the jq
+# call: shape_status stays 0. Only status 1 (a clean false: well formed)
 # passes; the status is captured with `|| shape_status=$?` so that neither
 # `set -e` nor an `if` condition can turn a jq error into a pass.
 shape_status=0
-printf '%s' "$input" | jq -e -s 'length != 1 or (.[0] | (type != "object") or ((.tool_input | type) != "object") or ((.tool_name | type) != "string") or ([.cwd, .agent_type] | any(. != null and type != "string")))' >/dev/null 2>&1 || shape_status=$?
+if [[ "$input" != *$'\002'* ]]; then
+  printf '%s' "$input" | jq -e -s 'length != 1 or (.[0] | (type != "object") or ((.tool_input | type) != "object") or ((.tool_name | type) != "string") or ([.cwd, .agent_type] | any(. != null and type != "string")))' >/dev/null 2>&1 || shape_status=$?
+fi
 if [[ "$shape_status" != 1 ]]; then
   deny "Hammertime path guard: the hook payload could not be read as a single tool call (the check ended with status ${shape_status}). A payload must be one JSON object whose tool_input is an object, whose tool_name is a string, and whose cwd and agent_type are strings, null or absent; without that, the guard cannot tell what the call would act on or who is making it. The tool call is refused."
 fi
 
+# The path is read from its tool's own field (ADR-0018 decision 24; see
+# FIELDS in the header): tool_input.file_path for a Read, Edit or Write,
+# tool_input.path for a Grep or Glob, and nothing for any other tool. The
+# same selector is used by the extraction check below, the NUL gate and the
+# trailing-newline test.
 tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
-file_path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.path // empty')"
+file_path="$(printf '%s' "$input" | jq -r '(if .tool_name == "Read" or .tool_name == "Edit" or .tool_name == "Write" then .tool_input.file_path elif .tool_name == "Grep" or .tool_name == "Glob" then .tool_input.path else null end) // empty')"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
 agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
+
+# Extraction check (ADR-0018 decision 19, part 4; see A GUARD THAT FAILS
+# DENIES in the header). Directly after the four extraction lines and
+# before the routing, for every caller. One jq call over the raw payload
+# asks whether each extracted field is empty exactly when the payload's
+# field, as `$(...)` renders it, is empty: absent, null or false render
+# empty; a string renders empty when, its NUL bytes removed, nothing but
+# newlines is left; any other value renders non-empty. jq is told only
+# which extracted fields are empty, never their values. The same call asks
+# whether cwd, when it is a string, ends with a newline or holds a NUL,
+# which `$(...)` would read as another directory. Only status 1 (a clean
+# false) passes; any other status ends the script with status 3, which the
+# trap turns into the backstop denial.
+extract_status=0
+printf '%s' "$input" | jq -e --arg tool_name "${tool_name:+1}" --arg cwd "${cwd:+1}" --arg agent_type "${agent_type:+1}" --arg path "${file_path:+1}" 'def rendered: if . == null or . == false then false elif type == "string" then (explode | map(select(. != 0)) | implode | test("\\A\n*\\z") | not) else true end; ([(.tool_name | rendered), (.cwd | rendered), (.agent_type | rendered), ((if .tool_name == "Read" or .tool_name == "Edit" or .tool_name == "Write" then .tool_input.file_path elif .tool_name == "Grep" or .tool_name == "Glob" then .tool_input.path else null end) | rendered)] != [$tool_name == "1", $cwd == "1", $agent_type == "1", $path == "1"]) or ((.cwd | type) == "string" and ((.cwd | endswith("\n")) or (.cwd | explode | map(select(. == 0)) != [])))' >/dev/null 2>&1 || extract_status=$?
+if [[ "$extract_status" != 1 ]]; then
+  exit 3
+fi
 
 # Scope routing -- deliberately NOT a check. This hook has to be wired
 # session-wide (see WIRING in the header), so it sees tool calls from
@@ -372,8 +528,9 @@ agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
 # Unset behaves as it always has and polices every call that reaches this
 # hook, which is what the test suite exercises.
 #
-# This test deliberately sits first, after only the payload-shape check
-# above, and before `guarded` is even worked out, so that an out-of-scope
+# This test deliberately sits first, after only the payload-shape and
+# extraction checks above, and before `guarded` is even worked out, so
+# that an out-of-scope
 # caller costs nothing and cannot be affected by this policy's
 # configuration.
 if [[ -n "${SCOPE_AGENT_TYPES:-}" ]]; then
@@ -417,15 +574,30 @@ case "$tool_name" in
   Read | Grep | Glob) content_tool=1 ;;
 esac
 
+# The tool and its fields (ADR-0018 decision 24; see FIELDS in the header).
+# Only under a guarded policy, after the routing, the PATH_ROOT check and
+# `guarded`, and before the NUL gate, so before every other check that
+# reads the path. The tool must be a Read, Edit or Write, or a Grep or
+# Glob, and the other kind's path field must be absent, null or false.
+# Only status 1 passes; the status is captured as in the NUL gate.
+if (( guarded )); then
+  fields_status=0
+  printf '%s' "$input" | jq -e 'if .tool_name == "Read" or .tool_name == "Edit" or .tool_name == "Write" then (.tool_input.path // false) != false elif .tool_name == "Grep" or .tool_name == "Glob" then (.tool_input.file_path // false) != false else true end' >/dev/null 2>&1 || fields_status=$?
+  if [[ "$fields_status" != 1 ]]; then
+    deny "Hammertime path guard: this guard reads the path of a Read, Edit or Write from file_path and the path of a Grep or Glob from path, and this call either comes from another tool or also names a path in the other field, so the guard cannot tell which path the tool would act on. The tool call is refused."
+  fi
+fi
+
 # NUL gate (ADR-0018 decision 17; see NUL GATE in the header). Only under a
 # guarded policy, and before the empty-path check: a path that is only a
 # NUL comes out of the extraction above empty, and EXEMPT_GLOBS below exits
 # 0 on a match, so a later gate would never see some NUL-bearing paths.
+# It tests the tool's own field, through decision 24's selector.
 # The status is captured with `|| nul_status=$?` so that neither `set -e`
 # nor an `if` condition can turn a jq error into "no NUL".
 if (( guarded )); then
   nul_status=0
-  printf '%s' "$input" | jq -e '(.tool_input.file_path // .tool_input.path // "") | explode | any(. == 0)' >/dev/null 2>&1 || nul_status=$?
+  printf '%s' "$input" | jq -e '((if .tool_name == "Read" or .tool_name == "Edit" or .tool_name == "Write" then .tool_input.file_path elif .tool_name == "Grep" or .tool_name == "Glob" then .tool_input.path else null end) // "") | explode | any(. == 0)' >/dev/null 2>&1 || nul_status=$?
   case "$nul_status" in
     1) ;;
     0)
@@ -435,6 +607,20 @@ if (( guarded )); then
       deny "Hammertime path guard: the path could not be checked for a NUL byte (the check ended with status ${nul_status} instead of a result), so the guard cannot confirm that the path it would vet is the path the tool would use. The tool call is refused."
       ;;
   esac
+fi
+
+# Trailing newline (ADR-0018 decision 17, seventh amendment; see NUL GATE
+# in the header). Only under a guarded policy, directly after the NUL
+# gate, so before the empty-path and project-root checks, which let an
+# Edit or Write through with exit 0. `$(...)` drops trailing newlines, so a
+# path that ends with one would be vetted as another path. Only status 1
+# passes; status 0, and any other status, get the denial.
+if (( guarded )); then
+  newline_status=0
+  printf '%s' "$input" | jq -e '((if .tool_name == "Read" or .tool_name == "Edit" or .tool_name == "Write" then .tool_input.file_path elif .tool_name == "Grep" or .tool_name == "Glob" then .tool_input.path else null end) // "") | endswith("\n")' >/dev/null 2>&1 || newline_status=$?
+  if [[ "$newline_status" != 1 ]]; then
+    deny "Hammertime path guard: the path ends with a newline, or could not be checked for one, and trailing newlines are dropped when the path is read, so the guard cannot vet the path the tool would actually use. Give the path without the newline. The tool call is refused."
+  fi
 fi
 
 # Search patterns (ADR-0018 decision 21; see SEARCH PATTERNS in the
@@ -455,6 +641,21 @@ if (( guarded )); then
   fi
 fi
 
+# Search values, rules 1 and 2 (ADR-0018 decision 23; see SEARCH VALUES in
+# the header). Only under a guarded policy, directly after decision 21's
+# check, so before the empty-path check and EXEMPT_GLOBS; a value decision
+# 21 refuses keeps its denial. For a Grep or a Glob: no string anywhere in
+# tool_input may begin with `-`, and no `/`-separated component of Glob's
+# pattern or Grep's glob may begin with `.` followed by `*` or `?`. Only
+# status 1 passes; the status is captured as in the NUL gate.
+if (( guarded )); then
+  values_status=0
+  printf '%s' "$input" | jq -e 'if .tool_name == "Grep" or .tool_name == "Glob" then ([.tool_input | .. | strings | startswith("-")] | any) or ((if .tool_name == "Glob" then .tool_input.pattern else .tool_input.glob end) as $p | if ($p | type) == "string" then ($p | test("(\\A|/)\\.[*?]")) else false end) else false end' >/dev/null 2>&1 || values_status=$?
+  if [[ "$values_status" != 1 ]]; then
+    deny "Hammertime path guard: no value in a Grep or a Glob may begin with '-', and no part of a Glob pattern or a Grep glob between slashes may begin with '.' followed by '*' or '?', because the tool could read such a value as an option, or match such a part against the '..' entry and search above the path being searched. Give the value in another form; a Grep pattern that has to match a leading '-' can begin with '[-]' instead. The tool call is refused."
+  fi
+fi
+
 # No path at all. For a guarded agent this is an unscoped Grep/Glob over
 # the whole project, which can return guarded content; deny it and say how
 # to proceed. Any other tool shape passes through as before.
@@ -471,8 +672,10 @@ fi
 # under PATH_ROOT='cwd' the payload's cwd, and unset or empty keeps the two
 # old bases, cwd then CLAUDE_PROJECT_DIR (which falls back to cwd), tried
 # in turn. A root or base is used only when it is usable (usable_root:
-# it begins with `/`, is in plain form by decision 18's four tests, and is
-# not `/`); any other one, unset or empty included, is treated as an empty
+# it begins with `/`, is in plain form by decision 18's four tests, the
+# fourth reaching every component's leading `~` since the seventh
+# amendment, and is not `/`); any other one, unset or empty included, is
+# treated as an empty
 # root, skipped, and contains no path. Its one trailing `/` is removed only
 # after that test. Note the exact-match arm:
 # without it, a path equal to the root itself fell through with `rel`
@@ -493,7 +696,7 @@ fi
 # project-root check's handling whatever the root.
 usable_root() {
   local root="$1"
-  [[ "$root" == /* && "$root" != / && "$root" != *//* && "/$root/" != */../* && "/$root/" != */./* ]]
+  [[ "$root" == /* && "$root" != / && "$root" != *//* && "/$root/" != */../* && "/$root/" != */./* && "$root" != *"/~"* ]]
 }
 project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
 case "$path_root" in
@@ -553,8 +756,10 @@ fi
 # EXEMPT_GLOBS, which exits 0 on a match. Wrapping the path in slashes makes
 # a `.` or `..` component at the start or the end look like one in the
 # middle. The `~` is quoted so that it is not subject to tilde expansion.
+# The fourth test reaches every component (seventh amendment): a `~` that
+# begins the path, or that follows any `/`.
 if (( guarded )); then
-  if [[ "/$file_path/" == */../* || "/$file_path/" == */./* || "$file_path" == *//* || "$file_path" == "~"* ]]; then
+  if [[ "/$file_path/" == */../* || "/$file_path/" == */./* || "$file_path" == *//* || "$file_path" == "~"* || "$file_path" == *"/~"* ]]; then
     deny "Hammertime path guard: the path contains a '.' or '..' component, a '//' or a leading '~'. This guard matches a path exactly as written and resolves none of these, so it cannot vet the file or directory the tool would actually use. Give the path without any of them. The tool call is refused."
   fi
 fi
@@ -567,6 +772,22 @@ fi
 if (( guarded )); then
   if (( ! inside )); then
     deny "Hammertime path guard: the path is not inside this policy's root directory: the project directory under PATH_ROOT='project', the working directory under PATH_ROOT='cwd', or either of them when PATH_ROOT is unset. Under PATH_ROOT='project' a relative path counts as inside only when the working directory is the project directory. This guard's glob lists judge only paths inside the root, so it cannot vet this one. Give an absolute path inside the root. The tool call is refused."
+  fi
+fi
+
+# Search values, rule 3 (ADR-0018 decision 23; see SEARCH VALUES in the
+# header). Only under a guarded policy, after the root rule and directly
+# before EXEMPT_GLOBS, so that a path out of plain form keeps decision 18's
+# denial, a path outside the root decision 20's, and the root's own
+# spellings the project-root check's handling. A Grep's or a Glob's path,
+# when it is a string, may hold only ASCII letters, digits and `_ - . /`;
+# it is tested as given, the root's part included. Only status 1 passes;
+# the status is captured as in the NUL gate.
+if (( guarded )); then
+  search_path_status=0
+  printf '%s' "$input" | jq -e 'if (.tool_name == "Grep" or .tool_name == "Glob") and ((.tool_input.path | type) == "string") then (.tool_input.path | test("\\A[A-Za-z0-9_./-]*\\z") | not) else false end' >/dev/null 2>&1 || search_path_status=$?
+  if [[ "$search_path_status" != 1 ]]; then
+    deny "Hammertime path guard: the path of a Grep or a Glob may contain only letters, digits and the characters _ - . /, because the tool could read any other character as part of a pattern or an option and search somewhere other than the path this guard vetted. Give the path in that form. The tool call is refused."
   fi
 fi
 
@@ -595,3 +816,5 @@ if [[ -n "${ALLOW_GLOBS:-}" ]] && ! matches_any "$rel" $ALLOW_GLOBS; then
 fi
 
 exit 0
+}
+exit 3
