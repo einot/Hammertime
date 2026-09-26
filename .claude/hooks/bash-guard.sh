@@ -79,13 +79,13 @@
 # one whose fields it could not read faithfully (see EXTRACTION CHECK).
 #
 # A GUARD THAT FAILS DENIES (ADR-0018 decision 19, fifth amendment; parts 1
-# and 3 amended, and parts 4 and 5 added, by the seventh). This script
-# ends with status 0 (allow, with no output) or 2 (deny) and nothing else.
-# Before this, any command that failed under `set -e` -- an extraction line
-# whose jq could not read the payload, or the jq inside `deny` -- ended the
-# script with some other status, which the harness treats as a
-# non-blocking hook error, so the call went through. Five parts, built in
-# for every policy, with no knob:
+# and 3 amended, and parts 4 and 5 added, by the seventh; part 6 added by
+# the eighth). This script ends with status 0 (allow, with no output) or 2
+# (deny) and nothing else. Before this, any command that failed under
+# `set -e` -- an extraction line whose jq could not read the payload, or
+# the jq inside `deny` -- ended the script with some other status, which
+# the harness treats as a non-blocking hook error, so the call went
+# through. Six parts, built in for every policy, with no knob:
 #
 #   FAIL-CLOSED EXIT. An EXIT trap, installed as the first command after
 #   `set -f -e -u -o pipefail`, turns any exit status other than 0, and
@@ -157,9 +157,27 @@
 #   the session. A guard process that never finishes (killed by a signal),
 #   or a hook command that cannot start, is outside what the script can do.
 #
+#   NO SUBSTITUTION OR HERE-STRING AFTER THE EXTRACTION CHECK (decision 19,
+#   part 6, eighth amendment). The extraction check covers the four
+#   extraction lines only, so after it no value a check uses is read
+#   through a command substitution or a here-string, either of which could
+#   in principle hand a check an empty or cut value if bash could not make
+#   its pipe. Each word is normalised in place: normalize_token applies its
+#   three deletions to a variable and leaves the result in
+#   `normalized_token`, where it used to be printed through a command
+#   substitution of its own, one fork per word. relative_to_project leaves
+#   its result in `relative_path`. The command is split into segments one
+#   line of `segments` at a time with parameter expansion, and each segment,
+#   and the literal check's text, into words by bash's own word splitting on
+#   the default IFS under the `set -f` set first, not by `read` from a
+#   here-string. The segments and the words each rule sees are exactly
+#   those the `read` calls gave, for every command, quote removal outside
+#   literal mode included.
+#
 # BOUNDS (ADR-0018 decision 25, seventh amendment). A command hook that
-# times out does not block the call, and the per-word rules below fork
-# once per word, so each guard's work is bounded well inside the hook's
+# times out does not block the call, and the per-word rules below once
+# forked once per word (no longer, since decision 19's part 6; the bound
+# stays), so each guard's work is bounded well inside the hook's
 # time limit: the payload is read only up to 8 MiB and one byte (above),
 # and an in-scope command longer than 16384 characters, as bash's ${#...}
 # counts them, is refused with the command-bound denial ("... longer than
@@ -351,13 +369,20 @@
 #     *_test.py file (with or without ::node ids), because pytest imports
 #     any .py and doctests any .txt/.rst named on its command line.
 #     `ruff format` without `--check`/`--diff` is write mode: explicit
-#     .py/.pyi files only, none matching WRITE_DENY_GLOBS, and (seventh
-#     amendment) none that names, relative to the payload's cwd, a
-#     directory or a symbolic link, which would make ruff rewrite every
-#     file beneath it or whatever the link points to; that refusal goes
-#     through the write-mode denial, "... is a directory or a symbolic
-#     link ...". Like the shadow check it reads the live filesystem, so it
-#     has a window between the check and ruff's run.
+#     .py/.pyi files only; each, less one leading `./`, in plain form (no
+#     `.` component, no `//`, no leading `/`; eighth amendment), because
+#     WRITE_DENY_GLOBS is matched against it exactly as written; none that
+#     names, relative to the payload's cwd, a directory, or any of whose
+#     components, taken in turn from cwd, is a symbolic link (seventh
+#     amendment, reaching every component since the eighth), which would
+#     make ruff rewrite every file beneath it or a file in a link's target;
+#     and none matching WRITE_DENY_GLOBS. Every write-mode refusal goes
+#     through the write-mode denial, the list's included since the eighth
+#     amendment: "... is not in plain form ...", "... is a directory or a
+#     symbolic link, or lies under a symbolic link ..." and "... matches
+#     '...' in WRITE_DENY_GLOBS ...". The link test reads the live
+#     filesystem, so, like the shadow check, it has a window between the
+#     check and ruff's run.
 #   * make (decision 8): exactly `make TARGET`, TARGET on
 #     ALLOW_MAKE_TARGETS, then the shadow check.
 #   * git add, commit and merge (decision 9): an option allowlist each,
@@ -944,7 +969,8 @@ esac
 [[ -n "$command_str" ]] || exit 0
 
 # --- Command bound (ADR-0018 decision 25, rule 2) -------------------------
-# The per-word rules below fork once per word, so an unbounded command
+# The per-word rules below once forked once per word (no longer, since
+# decision 19's part 6, but the bound stays), so an unbounded command
 # could keep this guard running until the hook's timeout, and a timed-out
 # hook does not block the call. So an in-scope command longer than 16384
 # characters, as bash's ${#...} counts them, is refused, for every policy,
@@ -1029,7 +1055,11 @@ check_literal() {
   local split="${cmd//|/ }"
   split="${split//;/ }"
   split="${split//&/ }"
-  read -r -a words <<< "$split"
+  # bash's own word splitting on the default IFS, under the `set -f` set
+  # first, so nothing is globbed; it splits exactly as `read -r -a` from a
+  # here-string did, since a newline and a backslash have been refused
+  # above (ADR-0018 decision 19, part 6: no here-string).
+  words=($split)
   for word in ${words[@]+"${words[@]}"}; do
     if [[ "$word" == '~'* || "$word" == *'=~'* || "$word" == *':~'* ]]; then
       deny_literal "the word '${word}', which bash would tilde-expand"
@@ -1067,13 +1097,15 @@ in_list() {
 # performs here: delete every quote and backslash character anywhere in
 # the token, not just a matching surrounding pair. See TOKEN
 # NORMALIZATION in the header -- partial quoting (`-"i"`, `-exe"c"`,
-# `-\i`) otherwise defeats every option rule below.
+# `-\i`) otherwise defeats every option rule below. The result is left in
+# `normalized_token`, not printed, so that no command substitution sits
+# between a word and the rules (ADR-0018 decision 19, part 6).
 normalize_token() {
   local token="$1"
   token="${token//\'/}"
   token="${token//\"/}"
   token="${token//\\/}"
-  printf '%s' "$token"
+  normalized_token="$token"
 }
 
 # Walk a short-option cluster (`-ni`) the way getopt reads it: letter by
@@ -1126,7 +1158,9 @@ matches_long() {
 
 # Normalize a path to the project/worktree root when it sits underneath
 # it, the same way path-guard.sh does, so that an absolute path and the
-# path as written both get a fair chance against the globs.
+# path as written both get a fair chance against the globs. The result is
+# left in `relative_path`, not printed, so that no command substitution
+# carries it (ADR-0018 decision 19, part 6).
 project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
 relative_to_project() {
   local path="$1" base
@@ -1139,7 +1173,7 @@ relative_to_project() {
     fi
   done
   path="${path#./}"
-  printf '%s' "$path"
+  relative_path="$path"
 }
 
 # --- Whole-command rejections -------------------------------------------
@@ -1670,7 +1704,8 @@ check_node() {
       deny "Hammertime bash guard: node's script path '${script}' starts with a tilde, which bash expands after this guard has approved the command, so the path checked here would not be the path node runs. Name the script exactly, as a path relative to the project or a full literal path (ALLOW_NODE_SCRIPTS: ${ALLOW_NODE_SCRIPTS:-none})."
       ;;
   esac
-  rel="$(relative_to_project "$script")"
+  relative_to_project "$script"
+  rel="$relative_path"
   if ! matches_any "$script" ${ALLOW_NODE_SCRIPTS:-} && ! matches_any "$rel" ${ALLOW_NODE_SCRIPTS:-}; then
     deny "Hammertime bash guard: node may not execute '${script}'. Running the repository's own code would execute target-controlled code, and that needs an OS-enforced sandbox this environment does not provide, so report what you found as needs-validation with the exact command a human should run instead (ALLOW_NODE_SCRIPTS: ${ALLOW_NODE_SCRIPTS:-none})."
   fi
@@ -1932,7 +1967,7 @@ deny_ruff_write() {
 }
 
 check_ruff() {
-  local sub token read_only=0 glob rel
+  local sub token read_only=0 glob rel probe part
   local -a operands=()
   if (( $# == 0 )) || [[ "$1" != "check" && "$1" != "format" ]]; then
     deny "Hammertime bash guard: 'ruff ${1:-}' is refused. ruff may be run only as ruff check or ruff format, with the subcommand first and no global option before it: uv run --locked ruff check . and uv run --locked ruff format --check ."
@@ -1976,18 +2011,40 @@ check_ruff() {
       deny_ruff_write "'${token}' is not a .py or .pyi file."
     fi
     rel="${token#./}"
-    # ADR-0018 decision 7, seventh amendment: an operand that names,
-    # relative to the payload's cwd, a directory or a symbolic link would
-    # make ruff rewrite every file beneath it, or whatever the link points
-    # to, which no list judged. The shadow check has already refused an
+    # ADR-0018 decision 7, eighth amendment, change 1: WRITE_DENY_GLOBS is
+    # matched against `rel` exactly as written, and its globs that begin
+    # with a directory are anchored at the root, so `rel` must be in plain
+    # form, as path-guard.sh's lists require through decision 18: no `.`
+    # component, no `//` and no leading `/` (the read operand rule above
+    # has already refused a leading `@`, `/` or `~` and a `..` component).
+    # One leading `./` stays allowed.
+    if [[ "/$rel/" == */./* || "$rel" == *//* || "$rel" == /* ]]; then
+      deny_ruff_write "'${token}' is not in plain form (a '.' component, a '//' or a leading '/' after one leading ./), and WRITE_DENY_GLOBS is matched against the operand exactly as written."
+    fi
+    # ADR-0018 decision 7, seventh amendment, and eighth amendment, change
+    # 3: an operand that names, relative to the payload's cwd, a directory,
+    # or any of whose components, taken in turn from cwd, is a symbolic
+    # link, would make ruff rewrite every file beneath it, or a file in the
+    # link's target, which no list judged. `rel` is in plain form (above)
+    # and, in literal mode, holds no blank, and `set -f` keeps the unquoted
+    # split from being globbed. The shadow check has already refused an
     # empty cwd. This reads the live filesystem, so, like the shadow check,
     # it has a window between the check and ruff's run.
-    if [[ -d "${cwd%/}/${rel}" || -L "${cwd%/}/${rel}" ]]; then
-      deny_ruff_write "'${token}' is a directory or a symbolic link, so ruff format would rewrite files this guard has not vetted."
+    probe="${cwd%/}"
+    for part in ${rel//\// }; do
+      probe="${probe}/${part}"
+      if [[ -L "$probe" ]]; then
+        deny_ruff_write "'${token}' is a directory or a symbolic link, or lies under a symbolic link, so ruff format would rewrite files this guard has not vetted."
+      fi
+    done
+    if [[ -d "$probe" ]]; then
+      deny_ruff_write "'${token}' is a directory or a symbolic link, or lies under a symbolic link, so ruff format would rewrite files this guard has not vetted."
     fi
+    # ADR-0018 decision 7, eighth amendment, change 2: the list's refusal
+    # goes through the write-mode denial, its own words unchanged.
     for glob in $WRITE_DENY_GLOBS; do
       if [[ "$rel" == $glob ]]; then
-        deny "Hammertime bash guard: '${token}' matches '${glob}' in WRITE_DENY_GLOBS, the same fence the Edit and Write tools apply, so ruff format may not rewrite it. If it needs formatting, report it."
+        deny_ruff_write "'${token}' matches '${glob}' in WRITE_DENY_GLOBS, the same fence the Edit and Write tools apply, so ruff format may not rewrite it. If it needs formatting, report it."
       fi
     done
   done
@@ -2005,15 +2062,36 @@ KNOWN_READONLY_CMDS="ls cat head tail wc stat grep jq diff cmp pwd"
 
 # --- Validate every segment ---------------------------------------------
 
+# ADR-0018 decision 19, part 6: no here-string and no command substitution
+# here. The segments are taken one line of `segments` at a time with
+# parameter expansion, every line included, the empty ones and the last,
+# exactly as `while IFS= read -r segment; do ... done <<< "$segments"`
+# took them (the here-string's own trailing newline made the last line a
+# whole one); `segments` holds no newline but the separators, since a
+# newline in the command was refused above. Each segment is split into
+# words by bash's own word splitting on the default IFS, under the
+# `set -f` set first, so nothing is globbed, exactly as `read -r -a` split
+# it; and each word is normalised in place by normalize_token, which sets
+# a variable, where it used to be printed through a command substitution
+# of its own (and a fork per word).
 saw_segment=0
-while IFS= read -r segment; do
-  read -r -a raw_tokens <<< "$segment"
+segments_rest="$segments"
+more_segments=1
+while (( more_segments )); do
+  segment="${segments_rest%%$'\n'*}"
+  if [[ "$segments_rest" == *$'\n'* ]]; then
+    segments_rest="${segments_rest#*$'\n'}"
+  else
+    more_segments=0
+  fi
+  raw_tokens=($segment)
   (( ${#raw_tokens[@]} )) || continue
   saw_segment=1
 
   tokens=()
   for raw in "${raw_tokens[@]}"; do
-    tokens+=("$(normalize_token "$raw")")
+    normalize_token "$raw"
+    tokens+=("$normalized_token")
   done
 
   cmd0="${tokens[0]}"
@@ -2061,7 +2139,7 @@ while IFS= read -r segment; do
     uv) check_uv ${args[@]+"${args[@]}"} ;;
     make) check_make ${args[@]+"${args[@]}"} ;;
   esac
-done <<< "$segments"
+done
 
 if (( ! saw_segment )); then
   deny "Hammertime bash guard: no command could be parsed out of this Bash call. Send one single-line command built from the allowed read-only tools (ALLOW_CMDS: ${ALLOW_CMDS})."

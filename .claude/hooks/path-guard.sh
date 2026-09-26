@@ -41,8 +41,10 @@
 # THAT FAILS DENIES below). For an in-scope call under a guarded policy,
 # another tool, or a call that also names a path in the other kind's field,
 # is refused first (see FIELDS); then a path containing a NUL byte, or a
-# path field that is not a string (see NUL GATE below), and a path that
-# ends with a newline (see TRAILING NEWLINE below); then a Glob pattern or
+# path field that is not a string (see NUL GATE below), a path that ends
+# with a newline (see TRAILING NEWLINE below), and a path that begins or
+# ends with whitespace or a control character (see EDGE CHARACTERS
+# below); then a Glob pattern or
 # Grep glob outside a narrow grammar (see SEARCH PATTERNS below), and a
 # search value that begins with `-` or a pattern component that could
 # match `..` (see SEARCH VALUES below). A path that is not in plain form is
@@ -187,7 +189,33 @@
 # status 0, and any other status, get the trailing-newline denial ("the
 # path ends with a newline, or could not be checked for one ..."). A path
 # with both a NUL and a trailing newline keeps the NUL denial. A newline
-# inside a path is carried intact and judged as written. There is no knob.
+# inside a path is carried intact and judged as written. Decision 26's
+# check (EDGE CHARACTERS) sits directly after this test. There is no knob.
+#
+# EDGE CHARACTERS (ADR-0018 decision 26, eighth amendment).
+#
+# The path is judged exactly as written, so a path that begins with a
+# space does not begin with `/`, is judged as a relative path and matches
+# no glob anchored at the root, and a path that ends with a space matches
+# no exact-name glob such as `*/CLAUDE.md`. A tool that trimmed its path
+# after the hook approved it would act on a path no list judged. So under
+# a guarded policy, for an in-scope call, whatever the tool, a path (the
+# tool's own field) whose first or last character is an edge character is
+# refused with the edge denial ("the path begins or ends with whitespace
+# or a control character, or could not be checked for one ..."). An edge
+# character is U+0000-U+0020 (the C0 controls and the space), U+007F-U+00A0
+# (DEL, the C1 controls and the no-break space), U+1680, U+180E,
+# U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 or U+FEFF: every
+# character a common trimming routine removes, and every control
+# character. A character inside a path is judged as written. The check is
+# one jq call over the raw payload, read from its exit status; only status
+# 1 passes. An absent, null or false path becomes "" and passes, to meet
+# the empty-path check as before. It sits directly after the
+# trailing-newline test, so before the search checks, the empty-path
+# check, the relativisation, the project-root check, the plain-form rule,
+# the root rule and every glob list; a path with a NUL keeps the NUL
+# denial, and one that ends with a newline the trailing-newline denial.
+# There is no knob.
 #
 # PLAIN FORM (ADR-0018 decision 18, fourth amendment).
 #
@@ -211,7 +239,8 @@
 #
 # It runs for every in-scope call under a guarded policy, whatever the
 # tool: it does not look at tool_name. It sits after the NUL gate, the
-# trailing-newline test, the search checks before the empty-path check,
+# trailing-newline test, the edge-character check, the search checks
+# before the empty-path check,
 # the empty-path check, the relativisation and the project-root check, and
 # before every glob list, EXEMPT_GLOBS included. The root's own spellings
 # (`<root>`, `<root>/`, `<root>/.`, `<root>/./`, `.` and `./`) are handled
@@ -246,8 +275,9 @@
 # is read from jq's exit status; only status 1 passes.
 #
 # It runs for every in-scope call under a guarded policy, after the NUL
-# gate and the trailing-newline test and before the empty-path check and
-# every glob list, EXEMPT_GLOBS included. There is no knob to turn it off.
+# gate, the trailing-newline test and the edge-character check, and before
+# the empty-path check and every glob list, EXEMPT_GLOBS included. There
+# is no knob to turn it off.
 # One exception to "only paths under the searched path": an engine that
 # lists a directory's `.` and `..` entries matches a component such as
 # `.?` against `..`; SEARCH VALUES refuses such a component.
@@ -298,9 +328,8 @@
 #                                        and `/`; any relative path
 #   unset/empty cwd, then                an absolute path inside either
 #               CLAUDE_PROJECT_DIR       usable base; a relative path
-#               (which falls back to     only when cwd is usable, or cwd
-#               cwd), as before          is empty and CLAUDE_PROJECT_DIR
-#                                        is usable
+#               (which falls back to     only when cwd is usable (eighth
+#               cwd), as before          amendment)
 #   other       none                     a configuration error: every
 #                                        in-scope call is refused
 #
@@ -318,9 +347,12 @@
 # outside it. So under `project` a CLAUDE_PROJECT_DIR, and under `cwd` a
 # cwd, that is not usable puts every guarded path outside the root. With
 # PATH_ROOT unset, an absolute path is compared only with a base that is
-# usable; a relative path is inside only when cwd is usable, or when cwd
-# is empty and CLAUDE_PROJECT_DIR is usable; and with no usable base the
-# root is empty. cwd is empty when the payload's cwd is absent, null or
+# usable, CLAUDE_PROJECT_DIR among them; a relative path is inside only
+# when cwd is usable (eighth amendment: an absent, null or empty cwd no
+# longer defers to CLAUDE_PROJECT_DIR for a relative path, which is then
+# outside every root and meets the root rule, whatever the harness would
+# resolve it against); and with no usable base the root is empty. cwd is
+# empty when the payload's cwd is absent, null or
 # the empty string, and CLAUDE_PROJECT_DIR when it is unset or empty. The
 # usability test is applied to the value as given, before its trailing
 # `/` is removed. The relativisation strips
@@ -623,9 +655,28 @@ if (( guarded )); then
   fi
 fi
 
+# Edge characters (ADR-0018 decision 26; see EDGE CHARACTERS in the
+# header). Only under a guarded policy, directly after the
+# trailing-newline test, so before decision 21's check, decision 23's
+# first check, the empty-path check, the relativisation, the project-root
+# check, the plain-form rule, the root rule and every glob list. A tool
+# that trims its path would act on another path than the one vetted, so a
+# path, the tool's own field, whose first or last character is whitespace
+# or a control character is refused. Only status 1 passes; status 0, and
+# any other status, get the denial. The status is captured as in the NUL
+# gate.
+if (( guarded )); then
+  edge_status=0
+  printf '%s' "$input" | jq -e '((if .tool_name == "Read" or .tool_name == "Edit" or .tool_name == "Write" then .tool_input.file_path elif .tool_name == "Grep" or .tool_name == "Glob" then .tool_input.path else null end) // "") | explode | if length == 0 then false else [.[0], .[-1]] | map(. <= 32 or (. >= 127 and . <= 160) or . == 5760 or . == 6158 or (. >= 8192 and . <= 8202) or . == 8232 or . == 8233 or . == 8239 or . == 8287 or . == 12288 or . == 65279) | any end' >/dev/null 2>&1 || edge_status=$?
+  if [[ "$edge_status" != 1 ]]; then
+    deny "Hammertime path guard: the path begins or ends with whitespace or a control character, or could not be checked for one, and a tool that trims its path would act on a path other than the one this guard vetted. Give the path without them. The tool call is refused."
+  fi
+fi
+
 # Search patterns (ADR-0018 decision 21; see SEARCH PATTERNS in the
-# header). Only under a guarded policy, directly after the NUL gate, so
-# that a path with a NUL keeps the NUL denial, and before the empty-path
+# header). Only under a guarded policy, after the NUL gate, the
+# trailing-newline test and decision 26's edge-character check, so that a
+# path with a NUL keeps the NUL denial, and before the empty-path
 # check and EXEMPT_GLOBS, which exits 0 on a match. The value is Glob's
 # tool_input.pattern or Grep's tool_input.glob. It is judged entirely in jq,
 # over the raw payload, and read from jq's exit status, so that no command
@@ -687,9 +738,12 @@ fi
 # under `cwd` inside only when cwd is usable; under `project` only when
 # CLAUDE_PROJECT_DIR is usable and the payload's cwd equals it, one
 # trailing `/` removed from each (the harness resolves a relative path
-# against cwd); and when PATH_ROOT is unset only when cwd is usable, or
-# when cwd is empty and CLAUDE_PROJECT_DIR is usable. With no usable base
-# the root is empty and contains no path. Under `project` and `cwd` only
+# against cwd); and when PATH_ROOT is unset only when cwd is usable (eighth
+# amendment: an absent, null or empty cwd no longer defers to
+# CLAUDE_PROJECT_DIR for a relative path, which is then outside every root
+# and meets the root rule). An absolute path is still compared with each
+# usable base, CLAUDE_PROJECT_DIR among them. With no usable base the root
+# is empty and contains no path. Under `project` and `cwd` only
 # an absolute path is compared with the root; unset keeps the old
 # comparison for every path, against usable bases only. Since a usable
 # root is absolute, `.` and `./` are never relativised and keep the
@@ -735,8 +789,6 @@ if (( ! inside )) && [[ "$file_path" != /* ]]; then
       ;;
     *)
       if usable_root "$cwd"; then
-        inside=1
-      elif [[ -z "$cwd" ]] && usable_root "${CLAUDE_PROJECT_DIR:-}"; then
         inside=1
       fi
       ;;
