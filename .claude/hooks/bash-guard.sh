@@ -75,55 +75,116 @@
 # Reads the PreToolUse JSON payload on stdin (see
 # https://code.claude.com/docs/en/hooks) and inspects tool_input.command.
 # Any tool other than Bash passes through. A payload this guard cannot read
-# is refused first, for every caller (see PAYLOAD SHAPE below).
+# is refused first, for every caller (see PAYLOAD SHAPE below), and so is
+# one whose fields it could not read faithfully (see EXTRACTION CHECK).
 #
-# A GUARD THAT FAILS DENIES (ADR-0018 decision 19, fifth amendment). This
-# script ends with status 0 (allow, with no output) or 2 (deny) and nothing
-# else. Before this, any command that failed under `set -e` -- an
-# extraction line whose jq could not read the payload, or the jq inside
-# `deny` -- ended the script with some other status, which the harness
-# treats as a non-blocking hook error, so the call went through. Three
-# parts, built in for every policy, with no knob:
+# A GUARD THAT FAILS DENIES (ADR-0018 decision 19, fifth amendment; parts 1
+# and 3 amended, and parts 4 and 5 added, by the seventh; part 6 added by
+# the eighth). This script ends with status 0 (allow, with no output) or 2
+# (deny) and nothing else. Before this, any command that failed under
+# `set -e` -- an extraction line whose jq could not read the payload, or
+# the jq inside `deny` -- ended the script with some other status, which
+# the harness treats as a non-blocking hook error, so the call went
+# through. Six parts, built in for every policy, with no knob:
 #
 #   FAIL-CLOSED EXIT. An EXIT trap, installed as the first command after
-#   `set -f -e -u -o pipefail`, turns any exit status other than 0 or 2
-#   into the backstop denial ("... the guard stopped with status N before
-#   reaching a verdict ...") and exit 2. It writes the JSON deny with
-#   printf and a fixed template, never with jq, which may be what failed.
-#   It carries no DENY_ADVICE paragraph, in any mode, because it can fire
-#   before the knobs are read: it is the one exception to decision 11's
-#   "every denial".
+#   `set -f -e -u -o pipefail`, turns any exit status other than 0, and
+#   other than the 2 of `deny`'s own `exit 2`, into the backstop denial
+#   ("... the guard stopped with status N before reaching a verdict ...")
+#   and exit 2. `deny` sets a flag immediately before its `exit 2`, after
+#   its jq or its fallback, so a command that fails with status 2 anywhere
+#   else gets the backstop, not a refusal with no reason. The trap writes
+#   the JSON deny with printf and a fixed template, never with jq, which
+#   may be what failed. It carries no DENY_ADVICE paragraph, in any mode,
+#   because it can fire before the knobs are read: it is the one exception
+#   to decision 11's "every denial".
 #
 #   DENY'S FALLBACK. `deny` still writes the JSON deny with `jq -n` and
 #   exits 2. If that jq fails, it writes the same reason, the DENY_ADVICE
 #   paragraph included, to stderr instead, and still exits 2, which blocks
 #   whether or not JSON is printed.
 #
-#   PAYLOAD SHAPE. Between reading stdin and the first extraction line, one
-#   `jq -e -s` call over the raw payload asks whether it is malformed. It
-#   is well formed when it is exactly one JSON value, that value is an
-#   object, its tool_input is an object, its tool_name is a string, and its
-#   cwd and agent_type are each a string, null or absent. Only status 1 (a
-#   clean false: well formed) passes; status 0 (malformed) and any other
+#   PAYLOAD SHAPE. The payload is read with `head -c 8388609`, so at most
+#   its first 8 MiB and one byte (decision 25, rule 1), through `tr`, which
+#   keeps each NUL byte as U+0002, a control character no JSON text holds
+#   raw; the rest of stdin is then read and discarded. So the command
+#   substitution drops nothing unseen, and a payload that holds a raw NUL
+#   is not judged with the byte removed. Between reading stdin and the
+#   first extraction line, one `jq -e -s` call over the payload asks
+#   whether it is malformed. A payload that holds a raw U+0002, whatever
+#   put it there, is malformed without that call, with status 0. It is
+#   well formed when it is exactly one JSON value, that value is an object,
+#   its tool_input is an object, its tool_name is a string, and its cwd and
+#   agent_type are each a string, null or absent. A payload longer than
+#   the bound is cut there, so it is not one JSON value unless the cut
+#   falls after one whole value and nothing but whitespace. Only status 1
+#   (a clean false: well formed) passes; status 0 (malformed) and any other
 #   status (not JSON, or jq failed) get the shape denial ("... could not be
 #   read as a single tool call ..."), which names the status and goes
-#   through `deny`. This is the one check in the script that runs BEFORE
-#   the tool_name test and the SCOPE_AGENT_TYPES routing, for every caller
-#   the hook sees, the top-level session included, and under a policy that
-#   constrains nothing: the routing reads agent_type through an extraction
-#   line, so a script that cannot read the payload cannot tell whether the
-#   caller is in scope. `deny`, DENY_ADVICE and FINAL_PARAGRAPH are
-#   therefore defined above the extraction lines. A field inside tool_input
-#   is not this check's business: a command that is not a string still
-#   meets the NUL gate's could-not-be-checked denial. Once the shape passes,
-#   no extraction line can fail on the payload, only through the
-#   environment, and the trap turns that into the backstop denial.
+#   through `deny`. This check runs BEFORE the tool_name test and the
+#   SCOPE_AGENT_TYPES routing, for every caller the hook sees, the
+#   top-level session included, and under a policy that constrains
+#   nothing: the routing reads agent_type through an extraction line, so a
+#   script that cannot read the payload cannot tell whether the caller is
+#   in scope. `deny`, DENY_ADVICE and FINAL_PARAGRAPH are therefore defined
+#   above the extraction lines. A field inside tool_input is not this
+#   check's business: a command that is not a string still meets the NUL
+#   gate's could-not-be-checked denial. Once the shape passes, no
+#   extraction line can fail on the payload, only through the environment.
+#
+#   EXTRACTION CHECK. Each extraction line reads its field through a
+#   command substitution, which bash may expand to nothing when it cannot
+#   make its pipe, and which drops NUL bytes and trailing newlines.
+#   Directly after the four extraction lines, and so also before the
+#   tool_name test and the routing, for every caller, one `jq -e` call over
+#   the payload, told only which extracted fields are empty, asks whether
+#   each is empty exactly when the payload's field, as `$(...)` renders
+#   it, is empty; and whether cwd, when it is a string, ends with a
+#   newline or holds a NUL, which `$(...)` would read as another directory
+#   (cwd is used for decisions 5 and 7 and the write targets). Only status
+#   1 passes; any other status ends the script with status 3, which the
+#   trap turns into the backstop denial.
+#
+#   ONE TOP-LEVEL COMMAND. Every command after the trap is inside one brace
+#   group, which ends every path through it with `exit`, and the script's
+#   last line, after the group, is `exit 3`. If bash abandoned a command
+#   part-way rather than exiting, only `exit 3` would be left to run, and
+#   the trap turns it into the backstop denial; so no path reaches exit 0
+#   with a check before it skipped.
 #
 #   The cost: a missing or broken jq now refuses every call this hook sees,
 #   the top-level session's included, until jq is restored from outside
-#   the session. A guard process that never finishes (killed by a signal
-#   or by the hook timeout), or a hook command that cannot start, is
-#   outside what the script can do.
+#   the session. A guard process that never finishes (killed by a signal),
+#   or a hook command that cannot start, is outside what the script can do.
+#
+#   NO SUBSTITUTION OR HERE-STRING AFTER THE EXTRACTION CHECK (decision 19,
+#   part 6, eighth amendment). The extraction check covers the four
+#   extraction lines only, so after it no value a check uses is read
+#   through a command substitution or a here-string, either of which could
+#   in principle hand a check an empty or cut value if bash could not make
+#   its pipe. Each word is normalised in place: normalize_token applies its
+#   three deletions to a variable and leaves the result in
+#   `normalized_token`, where it used to be printed through a command
+#   substitution of its own, one fork per word. relative_to_project leaves
+#   its result in `relative_path`. The command is split into segments one
+#   line of `segments` at a time with parameter expansion, and each segment,
+#   and the literal check's text, into words by bash's own word splitting on
+#   the default IFS under the `set -f` set first, not by `read` from a
+#   here-string. The segments and the words each rule sees are exactly
+#   those the `read` calls gave, for every command, quote removal outside
+#   literal mode included.
+#
+# BOUNDS (ADR-0018 decision 25, seventh amendment). A command hook that
+# times out does not block the call, and the per-word rules below once
+# forked once per word (no longer, since decision 19's part 6; the bound
+# stays), so each guard's work is bounded well inside the hook's
+# time limit: the payload is read only up to 8 MiB and one byte (above),
+# and an in-scope command longer than 16384 characters, as bash's ${#...}
+# counts them, is refused with the command-bound denial ("... longer than
+# 16384 characters ..."), for every policy, the auditor's included. That
+# check sits after the routing, the LITERAL_ONLY check, the ALLOW_CMDS
+# guard, the NUL gate and the empty-command check, and before literal mode
+# and every per-word rule. There is no knob.
 #
 # WIRING -- read this before believing the guard is doing anything.
 #
@@ -308,7 +369,20 @@
 #     *_test.py file (with or without ::node ids), because pytest imports
 #     any .py and doctests any .txt/.rst named on its command line.
 #     `ruff format` without `--check`/`--diff` is write mode: explicit
-#     .py/.pyi files only, none matching WRITE_DENY_GLOBS.
+#     .py/.pyi files only; each, less one leading `./`, in plain form (no
+#     `.` component, no `//`, no leading `/`; eighth amendment), because
+#     WRITE_DENY_GLOBS is matched against it exactly as written; none that
+#     names, relative to the payload's cwd, a directory, or any of whose
+#     components, taken in turn from cwd, is a symbolic link (seventh
+#     amendment, reaching every component since the eighth), which would
+#     make ruff rewrite every file beneath it or a file in a link's target;
+#     and none matching WRITE_DENY_GLOBS. Every write-mode refusal goes
+#     through the write-mode denial, the list's included since the eighth
+#     amendment: "... is not in plain form ...", "... is a directory or a
+#     symbolic link, or lies under a symbolic link ..." and "... matches
+#     '...' in WRITE_DENY_GLOBS ...". The link test reads the live
+#     filesystem, so, like the shadow check, it has a window between the
+#     check and ruff's run.
 #   * make (decision 8): exactly `make TARGET`, TARGET on
 #     ALLOW_MAKE_TARGETS, then the shadow check.
 #   * git add, commit and merge (decision 9): an option allowlist each,
@@ -693,24 +767,46 @@
 
 set -f -e -u -o pipefail
 
-# Fail-closed exit (ADR-0018 decision 19, part 1; see FAIL-CLOSED EXIT in
-# the header). Installed first, so that it covers every line below: any
-# status but 0 or 2 becomes the backstop denial and exit 2. Written with
-# printf and a fixed template, never with jq, which may be what failed; the
-# text has no `"` and no `\`, and the status is an integer, so nothing
-# needs escaping. No advice paragraph: it can fire before DENY_ADVICE is
-# read. The handler runs under `set -e` too, so its printf is guarded with
-# `|| :` and cannot end it early, and its last command is `exit 2`.
+# Fail-closed exit (ADR-0018 decision 19, part 1, as the seventh amendment
+# leaves it; see FAIL-CLOSED EXIT in the header). Installed first, so that
+# it covers every line below: any status but 0, and but the 2 of `deny`'s
+# own `exit 2` (which sets `denying` just before it), becomes the backstop
+# denial and exit 2. A status 2 that `deny` did not make gets the backstop
+# too. Written with printf and a fixed template, never with jq, which may
+# be what failed; the text has no `"` and no `\`, and the status is an
+# integer, so nothing needs escaping. No advice paragraph: it can fire
+# before DENY_ADVICE is read. The handler runs under `set -e` too, so its
+# printf is guarded with `|| :` and cannot end it early, and its last
+# command is `exit 2`. `${denying:-0}` keeps it safe under `set -u`
+# wherever it fires.
 on_exit() {
   local status="$1"
-  if (( status != 0 && status != 2 )); then
+  if (( status != 0 )) && ! (( status == 2 && ${denying:-0} )); then
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "Hammertime bash guard: the guard stopped with status ${status} before reaching a verdict, so it cannot vouch for this command. The command is refused." || :
     exit 2
   fi
 }
 trap 'on_exit "$?"' EXIT
 
-input="$(cat)"
+# One top-level command (ADR-0018 decision 19, part 5; see ONE TOP-LEVEL
+# COMMAND in the header). Every command after the trap is inside this
+# brace group, which ends every path through it with `exit`. The script's
+# last line, after the group, is `exit 3`: only a command that bash
+# abandoned part-way can reach it, and the trap turns it into the backstop
+# denial. The group's body is not re-indented, so that the lines inside it
+# read as they did before.
+{
+
+# The payload (ADR-0018 decision 19, part 3, and decision 25, rule 1; see
+# PAYLOAD SHAPE in the header). At most its first 8388609 bytes, 8 MiB and
+# one byte, are read; each NUL byte is kept as U+0002, which no JSON text
+# holds raw, so that the command substitution drops nothing unseen. The
+# rest of stdin is then read and discarded, so that the harness is never
+# left writing into a closed pipe. A longer payload is cut there, and the
+# shape check below refuses it unless the cut falls after one whole JSON
+# value and nothing but whitespace.
+input="$(head -c 8388609 | tr '\000' '\002')"
+cat >/dev/null
 
 # DENY_ADVICE (ADR-0018 decision 11). Unset, empty or `needs-validation`
 # keeps every message exactly as it was. Any other value -- including a
@@ -729,6 +825,9 @@ FINAL_PARAGRAPH="This refusal is final for this task. Do not retry the same effe
 # errors and the shared rules included. If jq cannot write the JSON deny,
 # the same reason goes to stderr instead, and the exit is still 2, which
 # blocks whether or not JSON is printed (ADR-0018 decision 19, part 2).
+# `denying` is set immediately before `exit 2`, after the jq or its
+# fallback, so that a failure of either still reaches the trap with its
+# own status (part 1).
 deny() {
   local reason="$1"
   if (( stop_and_report )); then
@@ -741,6 +840,7 @@ deny() {
       permissionDecisionReason: $reason
     }
   }' || printf '%s\n' "$reason" >&2
+  denying=1
   exit 2
 }
 
@@ -749,11 +849,15 @@ deny() {
 # that is not one JSON object whose tool_input is an object, whose
 # tool_name is a string, and whose cwd and agent_type are strings, null or
 # absent is refused, so that no extraction line below can fail on the
-# payload's shape. Only status 1 (a clean false: well formed) passes; the
-# status is captured with `|| shape_status=$?` so that neither `set -e` nor
-# an `if` condition can turn a jq error into a pass.
+# payload's shape. A payload that holds a raw U+0002, which is where a raw
+# NUL byte went when it was read, is malformed without the jq call:
+# shape_status stays 0. Only status 1 (a clean false: well formed) passes;
+# the status is captured with `|| shape_status=$?` so that neither
+# `set -e` nor an `if` condition can turn a jq error into a pass.
 shape_status=0
-printf '%s' "$input" | jq -e -s 'length != 1 or (.[0] | (type != "object") or ((.tool_input | type) != "object") or ((.tool_name | type) != "string") or ([.cwd, .agent_type] | any(. != null and type != "string")))' >/dev/null 2>&1 || shape_status=$?
+if [[ "$input" != *$'\002'* ]]; then
+  printf '%s' "$input" | jq -e -s 'length != 1 or (.[0] | (type != "object") or ((.tool_input | type) != "object") or ((.tool_name | type) != "string") or ([.cwd, .agent_type] | any(. != null and type != "string")))' >/dev/null 2>&1 || shape_status=$?
+fi
 if [[ "$shape_status" != 1 ]]; then
   deny "Hammertime bash guard: the hook payload could not be read as a single tool call (the check ended with status ${shape_status}). A payload must be one JSON object whose tool_input is an object, whose tool_name is a string, and whose cwd and agent_type are strings, null or absent; without that, the guard cannot tell what command would run or who sent it. The command is refused."
 fi
@@ -762,6 +866,24 @@ tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
 command_str="$(printf '%s' "$input" | jq -r '.tool_input.command // empty')"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty')"
 agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
+
+# Extraction check (ADR-0018 decision 19, part 4; see EXTRACTION CHECK in
+# the header). Directly after the four extraction lines and before the
+# tool_name test and the routing, for every caller. One jq call over the
+# raw payload asks whether each extracted field is empty exactly when the
+# payload's field, as `$(...)` renders it, is empty: absent, null or false
+# render empty; a string renders empty when, its NUL bytes removed,
+# nothing but newlines is left; any other value renders non-empty. jq is
+# told only which extracted fields are empty, never their values. The same
+# call asks whether cwd, when it is a string, ends with a newline or holds
+# a NUL, which `$(...)` would read as another directory. Only status 1 (a
+# clean false) passes; any other status ends the script with status 3,
+# which the trap turns into the backstop denial.
+extract_status=0
+printf '%s' "$input" | jq -e --arg tool_name "${tool_name:+1}" --arg cwd "${cwd:+1}" --arg agent_type "${agent_type:+1}" --arg command "${command_str:+1}" 'def rendered: if . == null or . == false then false elif type == "string" then (explode | map(select(. != 0)) | implode | test("\\A\n*\\z") | not) else true end; ([(.tool_name | rendered), (.cwd | rendered), (.agent_type | rendered), (.tool_input.command | rendered)] != [$tool_name == "1", $cwd == "1", $agent_type == "1", $command == "1"]) or ((.cwd | type) == "string" and ((.cwd | endswith("\n")) or (.cwd | explode | map(select(. == 0)) != [])))' >/dev/null 2>&1 || extract_status=$?
+if [[ "$extract_status" != 1 ]]; then
+  exit 3
+fi
 
 [[ "$tool_name" == "Bash" ]] || exit 0
 
@@ -774,8 +896,9 @@ agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty')"
 # "deny". Unset behaves as it always has and polices every Bash call
 # that reaches this hook, which is what the test suite exercises.
 #
-# This test deliberately sits first, after only the payload-shape check
-# above, and before the allowlist and the command are even looked at, so
+# This test deliberately sits first, after only the payload-shape and
+# extraction checks above, and before the allowlist and the command are
+# even looked at, so
 # that an out-of-scope caller costs nothing and cannot be affected by
 # this policy's configuration.
 if [[ -n "${SCOPE_AGENT_TYPES:-}" ]]; then
@@ -844,6 +967,19 @@ case "$nul_status" in
 esac
 
 [[ -n "$command_str" ]] || exit 0
+
+# --- Command bound (ADR-0018 decision 25, rule 2) -------------------------
+# The per-word rules below once forked once per word (no longer, since
+# decision 19's part 6, but the bound stays), so an unbounded command
+# could keep this guard running until the hook's timeout, and a timed-out
+# hook does not block the call. So an in-scope command longer than 16384
+# characters, as bash's ${#...} counts them, is refused, for every policy,
+# after the routing, the LITERAL_ONLY check, the ALLOW_CMDS guard, the NUL
+# gate and the empty-command check, and before literal mode and every
+# per-word rule.
+if (( ${#command_str} > 16384 )); then
+  deny "Hammertime bash guard: the command is longer than 16384 characters, which is more than this guard vets in one call, so that vetting it stays well inside the hook's time limit. Split it into shorter commands. The command is refused."
+fi
 
 # --- Literal mode (ADR-0018 decision 3) ----------------------------------
 # One lexical check, before every other check. What it leaves can only be
@@ -919,7 +1055,11 @@ check_literal() {
   local split="${cmd//|/ }"
   split="${split//;/ }"
   split="${split//&/ }"
-  read -r -a words <<< "$split"
+  # bash's own word splitting on the default IFS, under the `set -f` set
+  # first, so nothing is globbed; it splits exactly as `read -r -a` from a
+  # here-string did, since a newline and a backslash have been refused
+  # above (ADR-0018 decision 19, part 6: no here-string).
+  words=($split)
   for word in ${words[@]+"${words[@]}"}; do
     if [[ "$word" == '~'* || "$word" == *'=~'* || "$word" == *':~'* ]]; then
       deny_literal "the word '${word}', which bash would tilde-expand"
@@ -957,13 +1097,15 @@ in_list() {
 # performs here: delete every quote and backslash character anywhere in
 # the token, not just a matching surrounding pair. See TOKEN
 # NORMALIZATION in the header -- partial quoting (`-"i"`, `-exe"c"`,
-# `-\i`) otherwise defeats every option rule below.
+# `-\i`) otherwise defeats every option rule below. The result is left in
+# `normalized_token`, not printed, so that no command substitution sits
+# between a word and the rules (ADR-0018 decision 19, part 6).
 normalize_token() {
   local token="$1"
   token="${token//\'/}"
   token="${token//\"/}"
   token="${token//\\/}"
-  printf '%s' "$token"
+  normalized_token="$token"
 }
 
 # Walk a short-option cluster (`-ni`) the way getopt reads it: letter by
@@ -1016,7 +1158,9 @@ matches_long() {
 
 # Normalize a path to the project/worktree root when it sits underneath
 # it, the same way path-guard.sh does, so that an absolute path and the
-# path as written both get a fair chance against the globs.
+# path as written both get a fair chance against the globs. The result is
+# left in `relative_path`, not printed, so that no command substitution
+# carries it (ADR-0018 decision 19, part 6).
 project_dir="${CLAUDE_PROJECT_DIR:-$cwd}"
 relative_to_project() {
   local path="$1" base
@@ -1029,7 +1173,7 @@ relative_to_project() {
     fi
   done
   path="${path#./}"
-  printf '%s' "$path"
+  relative_path="$path"
 }
 
 # --- Whole-command rejections -------------------------------------------
@@ -1560,7 +1704,8 @@ check_node() {
       deny "Hammertime bash guard: node's script path '${script}' starts with a tilde, which bash expands after this guard has approved the command, so the path checked here would not be the path node runs. Name the script exactly, as a path relative to the project or a full literal path (ALLOW_NODE_SCRIPTS: ${ALLOW_NODE_SCRIPTS:-none})."
       ;;
   esac
-  rel="$(relative_to_project "$script")"
+  relative_to_project "$script"
+  rel="$relative_path"
   if ! matches_any "$script" ${ALLOW_NODE_SCRIPTS:-} && ! matches_any "$rel" ${ALLOW_NODE_SCRIPTS:-}; then
     deny "Hammertime bash guard: node may not execute '${script}'. Running the repository's own code would execute target-controlled code, and that needs an OS-enforced sandbox this environment does not provide, so report what you found as needs-validation with the exact command a human should run instead (ALLOW_NODE_SCRIPTS: ${ALLOW_NODE_SCRIPTS:-none})."
   fi
@@ -1822,7 +1967,7 @@ deny_ruff_write() {
 }
 
 check_ruff() {
-  local sub token read_only=0 glob rel
+  local sub token read_only=0 glob rel probe part
   local -a operands=()
   if (( $# == 0 )) || [[ "$1" != "check" && "$1" != "format" ]]; then
     deny "Hammertime bash guard: 'ruff ${1:-}' is refused. ruff may be run only as ruff check or ruff format, with the subcommand first and no global option before it: uv run --locked ruff check . and uv run --locked ruff format --check ."
@@ -1866,9 +2011,40 @@ check_ruff() {
       deny_ruff_write "'${token}' is not a .py or .pyi file."
     fi
     rel="${token#./}"
+    # ADR-0018 decision 7, eighth amendment, change 1: WRITE_DENY_GLOBS is
+    # matched against `rel` exactly as written, and its globs that begin
+    # with a directory are anchored at the root, so `rel` must be in plain
+    # form, as path-guard.sh's lists require through decision 18: no `.`
+    # component, no `//` and no leading `/` (the read operand rule above
+    # has already refused a leading `@`, `/` or `~` and a `..` component).
+    # One leading `./` stays allowed.
+    if [[ "/$rel/" == */./* || "$rel" == *//* || "$rel" == /* ]]; then
+      deny_ruff_write "'${token}' is not in plain form (a '.' component, a '//' or a leading '/' after one leading ./), and WRITE_DENY_GLOBS is matched against the operand exactly as written."
+    fi
+    # ADR-0018 decision 7, seventh amendment, and eighth amendment, change
+    # 3: an operand that names, relative to the payload's cwd, a directory,
+    # or any of whose components, taken in turn from cwd, is a symbolic
+    # link, would make ruff rewrite every file beneath it, or a file in the
+    # link's target, which no list judged. `rel` is in plain form (above)
+    # and, in literal mode, holds no blank, and `set -f` keeps the unquoted
+    # split from being globbed. The shadow check has already refused an
+    # empty cwd. This reads the live filesystem, so, like the shadow check,
+    # it has a window between the check and ruff's run.
+    probe="${cwd%/}"
+    for part in ${rel//\// }; do
+      probe="${probe}/${part}"
+      if [[ -L "$probe" ]]; then
+        deny_ruff_write "'${token}' is a directory or a symbolic link, or lies under a symbolic link, so ruff format would rewrite files this guard has not vetted."
+      fi
+    done
+    if [[ -d "$probe" ]]; then
+      deny_ruff_write "'${token}' is a directory or a symbolic link, or lies under a symbolic link, so ruff format would rewrite files this guard has not vetted."
+    fi
+    # ADR-0018 decision 7, eighth amendment, change 2: the list's refusal
+    # goes through the write-mode denial, its own words unchanged.
     for glob in $WRITE_DENY_GLOBS; do
       if [[ "$rel" == $glob ]]; then
-        deny "Hammertime bash guard: '${token}' matches '${glob}' in WRITE_DENY_GLOBS, the same fence the Edit and Write tools apply, so ruff format may not rewrite it. If it needs formatting, report it."
+        deny_ruff_write "'${token}' matches '${glob}' in WRITE_DENY_GLOBS, the same fence the Edit and Write tools apply, so ruff format may not rewrite it. If it needs formatting, report it."
       fi
     done
   done
@@ -1886,15 +2062,36 @@ KNOWN_READONLY_CMDS="ls cat head tail wc stat grep jq diff cmp pwd"
 
 # --- Validate every segment ---------------------------------------------
 
+# ADR-0018 decision 19, part 6: no here-string and no command substitution
+# here. The segments are taken one line of `segments` at a time with
+# parameter expansion, every line included, the empty ones and the last,
+# exactly as `while IFS= read -r segment; do ... done <<< "$segments"`
+# took them (the here-string's own trailing newline made the last line a
+# whole one); `segments` holds no newline but the separators, since a
+# newline in the command was refused above. Each segment is split into
+# words by bash's own word splitting on the default IFS, under the
+# `set -f` set first, so nothing is globbed, exactly as `read -r -a` split
+# it; and each word is normalised in place by normalize_token, which sets
+# a variable, where it used to be printed through a command substitution
+# of its own (and a fork per word).
 saw_segment=0
-while IFS= read -r segment; do
-  read -r -a raw_tokens <<< "$segment"
+segments_rest="$segments"
+more_segments=1
+while (( more_segments )); do
+  segment="${segments_rest%%$'\n'*}"
+  if [[ "$segments_rest" == *$'\n'* ]]; then
+    segments_rest="${segments_rest#*$'\n'}"
+  else
+    more_segments=0
+  fi
+  raw_tokens=($segment)
   (( ${#raw_tokens[@]} )) || continue
   saw_segment=1
 
   tokens=()
   for raw in "${raw_tokens[@]}"; do
-    tokens+=("$(normalize_token "$raw")")
+    normalize_token "$raw"
+    tokens+=("$normalized_token")
   done
 
   cmd0="${tokens[0]}"
@@ -1942,10 +2139,12 @@ while IFS= read -r segment; do
     uv) check_uv ${args[@]+"${args[@]}"} ;;
     make) check_make ${args[@]+"${args[@]}"} ;;
   esac
-done <<< "$segments"
+done
 
 if (( ! saw_segment )); then
   deny "Hammertime bash guard: no command could be parsed out of this Bash call. Send one single-line command built from the allowed read-only tools (ALLOW_CMDS: ${ALLOW_CMDS})."
 fi
 
 exit 0
+}
+exit 3
