@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "SCOPE_AGENT_TYPES='test-author' ALLOW_GLOBS='*/tests/* tests/* packages/hammertime-testkit/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+            "command": "SCOPE_AGENT_TYPES='test-author' PATH_ROOT='project' ALLOW_GLOBS='tests/* packages/*/tests/* services/*/tests/* tools/*/tests/* packages/hammertime-testkit/*' DENY_GLOBS='.claude .claude/* */.claude */.claude/* CLAUDE.md */CLAUDE.md CLAUDE.local.md */CLAUDE.local.md .mcp.json */.mcp.json .git .git/* */.git */.git/* .venv/* */.venv/* __pycache__/* */__pycache__/* .gitignore */.gitignore .gitattributes */.gitattributes *.py[cod] *.py[cod]/* venv/* */venv/* .env */.env .env/* */.env/* .uv/* */.uv/* uv.lock.bak */uv.lock.bak uv.lock.bak/* */uv.lock.bak/* dist/* */dist/* build/* */build/* *.egg-info/* .pytest_cache/* */.pytest_cache/* .ruff_cache/* */.ruff_cache/* .mypy_cache/* */.mypy_cache/* .coverage */.coverage .coverage/* */.coverage/* htmlcov/* */htmlcov/* data/* */data/* snapshots/* */snapshots/* *.snap *.snap/* .DS_Store */.DS_Store .DS_Store/* */.DS_Store/* .hypothesis/* */.hypothesis/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
           }
         ]
       },
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "SCOPE_AGENT_TYPES='test-author' EXEMPT_GLOBS='*/tests */tests/* tests tests/* packages/hammertime-testkit packages/hammertime-testkit/*' DENY_GLOBS='packages packages/* services services/* tools tools/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+            "command": "SCOPE_AGENT_TYPES='test-author' PATH_ROOT='project' EXEMPT_GLOBS='tests tests/* packages/*/tests packages/*/tests/* services/*/tests services/*/tests/* tools/*/tests tools/*/tests/* packages/hammertime-testkit packages/hammertime-testkit/*' DENY_GLOBS='packages packages/* services services/* tools tools/* .claude .claude/* .mypy_cache .mypy_cache/* build build/* dist dist/* htmlcov htmlcov/* .hypothesis .hypothesis/* .pytest_cache .pytest_cache/* .ruff_cache .ruff_cache/* .uv .uv/* .git .git/* .coverage .coverage.* snapshots snapshots/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
           }
         ]
       }
