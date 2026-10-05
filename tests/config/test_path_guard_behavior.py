@@ -127,6 +127,28 @@ has 200,000 components is decided within the helper's timeout. The tests at the
 end of this module encode them (brief T7). Decision 26's refusals and its order
 cases, and decision 20's refused cases, fail until brief C9 lands; their
 controls and boundaries, and the long path, pass today.
+
+ADR-0018's ninth amendment (2026-10-04), with its follow-ups of 2026-10-05,
+fixes SA1h's findings. Decision 19, part 7: every check that reads a `jq` status
+passes on status 0 alone, so a check whose `jq` exits 1, or never runs, refuses,
+and a raw U+0002 now names status 1; and part 1's flag is the script's own, so a
+`denying` in the hook's environment changes nothing. Decision 23's rule 1 looks
+past leading edge characters, and its denial says so. Decision 27 refuses a
+Read, Edit or Write path that ends with `/`, directly after decision 26's check.
+Decision 20's "The root itself" refuses an Edit or Write of `.`, `<root>` or
+`<root>/.`, where a Read, Grep or Glob keeps the project-root denial. Decision
+22's "What git does not show" and decision 12 (g) give the test-author's and
+the coder's Edit|Write `DENY_GLOBS` a per-directory `.gitignore`,
+`.gitattributes` and every path the root `.gitignore` or `.hypothesis/` ignores.
+Decision 14's last entry routes every MCP tool the coder, the test-author and
+the architect call to this script, where decision 24 refuses it. The tests at
+the end of this module encode them (brief T8), with decision 26's list checked
+against the installed Python's Unicode database. The wrapper cases, the
+`denying` cases, the refused cases of decisions 23, 27 and 20 and the order
+cases that need decision 27, and the changed existing tests, fail until brief
+C10 lands, and the configured coder case until step W; their controls, the
+`/dev/full` cases, the cases that do not occur, the Unicode cases, the
+explicit-policy git cases and the MCP behaviour cases pass today.
 """
 
 import json
@@ -135,6 +157,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -1962,13 +1986,14 @@ FAILING_GUARD_POLICIES: list[tuple[str, Mapping[str, str]]] = [
     [policy for _, policy in FAILING_GUARD_POLICIES],
     ids=[case_id for case_id, _ in FAILING_GUARD_POLICIES],
 )
-def test_a_guard_that_fails_after_the_shape_check_gets_the_backstop_denial(
+def test_a_guard_whose_jq_exits_1_gets_the_shape_denial_on_stderr(
     tmp_path: Path, policy: Mapping[str, str]
 ) -> None:
-    """Decision 19, parts 1 and 3, and assumption 56: with a `jq` that exits 1 and
-    prints nothing, the shape check reads status 1 and passes, the first
-    extraction line fails, and the `EXIT` trap denies with the backstop text,
-    written without `jq`. The extraction lines run before the routing, so a
+    """Decision 19, parts 2, 3 and 7, and assumption 146: with a `jq` that exits 1
+    and prints nothing, the shape check reads status 1, which no longer passes,
+    since a check passes on status 0 alone (part 7), so the shape denial follows,
+    naming status 1; `deny`'s own `jq` fails too, so the reason goes to stderr
+    and the exit is still 2. The shape check runs before the routing, so a
     caller outside the policy's scope is refused the same way. With the real
     `jq`, the same Write is allowed or passed through."""
     control = run_rooted("Write", policy=policy, file_path=IMPLEMENTATION_PATH)
@@ -1976,14 +2001,15 @@ def test_a_guard_that_fails_after_the_shape_check_gets_the_backstop_denial(
     write_failing_jq(tmp_path, 1)
     result = run_rooted("Write", policy=policy, file_path=IMPLEMENTATION_PATH, jq_dir=tmp_path)
     what = f"a Write of {IMPLEMENTATION_FILE} with a jq that exits 1"
-    reason = assert_denied(result, what)
-    assert reason.startswith(DENIAL_PREFIX), reason
-    assert BACKSTOP_PHRASE in reason, (
-        f"expected decision 19's backstop denial for {what}.\nreason: {reason!r}"
+    assert result.returncode == 2, (
+        f"expected the guard to DENY {what} (exit 2), got exit {result.returncode}.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert BACKSTOP_PATTERN.fullmatch(reason), (
-        f"the backstop denial for {what} must be decision 19's text verbatim, with N a "
-        f"status number.\nreason: {reason!r}"
+    assert result.stdout == "", f"expected nothing on stdout for {what}; got {result.stdout!r}"
+    expected = SHAPE_TEMPLATE.replace("status N", "status 1")
+    assert expected in result.stderr, (
+        f"expected decision 19's shape denial, naming status 1, on stderr for {what}.\n"
+        f"stderr: {result.stderr!r}"
     )
 
 
@@ -2993,15 +3019,17 @@ TRAILING_NEWLINE_MESSAGE = (
 )
 TRAILING_NEWLINE_PHRASE = "the path ends with a newline"
 
-# Decision 23's denial for its rules 1 and 2, the same way.
+# Decision 23's denial for its rules 1 and 2, the same way, as the ninth
+# amendment's "Rule 1 after leading whitespace" amends it (brief T8).
 SEARCH_VALUE_MESSAGE = (
     "Hammertime path guard: no value in a Grep or a Glob may begin with '-', "
-    "and no part of a Glob pattern or a Grep glob between slashes may begin "
-    "with '.' followed by '*' or '?', because the tool could read such a value "
-    "as an option, or match such a part against the '..' entry and search "
-    "above the path being searched. Give the value in another form; a Grep "
-    "pattern that has to match a leading '-' can begin with '[-]' instead. The "
-    "tool call is refused."
+    "even after leading whitespace or control characters, and no part of a "
+    "Glob pattern or a Grep glob between slashes may begin with '.' followed "
+    "by '*' or '?', because the tool could read such a value as an option, or "
+    "match such a part against the '..' entry and search above the path being "
+    "searched. Give the value in another form; a Grep pattern that has to "
+    "match a leading '-' can begin with '[-]' instead. The tool call is "
+    "refused."
 )
 SEARCH_VALUE_PHRASE = "no value in a Grep or a Glob may begin with '-'"
 
@@ -3539,8 +3567,10 @@ MIB = 1024 * 1024
 OVER_8_MIB = 9 * MIB
 JUST_UNDER_8_MIB = 8 * MIB - 4096
 
-# Decision 19's table: a raw NUL or U+0002 gets the shape denial naming status 0.
-SHAPE_STATUS_0 = "(the check ended with status 0)"
+# Decision 19's table, as the ninth amendment leaves it: a raw NUL or U+0002 gets
+# the shape denial naming status 1, the status of a malformed payload since a
+# check passes on status 0 alone (part 7; brief T8).
+SHAPE_STATUS_1 = "(the check ended with status 1)"
 
 
 def raw_bytes(text: str) -> str:
@@ -3579,12 +3609,12 @@ def test_a_payload_holding_a_raw_nul_or_u0002_gets_the_shape_denial(
 ) -> None:
     """Decision 19, part 3 as amended, and its table: the payload is read with
     each raw NUL kept as U+0002, and a payload holding a raw U+0002 is
-    malformed, with status 0, before the routing and under every policy. Before,
+    malformed, with status 1, before the routing and under every policy. Before,
     a raw NUL was dropped unseen."""
     assert "\x00" in stdin or "\x02" in stdin, "the payload must hold a raw byte"
     result = run_guard_stdin(stdin, policy=policy)
     reason = assert_shape_denied(result, f"a payload holding a raw byte under {dict(policy)!r}")
-    assert SHAPE_STATUS_0 in reason, reason
+    assert SHAPE_STATUS_1 in reason, reason
 
 
 @pytest.mark.parametrize(
@@ -3609,7 +3639,7 @@ def test_a_raw_nul_after_an_exact_protected_name_gets_the_shape_denial() -> None
     assert "\x00" in stdin, "the payload must hold a raw NUL"
     result = run_guard_stdin(stdin, policy=policy)
     reason = assert_shape_denied(result, "a Write of uv.lock, a raw NUL, then x")
-    assert SHAPE_STATUS_0 in reason, reason
+    assert SHAPE_STATUS_1 in reason, reason
 
 
 def test_a_payload_just_under_8_mib_is_judged_as_before() -> None:
@@ -3664,10 +3694,12 @@ WRAPPER_JQ_HEAD = sh_lines(
     "}",
 )
 
-# Item 7: prints nothing, and exits 1 for the shape check and 2 for every other call.
+# Item 7: prints nothing, and exits 0 for the shape check and 2 for every other call.
+# The shape check passes on status 0 alone (decision 19, part 7; brief T8), so 0
+# is what lets it pass.
 STATUS_2_RULE = sh_lines(
     "cat >/dev/null",
-    'if [ "$slurp" = 1 ]; then exit 1; fi',
+    'if [ "$slurp" = 1 ]; then exit 0; fi',
     "exit 2",
 )
 
@@ -3920,8 +3952,9 @@ EDGE_MESSAGE = (
 )
 EDGE_PHRASE = "begins or ends with whitespace or a control character"
 
-# Decision 14's coder Edit|Write DENY_GLOBS, copied from its text. It equals the
-# coder's Bash WRITE_DENY_GLOBS there.
+# Decision 14's coder Edit|Write DENY_GLOBS, copied from its text as the ninth
+# amendment leaves it, with decision 12 (g)'s globs after `uv.lock` (brief T8). It
+# equals the coder's Bash WRITE_DENY_GLOBS there.
 DECISION_14_CODER_GLOBS = (
     "tests tests/* */tests */tests/* packages/hammertime-testkit "
     "packages/hammertime-testkit/* docs/spec/* docs/adr/* docs/protocol/* schemas/* "
@@ -3934,7 +3967,13 @@ DECISION_14_CODER_GLOBS = (
     ".ruff.toml */.ruff.toml */ruff.toml uv.toml */uv.toml .python-version "
     "*/.python-version sitecustomize.py */sitecustomize.py usercustomize.py "
     "*/usercustomize.py pytest pytest/* ruff ruff/* mypy mypy/* GNUmakefile makefile "
-    "uv.lock"
+    "uv.lock */.gitignore .gitattributes */.gitattributes *.py[cod] *.py[cod]/* venv/* "
+    "*/venv/* .env */.env .env/* */.env/* .uv/* */.uv/* uv.lock.bak */uv.lock.bak "
+    "uv.lock.bak/* */uv.lock.bak/* dist/* */dist/* build/* */build/* *.egg-info/* "
+    ".pytest_cache/* */.pytest_cache/* .ruff_cache/* */.ruff_cache/* .mypy_cache/* "
+    "*/.mypy_cache/* .coverage */.coverage .coverage/* */.coverage/* htmlcov/* */htmlcov/* "
+    "data/* */data/* snapshots/* */snapshots/* *.snap *.snap/* .DS_Store */.DS_Store "
+    ".DS_Store/* */.DS_Store/* .hypothesis/* */.hypothesis/*"
 )
 
 DOCS_X_PATH = under_repo("docs/x.md")
@@ -4217,3 +4256,969 @@ def test_a_long_coder_path_is_decided_within_the_timeout(tmp_path: Path) -> None
     assert_allowed_silently(
         result, f"a coder Write of <tmp>/a, /test_a {LONG_PATH_COMPONENTS} times, then .md"
     )
+
+
+# --- the ninth amendment: SA1h's findings -------------------------------------
+#
+# ADR-0018's ninth amendment (2026-10-04), with its follow-ups of 2026-10-05,
+# brief T8. Every path or value that carries whitespace, a control character or a
+# character outside ASCII is built by string concatenation, with the character in
+# the Python string, written as its escape; `json.dumps` writes it as a JSON
+# escape, as the harness would send it. A raw U+007F goes in the JSON text itself
+# (`raw_del`), as `raw_bytes` puts a raw NUL there.
+
+# Decision 20's "The root itself" denial, verbatim, with the ADR's blockquote line
+# breaks joined by single spaces. It is ASCII only.
+ROOT_ITSELF_MESSAGE = (
+    "Hammertime path guard: the path of an Edit or Write names the root "
+    "directory itself, or the working directory, and not a file, so this guard "
+    "cannot vet what the tool would do with it. Give the path of a file inside "
+    "the root. The tool call is refused."
+)
+ROOT_ITSELF_PHRASE = "names the root directory itself"
+
+# Decision 27's denial, the same way.
+TRAILING_SLASH_MESSAGE = (
+    "Hammertime path guard: the path of a Read, Edit or Write ends with '/', or "
+    "could not be checked for one, and a tool that dropped the '/' would act on "
+    "a file this guard did not vet. Give the path of the file without it. The "
+    "tool call is refused."
+)
+TRAILING_SLASH_PHRASE = "the path of a Read, Edit or Write ends with '/'"
+
+# Decision 14's test-author Read|Grep|Glob entry, as an explicit policy.
+TEST_AUTHOR_READ_POLICY: dict[str, str] = {
+    "SCOPE_AGENT_TYPES": "test-author",
+    "PATH_ROOT": "project",
+    "EXEMPT_GLOBS": (
+        "tests tests/* packages/*/tests packages/*/tests/* services/*/tests "
+        "services/*/tests/* tools/*/tests tools/*/tests/* packages/hammertime-testkit "
+        "packages/hammertime-testkit/*"
+    ),
+    "DENY_GLOBS": (
+        "packages packages/* services services/* tools tools/* .claude .claude/* "
+        ".mypy_cache .mypy_cache/* build build/* dist dist/* htmlcov htmlcov/* "
+        ".hypothesis .hypothesis/* .pytest_cache .pytest_cache/* .ruff_cache "
+        ".ruff_cache/* .uv .uv/* .git .git/* .coverage .coverage.* snapshots snapshots/*"
+    ),
+}
+
+# Decision 14's test-author Edit|Write DENY_GLOBS, copied from its text as the
+# ninth amendment leaves it: decision 22's git list after `*/__pycache__/*`.
+TEST_AUTHOR_WRITE_DENY_GLOBS = (
+    ".claude .claude/* */.claude */.claude/* CLAUDE.md */CLAUDE.md CLAUDE.local.md "
+    "*/CLAUDE.local.md .mcp.json */.mcp.json .git .git/* */.git */.git/* .venv/* "
+    "*/.venv/* __pycache__/* */__pycache__/* .gitignore */.gitignore .gitattributes "
+    "*/.gitattributes *.py[cod] *.py[cod]/* venv/* */venv/* .env */.env .env/* "
+    "*/.env/* .uv/* */.uv/* uv.lock.bak */uv.lock.bak uv.lock.bak/* */uv.lock.bak/* "
+    "dist/* */dist/* build/* */build/* *.egg-info/* .pytest_cache/* */.pytest_cache/* "
+    ".ruff_cache/* */.ruff_cache/* .mypy_cache/* */.mypy_cache/* .coverage */.coverage "
+    ".coverage/* */.coverage/* htmlcov/* */htmlcov/* data/* */data/* snapshots/* "
+    "*/snapshots/* *.snap *.snap/* .DS_Store */.DS_Store .DS_Store/* */.DS_Store/* "
+    ".hypothesis/* */.hypothesis/*"
+)
+
+# Decision 14's test-author Edit|Write entry, as an explicit policy.
+TEST_AUTHOR_WRITE_POLICY: dict[str, str] = {
+    "SCOPE_AGENT_TYPES": "test-author",
+    "PATH_ROOT": "project",
+    "ALLOW_GLOBS": (
+        "tests/* packages/*/tests/* services/*/tests/* tools/*/tests/* "
+        "packages/hammertime-testkit/*"
+    ),
+    "DENY_GLOBS": TEST_AUTHOR_WRITE_DENY_GLOBS,
+}
+
+# Decision 14's coder Edit|Write entry, as an explicit policy.
+CODER_WRITE_POLICY: dict[str, str] = {
+    "SCOPE_AGENT_TYPES": "coder",
+    "PATH_ROOT": "cwd",
+    "DENY_GLOBS": DECISION_14_CODER_GLOBS,
+}
+
+# Decision 14's last entry, whose matcher is `mcp__.*`, as an explicit policy.
+MCP_POLICY: dict[str, str] = {
+    "SCOPE_AGENT_TYPES": "coder test-author architect",
+    "PATH_ROOT": "project",
+    "DENY_GLOBS": "*",
+}
+
+# The texts the wrapper `jq`s key on, each from the ADR's recommended filter for its
+# check (brief T8, "Building the payloads"): decision 21's check, the NUL gates,
+# decision 26's check and the extraction check.
+DECISION_21_KEY = 'contains("..")'
+NUL_GATE_KEY = "any(. == 0)"
+DECISION_26_KEY = "[.[0], .[-1]]"
+EXTRACTION_CHECK_KEY = "def rendered"
+
+SERVICE_PATH = under_repo(SERVICE_FILE)
+
+
+def status_1_rule(key: str) -> str:
+    """Brief T8, item 1: for the one call whose arguments hold `key`, read stdin to
+    its end, print nothing and exit 1; every other call runs the real `jq`."""
+    return sh_lines(
+        f"if has {shlex.quote(key)}; then",
+        "  cat >/dev/null",
+        "  exit 1",
+        "fi",
+    )
+
+
+def raw_del(text: str) -> str:
+    """`text`, a JSON text, with each JSON escape of U+007F replaced by that
+    character itself (brief T8). JSON admits a raw U+007F inside a string."""
+    return text.replace("\\u007f", "\x7f")
+
+
+def run_test_author_read(
+    tool_name: str, tool_input: Mapping[str, Any], *, jq_dir: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """`tool_input` from the test-author under decision 14's Read|Grep|Glob entry,
+    as an explicit policy, with `cwd` and CLAUDE_PROJECT_DIR the repository root."""
+    return run_rooted(
+        tool_name,
+        policy=TEST_AUTHOR_READ_POLICY,
+        tool_input=tool_input,
+        agent_type="test-author",
+        cwd=str(REPO_ROOT),
+        project_dir=str(REPO_ROOT),
+        jq_dir=jq_dir,
+    )
+
+
+def run_architect(tool_name: str, path: str) -> subprocess.CompletedProcess[str]:
+    """`path` from the architect under its configured Edit|Write policy, with `cwd`
+    and CLAUDE_PROJECT_DIR the repository root."""
+    return run_configured_rooted(
+        "architect", EDIT_WRITE, tool_name, path, cwd=str(REPO_ROOT), project_dir=str(REPO_ROOT)
+    )
+
+
+def assert_root_itself_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 20's "The root itself" denial, verbatim."""
+    return assert_denied_with(result, ROOT_ITSELF_MESSAGE, ROOT_ITSELF_PHRASE, what)
+
+
+def assert_trailing_slash_denied(result: subprocess.CompletedProcess[str], what: str) -> str:
+    """Decision 27's denial, verbatim."""
+    return assert_denied_with(result, TRAILING_SLASH_MESSAGE, TRAILING_SLASH_PHRASE, what)
+
+
+# Decision 19, part 7, brief T8 item 1: a check passes on status 0 alone. Each
+# wrapper `jq` makes the one call keyed on its text exit 1, and leaves every other
+# call to the real `jq`.
+
+PATTERN_WRAPPER_CASES: list[tuple[str, dict[str, Any], bool]] = [
+    ("dotdot-pattern", {"path": "tests", "pattern": "../packages/**/*.py"}, False),
+    ("plain-pattern", {"path": "tests", "pattern": "*.py"}, True),
+]
+
+
+@NEEDS_BIN_SH
+@pytest.mark.parametrize(
+    ("tool_input", "allowed"),
+    [case[1:] for case in PATTERN_WRAPPER_CASES],
+    ids=[case[0] for case in PATTERN_WRAPPER_CASES],
+)
+def test_a_pattern_check_whose_jq_exits_1_refuses(
+    tmp_path: Path, tool_input: dict[str, Any], allowed: bool
+) -> None:
+    """Decision 19, part 7, and decision 21: under decision 14's test-author read
+    entry, a Glob whose pattern check's `jq` exits 1 is refused with decision 21's
+    denial, whatever its pattern; before part 7, status 1 passed. The first case
+    is the one the session reproduced, with a check whose `jq` never ran. With the
+    real `jq`, the first is refused the same way and the second is allowed."""
+    what = f"test-author Glob with tool_input {tool_input!r}"
+    control = run_test_author_read("Glob", tool_input)
+    if allowed:
+        assert_allowed_silently(control, f"{what}, with the real jq")
+    else:
+        assert_denied_with(control, PATTERN_MESSAGE, PATTERN_PHRASE, f"{what}, with the real jq")
+    write_wrapper_jq(tmp_path, status_1_rule(DECISION_21_KEY))
+    result = run_test_author_read("Glob", tool_input, jq_dir=tmp_path)
+    assert_denied_with(result, PATTERN_MESSAGE, PATTERN_PHRASE, f"{what}, its jq exiting 1")
+
+
+DENY_TESTS_WRAPPER_CASES: list[tuple[str, str, str, str]] = [
+    ("nul-gate", NUL_GATE_KEY, NUL_MESSAGE, NUL_PHRASE),
+    ("edge-check", DECISION_26_KEY, EDGE_MESSAGE, EDGE_PHRASE),
+]
+
+
+@NEEDS_BIN_SH
+@pytest.mark.parametrize(
+    ("key", "message", "phrase"),
+    [case[1:] for case in DENY_TESTS_WRAPPER_CASES],
+    ids=[case[0] for case in DENY_TESTS_WRAPPER_CASES],
+)
+def test_a_path_check_whose_jq_exits_1_refuses_with_its_denial(
+    tmp_path: Path, key: str, message: str, phrase: str
+) -> None:
+    """Decision 19, part 7, decisions 17 and 26, and assumption 131: a NUL gate
+    whose `jq` exits 1 gets decision 17's NUL denial, although the path holds no
+    NUL, and decision 26's check whose `jq` exits 1 gets decision 26's denial;
+    before part 7, status 1 passed. With the real `jq`, the same Write is
+    allowed."""
+    control = run_rooted("Write", policy=DENY_TESTS, file_path=SERVICE_PATH)
+    assert_allowed_silently(control, f"a Write of {SERVICE_FILE} with the real jq")
+    write_wrapper_jq(tmp_path, status_1_rule(key))
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=SERVICE_PATH, jq_dir=tmp_path)
+    assert_denied_with(result, message, phrase, f"a Write of {SERVICE_FILE}, {key!r} exiting 1")
+
+
+@NEEDS_BIN_SH
+def test_an_extraction_check_whose_jq_exits_1_gets_the_backstop_denial(tmp_path: Path) -> None:
+    """Decision 19, parts 4 and 7: an extraction check whose `jq` exits 1 ends the
+    script with status 3, which the trap names in the backstop denial; before
+    part 7, status 1 passed. With the real `jq`, the same Write is allowed."""
+    control = run_rooted("Write", policy=DENY_TESTS, file_path=SERVICE_PATH)
+    assert_allowed_silently(control, f"a Write of {SERVICE_FILE} with the real jq")
+    write_wrapper_jq(tmp_path, status_1_rule(EXTRACTION_CHECK_KEY))
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=SERVICE_PATH, jq_dir=tmp_path)
+    assert_backstop_status(result, 3, f"a Write of {SERVICE_FILE}, its extraction check failing")
+
+
+# Decision 19, part 1, its ninth-amendment note, brief T8 item 2: the trap's flag.
+
+
+@NEEDS_BIN_SH
+@pytest.mark.parametrize("value", ["1", "yes"])
+def test_a_denying_flag_in_the_environment_does_not_silence_the_backstop(
+    tmp_path: Path, value: str
+) -> None:
+    """Decision 19, part 1, its ninth-amendment note, and assumption 132: the
+    script sets `denying=0` itself before the trap, so a `denying` in the hook's
+    environment cannot let a status 2 that `deny` did not make end the guard with
+    no reason. With STATUS_2_RULE the first extraction line ends the script with
+    status 2, and the trap names it in the backstop denial."""
+    write_wrapper_jq(tmp_path, STATUS_2_RULE)
+    policy = {**DENY_TESTS, "denying": value}
+    result = run_rooted("Write", policy=policy, file_path=SERVICE_PATH, jq_dir=tmp_path)
+    assert_backstop_status(result, 2, f"a Write of {SERVICE_FILE} with denying={value!r}")
+
+
+def dev_full_env(policy: Mapping[str, str], jq_dir: Path | None) -> dict[str, str]:
+    """`run_guard_stdin`'s environment: the policy variables cleared,
+    CLAUDE_PROJECT_DIR the repository root, `jq_dir` first on `PATH` when given,
+    then `policy`."""
+    env = dict(os.environ)
+    for name in ROOTED_POLICY_VARS:
+        env.pop(name, None)
+    env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
+    if jq_dir is not None:
+        env["PATH"] = f"{jq_dir}:{os.environ.get('PATH', '')}"
+    env.update(policy)
+    return env
+
+
+def run_guard_stdin_stdout_full(
+    stdin: str,
+    *,
+    policy: Mapping[str, str],
+    jq_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`run_guard_stdin_stderr_full`'s sibling with the guard's stdout opened on
+    `/dev/full`, where every write fails, and its stderr captured (brief T8, item
+    2). `stdout` is None."""
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+    with open("/dev/full", "w", encoding="utf-8") as full:
+        return subprocess.run(
+            [BASH or "bash", str(GUARD)],
+            input=stdin,
+            stdout=full,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=dev_full_env(policy, jq_dir),
+            timeout=30,
+            check=False,
+        )
+
+
+def run_guard_stdin_both_full(
+    stdin: str,
+    *,
+    policy: Mapping[str, str],
+    jq_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`run_guard_stdin_stderr_full`'s sibling with both the guard's stdout and its
+    stderr opened on `/dev/full` (brief T8, item 2). `stdout` and `stderr` are
+    None."""
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+    with open("/dev/full", "w", encoding="utf-8") as full:
+        return subprocess.run(
+            [BASH or "bash", str(GUARD)],
+            input=stdin,
+            stdout=full,
+            stderr=full,
+            text=True,
+            env=dev_full_env(policy, jq_dir),
+            timeout=30,
+            check=False,
+        )
+
+
+DEV_FULL_WRITE = tool_payload("Write", {"file_path": under_repo("tests/x.py")})
+
+
+@NEEDS_DEV_FULL
+def test_a_denial_whose_stdout_fails_exits_2_with_the_reason_on_stderr() -> None:
+    """Decision 19, parts 1 and 2, and assumption 132: with the guard's stdout on
+    `/dev/full` and the real `jq`, `deny`'s `jq` cannot write the JSON deny, so the
+    reason goes to stderr, and the exit is 2, which blocks whatever stdout
+    holds."""
+    result = run_guard_stdin_stdout_full(DEV_FULL_WRITE, policy=DENY_TESTS)
+    what = "a Write of tests/x.py under DENY_TESTS, with stdout on /dev/full"
+    assert result.returncode == 2, (
+        f"expected the guard to DENY {what} (exit 2), got exit {result.returncode}.\n"
+        f"stderr: {result.stderr}"
+    )
+    denials = [
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith(DENIAL_PREFIX) and DENY_GLOBS_PHRASE in line
+    ]
+    assert denials, (
+        f"expected the DENY_GLOBS denial on stderr for {what}.\nstderr: {result.stderr!r}"
+    )
+
+
+@NEEDS_DEV_FULL
+def test_a_denial_whose_stdout_and_stderr_fail_still_exits_2() -> None:
+    """Decision 19, parts 1 and 2, and assumption 132: with both streams on
+    `/dev/full`, no reason can be written anywhere, and the exit is still 2."""
+    result = run_guard_stdin_both_full(DEV_FULL_WRITE, policy=DENY_TESTS)
+    assert result.returncode == 2, (
+        "expected the guard to DENY a Write of tests/x.py under DENY_TESTS, with both "
+        f"streams on /dev/full (exit 2), got exit {result.returncode}"
+    )
+
+
+# Decision 23's "Rule 1 after leading whitespace", brief T8 item 3: Greps of
+# `tests` under the test-author's configured read policy.
+
+LEADING_EDGE_REFUSED: list[tuple[str, dict[str, Any]]] = [
+    ("space-long-option", {"path": "tests", "pattern": " " + "--PROBE-TRIM-NO-SUCH-FLAG"}),
+    ("tab-u", {"path": "tests", "pattern": "\t" + "-u"}),
+    ("no-break-space-x", {"path": "tests", "pattern": "\N{NO-BREAK SPACE}" + "-x"}),
+    ("ideographic-space-pre", {"path": "tests", "pattern": "\N{IDEOGRAPHIC SPACE}" + "--pre=sh"}),
+    ("byte-order-mark-e", {"path": "tests", "pattern": "\N{ZERO WIDTH NO-BREAK SPACE}" + "-e"}),
+    ("carriage-return-newline-x", {"path": "tests", "pattern": "\r\n" + "-x"}),
+    ("type-space-u", {"path": "tests", "pattern": "x", "type": " " + "-u"}),
+]
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [case[1] for case in LEADING_EDGE_REFUSED],
+    ids=[case[0] for case in LEADING_EDGE_REFUSED],
+)
+def test_a_grep_value_with_leading_edge_characters_then_a_dash_is_refused(
+    tool_input: dict[str, Any],
+) -> None:
+    """Decision 23's rule 1, as the ninth amendment amends it, and assumption 133:
+    a string in a Grep's `tool_input` whose first character that is not an edge
+    character of decision 26's list is `-` is refused with the amended denial. The
+    first case is the one the session reproduced: a tool that trimmed its pattern
+    would hand ripgrep an option."""
+    result = run_test_author_search("Grep", tool_input)
+    assert_search_value_denied(result, f"test-author Grep with tool_input {tool_input!a}")
+
+
+LEADING_EDGE_CONTROLS: list[tuple[str, str]] = [
+    ("indented-def", " " * 4 + "def test_"),
+    ("space-then-x-dash", " " + "x-"),
+    ("inner-space-dash", "x -y"),
+    ("space-then-bracketed-dash", " " + "[-]x"),
+    ("spaces-only", " " * 3),
+]
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [case[1] for case in LEADING_EDGE_CONTROLS],
+    ids=[case[0] for case in LEADING_EDGE_CONTROLS],
+)
+def test_a_grep_value_whose_first_other_character_is_not_a_dash_is_allowed(pattern: str) -> None:
+    """Decision 23's rule 1, as amended: a search for indented code, a `-` that is
+    not the first character past the edge characters, a `-` in brackets, and a
+    value of edge characters only are not refused."""
+    tool_input = {"path": "tests", "pattern": pattern}
+    result = run_test_author_search("Grep", tool_input)
+    assert_allowed_silently(result, f"test-author Grep with tool_input {tool_input!r}")
+
+
+# Decision 27, brief T8 item 4: a Read, Edit or Write path that ends with `/`.
+
+ARCHITECT_TRAILING_SLASH: list[tuple[str, str, str]] = [
+    ("Write-docs-claude-md", "Write", under_repo("docs/CLAUDE.md") + "/"),
+    ("Write-docs-x-md", "Write", DOCS_X_PATH + "/"),
+    ("Edit-docs-x-md", "Edit", DOCS_X_PATH + "/"),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path"),
+    [case[1:] for case in ARCHITECT_TRAILING_SLASH],
+    ids=[case[0] for case in ARCHITECT_TRAILING_SLASH],
+)
+def test_an_architect_path_that_ends_with_a_slash_is_refused(tool_name: str, path: str) -> None:
+    """Decision 27 and assumption 134: `docs/CLAUDE.md/` matched `docs/*` and no
+    exact-name glob, and a tool that dropped the `/` would write
+    `docs/CLAUDE.md`. A Read, Edit or Write path that ends with `/` is refused,
+    whatever it names."""
+    result = run_architect(tool_name, path)
+    assert_trailing_slash_denied(result, f"architect {tool_name} of {repo_relative_id(path)!r}")
+
+
+def test_a_coder_write_of_uv_lock_with_a_trailing_slash_is_refused() -> None:
+    """Decision 27: `uv.lock/` matched nothing on the coder's list."""
+    path = under_repo("uv.lock") + "/"
+    result = run_rooted("Write", policy=SCOPED_TO_CODER, file_path=path, agent_type="coder")
+    assert_trailing_slash_denied(result, "coder writing <repo>/uv.lock/")
+
+
+TEST_AUTHOR_TRAILING_SLASH: list[tuple[str, str]] = [
+    ("absolute-test-file", under_repo(TOP_LEVEL_TEST_FILE) + "/"),
+    ("relative-tests", "tests/"),
+]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [case[1] for case in TEST_AUTHOR_TRAILING_SLASH],
+    ids=[case[0] for case in TEST_AUTHOR_TRAILING_SLASH],
+)
+def test_a_test_author_read_that_ends_with_a_slash_is_refused(path: str) -> None:
+    """Decision 27: the rule covers a Read as it covers an Edit or a Write."""
+    result = run_configured_rooted("test-author", READ_GREP_GLOB, "Read", path)
+    assert_trailing_slash_denied(result, f"test-author Read of {repo_relative_id(path)!r}")
+
+
+def test_the_trailing_slash_check_runs_before_the_plain_form_rule() -> None:
+    """Decision 27, "Where it sits": before decision 18's rule, so a path with a
+    `..` that ends with `/` gets decision 27's denial, not decision 18's."""
+    path = under_repo("tests/../x") + "/"
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    reason = assert_trailing_slash_denied(result, "a Write of <repo>/tests/../x/")
+    assert PLAIN_FORM_PHRASE not in reason, reason
+
+
+def test_the_trailing_newline_test_runs_before_the_trailing_slash_check() -> None:
+    """Decision 27, "Where it sits": a path that ends with `/` and then a newline
+    keeps decision 17's trailing-newline denial."""
+    path = under_repo("x") + "/" + "\n"
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    assert_trailing_newline_denied(result, "a Write of <repo>/x/ and a newline")
+
+
+def test_the_edge_check_runs_before_the_trailing_slash_check() -> None:
+    """Decision 27, "Where it sits": directly after decision 26's check, so a path
+    that ends with `/` and then a space keeps decision 26's denial."""
+    path = under_repo("x") + "/" + " "
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    assert_edge_denied(result, "a Write of <repo>/x/ and a space")
+
+
+def test_the_trailing_slash_check_runs_before_the_project_root_check() -> None:
+    """Decision 27, "Where it sits": a root's own spelling that ends with `/` gets
+    decision 27's denial for a Write, not the project-root handling."""
+    path = str(REPO_ROOT) + "/"
+    result = run_architect("Write", path)
+    reason = assert_trailing_slash_denied(result, "architect writing <repo>/")
+    assert ROOT_ITSELF_PHRASE not in reason, reason
+
+
+def test_a_search_path_that_ends_with_a_slash_is_not_covered() -> None:
+    """Decision 27: a Grep's `path` names a directory, and decision 18 keeps one
+    trailing `/` plain there, as T3's test has it."""
+    result = run_configured("test-author", READ_GREP_GLOB, "Grep", "tests/")
+    assert_allowed(result, "test-author Grep of 'tests/'")
+
+
+def test_the_architect_may_write_docs_x_md_without_a_trailing_slash() -> None:
+    """Decision 27's control: the same path without the `/` is in the architect's
+    scope and allowed."""
+    result = run_architect("Write", DOCS_X_PATH)
+    assert_allowed_silently(result, "architect writing docs/x.md")
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in FIELD_SILENT_POLICIES],
+    ids=[case_id for case_id, _ in FIELD_SILENT_POLICIES],
+)
+def test_the_trailing_slash_check_polices_only_in_scope_calls_under_a_guarded_policy(
+    policy: Mapping[str, str],
+) -> None:
+    """Decision 27: a policy that constrains no paths, and a policy scoped to the
+    coder with a call that sets no `agent_type`, are untouched."""
+    path = DOCS_X_PATH + "/"
+    result = run_rooted("Write", policy=policy, file_path=path)
+    assert_allowed_silently(result, f"a Write of <repo>/docs/x.md/ under {dict(policy)!r}")
+
+
+# Decision 20's "The root itself", brief T8 item 5.
+
+ROOT_ITSELF_WRITES: list[tuple[str, str]] = [
+    ("absolute", str(REPO_ROOT)),
+    ("dot", "."),
+    ("trailing-dot", str(REPO_ROOT) + "/."),
+]
+
+ARCHITECT_ROOT_ITSELF: list[tuple[str, str, str]] = [
+    ("Write-absolute", "Write", str(REPO_ROOT)),
+    ("Write-dot", "Write", "."),
+    ("Write-trailing-dot", "Write", str(REPO_ROOT) + "/."),
+    ("Edit-dot", "Edit", "."),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path"),
+    [case[1:] for case in ARCHITECT_ROOT_ITSELF],
+    ids=[case[0] for case in ARCHITECT_ROOT_ITSELF],
+)
+def test_an_architect_edit_or_write_of_the_root_itself_is_refused(
+    tool_name: str, path: str
+) -> None:
+    """Decision 20's "The root itself" and assumption 135: an Edit or Write whose
+    path the project-root check catches names a directory, not a file, and is
+    refused; it used to exit 0."""
+    result = run_architect(tool_name, path)
+    assert_root_itself_denied(result, f"architect {tool_name} of {repo_relative_id(path)!r}")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [case[1] for case in ROOT_ITSELF_WRITES],
+    ids=[case[0] for case in ROOT_ITSELF_WRITES],
+)
+def test_a_guarded_write_of_the_root_itself_is_refused(path: str) -> None:
+    """Decision 20's "The root itself": under an explicit guarded policy too."""
+    result = run_rooted("Write", policy=DENY_TESTS, file_path=path)
+    assert_root_itself_denied(result, f"a Write of {repo_relative_id(path)!r}")
+
+
+def test_a_write_of_dot_under_an_unusable_root_is_refused() -> None:
+    """Decision 20's "The root itself": `.` is never relativised, and keeps the
+    project-root check's handling whatever the root, so under a root that is not
+    usable a Write of `.` is refused with this denial too."""
+    policy = {"PATH_ROOT": "project", "DENY_GLOBS": "packages/*"}
+    result = run_rooted("Write", policy=policy, file_path=".", project_dir="/")
+    assert_root_itself_denied(result, f"a Write of '.', CLAUDE_PROJECT_DIR '/', under {policy}")
+
+
+@pytest.mark.parametrize("tool_name", ["Grep", "Read"])
+def test_a_search_or_read_of_the_root_keeps_the_project_root_denial(tool_name: str) -> None:
+    """Decision 20's "The root itself": a Read, Grep or Glob of a root's spelling
+    keeps the project-root denial."""
+    path = str(REPO_ROOT)
+    result = run_configured_rooted("test-author", READ_GREP_GLOB, tool_name, path)
+    reason = assert_project_root_denied(result, f"test-author {tool_name} of <repo>")
+    assert ROOT_ITSELF_PHRASE not in reason, reason
+    assert TRAILING_SLASH_PHRASE not in reason, reason
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [policy for _, policy in FIELD_SILENT_POLICIES],
+    ids=[case_id for case_id, _ in FIELD_SILENT_POLICIES],
+)
+def test_the_root_itself_rule_polices_only_in_scope_calls_under_a_guarded_policy(
+    policy: Mapping[str, str],
+) -> None:
+    """Decision 20's "The root itself": a policy that constrains no paths, and a
+    caller a policy does not name, are untouched."""
+    result = run_rooted("Write", policy=policy, file_path=".")
+    assert_allowed_silently(result, f"a Write of '.' under {dict(policy)!r}")
+
+
+def test_a_guarded_write_with_no_path_still_exits_0() -> None:
+    """Decision 20's "The root itself" and assumption 135: a Write with no
+    `file_path` has no path for a tool to act on, and still exits 0 at the
+    empty-path check."""
+    result = run_rooted("Write", policy=DENY_TESTS)
+    assert_allowed_silently(result, "a Write with no file_path under DENY_TESTS")
+
+
+# Decision 22's "What git does not show" and decision 12 (g), brief T8 item 7.
+
+
+def run_test_author_write(path: str) -> subprocess.CompletedProcess[str]:
+    """A Write of `path`, relative to the repository, from the test-author under
+    decision 14's Edit|Write entry as an explicit policy, with `cwd` and
+    CLAUDE_PROJECT_DIR the repository root. The path is sent absolute."""
+    return run_rooted(
+        "Write",
+        policy=TEST_AUTHOR_WRITE_POLICY,
+        file_path=under_repo(path),
+        agent_type="test-author",
+        cwd=str(REPO_ROOT),
+        project_dir=str(REPO_ROOT),
+    )
+
+
+def run_coder_write(tmp_path: Path, path: str) -> subprocess.CompletedProcess[str]:
+    """A Write of `path` from the coder under decision 14's Edit|Write entry as an
+    explicit policy, with `cwd` `tmp_path`, its worktree."""
+    return run_rooted(
+        "Write",
+        policy=CODER_WRITE_POLICY,
+        file_path=path,
+        agent_type="coder",
+        cwd=str(tmp_path),
+        project_dir=str(REPO_ROOT),
+    )
+
+
+TEST_AUTHOR_GIT_REFUSED = [
+    "tests/config/.gitignore",
+    "tests/.gitattributes",
+    "packages/hammertime-core/src/hammertime/core/tests/.gitignore",
+    "tests/config/data/test_hidden.py",
+    "tests/config/snapshots/x.json",
+    "tests/x.egg-info/PKG-INFO",
+    "tests/config/build/x.py",
+    "tests/config/x.pyc",
+    "tests/config/a.snap",
+    "tests/config/.env",
+    "tests/config/.hypothesis/x.py",
+    "packages/hammertime-testkit/.DS_Store",
+]
+
+TEST_AUTHOR_GIT_ALLOWED = [
+    "tests/config/test_x.py",
+    "tests/config/fixtures/data.json",
+    "tests/config/databases/x.py",
+    "tests/config/build_x.py",
+]
+
+TEST_AUTHOR_GIT_CASES: list[tuple[str, str]] = [
+    *((path, VERDICT_DENY_GLOBS) for path in TEST_AUTHOR_GIT_REFUSED),
+    *((path, VERDICT_ALLOW) for path in TEST_AUTHOR_GIT_ALLOWED),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "verdict"),
+    TEST_AUTHOR_GIT_CASES,
+    ids=[f"{verdict}-{path}" for path, verdict in TEST_AUTHOR_GIT_CASES],
+)
+def test_the_test_author_write_entry_refuses_what_git_does_not_show(
+    path: str, verdict: str
+) -> None:
+    """Decision 22's "What git does not show" and assumption 136: under the
+    test-author's Edit|Write entry as decision 14 now gives it, a per-directory
+    `.gitignore` or `.gitattributes`, and a path the root `.gitignore` or
+    `.hypothesis/` ignores, is refused with the DENY_GLOBS denial, inside a test
+    directory too. The first case is the one the session reproduced. A name that
+    merely begins like an ignored one is allowed."""
+    result = run_test_author_write(path)
+    assert_verdict(result, verdict, f"test-author writing {path}")
+
+
+CODER_GIT_CASES: list[tuple[str, str]] = [
+    ("{tmp}/services/trie/.gitignore", VERDICT_DENY_GLOBS),
+    ("{tmp}/.gitattributes", VERDICT_DENY_GLOBS),
+    ("{tmp}/services/trie/src/hammertime/trie/data/x.py", VERDICT_DENY_GLOBS),
+    ("{tmp}/services/trie/src/hammertime/trie/x.pyc", VERDICT_DENY_GLOBS),
+    ("{tmp}/.hypothesis/x.py", VERDICT_DENY_GLOBS),
+    ("{tmp}/.gitignore", VERDICT_ALLOW),
+    ("{tmp}/.commit-msg", VERDICT_ALLOW),
+    ("{tmp}/services/trie/src/hammertime/trie/database.py", VERDICT_ALLOW),
+]
+
+
+@pytest.mark.parametrize(
+    ("template", "verdict"),
+    CODER_GIT_CASES,
+    ids=[f"{verdict}-{template}" for template, verdict in CODER_GIT_CASES],
+)
+def test_the_coder_write_entry_refuses_what_git_does_not_show(
+    tmp_path: Path, template: str, verdict: str
+) -> None:
+    """Decision 12 (g) and assumption 136: under the coder's Edit|Write entry as
+    decision 14 now gives it, with `cwd` its worktree, a `.gitignore` below the
+    root, a `.gitattributes` and an ignored path are refused with the DENY_GLOBS
+    denial; the root `.gitignore`, `.commit-msg` and a module whose name merely
+    begins like an ignored directory are allowed."""
+    path = fill(template, tmp_path)
+    result = run_coder_write(tmp_path, path)
+    assert_verdict(result, verdict, f"coder writing {template}")
+
+
+# Decision 22's "Kept in step with `.gitignore`": every pattern of the root
+# `.gitignore` but these two, and the tool cache decision 22's paragraph adds.
+GITIGNORE = REPO_ROOT / ".gitignore"
+GITIGNORE_LEFT_OUT = frozenset({".claude/worktrees/", "/.commit-msg"})
+TOOL_CACHE_PATTERNS = (".hypothesis/",)
+GIT_TEST_DIRECTORY = "tests/config"
+GIT_CODE_DIRECTORY = "services/trie/src/hammertime/trie"
+
+
+def gitignore_patterns() -> list[str]:
+    """Each line of the root `.gitignore` that is neither blank nor a comment, but
+    `.claude/worktrees/` and `/.commit-msg`, then `.hypothesis/`."""
+    patterns: list[str] = []
+    for line in GITIGNORE.read_text(encoding="utf-8").splitlines():
+        pattern = line.strip()
+        if pattern and not pattern.startswith("#") and pattern not in GITIGNORE_LEFT_OUT:
+            patterns.append(pattern)
+    return [*patterns, *TOOL_CACHE_PATTERNS]
+
+
+def ignored_path(directory: str, pattern: str) -> str:
+    """A path under `directory` that `pattern` ignores (brief T8, item 7): for a
+    pattern that ends with `/`, `<directory>/<name>/probe.py`, where `<name>` is
+    the pattern less its `/`; for any other, `<directory>/<name>`; in each
+    `<name>`, every `*` replaced by `x` and `[cod]` by `c`."""
+    name = pattern.removesuffix("/").replace("[cod]", "c").replace("*", "x")
+    if pattern.endswith("/"):
+        return f"{directory}/{name}/probe.py"
+    return f"{directory}/{name}"
+
+
+def deny_globs_failure(result: subprocess.CompletedProcess[str]) -> str | None:
+    """None when `result` is the DENY_GLOBS denial; otherwise what it was."""
+    if result.returncode != 2:
+        return f"exit {result.returncode}, stdout {result.stdout!r}"
+    try:
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+    except (ValueError, KeyError, TypeError):
+        return f"exit 2 with stdout {result.stdout!r}"
+    reason = str(decision.get("permissionDecisionReason", ""))
+    if decision.get("permissionDecision") != "deny":
+        return f"no deny decision: {decision!r}"
+    if not reason.startswith(DENIAL_PREFIX) or DENY_GLOBS_PHRASE not in reason:
+        return f"another refusal: {reason!r}"
+    return None
+
+
+def test_the_git_lists_refuse_what_the_root_gitignore_ignores(tmp_path: Path) -> None:
+    """Decision 22's "What git does not show", "Kept in step with `.gitignore`",
+    and decision 12 (g): for each pattern of the root `.gitignore` but
+    `.claude/worktrees/` and `/.commit-msg`, and for `.hypothesis/`, a path it
+    ignores in a test directory is refused by the test-author's Edit|Write entry,
+    and one in a code tree by the coder's, each as decision 14 now gives it, with
+    the DENY_GLOBS denial. A pattern added to `.gitignore` fails here, naming the
+    pattern, until the lists name it."""
+    patterns = gitignore_patterns()
+    assert len(patterns) > len(TOOL_CACHE_PATTERNS), f"no pattern was read from {GITIGNORE}"
+    failures: list[str] = []
+    for pattern in patterns:
+        path = ignored_path(GIT_TEST_DIRECTORY, pattern)
+        failure = deny_globs_failure(run_test_author_write(path))
+        if failure is not None:
+            failures.append(f"pattern {pattern!r}: test-author writing {path}: {failure}")
+        path = ignored_path(f"{tmp_path}/{GIT_CODE_DIRECTORY}", pattern)
+        failure = deny_globs_failure(run_coder_write(tmp_path, path))
+        if failure is not None:
+            shown = path.replace(str(tmp_path), "<tmp>")
+            failures.append(f"pattern {pattern!r}: coder writing {shown}: {failure}")
+    assert not failures, "these .gitignore patterns are not refused:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize("path", ["tests/config/.gitignore", "tests/config/data/test_hidden.py"])
+def test_configured_test_author_write_policy_refuses_what_git_does_not_show(path: str) -> None:
+    """Decisions 14 and 22, under the configured policy: step W1 applied the
+    test-author's Edit|Write entry, so the session's reproduction is refused with
+    the DENY_GLOBS denial."""
+    result = run_configured_rooted(
+        "test-author",
+        EDIT_WRITE,
+        "Write",
+        under_repo(path),
+        cwd=str(REPO_ROOT),
+        project_dir=str(REPO_ROOT),
+    )
+    assert_verdict(result, VERDICT_DENY_GLOBS, f"test-author writing {path}")
+
+
+def test_configured_coder_write_policy_refuses_a_gitignore_below_the_root_after_step_w() -> None:
+    """Decisions 12 (g) and 14, under the configured policy after step W: the
+    coder's Write of `services/trie/.gitignore` is refused with the DENY_GLOBS
+    denial."""
+    path = "services/trie/.gitignore"
+    result = run_configured_rooted(
+        "coder",
+        EDIT_WRITE,
+        "Write",
+        under_repo(path),
+        cwd=str(REPO_ROOT),
+        project_dir=str(REPO_ROOT),
+    )
+    assert_verdict(result, VERDICT_DENY_GLOBS, f"coder writing {path}")
+
+
+# SA1h's parts 5 and 8, as the session's validation settled them, brief T8 item 8:
+# what does not occur.
+
+CONTROL_INSIDE_DOCS: list[tuple[str, str]] = [
+    ("del", "do" + "\x7f" + "cs/x.md"),
+    ("u0001", "do" + "\x01" + "cs/x.md"),
+]
+
+
+def assert_allow_globs_denied_with_name(
+    result: subprocess.CompletedProcess[str], name: str, what: str
+) -> None:
+    """The ALLOW_GLOBS denial, whose quoted path holds `name`, byte for byte."""
+    reason = assert_denied(result, what)
+    assert reason.startswith(DENIAL_PREFIX), reason
+    assert "ALLOW_GLOBS" in reason, f"expected the ALLOW_GLOBS denial for {what}: {reason!r}"
+    assert name in reason, (
+        f"the ALLOW_GLOBS denial for {what} must quote the path with its byte present.\n"
+        f"reason: {reason!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [case[1] for case in CONTROL_INSIDE_DOCS],
+    ids=[case[0] for case in CONTROL_INSIDE_DOCS],
+)
+def test_a_control_byte_inside_an_architect_path_is_judged_with_the_byte(name: str) -> None:
+    """SA1h's part 5 and assumption 138: a U+007F or a U+0001 inside a path is not
+    dropped on the way in, so `do<byte>cs/x.md` is outside the architect's
+    `docs/*` and refused with the ALLOW_GLOBS denial, which quotes the byte."""
+    path = under_repo(name)
+    result = run_architect("Write", path)
+    assert_allow_globs_denied_with_name(result, name, f"architect writing {edge_id(path)}")
+
+
+def test_a_raw_del_inside_an_architect_path_is_judged_with_the_byte() -> None:
+    """SA1h's part 5 and assumption 138: the same with the U+007F raw in the
+    payload."""
+    name = CONTROL_INSIDE_DOCS[0][1]
+    policy, script = configured_policy("architect", EDIT_WRITE)
+    payload = tool_payload("Write", {"file_path": under_repo(name)}, agent_type="architect")
+    stdin = raw_del(payload)
+    assert "\x7f" in stdin, "the payload must hold a raw U+007F"
+    result = run_guard_stdin(stdin, policy=policy, script=script)
+    assert_allow_globs_denied_with_name(result, name, "architect writing do, a raw DEL, cs/x.md")
+
+
+def test_a_raw_del_at_the_end_of_an_architect_path_gets_decision_26s_denial() -> None:
+    """SA1h's part 5 and assumption 138: a raw U+007F after `docs/x.md` is kept,
+    and decision 26 refuses it."""
+    policy, script = configured_policy("architect", EDIT_WRITE)
+    payload = tool_payload("Write", {"file_path": DOCS_X_PATH + "\x7f"}, agent_type="architect")
+    stdin = raw_del(payload)
+    assert "\x7f" in stdin, "the payload must hold a raw U+007F"
+    result = run_guard_stdin(stdin, policy=policy, script=script)
+    assert_edge_denied(result, "architect writing <repo>/docs/x.md and a raw DEL")
+
+
+def test_a_glob_pattern_that_ends_with_a_newline_is_refused() -> None:
+    """SA1h's part 8 and assumption 138: decision 21's grammar is anchored at the
+    very end, so `*.py` and a newline is refused with decision 21's denial."""
+    tool_input = {"path": "tests", "pattern": "*.py" + "\n"}
+    result = run_test_author_search("Glob", tool_input)
+    what = f"test-author Glob with tool_input {tool_input!r}"
+    assert_denied_with(result, PATTERN_MESSAGE, PATTERN_PHRASE, what)
+
+
+def test_a_dash_value_nested_in_an_array_is_refused() -> None:
+    """SA1h's part 8 and assumptions 133 and 138: rule 1 reaches a string nested in
+    an array."""
+    tool_input = {"path": "tests", "pattern": "x", "type": ["-u"]}
+    result = run_test_author_search("Grep", tool_input)
+    assert_search_value_denied(result, f"test-author Grep with tool_input {tool_input!r}")
+
+
+def test_numbers_and_booleans_in_a_grep_are_passed_over() -> None:
+    """SA1h's part 8 and assumptions 133 and 138: rule 1 reads strings only, so a
+    Grep's numeric and boolean options are allowed."""
+    tool_input = {"path": "tests", "pattern": "x", "-n": True, "-A": 2, "head_limit": 5}
+    result = run_test_author_search("Grep", tool_input)
+    assert_allowed_silently(result, f"test-author Grep with tool_input {tool_input!r}")
+
+
+# Decision 26's ninth-amendment note, brief T8 item 9: its list against the
+# installed Python's Unicode database.
+
+UNICODE_EDGE_CATEGORIES = frozenset({"Cc", "Zs", "Zl", "Zp"})
+
+
+def unicode_edge_code_points() -> list[int]:
+    """Every code point for which the installed Python's `str.isspace` holds, or
+    whose Unicode category is Cc, Zs, Zl or Zp, and U+180E and U+FEFF."""
+    points = {0x180E, 0xFEFF}
+    for code in range(sys.maxunicode + 1):
+        character = chr(code)
+        if character.isspace() or unicodedata.category(character) in UNICODE_EDGE_CATEGORIES:
+            points.add(code)
+    return sorted(points)
+
+
+UNICODE_EDGE_CODE_POINTS = unicode_edge_code_points()
+UNICODE_EDGE_IDS = [f"U+{code:04X}" for code in UNICODE_EDGE_CODE_POINTS]
+
+
+@pytest.mark.parametrize("position", ["first", "last"])
+@pytest.mark.parametrize("code", UNICODE_EDGE_CODE_POINTS, ids=UNICODE_EDGE_IDS)
+def test_every_unicode_space_or_control_at_either_end_is_refused(code: int, position: str) -> None:
+    """Decision 26, its ninth-amendment note, and assumption 141: each such code
+    point at either end of an architect Write's path is refused: U+0000 with
+    decision 17's NUL denial, U+000A at the end with the trailing-newline denial,
+    and every other with decision 26's denial."""
+    character = chr(code)
+    path = DOCS_X_PATH + character if position == "last" else character + DOCS_X_PATH
+    result = run_architect("Write", path)
+    what = f"architect writing {edge_id(path)}"
+    if code == 0:
+        assert_denied_with(result, NUL_MESSAGE, NUL_PHRASE, what)
+    elif code == 0x0A and position == "last":
+        assert_trailing_newline_denied(result, what)
+    else:
+        assert_edge_denied(result, what)
+
+
+# Decision 14's last entry, decision 24 and Question 13's answer, brief T8 item
+# 10: MCP tools for the fenced agents.
+
+MCP_CALLS: list[tuple[str, str, dict[str, Any]]] = [
+    ("get-me", "mcp__github__get_me", {}),
+    ("write-file", "mcp__probe__write_file", {"path": "docs/x.md", "content": "x"}),
+]
+
+
+def run_mcp(
+    tool_name: str, tool_input: Mapping[str, Any], agent_type: str | None
+) -> subprocess.CompletedProcess[str]:
+    """A call from `tool_name` under decision 14's last entry, as an explicit
+    policy, with `cwd` and CLAUDE_PROJECT_DIR the repository root."""
+    stdin = tool_payload(tool_name, tool_input, cwd=str(REPO_ROOT), agent_type=agent_type)
+    return run_guard_stdin(stdin, policy=MCP_POLICY, project_dir=str(REPO_ROOT))
+
+
+@pytest.mark.parametrize("agent_type", ["coder", "test-author", "architect"])
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in MCP_CALLS],
+    ids=[case[0] for case in MCP_CALLS],
+)
+def test_an_mcp_tool_from_a_fenced_agent_is_refused(
+    tool_name: str, tool_input: dict[str, Any], agent_type: str
+) -> None:
+    """Decision 14's last entry, decision 24's rule 1 and assumption 155: every MCP
+    tool the coder, the test-author or the architect calls is refused with
+    decision 24's denial, whatever its input."""
+    result = run_mcp(tool_name, tool_input, agent_type)
+    assert_field_denied(result, f"{agent_type} calling {tool_name}")
+
+
+@pytest.mark.parametrize("agent_type", ["security-auditor", None], ids=["auditor", "no-agent"])
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [case[1:] for case in MCP_CALLS],
+    ids=[case[0] for case in MCP_CALLS],
+)
+def test_an_mcp_tool_from_a_caller_the_entry_does_not_name_is_untouched(
+    tool_name: str, tool_input: dict[str, Any], agent_type: str | None
+) -> None:
+    """Decision 14's last entry: the security-auditor, whom the entry does not
+    name, and a call with no `agent_type` pass through the routing silently."""
+    result = run_mcp(tool_name, tool_input, agent_type)
+    assert_allowed_silently(result, f"agent_type={agent_type!r} calling {tool_name}")

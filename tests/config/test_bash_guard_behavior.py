@@ -77,6 +77,21 @@ pins. Group R's decision 7 cases fail until brief C9 lands, except their
 controls and the target of a link, which pass today; its cases under the
 configured coder policy fail until step W as well; its decision 19 cases pass
 today.
+
+ADR-0018's ninth amendment (2026-10-04), with its follow-ups of 2026-10-05,
+adds group S (brief T8). Decision 19, part 7: every check that reads a `jq`
+status passes on status 0 alone, so a check whose `jq` exits 1, or never runs,
+refuses, a raw U+0002 now names status 1, and a `jq` that exits 1 meets the
+shape denial; and part 1's flag is the script's own, so a `denying` in the
+hook's environment changes nothing. Decision 28 refuses, in literal mode, a
+Bash call whose `run_in_background` is anything but absent, `null` or `false`,
+after decision 25's bound and before the literal check. Decision 12 (g) adds the
+files git does not show to the coder's `WRITE_DENY_GLOBS`. SA1h's refuted
+findings are pinned: a `[subscript]=value` word is not an assignment, and a
+U+0001 or U+007F neither vanishes nor splits a word. Group S's wrapper cases,
+its `denying` case, decision 28's refusals and its `python3 -V` order case, and
+the changed existing tests, fail until brief C10 lands; the rest of group S
+passes today.
 """
 
 import json
@@ -1730,25 +1745,29 @@ def test_the_well_formed_payload_is_judged_as_before(
 
 
 @NEEDS_BIN_SH
-def test_a_bash_guard_that_fails_after_the_shape_check_gets_the_backstop_denial(
+def test_a_bash_guard_whose_jq_exits_1_gets_the_shape_denial_on_stderr(
     tmp_path: Path,
 ) -> None:
-    """Decision 19, parts 1 and 3, and assumption 56: with a `jq` that exits 1 and
-    prints nothing, the shape check reads status 1 and passes, the first
-    extraction line fails, and the `EXIT` trap denies with the backstop text. It
-    carries no decision 11 paragraph under any DENY_ADVICE. With the real `jq`,
-    the same command is allowed."""
+    """Decision 19, parts 2, 3 and 7, and assumption 146: with a `jq` that exits 1
+    and prints nothing, the shape check reads status 1, which no longer passes,
+    since a check passes on status 0 alone (part 7), so the shape denial follows,
+    naming status 1; `deny`'s own `jq` fails too, so the reason `deny` builds,
+    decision 11's paragraph included, goes to stderr, and the exit is still 2.
+    With the real `jq`, the same command is allowed."""
     payload = bash_payload("coder")
     assert_allowed(run_guard_stdin(payload, policy=CODER_POLICY), "git status with the real jq")
     write_failing_jq(tmp_path, 1)
     result = run_guard_stdin(payload, policy=CODER_POLICY, jq_dir=tmp_path)
     what = "git status under the coder policy with a jq that exits 1"
-    reason = assert_denied(result, what)
-    assert BACKSTOP_PHRASE in reason, reason
-    assert FINAL_SENTENCE not in reason, reason
-    assert BASH_BACKSTOP_PATTERN.fullmatch(reason), (
-        f"the backstop denial for {what} must be decision 19's text verbatim, with N a "
-        f"status number, and no paragraph.\nreason: {reason!r}"
+    assert result.returncode == 2, (
+        f"expected the guard to DENY {what} (exit 2), got exit {result.returncode}.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert result.stdout == "", f"expected nothing on stdout for {what}; got {result.stdout!r}"
+    expected = BASH_SHAPE_TEMPLATE.replace("status N", "status 1") + f" {FINAL_PARAGRAPH}"
+    assert expected in result.stderr, (
+        f"expected the bash shape denial, naming status 1, and decision 11's paragraph on "
+        f"stderr for {what}.\nstderr: {result.stderr!r}"
     )
 
 
@@ -1799,8 +1818,10 @@ MIB = 1024 * 1024
 OVER_8_MIB = 9 * MIB
 JUST_UNDER_8_MIB = 8 * MIB - 4096
 
-# Decision 19's table: a raw NUL or U+0002 gets the shape denial naming status 0.
-SHAPE_STATUS_0 = "(the check ended with status 0)"
+# Decision 19's table, as the ninth amendment leaves it: a raw NUL or U+0002 gets
+# the shape denial naming status 1, the status of a malformed payload since a
+# check passes on status 0 alone (part 7; brief T8).
+SHAPE_STATUS_1 = "(the check ended with status 1)"
 
 TESTKIT_FILE = "packages/hammertime-testkit/src/hammertime/testkit/generators.py"
 
@@ -1889,14 +1910,14 @@ def test_a_payload_holding_a_raw_nul_or_u0002_gets_the_bash_shape_denial(
 ) -> None:
     """Decision 19, part 3 as amended, and its table: the payload is read with
     each raw NUL kept as U+0002, and a payload holding a raw U+0002 is
-    malformed, with status 0, before the routing and under every policy. Before,
+    malformed, with status 1, before the routing and under every policy. Before,
     a raw NUL was dropped unseen."""
     stdin = raw_byte_stdin(case, agent_type)
     assert "\x00" in stdin or "\x02" in stdin, "the payload must hold a raw byte"
     result = run_guard_stdin(stdin, policy=policy)
     what = f"the {case} payload from agent_type={agent_type!r} under {dict(policy)!r}"
     body = shape_denial_body(result, policy, what)
-    assert SHAPE_STATUS_0 in body, body
+    assert SHAPE_STATUS_1 in body, body
 
 
 @pytest.mark.parametrize(
@@ -1924,7 +1945,7 @@ def test_a_raw_nul_in_a_command_allowed_without_it_gets_the_bash_shape_denial() 
     assert "\x00" in stdin, "the payload must hold a raw NUL"
     result = run_guard_stdin(stdin, policy=CODER_POLICY)
     body = shape_denial_body(result, CODER_POLICY, f"{command!r} with a raw NUL, as the coder")
-    assert SHAPE_STATUS_0 in body, body
+    assert SHAPE_STATUS_1 in body, body
 
 
 def test_a_bash_payload_just_under_8_mib_is_judged_as_before() -> None:
@@ -1979,10 +2000,12 @@ WRAPPER_JQ_HEAD = sh_lines(
     "}",
 )
 
-# Item 7: prints nothing, and exits 1 for the shape check and 2 for every other call.
+# Item 7: prints nothing, and exits 0 for the shape check and 2 for every other call.
+# The shape check passes on status 0 alone (decision 19, part 7; brief T8), so 0
+# is what lets it pass.
 STATUS_2_RULE = sh_lines(
     "cat >/dev/null",
-    'if [ "$slurp" = 1 ]; then exit 1; fi',
+    'if [ "$slurp" = 1 ]; then exit 0; fi',
     "exit 2",
 )
 
@@ -2280,9 +2303,10 @@ def test_configured_coder_bash_policy_refuses_formatting_the_testkit_after_step_
 # symbolic links decision 7's cases need are created inside `tmp_path`, which is
 # the payload's `cwd`.
 
-# Decision 14's coder Bash WRITE_DENY_GLOBS, copied from its text. It equals the
-# coder's Edit|Write DENY_GLOBS there. Unlike DECISION_12_GLOBS, it holds the
-# testkit's globs (decision 12 (f)).
+# Decision 14's coder Bash WRITE_DENY_GLOBS, copied from its text as the ninth
+# amendment leaves it, with decision 12 (g)'s globs after `uv.lock` (brief T8). It
+# equals the coder's Edit|Write DENY_GLOBS there. Unlike DECISION_12_GLOBS, it
+# holds the testkit's globs (decision 12 (f)).
 DECISION_14_CODER_GLOBS = (
     "tests tests/* */tests */tests/* packages/hammertime-testkit "
     "packages/hammertime-testkit/* docs/spec/* docs/adr/* docs/protocol/* schemas/* "
@@ -2295,7 +2319,13 @@ DECISION_14_CODER_GLOBS = (
     ".ruff.toml */.ruff.toml */ruff.toml uv.toml */uv.toml .python-version "
     "*/.python-version sitecustomize.py */sitecustomize.py usercustomize.py "
     "*/usercustomize.py pytest pytest/* ruff ruff/* mypy mypy/* GNUmakefile makefile "
-    "uv.lock"
+    "uv.lock */.gitignore .gitattributes */.gitattributes *.py[cod] *.py[cod]/* venv/* "
+    "*/venv/* .env */.env .env/* */.env/* .uv/* */.uv/* uv.lock.bak */uv.lock.bak "
+    "uv.lock.bak/* */uv.lock.bak/* dist/* */dist/* build/* */build/* *.egg-info/* "
+    ".pytest_cache/* */.pytest_cache/* .ruff_cache/* */.ruff_cache/* .mypy_cache/* "
+    "*/.mypy_cache/* .coverage */.coverage .coverage/* */.coverage/* htmlcov/* */htmlcov/* "
+    "data/* */data/* snapshots/* */snapshots/* *.snap *.snap/* .DS_Store */.DS_Store "
+    ".DS_Store/* */.DS_Store/* .hypothesis/* */.hypothesis/*"
 )
 
 # Decision 7, "Write-mode operands, the list's refusal and links": the phrases
@@ -2538,3 +2568,404 @@ def test_the_coder_segments_and_blanks_are_split_as_before(tmp_path: Path, comma
     """Decision 19, part 6: in literal mode, a pipe between two allowed commands
     and two blanks between words leave each segment what it was."""
     assert_allowed(coder(command, tmp_path), command)
+
+
+# --- S. the ninth amendment (decisions 7, 12 (g), 19 and 28) --------------------
+#
+# ADR-0018's ninth amendment (2026-10-04), with its follow-ups of 2026-10-05,
+# brief T8. A control character goes in the Python command string, written as its
+# escape; `json.dumps` writes it as a JSON escape. A raw U+007F goes in the JSON
+# text itself (`raw_del`), as `raw_bytes` puts a raw NUL there.
+
+# Decision 28's denial, verbatim, with the ADR's blockquote line breaks joined by
+# single spaces. It is ASCII only.
+BACKGROUND_MESSAGE = (
+    "Hammertime bash guard: the command asks to run in the background "
+    "(run_in_background), and this guard vets each command as one call that "
+    "ends before the next is vetted, so a command left running could act "
+    "between a later command's check and its run. Run it in the foreground. "
+    "The command is refused."
+)
+BACKGROUND_PHRASE = "run_in_background"
+
+# The texts the wrapper `jq`s key on, each from the ADR's recommended filter for its
+# check (brief T8, "Building the payloads"): the NUL gate, the extraction check
+# and decision 28's check.
+NUL_GATE_KEY = "any(. == 0)"
+EXTRACTION_CHECK_KEY = "def rendered"
+DECISION_28_KEY = "run_in_background"
+
+GIT_STATUS_AS_CODER = command_payload("git status", agent_type="coder")
+GIT_STATUS_AS_AUDITOR = command_payload("git status", agent_type="security-auditor")
+PYTHON_AS_CODER = command_payload(PYTHON_COMMAND, agent_type="coder")
+
+
+def status_1_rule(key: str) -> str:
+    """Brief T8, item 1: for the one call whose arguments hold `key`, read stdin to
+    its end, print nothing and exit 1; every other call runs the real `jq`."""
+    return sh_lines(
+        f"if has {shlex.quote(key)}; then",
+        "  cat >/dev/null",
+        "  exit 1",
+        "fi",
+    )
+
+
+def raw_del(text: str) -> str:
+    """`text`, a JSON text, with each JSON escape of U+007F replaced by that
+    character itself (brief T8). JSON admits a raw U+007F inside a string."""
+    return text.replace("\\u007f", "\x7f")
+
+
+def background_payload(command: str, run_in_background: Any, *, agent_type: str | None) -> str:
+    """A well-formed Bash payload for `command`, from `agent_type`, as JSON text,
+    with `cwd` the repository root and `tool_input.run_in_background` set to
+    `run_in_background`, or left out when it is ABSENT."""
+    tool_input: dict[str, Any] = {"command": command}
+    if run_in_background is not ABSENT:
+        tool_input["run_in_background"] = run_in_background
+    payload: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": tool_input,
+        "cwd": str(REPO_ROOT),
+    }
+    if agent_type is not None:
+        payload["agent_type"] = agent_type
+    return json.dumps(payload)
+
+
+# Decision 19, part 7, brief T8 item 1: a check passes on status 0 alone. Each
+# wrapper `jq` makes the one call keyed on its text exit 1, and leaves every other
+# call to the real `jq`.
+
+CODER_WRAPPER_CASES: list[tuple[str, str, str]] = [
+    ("nul-gate", NUL_GATE_KEY, f"{NUL_MESSAGE} {FINAL_PARAGRAPH}"),
+    ("background-check", DECISION_28_KEY, f"{BACKGROUND_MESSAGE} {FINAL_PARAGRAPH}"),
+]
+
+
+@NEEDS_BIN_SH
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [case[1:] for case in CODER_WRAPPER_CASES],
+    ids=[case[0] for case in CODER_WRAPPER_CASES],
+)
+def test_a_coder_check_whose_jq_exits_1_refuses_with_its_denial(
+    tmp_path: Path, key: str, expected: str
+) -> None:
+    """Decision 19, part 7, decisions 3, 11 and 28, and assumption 131: as the
+    coder, a NUL gate whose `jq` exits 1 gets decision 11's NUL denial, although
+    the command holds no NUL, and decision 28's check whose `jq` exits 1 gets
+    decision 28's denial, each with decision 11's paragraph; before part 7,
+    status 1 passed. With the real `jq`, `git status` is allowed."""
+    control = run_guard_stdin(GIT_STATUS_AS_CODER, policy=CODER_POLICY)
+    assert_allowed(control, "git status, as the coder, with the real jq")
+    write_wrapper_jq(tmp_path, status_1_rule(key))
+    result = run_guard_stdin(GIT_STATUS_AS_CODER, policy=CODER_POLICY, jq_dir=tmp_path)
+    reason = assert_denied(result, f"git status, as the coder, {key!r} exiting 1")
+    assert reason == expected, f"expected {expected!r}\nreason:   {reason!r}"
+
+
+@NEEDS_BIN_SH
+def test_a_bash_extraction_check_exiting_1_gets_the_backstop_denial(tmp_path: Path) -> None:
+    """Decision 19, parts 4 and 7: as the coder, an extraction check whose `jq`
+    exits 1 ends the script with status 3, which the trap names in the backstop
+    denial; before part 7, status 1 passed. With the real `jq`, `git status` is
+    allowed."""
+    control = run_guard_stdin(GIT_STATUS_AS_CODER, policy=CODER_POLICY)
+    assert_allowed(control, "git status, as the coder, with the real jq")
+    write_wrapper_jq(tmp_path, status_1_rule(EXTRACTION_CHECK_KEY))
+    result = run_guard_stdin(GIT_STATUS_AS_CODER, policy=CODER_POLICY, jq_dir=tmp_path)
+    assert_bash_backstop_status(result, 3, "git status, as the coder, extraction check failing")
+
+
+@NEEDS_BIN_SH
+def test_an_auditor_nul_gate_exiting_1_refuses_without_the_paragraph(tmp_path: Path) -> None:
+    """Decision 19, part 7, and decisions 3 and 11: as the auditor, a NUL gate
+    whose `jq` exits 1 gets decision 11's NUL denial, with no paragraph, since the
+    auditor sets no DENY_ADVICE. With the real `jq`, `git status` is allowed."""
+    control = run_guard_stdin(GIT_STATUS_AS_AUDITOR, policy=AUDITOR_POLICY)
+    assert_allowed(control, "git status, as the auditor, with the real jq")
+    write_wrapper_jq(tmp_path, status_1_rule(NUL_GATE_KEY))
+    result = run_guard_stdin(GIT_STATUS_AS_AUDITOR, policy=AUDITOR_POLICY, jq_dir=tmp_path)
+    reason = assert_denied(result, "git status, as the auditor, the NUL gate exiting 1")
+    assert reason == NUL_MESSAGE, f"expected {NUL_MESSAGE!r}\nreason:   {reason!r}"
+
+
+# Decision 19, part 1, its ninth-amendment note, brief T8 item 2: the trap's flag.
+
+
+@NEEDS_BIN_SH
+def test_a_bash_denying_flag_in_the_environment_does_not_silence_the_backstop(
+    tmp_path: Path,
+) -> None:
+    """Decision 19, part 1, its ninth-amendment note, and assumption 132: the
+    script sets `denying=0` itself before the trap, so `denying=1` in the hook's
+    environment cannot let a status 2 that `deny` did not make end the guard with
+    no reason. With STATUS_2_RULE the first extraction line ends the script with
+    status 2, and the trap names it in the backstop denial."""
+    write_wrapper_jq(tmp_path, STATUS_2_RULE)
+    policy = {**CODER_POLICY, "denying": "1"}
+    result = run_guard_stdin(GIT_STATUS_AS_CODER, policy=policy, jq_dir=tmp_path)
+    assert_bash_backstop_status(result, 2, "git status, as the coder, with denying=1")
+
+
+def dev_full_env(policy: Mapping[str, str], jq_dir: Path | None) -> dict[str, str]:
+    """`run_guard_stdin`'s environment: the policy variables cleared,
+    CLAUDE_PROJECT_DIR the repository root, `jq_dir` first on `PATH` when given,
+    then `policy`."""
+    env = dict(os.environ)
+    for name in ROOTED_POLICY_VARS:
+        env.pop(name, None)
+    env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
+    if jq_dir is not None:
+        env["PATH"] = f"{jq_dir}:{os.environ.get('PATH', '')}"
+    env.update(policy)
+    return env
+
+
+def run_guard_stdin_stdout_full(
+    stdin: str,
+    *,
+    policy: Mapping[str, str],
+    jq_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`run_guard_stdin_stderr_full`'s sibling with the guard's stdout opened on
+    `/dev/full`, where every write fails, and its stderr captured (brief T8, item
+    2). `stdout` is None."""
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+    with open("/dev/full", "w", encoding="utf-8") as full:
+        return subprocess.run(
+            [BASH or "bash", str(GUARD)],
+            input=stdin,
+            stdout=full,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=dev_full_env(policy, jq_dir),
+            timeout=30,
+            check=False,
+        )
+
+
+def run_guard_stdin_both_full(
+    stdin: str,
+    *,
+    policy: Mapping[str, str],
+    jq_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`run_guard_stdin_stderr_full`'s sibling with both the guard's stdout and its
+    stderr opened on `/dev/full` (brief T8, item 2). `stdout` and `stderr` are
+    None."""
+    assert GUARD.is_file(), f"{GUARD} does not exist, so no guard can run"
+    with open("/dev/full", "w", encoding="utf-8") as full:
+        return subprocess.run(
+            [BASH or "bash", str(GUARD)],
+            input=stdin,
+            stdout=full,
+            stderr=full,
+            text=True,
+            env=dev_full_env(policy, jq_dir),
+            timeout=30,
+            check=False,
+        )
+
+
+@NEEDS_DEV_FULL
+def test_a_bash_denial_whose_stdout_fails_exits_2_with_the_reason_on_stderr() -> None:
+    """Decision 19, parts 1 and 2, and assumption 132: with the guard's stdout on
+    `/dev/full` and the real `jq`, `deny`'s `jq` cannot write the JSON deny, so the
+    reason `deny` builds, decision 11's paragraph included, goes to stderr, and the
+    exit is 2."""
+    result = run_guard_stdin_stdout_full(PYTHON_AS_CODER, policy=CODER_POLICY)
+    what = f"{PYTHON_COMMAND}, as the coder, with stdout on /dev/full"
+    assert result.returncode == 2, (
+        f"expected the guard to DENY {what} (exit 2), got exit {result.returncode}.\n"
+        f"stderr: {result.stderr}"
+    )
+    denials = [
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith(PREFIX) and line.endswith(f" {FINAL_PARAGRAPH}")
+    ]
+    assert denials, (
+        f"expected the denial and decision 11's paragraph on stderr for {what}.\n"
+        f"stderr: {result.stderr!r}"
+    )
+    assert_phrase(denials[0], "uv run --locked pytest", what)
+
+
+@NEEDS_DEV_FULL
+def test_a_bash_denial_whose_stdout_and_stderr_fail_still_exits_2() -> None:
+    """Decision 19, parts 1 and 2, and assumption 132: with both streams on
+    `/dev/full`, no reason can be written anywhere, and the exit is still 2."""
+    result = run_guard_stdin_both_full(PYTHON_AS_CODER, policy=CODER_POLICY)
+    assert result.returncode == 2, (
+        f"expected the guard to DENY {PYTHON_COMMAND}, as the coder, with both streams on "
+        f"/dev/full (exit 2), got exit {result.returncode}"
+    )
+
+
+# Decision 28, brief T8 item 6: no background run in literal mode.
+
+BACKGROUND_REFUSED: list[tuple[str, str, Any]] = [
+    ("git-status-true", "git status", True),
+    ("git-status-string-true", "git status", "true"),
+    ("git-status-one", "git status", 1),
+    ("git-status-string-yes", "git status", "yes"),
+    ("pytest-then-merge-true", "uv run --locked pytest -q; git merge --ff-only probe-ref", True),
+]
+
+
+@pytest.mark.parametrize(
+    ("command", "value"),
+    [case[1:] for case in BACKGROUND_REFUSED],
+    ids=[case[0] for case in BACKGROUND_REFUSED],
+)
+def test_a_coder_command_asked_to_run_in_the_background_is_refused(
+    command: str, value: Any
+) -> None:
+    """Decision 28 and assumption 137: in literal mode, a Bash call whose
+    `run_in_background` is anything but absent, `null` or `false` is refused with
+    decision 28's denial and decision 11's paragraph, a string `"true"` included.
+    The last case is the one the session ran: the guard did not read the field."""
+    stdin = background_payload(command, value, agent_type="coder")
+    what = f"{command!r} with run_in_background={value!r}, as the coder"
+    reason = assert_denied(run_guard_stdin(stdin, policy=CODER_POLICY), what)
+    assert_phrase(reason, BACKGROUND_PHRASE, what)
+    expected = f"{BACKGROUND_MESSAGE} {FINAL_PARAGRAPH}"
+    assert reason == expected, f"expected {expected!r}\nreason:   {reason!r}"
+
+
+@pytest.mark.parametrize("value", [False, None, ABSENT], ids=["false", "null", "absent"])
+def test_a_coder_command_in_the_foreground_is_allowed(value: Any) -> None:
+    """Decision 28's controls: `run_in_background` `false`, `null` or absent is a
+    foreground run, and `git status` is allowed."""
+    stdin = background_payload("git status", value, agent_type="coder")
+    shown = "absent" if value is ABSENT else repr(value)
+    result = run_guard_stdin(stdin, policy=CODER_POLICY)
+    assert_allowed(result, f"git status with run_in_background {shown}, as the coder")
+
+
+BACKGROUND_ORDER: list[tuple[str, str, str]] = [
+    ("nul", "git status" + "\x00", f"{NUL_MESSAGE} {FINAL_PARAGRAPH}"),
+    ("16385-characters", OVER_THE_BOUND, f"{BOUND_MESSAGE} {FINAL_PARAGRAPH}"),
+    ("python3-V", "python3 -V", f"{BACKGROUND_MESSAGE} {FINAL_PARAGRAPH}"),
+]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [case[1:] for case in BACKGROUND_ORDER],
+    ids=[case[0] for case in BACKGROUND_ORDER],
+)
+def test_the_background_check_sits_after_the_nul_gate_and_the_bound(
+    command: str, expected: str
+) -> None:
+    """Decision 28, "Where it sits": after decision 3's NUL gate and decision 25's
+    bound, which keep their denials, and before the literal check and every
+    per-command rule, so `python3 -V` gets decision 28's denial, not the
+    not-allowed denial."""
+    assert len(OVER_THE_BOUND) == 16385
+    stdin = background_payload(command, True, agent_type="coder")
+    what = f"a command of {len(command)} characters with run_in_background true, as the coder"
+    reason = assert_denied(run_guard_stdin(stdin, policy=CODER_POLICY), what)
+    assert reason == expected, f"expected {expected[:200]!r}...\nreason:   {reason!r}"
+
+
+def test_the_auditor_may_run_a_command_in_the_background() -> None:
+    """Decision 28: the auditor's non-literal policy does not change."""
+    stdin = background_payload("git status", True, agent_type="security-auditor")
+    result = run_guard_stdin(stdin, policy=AUDITOR_POLICY)
+    assert_allowed(result, "git status with run_in_background true, as the auditor")
+
+
+def test_the_background_rule_does_not_police_a_caller_outside_the_policy_scope() -> None:
+    """Decision 28, "Where it sits": after the routing, so a call with no
+    `agent_type` under the coder's policy passes through."""
+    stdin = background_payload("git status", True, agent_type=None)
+    result = run_guard_stdin(stdin, policy=CODER_POLICY)
+    assert_allowed(result, "git status with run_in_background true and no agent_type")
+
+
+# Decision 12 (g), brief T8 item 7: the coder's WRITE_DENY_GLOBS refuse what git
+# does not show.
+
+
+def test_ruff_format_refuses_a_module_under_an_ignored_directory(tmp_path: Path) -> None:
+    """Decisions 7 and 12 (g): under decision 14's coder list, `data/` at any depth
+    is ignored by the root `.gitignore`, so a write-mode `ruff format` of a module
+    there gets the list's refusal."""
+    command = "uv run --locked ruff format services/trie/src/hammertime/trie/data/x.py"
+    result = coder_decision_14(command, tmp_path)
+    assert_write_mode_denied(result, command, LIST_REFUSAL_PHRASE)
+
+
+def test_ruff_format_allows_a_module_named_like_an_ignored_directory(tmp_path: Path) -> None:
+    """Decision 12 (g)'s control: `database.py` is not under `data/`."""
+    command = "uv run --locked ruff format services/trie/src/hammertime/trie/database.py"
+    assert_allowed(coder_decision_14(command, tmp_path), command)
+
+
+# SA1h's part 2, as the session's validation settled it, brief T8 item 8: what does
+# not occur, under the auditor's policy.
+
+SUBSCRIPT_WORD_COMMANDS: list[tuple[str, str]] = [
+    ("index-zero", "python3 -c pass [0]=cat"),
+    ("more-segments", "ls [more_segments=0,1]=x ; python3 -V"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [case[1] for case in SUBSCRIPT_WORD_COMMANDS],
+    ids=[case[0] for case in SUBSCRIPT_WORD_COMMANDS],
+)
+def test_a_subscript_assignment_word_is_vetted_as_a_word(tmp_path: Path, command: str) -> None:
+    """SA1h's part 2 and assumption 138: a word `[subscript]=value` from a
+    segment's split is a literal word, not an indexed assignment, so the
+    segments are what they were and `python3` is refused by name."""
+    what = f"{command!r} (auditor)"
+    reason = assert_denied(auditor(command, tmp_path), what)
+    assert_phrase(reason, "python3", what)
+
+
+CONTROL_BYTE_WORDS: list[tuple[str, str]] = [
+    ("l-u0001-s", "l" + "\x01" + "s"),
+    ("l-del-s", "l" + "\x7f" + "s"),
+    ("ls-u0001-la", "ls" + "\x01" + "-la"),
+]
+
+
+def assert_not_on_the_auditors_list(result: subprocess.CompletedProcess[str], what: str) -> None:
+    """The auditor's denial of a command its ALLOW_CMDS does not list, which says
+    `needs-validation`, and no other refusal."""
+    reason = assert_denied(result, what)
+    assert_phrase(reason, "needs-validation", what)
+    for phrase in ("NUL byte", SHAPE_PHRASE, BACKSTOP_PHRASE, BOUND_PHRASE):
+        assert phrase not in reason, f"expected the not-allowed denial for {what}: {reason!r}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [case[1] for case in CONTROL_BYTE_WORDS],
+    ids=[case[0] for case in CONTROL_BYTE_WORDS],
+)
+def test_a_control_byte_neither_vanishes_from_nor_splits_a_word(
+    tmp_path: Path, command: str
+) -> None:
+    """SA1h's part 2 and assumption 138: a U+0001 or a U+007F inside the first
+    word is kept in it, so the word is not `ls`, and `ls` is not split from
+    `-la`: each command is refused as one the auditor's list does not hold."""
+    assert_not_on_the_auditors_list(auditor(command, tmp_path), f"{command!a} (auditor)")
+
+
+def test_a_raw_del_neither_vanishes_from_nor_splits_a_word(tmp_path: Path) -> None:
+    """SA1h's part 2 and assumption 138: the same with the U+007F raw in the
+    payload."""
+    command = CONTROL_BYTE_WORDS[1][1]
+    payload = command_payload(command, agent_type="security-auditor", cwd=str(tmp_path))
+    stdin = raw_del(payload)
+    assert "\x7f" in stdin, "the payload must hold a raw U+007F"
+    result = run_guard_stdin(stdin, policy=AUDITOR_POLICY)
+    assert_not_on_the_auditors_list(result, "l, a raw DEL, then s (auditor)")

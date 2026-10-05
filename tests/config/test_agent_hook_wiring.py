@@ -66,6 +66,20 @@ refuse a file of that name at any depth (group (e)), and
 (group (f), the owner's decision on Question 11). The module's last test pins
 the four in both lists (brief T6, item 12). It fails until step W.
 
+ADR-0018's ninth amendment (2026-10-04), with its follow-ups of 2026-10-05,
+adds decision 22's "What git does not show" and decision 12 (g) to decision 14's
+text, and a last entry whose matcher is `mcp__.*`. The module's final section
+pins them (brief T8, items 7 and 10): the test-author's Edit|Write `DENY_GLOBS`
+hold its git list, a per-directory `.gitignore`, `.gitattributes` and a glob for
+each pattern of the root `.gitignore`; the coder's Edit|Write `DENY_GLOBS` and
+its Bash `WRITE_DENY_GLOBS` hold the same less `.gitignore`, and neither holds
+the root `.gitignore` or `.commit-msg`; and exactly one entry routes `mcp__.*`
+to `path-guard.sh` for the coder, the test-author and the architect, with
+`PATH_ROOT` `project` and `DENY_GLOBS` `*`. T4's test that every
+`path-guard.sh` policy names its agents' one root leaves that entry out, which
+is the owner's decision (assumptions 155 and 165). The test-author's list passes
+since step W1; the coder's lists and the `mcp__.*` entry fail until step W.
+
 See also `.claude/hooks/path-guard.sh` and `.claude/hooks/bash-guard.sh`, whose
 own headers record the probes of the frontmatter wiring, and
 `tests/config/test_path_guard_behavior.py`, which exercises the guard script
@@ -762,6 +776,10 @@ def test_coder_edit_write_deny_globs_cover_decision_12() -> None:
 # Decision 20: the root each agent's path-guard.sh policies name.
 EXPECTED_PATH_ROOTS = {"coder": "cwd", "architect": "project", "test-author": "project"}
 
+# Decision 14's last entry (the ninth amendment's follow-up of 2026-10-05): the
+# matcher that routes every MCP tool to path-guard.sh for the fenced agents.
+MCP_MATCHER = "mcp__.*"
+
 # Decision 22's agent-configuration list, which every Edit/Write policy carries.
 AGENT_CONFIGURATION_GLOBS = frozenset(
     [
@@ -876,9 +894,17 @@ def test_every_path_guard_policy_sets_its_path_root() -> None:
     """ADR-0018 decisions 14 and 20: every path-guard.sh policy names its root,
     `cwd` for the coder, whose root is its worktree, and `project` for the
     architect and the test-author. An unset PATH_ROOT keeps the two old bases,
-    and a policy scoped to agents with different roots cannot name one."""
+    and a policy scoped to agents with different roots cannot name one.
+
+    The entry whose matcher is `mcp__.*` is left out: it is scoped to agents
+    whose roots differ, judges no path, and is pinned exactly by
+    `test_the_mcp_entry_is_decision_14s_last_entry` instead (the ninth
+    amendment's follow-up of 2026-10-05; assumptions 155 and 165, the owner's
+    decision). Every other path-guard.sh policy is judged as before."""
     offenders = []
     for command in path_guard_policies():
+        if command.matcher == MCP_MATCHER:
+            continue
         roots = {
             EXPECTED_PATH_ROOTS[agent]
             for agent in command.scoped_agents
@@ -1042,3 +1068,153 @@ def test_coder_deny_lists_refuse_tests_names_and_the_testkit(
     assert not missing, (
         f"the coder's {tool} policy's {variable} lacks ADR-0018 decision 12's {sorted(missing)}"
     )
+
+
+# --- ADR-0018's ninth amendment: what git does not show, and MCP tools --------
+#
+# Brief T8, items 7 and 10. Compared as sets of words.
+
+# Decision 22's "What git does not show": the ignored names, one or more globs for
+# each pattern of the root `.gitignore`, and `.hypothesis/`'s content.
+GIT_IGNORED_NAME_GLOBS = frozenset(
+    [
+        "*.py[cod]",
+        "*.py[cod]/*",
+        "venv/*",
+        "*/venv/*",
+        ".env",
+        "*/.env",
+        ".env/*",
+        "*/.env/*",
+        ".uv/*",
+        "*/.uv/*",
+        "uv.lock.bak",
+        "*/uv.lock.bak",
+        "uv.lock.bak/*",
+        "*/uv.lock.bak/*",
+        "dist/*",
+        "*/dist/*",
+        "build/*",
+        "*/build/*",
+        "*.egg-info/*",
+        ".pytest_cache/*",
+        "*/.pytest_cache/*",
+        ".ruff_cache/*",
+        "*/.ruff_cache/*",
+        ".mypy_cache/*",
+        "*/.mypy_cache/*",
+        ".coverage",
+        "*/.coverage",
+        ".coverage/*",
+        "*/.coverage/*",
+        "htmlcov/*",
+        "*/htmlcov/*",
+        "data/*",
+        "*/data/*",
+        "snapshots/*",
+        "*/snapshots/*",
+        "*.snap",
+        "*.snap/*",
+        ".DS_Store",
+        "*/.DS_Store",
+        ".DS_Store/*",
+        "*/.DS_Store/*",
+        ".hypothesis/*",
+        "*/.hypothesis/*",
+    ]
+)
+
+# Decision 22's git list for the test-author: `.gitignore`, `*/.gitignore`,
+# `.gitattributes` and `*/.gitattributes`, and the ignored names.
+TEST_AUTHOR_GIT_GLOBS = (
+    frozenset([".gitignore", "*/.gitignore", ".gitattributes", "*/.gitattributes"])
+    | GIT_IGNORED_NAME_GLOBS
+)
+
+# Decision 22's git list for the coder: the same less `.gitignore` (decision 12 (g)).
+CODER_GIT_GLOBS = (
+    frozenset(["*/.gitignore", ".gitattributes", "*/.gitattributes"]) | GIT_IGNORED_NAME_GLOBS
+)
+
+# The two names decision 12 (g) leaves the coder: the root `.gitignore`, and
+# `.commit-msg`, its own ignored file (decision 9).
+CODER_KEPT_NAMES = frozenset([".gitignore", ".commit-msg"])
+
+
+def test_test_author_write_deny_globs_hold_decision_22s_git_list() -> None:
+    """ADR-0018 decisions 14 and 22, "What git does not show": the test-author's
+    Edit|Write DENY_GLOBS hold its git list, so it writes no per-directory
+    `.gitignore`, no `.gitattributes` and no path the root `.gitignore`
+    ignores."""
+    command = path_guard_policy("test-author", EDIT_WRITE)
+    missing = TEST_AUTHOR_GIT_GLOBS - words(command, "DENY_GLOBS")
+    assert not missing, (
+        f"the test-author's Edit|Write DENY_GLOBS lack decision 22's git list's {sorted(missing)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool", "script_name", "variable"),
+    [("Write", PATH_GUARD, "DENY_GLOBS"), ("Bash", BASH_GUARD, "WRITE_DENY_GLOBS")],
+    ids=["Edit|Write-DENY_GLOBS", "Bash-WRITE_DENY_GLOBS"],
+)
+def test_coder_deny_lists_hold_decision_22s_git_list(
+    tool: str, script_name: str, variable: str
+) -> None:
+    """ADR-0018 decisions 12 (g), 14 and 22: after step W the coder's Edit|Write
+    `DENY_GLOBS` and its Bash `WRITE_DENY_GLOBS` each hold the coder's git list,
+    and neither holds the root `.gitignore` or `.commit-msg`, which the coder
+    keeps."""
+    command = coder_policy(tool, script_name)
+    listed = words(command, variable)
+    missing = CODER_GIT_GLOBS - listed
+    assert not missing, (
+        f"the coder's {tool} policy's {variable} lacks decision 22's git list's {sorted(missing)}"
+    )
+    kept = sorted(CODER_KEPT_NAMES & listed)
+    assert not kept, (
+        f"the coder's {tool} policy's {variable} holds {kept}; decision 12 (g) leaves them"
+    )
+
+
+# Decision 14's last entry, exactly: the variables and their words.
+MCP_ENTRY_SCRIPT = "${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+MCP_ENTRY_SCOPE = frozenset(["coder", "test-author", "architect"])
+
+
+def test_the_mcp_entry_is_decision_14s_last_entry() -> None:
+    """ADR-0018 decision 14's last entry (the ninth amendment's follow-up of
+    2026-10-05), decision 24 and Question 13's answer: exactly one PreToolUse
+    entry has the matcher `mcp__.*`; it holds exactly one command hook, which
+    runs path-guard.sh with exactly SCOPE_AGENT_TYPES naming the coder, the
+    test-author and the architect, PATH_ROOT `project` and DENY_GLOBS `*`, so
+    that decision 24 refuses every MCP tool those three agents call."""
+    entries = [entry for entry in load_pretooluse_entries() if entry.get("matcher") == MCP_MATCHER]
+    assert len(entries) == 1, (
+        f"expected exactly one PreToolUse entry in {SETTINGS_PATH} whose matcher is "
+        f"{MCP_MATCHER!r} (ADR-0018 decision 14); found {len(entries)}"
+    )
+    hooks = entries[0].get("hooks")
+    assert isinstance(hooks, list) and len(hooks) == 1, (
+        f"the {MCP_MATCHER!r} entry must hold exactly one hook; found {hooks!r}"
+    )
+    hook = hooks[0]
+    assert isinstance(hook, dict) and hook.get("type") == "command", hook
+    command = hook.get("command", "")
+    assert isinstance(command, str), hook
+    env, script = split_hook_command(command)
+    assert script == MCP_ENTRY_SCRIPT, (
+        f"the {MCP_MATCHER!r} entry runs {script!r}; decision 14 says {MCP_ENTRY_SCRIPT!r}"
+    )
+    assert len(shlex.split(command)) == len(env) + 1, (
+        f"the {MCP_MATCHER!r} entry's command line holds more than its variables and its "
+        f"script: {command}"
+    )
+    assert sorted(env) == ["DENY_GLOBS", "PATH_ROOT", "SCOPE_AGENT_TYPES"], (
+        f"the {MCP_MATCHER!r} entry must set exactly SCOPE_AGENT_TYPES, PATH_ROOT and "
+        f"DENY_GLOBS; it sets {sorted(env)}"
+    )
+    assert frozenset(env["SCOPE_AGENT_TYPES"].split()) == MCP_ENTRY_SCOPE, env
+    assert len(env["SCOPE_AGENT_TYPES"].split()) == len(MCP_ENTRY_SCOPE), env
+    assert env["PATH_ROOT"] == "project", env
+    assert env["DENY_GLOBS"] == "*", env
