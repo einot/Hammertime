@@ -2590,10 +2590,11 @@ BACKGROUND_PHRASE = "run_in_background"
 
 # The texts the wrapper `jq`s key on, each from the ADR's recommended filter for its
 # check (brief T8, "Building the payloads"): the NUL gate, the extraction check
-# and decision 28's check.
+# and decision 28's check. Decision 28's key names the field's path, because its
+# denial, which `deny` hands to `jq` as an argument, holds the bare field name.
 NUL_GATE_KEY = "any(. == 0)"
 EXTRACTION_CHECK_KEY = "def rendered"
-DECISION_28_KEY = "run_in_background"
+DECISION_28_KEY = ".tool_input.run_in_background"
 
 GIT_STATUS_AS_CODER = command_payload("git status", agent_type="coder")
 GIT_STATUS_AS_AUDITOR = command_payload("git status", agent_type="security-auditor")
